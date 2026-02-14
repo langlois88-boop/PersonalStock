@@ -1,0 +1,10 @@
+**/__pycache__
+**/.pytest_cache
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.DS_Store
+**/.env
+**/node_modules
+**/build
+portfolio_backend/db.sqlite3

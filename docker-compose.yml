@@ -1,0 +1,56 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+  backend:
+    build:
+      context: ./portfolio_backend
+      dockerfile: Dockerfile
+    env_file:
+      - ./deploy/.env
+    depends_on:
+      - redis
+    volumes:
+      - backend_media:/app/media
+      - backend_static:/app/staticfiles
+      - backend_db:/app/db
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  celery_worker:
+    build:
+      context: ./portfolio_backend
+      dockerfile: Dockerfile
+    command: celery -A portfolio_backend worker -B --loglevel=INFO --pool=solo
+    env_file:
+      - ./deploy/.env
+    depends_on:
+      - redis
+      - backend
+    volumes:
+      - backend_media:/app/media
+      - backend_static:/app/staticfiles
+      - backend_db:/app/db
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./portfolio-frontend
+      dockerfile: Dockerfile
+    depends_on:
+      - backend
+    ports:
+      - "3001:80"
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  backend_media:
+  backend_static:
+  backend_db:
