@@ -18,7 +18,7 @@ services:
       - backend_static:/app/staticfiles
       - backend_db:/app/db
     ports:
-      - "8000:8000"
+      - "8001:8000"
     restart: unless-stopped
 
   celery_worker:
