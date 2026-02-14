@@ -7,8 +7,8 @@ services:
 
   backend:
     build:
-      context: .
-      dockerfile: portfolio_backend/Dockerfile
+      context: ./portfolio_backend
+      dockerfile: Dockerfile
     env_file:
       - ./deploy/.env
     depends_on:
@@ -23,8 +23,8 @@ services:
 
   celery_worker:
     build:
-      context: .
-      dockerfile: portfolio_backend/Dockerfile
+      context: ./portfolio_backend
+      dockerfile: Dockerfile
     command: celery -A portfolio_backend worker -B --loglevel=INFO --pool=solo
     env_file:
       - ./deploy/.env
@@ -39,8 +39,8 @@ services:
 
   frontend:
     build:
-      context: .
-      dockerfile: portfolio-frontend/Dockerfile
+      context: ./portfolio-frontend
+      dockerfile: Dockerfile
     depends_on:
       - backend
     ports:
