@@ -1,0 +1,211 @@
+.app-shell {
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app-container {
+  padding: 32px 16px 72px;
+}
+
+.app-hero {
+  margin-bottom: 24px;
+  padding: 20px 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 8px 24px var(--shadow);
+}
+
+.hero-eyebrow {
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.hero-title {
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.hero-subtitle {
+  color: var(--text-muted);
+  max-width: 720px;
+}
+
+.lux-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 20px 22px;
+  box-shadow: 0 8px 24px var(--shadow);
+}
+
+.card-header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.card-title {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.card-subtitle {
+  color: var(--text-muted);
+}
+
+.card-divider {
+  border-color: var(--border);
+}
+
+.card-body {
+  color: var(--text);
+}
+
+.portfolio-page {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 20px 16px 32px;
+  text-align: left;
+  color: inherit;
+}
+
+.portfolio-page h1 {
+  margin-bottom: 24px;
+  font-size: 2rem;
+}
+
+.portfolio-card {
+  background: var(--surface);
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 24px var(--shadow);
+  padding: 20px 22px 26px;
+  margin-bottom: 24px;
+}
+
+.portfolio-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 12px;
+}
+
+.portfolio-header h2 {
+  margin: 0;
+}
+
+.chart-wrap {
+  background: var(--surface-muted);
+  padding: 16px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+}
+
+.stock-select {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.error {
+  color: #b91c1c;
+  font-weight: 600;
+}
+
+.success {
+  color: #15803d;
+  font-weight: 600;
+}
+
+.transaction-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+  margin-top: 12px;
+}
+
+.transaction-form label {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  gap: 6px;
+}
+
+.transaction-form input,
+.transaction-form select {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 0.95rem;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.transaction-form button {
+  background: var(--text);
+  color: var(--bg);
+  border: none;
+  padding: 10px 16px;
+  border-radius: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  align-self: end;
+  box-shadow: 0 6px 16px var(--shadow);
+}
+
+.transaction-form button:hover {
+  filter: brightness(1.05);
+}
+
+body[data-theme='dark'] .MuiPaper-root,
+body[data-theme='dark'] .MuiCard-root,
+body[data-theme='dark'] .MuiTableContainer-root {
+  background-color: var(--surface);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+body[data-theme='dark'] .MuiTableCell-root,
+body[data-theme='dark'] .MuiTypography-root {
+  color: var(--text);
+}
+
+body[data-theme='dark'] .MuiDivider-root {
+  border-color: var(--border);
+}
+
+body[data-theme='dark'] .MuiInputBase-root,
+body[data-theme='dark'] .MuiOutlinedInput-notchedOutline,
+body[data-theme='dark'] .MuiSelect-icon {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+body[data-theme='dark'] .MuiInputBase-input,
+body[data-theme='dark'] .MuiInputLabel-root,
+body[data-theme='dark'] .MuiFormLabel-root,
+body[data-theme='dark'] .MuiFormHelperText-root {
+  color: var(--text) !important;
+}
+
+body[data-theme='dark'] .MuiTabs-root,
+body[data-theme='dark'] .MuiTab-root {
+  color: var(--text) !important;
+}
+
+body[data-theme='dark'] .MuiTab-root.Mui-selected {
+  color: #38bdf8 !important;
+}
+
+body[data-theme='dark'] .delete-portfolio {
+  color: #ef4444;
+}
