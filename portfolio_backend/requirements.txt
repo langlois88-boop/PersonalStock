@@ -20,3 +20,4 @@ praw
 newsapi-python
 python-dotenv
 prophet
+openai
