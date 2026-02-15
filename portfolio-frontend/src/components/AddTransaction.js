@@ -1,6 +1,7 @@
 import { Box, Typography } from '@mui/material';
 
 import TransactionForm from './TransactionForm';
+import TransactionEditor from './TransactionEditor';
 
 function AddTransaction() {
   return (
@@ -9,6 +10,7 @@ function AddTransaction() {
         Add Transaction
       </Typography>
       <TransactionForm />
+      <TransactionEditor />
     </Box>
   );
 }

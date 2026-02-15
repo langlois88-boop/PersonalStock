@@ -101,7 +101,14 @@ function AIRecommendations({ items, title = 'AI Portfolio Optimizer', emptyMessa
                 <div>
                   <div className="flex items-center gap-2">
                     <div className="relative group/ticker">
-                      <span className="text-lg font-bold text-white cursor-help">{item.ticker}</span>
+                      <a
+                        href={`https://finance.yahoo.com/quote/${item.ticker}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-lg font-bold text-white cursor-help hover:text-indigo-300"
+                      >
+                        {item.ticker}
+                      </a>
                       <div className="absolute left-0 top-full mt-2 hidden group-hover/ticker:block w-80 z-20 bg-slate-950 border border-slate-800 rounded-xl p-4 text-xs text-slate-200 shadow-xl">
                         <p className="text-sm text-slate-100 font-semibold">{item.ticker} · Détails IA</p>
                         <p className="text-slate-400 mt-1">{item.reason}</p>
