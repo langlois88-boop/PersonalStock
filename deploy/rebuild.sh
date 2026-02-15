@@ -13,6 +13,8 @@ docker compose build --no-cache
 docker compose up -d
 
 echo "[rebuild] Update prices"
+echo "[rebuild] Run migrations"
+docker compose exec -T backend python manage.py migrate
 docker compose exec -T backend python manage.py fetch_prices
 
 echo "[rebuild] Done"
