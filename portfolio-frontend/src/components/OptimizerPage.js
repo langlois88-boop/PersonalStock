@@ -14,6 +14,10 @@ function OptimizerPage() {
     if (pnlPct <= -7) signal = 'SELL';
     if (pnlPct >= 3) signal = 'BUY MORE';
 
+    const dividendYield = Number(holding.dividend_yield || 0);
+    const sector = holding.sector || 'Non défini';
+    const fundamentals = `Secteur ${sector} · Dividende ${(dividendYield * 100).toFixed(2)}%`;
+
     const confidence = Math.min(95, Math.max(55, Math.round(50 + Math.abs(pnlPct) * 3)));
     const reason = `P/L ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%).`;
 
@@ -28,8 +32,8 @@ function OptimizerPage() {
         `Valeur marché ${Number(holding.value || 0).toFixed(2)}.`,
       ],
       details: {
-        dilution: 'Analyse fondamentale indisponible.',
-        dilutionSource: 'Source: transactions du compte.',
+        fundamentals,
+        fundamentalsSource: 'Source: profil du stock.',
         rsi: `Prix actuel ${Number(holding.price || 0).toFixed(2)}.`,
       },
       name: holding.name || holding.ticker,
@@ -150,9 +154,9 @@ function OptimizerPage() {
                         </ul>
                       </div>
                       <div>
-                        <p className="text-slate-400">Dilution détectée</p>
-                        <p className="text-slate-200">{item.details.dilution}</p>
-                        <p className="text-slate-500 text-xs">Source: {item.details.dilutionSource}</p>
+                        <p className="text-slate-400">Fondamentaux</p>
+                        <p className="text-slate-200">{item.details.fundamentals}</p>
+                        <p className="text-slate-500 text-xs">Source: {item.details.fundamentalsSource}</p>
                       </div>
                       <div>
                         <p className="text-slate-400">RSI</p>

@@ -1005,6 +1005,8 @@ class PortfolioDashboardView(APIView):
 				items.append({
 					'ticker': stock.symbol,
 					'name': stock.name,
+					'sector': stock.sector,
+					'dividend_yield': float(stock.dividend_yield or 0),
 					'shares': shares,
 					'price': price,
 					'value': value,
@@ -1037,6 +1039,25 @@ class PortfolioDashboardView(APIView):
 			}, status=200)
 
 		holdings = PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
+		try:
+			account_transactions = AccountTransaction.objects.select_related('stock').all()
+		except OperationalError:
+			account_transactions = []
+
+		cost_map = {}
+		for tx in account_transactions:
+			if tx.type == 'DIVIDEND':
+				continue
+			sign = 1 if tx.type == 'BUY' else -1
+			entry = cost_map.setdefault(
+				tx.stock_id,
+				{'shares': 0.0, 'buy_qty': 0.0, 'buy_cost': 0.0},
+			)
+			qty = float(tx.quantity or 0)
+			entry['shares'] += qty * sign
+			if tx.type == 'BUY':
+				entry['buy_qty'] += qty
+				entry['buy_cost'] += qty * float(tx.price or 0)
 		items = []
 		total_value = 0.0
 		stable_value = 0.0
@@ -1053,6 +1074,13 @@ class PortfolioDashboardView(APIView):
 			price = float(price or 0)
 			value = float(holding.shares or 0) * price
 			total_value += value
+			cost_data = cost_map.get(stock.id, {})
+			buy_qty = float(cost_data.get('buy_qty') or 0)
+			buy_cost = float(cost_data.get('buy_cost') or 0)
+			avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
+			cost_value = avg_cost * float(holding.shares or 0)
+			unrealized = value - cost_value
+			unrealized_pct = (unrealized / cost_value * 100) if cost_value else 0
 
 			prev_1d = PriceHistory.objects.filter(stock=stock).order_by('-date')[1:2].first()
 			if prev_1d:
@@ -1071,9 +1099,15 @@ class PortfolioDashboardView(APIView):
 			items.append({
 				'ticker': stock.symbol,
 				'name': stock.name,
+				'sector': stock.sector,
+				'dividend_yield': float(stock.dividend_yield or 0),
 				'shares': float(holding.shares or 0),
 				'price': price,
 				'value': value,
+				'avg_cost': round(avg_cost, 4),
+				'cost_value': round(cost_value, 2),
+				'unrealized_pnl': round(unrealized, 2),
+				'unrealized_pnl_pct': round(unrealized_pct, 2),
 				'category': 'Stable' if is_stable else 'Risky',
 			})
 
