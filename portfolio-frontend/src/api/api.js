@@ -1,9 +1,28 @@
 import axios from 'axios';
+import { pushApiError } from './errorStore';
 
 const apiBaseUrl =
 	process.env.REACT_APP_API_BASE_URL ||
 	`${window.location.protocol}//${window.location.hostname}:8001/api/`;
 
 const api = axios.create({ baseURL: apiBaseUrl });
+
+api.interceptors.response.use(
+	(response) => response,
+	(error) => {
+		const status = error?.response?.status;
+		const url = error?.config?.url;
+		const method = error?.config?.method;
+		const message = error?.response?.data?.error || error?.message || 'Request failed';
+		pushApiError({
+			status,
+			url,
+			method,
+			message,
+			timestamp: new Date().toISOString(),
+		});
+		return Promise.reject(error);
+	}
+);
 
 export default api;

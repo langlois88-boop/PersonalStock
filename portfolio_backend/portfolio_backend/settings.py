@@ -45,6 +45,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
 
+    'channels',
     'rest_framework',
     'corsheaders',
     'portfolio',
@@ -86,6 +87,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'portfolio_backend.wsgi.application'
+ASGI_APPLICATION = 'portfolio_backend.asgi.application'
 
 
 # Database
@@ -148,6 +150,11 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
+REST_FRAMEWORK = {
+    'DEFAULT_PAGINATION_CLASS': 'portfolio.pagination.DefaultPagination',
+    'PAGE_SIZE': 25,
+}
+
 # Celery / Redis
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
 CELERY_BROKER_URL = REDIS_URL
@@ -156,6 +163,15 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
+
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        'CONFIG': {
+            'hosts': [os.getenv('REDIS_URL', 'redis://localhost:6379/0')],
+        },
+    },
+}
 
 CELERY_BEAT_SCHEDULE = {
     'fetch-prices-hourly': {
@@ -226,9 +242,53 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.execute_paper_trades',
         'schedule': crontab(minute='*/15', hour='9-16', day_of_week='mon-fri'),
     },
+    'refresh-ai-bluechip-watchlist-hourly': {
+        'task': 'portfolio.tasks.refresh_ai_bluechip_watchlist',
+        'schedule': crontab(minute=5, hour='8-16', day_of_week='mon-fri'),
+    },
+    'refresh-ai-penny-watchlist-hourly': {
+        'task': 'portfolio.tasks.refresh_ai_penny_watchlist',
+        'schedule': crontab(minute=10, hour='8-16', day_of_week='mon-fri'),
+    },
+    'paper-trades-ai-bluechip-15min': {
+        'task': 'portfolio.tasks.execute_paper_trades_ai_bluechip',
+        'schedule': crontab(minute='*/15', hour='9-16', day_of_week='mon-fri'),
+    },
+    'paper-trades-ai-penny-15min': {
+        'task': 'portfolio.tasks.execute_paper_trades_ai_penny',
+        'schedule': crontab(minute='*/15', hour='9-16', day_of_week='mon-fri'),
+    },
     'paper-trade-retrain-daily': {
         'task': 'portfolio.tasks.retrain_from_paper_trades_daily',
         'schedule': crontab(minute=40, hour=7),
+    },
+    'model-evaluation-daily': {
+        'task': 'portfolio.tasks.compute_model_evaluation_daily',
+        'schedule': crontab(minute=50, hour=7),
+    },
+    'data-pipeline-daily': {
+        'task': 'portfolio.tasks.ensure_data_pipeline_daily',
+        'schedule': crontab(minute=10, hour=7),
+    },
+    'data-qa-daily': {
+        'task': 'portfolio.tasks.compute_data_qa_daily',
+        'schedule': crontab(minute=20, hour=7),
+    },
+    'continuous-evaluation-daily': {
+        'task': 'portfolio.tasks.compute_continuous_evaluation_daily',
+        'schedule': crontab(minute=35, hour=7),
+    },
+    'drift-retrain-daily': {
+        'task': 'portfolio.tasks.auto_retrain_on_drift_daily',
+        'schedule': crontab(minute=45, hour=7),
+    },
+    'model-rollback-daily': {
+        'task': 'portfolio.tasks.auto_rollback_models_daily',
+        'schedule': crontab(minute=55, hour=7),
+    },
+    'cleanup-taskrunlog-daily': {
+        'task': 'portfolio.tasks.cleanup_task_run_logs',
+        'schedule': crontab(minute=15, hour=2),
     },
 }
 

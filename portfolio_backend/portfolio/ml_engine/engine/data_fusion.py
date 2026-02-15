@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
+from functools import lru_cache
 from typing import Optional
 
 import pandas as pd
@@ -45,7 +46,7 @@ class DataFusionEngine:
         if not fred_key:
             return pd.DataFrame()
 
-        series = ["GS10", "VIXCLS"]
+        series = ["GS10", "VIXCLS", "CPIAUCSL", "DCOILWTICO"]
         frames = []
         for series_id in series:
             data = self._fetch_fred_series(series_id, fred_key)
@@ -81,6 +82,8 @@ class DataFusionEngine:
         fused["MA200"] = fused["Close"].rolling(window=200).mean()
         fused["Volatility"] = fused["Returns"].rolling(window=21).std()
         fused["Momentum20"] = fused["Close"].pct_change(20)
+        fused["vol_regime"] = fused["Volatility"] / fused["Volatility"].rolling(window=252).mean()
+        fused["sector_code"] = _get_sector_code(self.ticker)
 
         delta = fused["Close"].diff()
         gain = delta.clip(lower=0).rolling(14).mean()
@@ -119,3 +122,28 @@ class DataFusionEngine:
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
         df = df.set_index("date")
         return df[["value"]]
+
+
+SECTOR_CODES = {
+    "technology": 1,
+    "financial services": 2,
+    "consumer defensive": 3,
+    "consumer cyclical": 4,
+    "healthcare": 5,
+    "industrials": 6,
+    "energy": 7,
+    "basic materials": 8,
+    "communication services": 9,
+    "utilities": 10,
+    "real estate": 11,
+}
+
+
+@lru_cache(maxsize=256)
+def _get_sector_code(ticker: str) -> int:
+    try:
+        info = yf.Ticker(ticker).info or {}
+        sector = (info.get("sector") or "").strip().lower()
+    except Exception:
+        sector = ""
+    return SECTOR_CODES.get(sector, 0)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import os
 from pathlib import Path
 from typing import Iterable
@@ -12,18 +13,48 @@ from sklearn.ensemble import RandomForestClassifier
 
 
 MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_v1.pkl"
+BLUECHIP_MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_bluechip_v1.pkl"
+PENNY_MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_penny_v1.pkl"
 FEATURE_COLUMNS = [
     "Returns",
     "GS10",
     "VIXCLS",
+    "CPIAUCSL",
+    "DCOILWTICO",
     "sentiment_score",
+    "news_count",
     "Volatility",
+    "vol_regime",
     "MA20",
     "MA50",
     "MA200",
     "Momentum20",
     "RSI14",
+    "sector_code",
 ]
+
+
+def get_model_path(universe: str | None = None) -> Path:
+    universe_key = (universe or '').strip().upper()
+    if universe_key in {'AI_PENNY', 'PENNY', 'PENNY_STOCK', 'PENNY_STOCKS'}:
+        return Path(os.getenv('PENNY_MODEL_PATH', str(PENNY_MODEL_PATH)))
+    if universe_key in {'AI_BLUECHIP', 'BLUECHIP', 'BLUE_CHIP', 'BLUE'}:
+        return Path(os.getenv('BLUECHIP_MODEL_PATH', str(BLUECHIP_MODEL_PATH)))
+    return Path(os.getenv('BLUECHIP_MODEL_PATH', str(BLUECHIP_MODEL_PATH)))
+
+
+def _new_model_version() -> str:
+    return datetime.utcnow().strftime('%Y%m%d%H%M%S')
+
+
+def get_model_version(payload: dict | None, model_path: Path) -> str:
+    if payload and payload.get('model_version'):
+        return str(payload.get('model_version'))
+    try:
+        mtime = int(model_path.stat().st_mtime)
+        return f"{model_path.name}:{mtime}"
+    except Exception:
+        return model_path.name
 
 
 @dataclass
@@ -138,7 +169,10 @@ def _build_training_set(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[
         return np.array([]), np.array([]), []
 
     X_df = data[FEATURE_COLUMNS].fillna(0)
-    y = (data["Returns"].shift(-1) > 0).astype(int).values
+    future_returns = data["Returns"].shift(-1)
+    risk_denom = data["Volatility"].replace(0, pd.NA)
+    risk_adj = future_returns / risk_denom
+    y = (risk_adj > 0).astype(int).values
     if len(y) > 0:
         X_df = X_df.iloc[:-1]
         y = y[:-1]
@@ -168,7 +202,7 @@ def train_fusion_model(df: pd.DataFrame, model_path: Path = MODEL_PATH) -> dict 
         random_state=42,
     )
     model.fit(X, y)
-    payload = {"model": model, "features": selected}
+    payload = {"model": model, "features": selected, "model_version": _new_model_version()}
     joblib.dump(payload, model_path)
     return payload
 
@@ -202,6 +236,7 @@ def train_fusion_model_from_labels(
         "features": FEATURE_COLUMNS,
         "trained_from": "paper_trades",
         "sample_count": int(len(X_df)),
+        "model_version": _new_model_version(),
     }
     if save:
         joblib.dump(payload, model_path)

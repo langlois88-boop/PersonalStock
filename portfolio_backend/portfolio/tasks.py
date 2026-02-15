@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from datetime import datetime, timedelta
+from math import isfinite
 from typing import Any
 
 import yfinance as yf
 import requests
 import random
+import json
 import pandas as pd
 from celery import shared_task
 from django.conf import settings
@@ -24,6 +26,7 @@ import praw
 from newsapi import NewsApiClient
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from transformers import pipeline
+from sklearn.ensemble import RandomForestClassifier
 
 from .models import (
     Account,
@@ -31,6 +34,12 @@ from .models import (
     AlertEvent,
     DividendHistory,
     DripSnapshot,
+    MacroIndicator,
+    DataQADaily,
+    ModelCalibrationDaily,
+    ModelDriftDaily,
+    ModelRegistry,
+    ModelEvaluationDaily,
     Portfolio,
     PortfolioDigest,
     PennyStockSnapshot,
@@ -39,8 +48,10 @@ from .models import (
     PriceHistory,
     Prediction,
     PaperTrade,
+    SandboxWatchlist,
     Stock,
     StockNews,
+    TaskRunLog,
     UserPreference,
 )
 from .ai_module import run_predictions
@@ -49,6 +60,8 @@ from .ml_engine.backtester import (
     AIBacktester,
     FEATURE_COLUMNS,
     apply_feature_weighting_to_signal,
+    get_model_version,
+    get_model_path,
     load_or_train_model,
     save_model_payload,
     train_fusion_model,
@@ -57,6 +70,65 @@ from .ml_engine.backtester import (
 
 
 DEFAULT_YIELD = 0.02
+
+
+def _send_alert(subject: str, message: str) -> None:
+    alert_to = os.getenv('ALERT_EMAIL_TO')
+    from_email = os.getenv('DEFAULT_FROM_EMAIL', 'alerts@localhost')
+    if alert_to:
+        try:
+            send_mail(subject, message, from_email, [alert_to], fail_silently=True)
+        except Exception:
+            pass
+
+    webhook = os.getenv('SLACK_WEBHOOK_URL')
+    if webhook:
+        try:
+            requests.post(webhook, json={'text': f"{subject}\n{message}"}, timeout=10)
+        except Exception:
+            pass
+
+
+def _task_log_start(task_name: str) -> TaskRunLog:
+    return TaskRunLog.objects.create(task_name=task_name, status='SUCCESS')
+
+
+def _task_log_finish(log: TaskRunLog, status: str, payload: dict[str, Any] | None = None, error: str = '') -> None:
+    finished = timezone.now()
+    duration_ms = int((finished - log.started_at).total_seconds() * 1000)
+    log.status = status
+    log.finished_at = finished
+    log.duration_ms = duration_ms
+    if error:
+        log.error = str(error)[:2000]
+    if payload is not None:
+        log.payload = payload
+    log.save(update_fields=['status', 'finished_at', 'duration_ms', 'error', 'payload'])
+
+
+@shared_task
+def cleanup_task_run_logs() -> dict[str, Any]:
+    log = _task_log_start('cleanup_task_run_logs')
+    retention_days = int(os.getenv('TASKRUNLOG_RETENTION_DAYS', '30'))
+    cutoff = timezone.now() - timedelta(days=retention_days)
+    deleted, _ = TaskRunLog.objects.filter(started_at__lt=cutoff).delete()
+    result = {'deleted': deleted, 'retention_days': retention_days}
+    _task_log_finish(log, 'SUCCESS', result)
+    return result
+
+
+def _is_valid_price(value: float | None) -> bool:
+    return value is not None and isfinite(value) and value > 0
+
+
+def _backfill_latest_price(stock: Stock) -> bool:
+    last = PriceHistory.objects.filter(stock=stock).order_by('-date').first()
+    if last and _is_valid_price(float(last.close_price or 0)):
+        stock.latest_price = float(last.close_price)
+        stock.latest_price_updated_at = timezone.now()
+        stock.save(update_fields=['latest_price', 'latest_price_updated_at'])
+        return True
+    return False
 
 
 def _normalize_weights(stocks: list[Stock]) -> list[float]:
@@ -77,61 +149,76 @@ def _calc_yield(stocks: list[Stock]) -> float:
 
 @shared_task
 def fetch_prices_hourly() -> dict[str, float]:
+    log = _task_log_start('fetch_prices_hourly')
     prices: dict[str, float] = {}
-    for stock in Stock.objects.all().order_by('symbol'):
-        if not _is_valid_symbol(stock.symbol):
-            continue
-        ticker = yf.Ticker(stock.symbol)
-        try:
-            data = ticker.history(period='1mo', interval='1d', timeout=10)
-        except Exception:
-            continue
-        if data is None or data.empty or 'Close' not in data:
-            continue
-        last_row = data.iloc[-1]
-        price = float(last_row['Close'])
-        day_low = float(last_row['Low']) if 'Low' in data else None
-        day_high = float(last_row['High']) if 'High' in data else None
+    try:
+        for stock in Stock.objects.all().order_by('symbol'):
+            if not _is_valid_symbol(stock.symbol):
+                continue
+            ticker = yf.Ticker(stock.symbol)
+            try:
+                data = ticker.history(period='1mo', interval='1d', timeout=10)
+            except Exception:
+                data = None
+            if data is None or data.empty or 'Close' not in data:
+                if _backfill_latest_price(stock):
+                    prices[stock.symbol] = float(stock.latest_price or 0)
+                continue
+            last_row = data.iloc[-1]
+            price = float(last_row['Close'])
+            if not _is_valid_price(price):
+                if _backfill_latest_price(stock):
+                    prices[stock.symbol] = float(stock.latest_price or 0)
+                continue
+            day_low = float(last_row['Low']) if 'Low' in data else None
+            day_high = float(last_row['High']) if 'High' in data else None
 
-        info: dict[str, Any] = {}
-        try:
-            info = ticker.info or {}
-        except Exception:
-            info = {}
+            info: dict[str, Any] = {}
+            try:
+                info = ticker.info or {}
+            except Exception:
+                info = {}
 
-        sector = (info.get('sector') or '').strip()
-        div_yield = info.get('dividendYield')
-        if div_yield is None:
-            div_yield = info.get('trailingAnnualDividendYield')
-        div_yield = float(div_yield) if div_yield is not None else None
+            sector = (info.get('sector') or '').strip()
+            div_yield = info.get('dividendYield')
+            if div_yield is None:
+                div_yield = info.get('trailingAnnualDividendYield')
+            div_yield = float(div_yield) if div_yield is not None else None
 
-        stock.latest_price = price
-        stock.day_low = day_low
-        stock.day_high = day_high
-        if (not stock.sector) or stock.sector.lower() == 'unknown':
-            if sector:
-                stock.sector = sector
-        if not stock.dividend_yield or float(stock.dividend_yield or 0) == 0:
-            if div_yield is not None:
-                stock.dividend_yield = div_yield
-        stock.latest_price_updated_at = timezone.now()
-        stock.save(update_fields=['latest_price', 'day_low', 'day_high', 'sector', 'dividend_yield', 'latest_price_updated_at'])
+            stock.latest_price = price
+            stock.day_low = day_low
+            stock.day_high = day_high
+            if (not stock.sector) or stock.sector.lower() == 'unknown':
+                if sector:
+                    stock.sector = sector
+            if not stock.dividend_yield or float(stock.dividend_yield or 0) == 0:
+                if div_yield is not None:
+                    stock.dividend_yield = div_yield
+            stock.latest_price_updated_at = timezone.now()
+            stock.save(update_fields=['latest_price', 'day_low', 'day_high', 'sector', 'dividend_yield', 'latest_price_updated_at'])
 
-        for dt, row in data.iterrows():
-            PriceHistory.objects.update_or_create(
-                stock=stock,
-                date=dt.date(),
-                defaults={'close_price': float(row['Close'])},
-            )
+            for dt, row in data.iterrows():
+                PriceHistory.objects.update_or_create(
+                    stock=stock,
+                    date=dt.date(),
+                    defaults={'close_price': float(row['Close'])},
+                )
 
-        prices[stock.symbol] = price
-    return prices
+            prices[stock.symbol] = price
+        _task_log_finish(log, 'SUCCESS', {'count': len(prices)})
+        return prices
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        _send_alert('Task failed: fetch_prices_hourly', str(exc))
+        raise
 
 
 @shared_task
 def fetch_news_daily(days: int = 1, page_size: int = 10, language: str = 'en') -> dict[str, int]:
+    log = _task_log_start('fetch_news_daily')
     api_key = os.getenv('NEWSAPI_KEY')
     if not api_key:
+        _task_log_finish(log, 'SUCCESS', {'created': 0, 'seen': 0, 'skipped': 'missing_api_key'})
         return {'created': 0, 'seen': 0}
 
     newsapi = NewsApiClient(api_key=api_key)
@@ -142,58 +229,66 @@ def fetch_news_daily(days: int = 1, page_size: int = 10, language: str = 'en') -
     created = 0
     seen = 0
 
-    for stock in Stock.objects.all().order_by('symbol'):
-        result: dict[str, Any] = newsapi.get_everything(
-            q=stock.symbol,
-            language=language,
-            sort_by='publishedAt',
-            from_param=from_iso,
-            page_size=page_size,
-        )
-        articles = result.get('articles') or []
-
-        for a in articles:
-            seen += 1
-            url = a.get('url')
-            if not url:
-                continue
-
-            published_at = None
-            published_raw = a.get('publishedAt')
-            if published_raw:
-                try:
-                    published_at = datetime.fromisoformat(published_raw.replace('Z', '+00:00'))
-                except ValueError:
-                    published_at = None
-
-            headline = (a.get('title') or '').strip()[:300] or url
-            description = (a.get('description') or '').strip()
-            text_for_sentiment = f"{headline}. {description}".strip()
-            sentiment = analyzer.polarity_scores(text_for_sentiment).get('compound')
-
-            _, was_created = StockNews.objects.get_or_create(
-                url=url,
-                defaults={
-                    'stock': stock,
-                    'headline': headline,
-                    'source': ((a.get('source') or {}).get('name') or '').strip()[:100],
-                    'published_at': published_at,
-                    'sentiment': sentiment,
-                    'raw': a,
-                },
+    try:
+        for stock in Stock.objects.all().order_by('symbol'):
+            result: dict[str, Any] = newsapi.get_everything(
+                q=stock.symbol,
+                language=language,
+                sort_by='publishedAt',
+                from_param=from_iso,
+                page_size=page_size,
             )
-            if was_created:
-                created += 1
-            else:
-                updated += 1
+            articles = result.get('articles') or []
 
+            for a in articles:
+                seen += 1
+                url = a.get('url')
+                if not url:
+                    continue
+
+                published_at = None
+                published_raw = a.get('publishedAt')
+                if published_raw:
+                    try:
+                        published_at = datetime.fromisoformat(published_raw.replace('Z', '+00:00'))
+                    except ValueError:
+                        published_at = None
+
+                headline = (a.get('title') or '').strip()[:300] or url
+                description = (a.get('description') or '').strip()
+                text_for_sentiment = f"{headline}. {description}".strip()
+                sentiment = analyzer.polarity_scores(text_for_sentiment).get('compound')
+
+                _, was_created = StockNews.objects.get_or_create(
+                    url=url,
+                    defaults={
+                        'stock': stock,
+                        'headline': headline,
+                        'source': ((a.get('source') or {}).get('name') or '').strip()[:100],
+                        'published_at': published_at,
+                        'sentiment': sentiment,
+                        'raw': a,
+                    },
+                )
+                if was_created:
+                    created += 1
+                else:
+                    updated += 1
+
+        _task_log_finish(log, 'SUCCESS', {'created': created, 'updated': updated})
         return {'created': created, 'updated': updated}
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        _send_alert('Task failed: fetch_news_daily', str(exc))
+        raise
 
 
 @shared_task
 def fetch_finnhub_news_daily(days: int = 1) -> dict[str, int]:
+    log = _task_log_start('fetch_finnhub_news_daily')
     api_key = os.getenv('FINNHUB_API_KEY')
     if not api_key:
+        _task_log_finish(log, 'SUCCESS', {'created': 0, 'seen': 0, 'skipped': 'missing_api_key'})
         return {'created': 0, 'seen': 0}
 
     client = finnhub.Client(api_key=api_key)
@@ -205,167 +300,250 @@ def fetch_finnhub_news_daily(days: int = 1) -> dict[str, int]:
     created = 0
     seen = 0
 
-    for stock in Stock.objects.all().order_by('symbol'):
-        news = client.company_news(stock.symbol, _from=str(from_dt), to=str(to_dt))
-        for item in news:
-            seen += 1
-            url = item.get('url')
-            if not url:
-                continue
+    try:
+        for stock in Stock.objects.all().order_by('symbol'):
+            news = client.company_news(stock.symbol, _from=str(from_dt), to=str(to_dt))
+            for item in news:
+                seen += 1
+                url = item.get('url')
+                if not url:
+                    continue
 
-            headline = (item.get('headline') or '').strip()[:300] or url
-            summary = (item.get('summary') or '').strip()
-            text_for_sentiment = f"{headline}. {summary}".strip()
-            sentiment = analyzer.polarity_scores(text_for_sentiment).get('compound')
+                headline = (item.get('headline') or '').strip()[:300] or url
+                summary = (item.get('summary') or '').strip()
+                text_for_sentiment = f"{headline}. {summary}".strip()
+                sentiment = analyzer.polarity_scores(text_for_sentiment).get('compound')
 
-            published_at = None
-            if item.get('datetime'):
-                published_at = datetime.fromtimestamp(item['datetime'], tz=timezone.UTC)
+                published_at = None
+                if item.get('datetime'):
+                    published_at = datetime.fromtimestamp(item['datetime'], tz=timezone.UTC)
 
-            _, was_created = StockNews.objects.get_or_create(
-                url=url,
-                defaults={
-                    'stock': stock,
-                    'headline': headline,
-                    'source': 'Finnhub',
-                    'published_at': published_at,
-                    'sentiment': sentiment,
-                    'raw': item,
-                },
-            )
-            if was_created:
-                created += 1
+                _, was_created = StockNews.objects.get_or_create(
+                    url=url,
+                    defaults={
+                        'stock': stock,
+                        'headline': headline,
+                        'source': 'Finnhub',
+                        'published_at': published_at,
+                        'sentiment': sentiment,
+                        'raw': item,
+                    },
+                )
+                if was_created:
+                    created += 1
 
-    return {'created': created, 'seen': seen}
+        _task_log_finish(log, 'SUCCESS', {'created': created, 'seen': seen})
+        return {'created': created, 'seen': seen}
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        _send_alert('Task failed: fetch_finnhub_news_daily', str(exc))
+        raise
 
 
 @shared_task
 def fetch_google_news_daily(days: int = 1) -> dict[str, int]:
+    log = _task_log_start('fetch_google_news_daily')
     analyzer = SentimentIntensityAnalyzer()
     cutoff = timezone.now() - timedelta(days=days)
 
     created = 0
     seen = 0
 
-    for stock in Stock.objects.all().order_by('symbol'):
-        query = quote_plus(f"{stock.symbol} stock")
-        url = (
-            "https://news.google.com/rss/search"
-            f"?q={query}&hl=en-US&gl=US&ceid=US:en"
-        )
-        feed = feedparser.parse(url)
-
-        for entry in feed.entries:
-            seen += 1
-            link = entry.get('link')
-            if not link:
-                continue
-
-            headline = (entry.get('title') or '').strip()[:300] or link
-            summary = (entry.get('summary') or '').strip()
-            text_for_sentiment = f"{headline}. {summary}".strip()
-            sentiment = analyzer.polarity_scores(text_for_sentiment).get('compound')
-
-            published_at = None
-            if entry.get('published'):
-                try:
-                    published_at = parsedate_to_datetime(entry['published'])
-                except Exception:
-                    published_at = None
-
-            if published_at and published_at < cutoff:
-                continue
-
-            _, was_created = StockNews.objects.get_or_create(
-                url=link,
-                defaults={
-                    'stock': stock,
-                    'headline': headline,
-                    'source': 'Google News',
-                    'published_at': published_at,
-                    'sentiment': sentiment,
-                    'raw': entry,
-                },
+    try:
+        for stock in Stock.objects.all().order_by('symbol'):
+            query = quote_plus(f"{stock.symbol} stock")
+            url = (
+                "https://news.google.com/rss/search"
+                f"?q={query}&hl=en-US&gl=US&ceid=US:en"
             )
-            if was_created:
-                created += 1
+            feed = feedparser.parse(url)
 
-    return {'created': created, 'seen': seen}
+            for entry in feed.entries:
+                seen += 1
+                link = entry.get('link')
+                if not link:
+                    continue
+
+                headline = (entry.get('title') or '').strip()[:300] or link
+                summary = (entry.get('summary') or '').strip()
+                text_for_sentiment = f"{headline}. {summary}".strip()
+                sentiment = analyzer.polarity_scores(text_for_sentiment).get('compound')
+
+                published_at = None
+                if entry.get('published'):
+                    try:
+                        published_at = parsedate_to_datetime(entry['published'])
+                    except Exception:
+                        published_at = None
+
+                if published_at and published_at < cutoff:
+                    continue
+
+                _, was_created = StockNews.objects.get_or_create(
+                    url=link,
+                    defaults={
+                        'stock': stock,
+                        'headline': headline,
+                        'source': 'Google News',
+                        'published_at': published_at,
+                        'sentiment': sentiment,
+                        'raw': entry,
+                    },
+                )
+                if was_created:
+                    created += 1
+
+        _task_log_finish(log, 'SUCCESS', {'created': created, 'seen': seen})
+        return {'created': created, 'seen': seen}
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        _send_alert('Task failed: fetch_google_news_daily', str(exc))
+        raise
 
 
 @shared_task
 def fetch_macro_daily(start: str = '2025-01-01') -> dict[str, int]:
+    log = _task_log_start('fetch_macro_daily')
     try:
         call_command('fetch_macro', start=start)
     except Exception:
+        _task_log_finish(log, 'FAILED', error='fetch_macro failed')
+        _send_alert('Task failed: fetch_macro_daily', 'fetch_macro failed')
         return {'ok': 0}
+    _task_log_finish(log, 'SUCCESS', {'ok': 1})
     return {'ok': 1}
 
 
 @shared_task
+def ensure_data_pipeline_daily() -> dict[str, Any]:
+    """Quality checks and backfills for market, macro, and news data."""
+    log = _task_log_start('ensure_data_pipeline_daily')
+    results: dict[str, Any] = {}
+    cutoff = timezone.now() - timedelta(days=2)
+    stale = Stock.objects.filter(
+        models.Q(latest_price_updated_at__lt=cutoff) | models.Q(latest_price_updated_at__isnull=True)
+    )
+    backfilled_prices = 0
+    for stock in stale:
+        if _backfill_latest_price(stock):
+            backfilled_prices += 1
+    results['price_backfilled'] = backfilled_prices
+    results['stale_prices'] = stale.count()
+
+    macro_recent = MacroIndicator.objects.filter(
+        date__gte=timezone.now().date() - timedelta(days=1)
+    ).exists()
+    if not macro_recent:
+        try:
+            last = MacroIndicator.objects.order_by('-date').first()
+            start_date = (last.date + timedelta(days=1)) if last else (timezone.now().date() - timedelta(days=30))
+            call_command('fetch_macro', start=start_date.isoformat())
+            results['macro_backfill'] = True
+        except Exception as exc:
+            results['macro_backfill'] = False
+            results['macro_error'] = str(exc)
+    else:
+        results['macro_backfill'] = False
+
+    news_cutoff = timezone.now() - timedelta(hours=24)
+    news_count = StockNews.objects.filter(fetched_at__gte=news_cutoff).count()
+    results['news_count_24h'] = news_count
+    min_daily_news = int(os.getenv('MIN_DAILY_NEWS', '25'))
+    if news_count < min_daily_news:
+        backfill_days = int(os.getenv('NEWS_BACKFILL_DAYS', '3'))
+        results['news_backfill'] = {
+            'newsapi': fetch_news_daily(days=backfill_days, page_size=20),
+            'finnhub': fetch_finnhub_news_daily(days=backfill_days),
+            'google': fetch_google_news_daily(days=backfill_days),
+            'press_releases': fetch_press_releases_hourly(hours=72),
+        }
+        _send_alert(
+            'Data gap: low news volume',
+            f"News count 24h={news_count}, backfilled {backfill_days} days",
+        )
+    else:
+        results['news_backfill'] = None
+
+    if results['stale_prices']:
+        _send_alert('Data gap: stale prices', f"Stale prices={results['stale_prices']}")
+    if results.get('macro_backfill') is True:
+        _send_alert('Data gap: macro backfill', 'Macro data was backfilled')
+
+    _task_log_finish(log, 'SUCCESS', results)
+    return results
+
+
+@shared_task
 def fetch_press_releases_hourly(hours: int = 24) -> dict[str, int]:
+    log = _task_log_start('fetch_press_releases_hourly')
     cutoff = timezone.now() - timedelta(hours=hours)
     finbert = _finbert_pipeline()
 
     created = 0
     seen = 0
 
-    for stock in Stock.objects.all().order_by('symbol'):
-        query = quote_plus(f"{stock.symbol} press release")
-        url = (
-            "https://news.google.com/rss/search"
-            f"?q={query}&hl=en-US&gl=US&ceid=US:en"
-        )
-        feed = feedparser.parse(url)
-
-        for entry in feed.entries:
-            seen += 1
-            link = entry.get('link')
-            if not link:
-                continue
-
-            headline = (entry.get('title') or '').strip()[:300] or link
-            summary = (entry.get('summary') or '').strip()
-
-            published_at = None
-            if entry.get('published'):
-                try:
-                    published_at = parsedate_to_datetime(entry['published'])
-                except Exception:
-                    published_at = None
-
-            if published_at and published_at < cutoff:
-                continue
-
-            text = f"{headline}. {summary}".strip()
-            finbert_result = finbert(text[:1000])[0]
-            label = finbert_result.get('label', '').lower()
-            score = float(finbert_result.get('score') or 0)
-            if label == 'positive':
-                sentiment = score
-            elif label == 'negative':
-                sentiment = -score
-            else:
-                sentiment = 0.0
-
-            _, was_created = StockNews.objects.get_or_create(
-                url=link,
-                defaults={
-                    'stock': stock,
-                    'headline': headline,
-                    'source': 'Press Release',
-                    'published_at': published_at,
-                    'sentiment': sentiment,
-                    'raw': _sanitize_json({
-                        'summary': summary,
-                        'finbert': finbert_result,
-                    }),
-                },
+    try:
+        for stock in Stock.objects.all().order_by('symbol'):
+            query = quote_plus(f"{stock.symbol} press release")
+            url = (
+                "https://news.google.com/rss/search"
+                f"?q={query}&hl=en-US&gl=US&ceid=US:en"
             )
-            if was_created:
-                created += 1
+            feed = feedparser.parse(url)
 
-    return {'created': created, 'seen': seen}
+            for entry in feed.entries:
+                seen += 1
+                link = entry.get('link')
+                if not link:
+                    continue
+
+                headline = (entry.get('title') or '').strip()[:300] or link
+                summary = (entry.get('summary') or '').strip()
+
+                published_at = None
+                if entry.get('published'):
+                    try:
+                        published_at = parsedate_to_datetime(entry['published'])
+                    except Exception:
+                        published_at = None
+
+                if published_at and published_at < cutoff:
+                    continue
+
+                text = f"{headline}. {summary}".strip()
+                finbert_result = finbert(text[:1000])[0]
+                label = finbert_result.get('label', '').lower()
+                score = float(finbert_result.get('score') or 0)
+                if label == 'positive':
+                    sentiment = score
+                elif label == 'negative':
+                    sentiment = -score
+                else:
+                    sentiment = 0.0
+
+                _, was_created = StockNews.objects.get_or_create(
+                    url=link,
+                    defaults={
+                        'stock': stock,
+                        'headline': headline,
+                        'source': 'Press Release',
+                        'published_at': published_at,
+                        'sentiment': sentiment,
+                        'raw': _sanitize_json({
+                            'summary': summary,
+                            'finbert': finbert_result,
+                        }),
+                    },
+                )
+                if was_created:
+                    created += 1
+
+        _task_log_finish(log, 'SUCCESS', {'created': created, 'seen': seen})
+        return {'created': created, 'seen': seen}
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        _send_alert('Task failed: fetch_press_releases_hourly', str(exc))
+        raise
 
 
 @shared_task
@@ -1243,13 +1421,14 @@ def backtest_retrain_guard() -> dict[str, Any]:
     if data is None or data.empty:
         return {'status': 'no_data', 'symbol': symbol}
 
-    model = load_or_train_model(data)
+    model_path = get_model_path('BLUECHIP')
+    model = load_or_train_model(data, model_path=model_path)
     backtester = AIBacktester(data, model, symbol=symbol)
     result = backtester.run_simulation(lookback_days=lookback_days)
 
     retrained = False
     if result.win_rate < min_win_rate:
-        model = train_fusion_model(data)
+        model = train_fusion_model(data, model_path=model_path)
         retrained = model is not None
 
     return {
@@ -1262,22 +1441,49 @@ def backtest_retrain_guard() -> dict[str, Any]:
     }
 
 
-@shared_task
-def execute_paper_trades() -> dict[str, Any]:
-    """Execute live paper trades using model signals and risk rules."""
-    watchlist = os.getenv('PAPER_WATCHLIST', 'SPY,AAPL,MSFT,NVDA,AMZN').split(',')
-    watchlist = [s.strip().upper() for s in watchlist if s.strip()]
-    buy_threshold = float(os.getenv('PAPER_BUY_THRESHOLD', '0.82'))
-    sell_threshold = float(os.getenv('PAPER_SELL_THRESHOLD', '0.4'))
-    trail_pct = float(os.getenv('PAPER_TRAIL_PCT', '0.04'))
-    atr_mult = float(os.getenv('PAPER_ATR_MULT', '1.5'))
-    risk_pct = float(os.getenv('PAPER_RISK_PCT', '0.015'))
-    position_cap_pct = float(os.getenv('PAPER_POSITION_CAP_PCT', '0.10'))
-    initial_capital = float(os.getenv('PAPER_CAPITAL', '10000'))
+def _env_float(prefix: str, name: str, default: str) -> float:
+    return float(os.getenv(f'{prefix}_{name}', os.getenv(f'PAPER_{name}', default)))
 
-    closed_trades = PaperTrade.objects.filter(status='CLOSED')
+
+def _sandbox_env_float(sandbox: str, name: str, default: str) -> float:
+    key = f'{sandbox}_{name}'
+    return float(os.getenv(key, os.getenv(name, default)))
+
+
+def _sandbox_env_int(sandbox: str, name: str, default: str) -> int:
+    key = f'{sandbox}_{name}'
+    return int(os.getenv(key, os.getenv(name, default)))
+
+
+def _env_list(prefix: str, name: str, default: str) -> list[str]:
+    raw = os.getenv(f'{prefix}_{name}', os.getenv(f'PAPER_{name}', default))
+    items = [s.strip().upper() for s in str(raw).split(',') if s.strip()]
+    return items
+
+
+def _get_watchlist(sandbox: str, prefix: str, default: str) -> list[str]:
+    stored = SandboxWatchlist.objects.filter(sandbox=sandbox).first()
+    if stored and stored.symbols:
+        return [str(s).strip().upper() for s in stored.symbols if str(s).strip()]
+    return _env_list(prefix, 'WATCHLIST', default)
+
+
+def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, Any]:
+    """Execute live paper trades for a specific sandbox using model signals and risk rules."""
+    watchlist = _get_watchlist(sandbox, prefix, 'SPY,AAPL,MSFT,NVDA,AMZN')
+    universe = 'PENNY' if sandbox == 'AI_PENNY' else 'BLUECHIP'
+    model_path = get_model_path(universe)
+    buy_threshold = _env_float(prefix, 'BUY_THRESHOLD', '0.82')
+    sell_threshold = _env_float(prefix, 'SELL_THRESHOLD', '0.4')
+    trail_pct = _env_float(prefix, 'TRAIL_PCT', '0.04')
+    atr_mult = _env_float(prefix, 'ATR_MULT', '1.5')
+    risk_pct = _env_float(prefix, 'RISK_PCT', '0.015')
+    position_cap_pct = _env_float(prefix, 'POSITION_CAP_PCT', '0.10')
+    initial_capital = _env_float(prefix, 'CAPITAL', '10000')
+
+    closed_trades = PaperTrade.objects.filter(status='CLOSED', sandbox=sandbox)
     closed_pnl = float(sum([float(t.pnl or 0) for t in closed_trades]))
-    open_trades = {t.ticker: t for t in PaperTrade.objects.filter(status='OPEN')}
+    open_trades = {t.ticker: t for t in PaperTrade.objects.filter(status='OPEN', sandbox=sandbox)}
     open_value = sum([float(t.entry_price) * float(t.quantity) for t in open_trades.values()])
     capital = initial_capital + closed_pnl
     available = max(0.0, capital - open_value)
@@ -1312,7 +1518,7 @@ def execute_paper_trades() -> dict[str, Any]:
             fusion_df = fusion.fuse_all()
             if fusion_df is None or fusion_df.empty:
                 return None
-            payload = load_or_train_model(fusion_df)
+            payload = load_or_train_model(fusion_df, model_path=model_path)
             if not payload or not payload.get('model'):
                 return None
             last_row = fusion_df.tail(1).copy()
@@ -1324,7 +1530,34 @@ def execute_paper_trades() -> dict[str, Any]:
             signal = float(payload['model'].predict_proba(features)[0][1])
             signal = apply_feature_weighting_to_signal(signal, last_row.iloc[0], symbol)
             feature_snapshot = {col: float(last_row.iloc[0].get(col, 0.0)) for col in FEATURE_COLUMNS}
-            return {'signal': signal, 'features': feature_snapshot}
+            explanations = []
+            try:
+                importances = getattr(payload['model'], 'feature_importances_', None)
+                if importances is not None and len(importances) == len(feature_list):
+                    weights = []
+                    for i, col in enumerate(feature_list):
+                        value = float(last_row.iloc[0].get(col, 0.0))
+                        weight = abs(value) * float(importances[i])
+                        weights.append((col, value, weight))
+                    total = sum([w[2] for w in weights]) or 1.0
+                    top_n = int(os.getenv('TRADE_EXPLANATION_TOP_N', '5'))
+                    explanations = [
+                        {
+                            'feature': col,
+                            'value': value,
+                            'contribution': round((weight / total) * 100, 2),
+                        }
+                        for col, value, weight in sorted(weights, key=lambda item: item[2], reverse=True)[:top_n]
+                    ]
+            except Exception:
+                explanations = []
+            return {
+                'signal': signal,
+                'features': feature_snapshot,
+                'explanations': explanations,
+                'model_version': get_model_version(payload, model_path),
+                'model_name': universe,
+            }
         except Exception:
             return None
 
@@ -1345,8 +1578,9 @@ def execute_paper_trades() -> dict[str, Any]:
             trade.exit_price = price
             trade.exit_date = timezone.now()
             trade.pnl = float(price - float(trade.entry_price)) * float(trade.quantity)
+            trade.outcome = 'WIN' if float(trade.pnl or 0) > 0 else 'LOSS'
             closed += 1
-        trade.save(update_fields=['stop_loss', 'status', 'exit_price', 'exit_date', 'pnl'])
+        trade.save(update_fields=['stop_loss', 'status', 'exit_price', 'exit_date', 'pnl', 'outcome'])
 
     for symbol in watchlist:
         if symbol in open_trades:
@@ -1369,10 +1603,14 @@ def execute_paper_trades() -> dict[str, Any]:
         stop_loss = price - stop_distance
         PaperTrade.objects.create(
             ticker=symbol,
+            sandbox=sandbox,
             entry_price=round(price, 2),
             quantity=quantity,
             entry_signal=signal,
             entry_features=(signal_payload or {}).get('features'),
+            entry_explanations=(signal_payload or {}).get('explanations'),
+            model_name=(signal_payload or {}).get('model_name', universe),
+            model_version=(signal_payload or {}).get('model_version', ''),
             stop_loss=round(stop_loss, 2),
             status='OPEN',
             pnl=0,
@@ -1385,81 +1623,697 @@ def execute_paper_trades() -> dict[str, Any]:
 
 
 @shared_task
-def retrain_from_paper_trades_daily() -> dict[str, Any]:
+def execute_paper_trades() -> dict[str, Any]:
+    return _execute_paper_trades_for_sandbox('WATCHLIST', 'PAPER')
+
+
+@shared_task
+def execute_paper_trades_ai_bluechip() -> dict[str, Any]:
+    return _execute_paper_trades_for_sandbox('AI_BLUECHIP', 'AI_BLUECHIP')
+
+
+@shared_task
+def execute_paper_trades_ai_penny() -> dict[str, Any]:
+    return _execute_paper_trades_for_sandbox('AI_PENNY', 'AI_PENNY')
+
+
+@shared_task
+def retrain_from_paper_trades_daily(sandbox_override: str | None = None) -> dict[str, Any]:
     """Retrain the fusion model daily from closed paper trades + fresh API/news data."""
+    log = _task_log_start('retrain_from_paper_trades_daily')
     learn_days = int(os.getenv('PAPER_TRADE_LEARN_DAYS', '90'))
     min_samples = int(os.getenv('PAPER_TRADE_MIN_SAMPLES', '20'))
     min_win_improve = float(os.getenv('PAPER_TRADE_MIN_WIN_IMPROVEMENT', '0.5'))
+    min_promote_trades = int(os.getenv('PAPER_TRADE_PROMOTE_MIN_TRADES', '20'))
+    min_promote_win_rate = float(os.getenv('PAPER_TRADE_PROMOTE_MIN_WIN_RATE', '0.5'))
+    holdout_ratio = float(os.getenv('PAPER_TRADE_HOLDOUT_RATIO', '0.2'))
+    min_holdout_accuracy = float(os.getenv('PAPER_TRADE_MIN_HOLDOUT_ACCURACY', '0.55'))
+    holdout_days = int(os.getenv('PAPER_TRADE_HOLDOUT_DAYS', '0'))
+    min_holdout_samples = int(os.getenv('PAPER_TRADE_MIN_HOLDOUT_SAMPLES', '10'))
+    sandbox = (sandbox_override or os.getenv('PAPER_TRADE_SANDBOX', 'WATCHLIST')).strip().upper() or 'WATCHLIST'
     cutoff = timezone.now() - timedelta(days=learn_days)
+    def _label_from_trade(trade: PaperTrade, vol: float | None) -> int:
+        try:
+            entry_value = float(trade.entry_price) * float(trade.quantity)
+            record_pnl = float(trade.pnl or 0)
+            if entry_value <= 0:
+                return 0
+            ret = record_pnl / entry_value
+            if vol and vol > 0:
+                ret = ret / vol
+            return 1 if ret > 0 else 0
+        except Exception:
+            return 0
 
-    trades = (
-        PaperTrade.objects.filter(status='CLOSED', entry_date__gte=cutoff)
-        .exclude(exit_date__isnull=True)
-        .order_by('-entry_date')
-    )
+    def _ensure_feature_cols(frame: pd.DataFrame) -> pd.DataFrame:
+        for col in FEATURE_COLUMNS:
+            if col not in frame.columns:
+                frame[col] = 0.0
+        return frame
 
-    if not trades.exists():
-        return {'status': 'no_trades', 'samples': 0}
+    def _split_time(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        if df.empty:
+            return df, pd.DataFrame()
+        df = df.sort_values('entry_date')
+        if holdout_days > 0:
+            cut = timezone.now() - timedelta(days=holdout_days)
+            train_df = df[df['entry_date'] < cut]
+            holdout_df = df[df['entry_date'] >= cut]
+            return train_df, holdout_df
+        split_index = int(len(df) * (1 - holdout_ratio))
+        train_df = df.iloc[:split_index] if split_index > 0 else df
+        holdout_df = df.iloc[split_index:] if split_index < len(df) else pd.DataFrame()
+        return train_df, holdout_df
 
-    samples: list[dict[str, float]] = []
+    def _train_for_sandbox(selected_sandbox: str) -> dict[str, Any]:
+        model_name = 'PENNY' if selected_sandbox == 'AI_PENNY' else 'BLUECHIP'
+        trades = (
+            PaperTrade.objects.filter(status='CLOSED', entry_date__gte=cutoff, sandbox=selected_sandbox)
+            .exclude(exit_date__isnull=True)
+            .order_by('entry_date')
+        )
+        if not trades.exists():
+            return {'sandbox': selected_sandbox, 'status': 'no_trades', 'samples': 0}
 
-    for trade in trades:
-        symbol = (trade.ticker or '').strip().upper()
-        if not symbol:
-            continue
-        if trade.entry_features:
-            sample = {col: float((trade.entry_features or {}).get(col, 0.0)) for col in FEATURE_COLUMNS}
+        samples: list[dict[str, Any]] = []
+        for trade in trades:
+            symbol = (trade.ticker or '').strip().upper()
+            if not symbol:
+                continue
+            entry_date = trade.entry_date or trade.exit_date
+            if not entry_date:
+                continue
+            if trade.entry_features:
+                sample = {col: float((trade.entry_features or {}).get(col, 0.0)) for col in FEATURE_COLUMNS}
+                vol = float((trade.entry_features or {}).get('Volatility') or 0) or None
+            else:
+                fusion = DataFusionEngine(symbol)
+                fusion_df = fusion.fuse_all()
+                if fusion_df is None or fusion_df.empty:
+                    continue
+                df = fusion_df.copy().sort_index()
+                if not isinstance(df.index, pd.DatetimeIndex):
+                    df.index = pd.to_datetime(df.index)
+                entry_ts = pd.to_datetime(entry_date)
+                row = df[df.index <= entry_ts].tail(1)
+                if row.empty:
+                    continue
+                sample = {col: float(row.iloc[0].get(col, 0.0)) for col in FEATURE_COLUMNS}
+                vol = float(row.iloc[0].get('Volatility') or 0) or None
+            sample['label'] = _label_from_trade(trade, vol)
+            sample['entry_date'] = pd.to_datetime(entry_date)
+            samples.append(sample)
+
+        samples_df = pd.DataFrame(samples)
+        if samples_df.empty:
+            return {'sandbox': selected_sandbox, 'status': 'no_samples', 'samples': 0}
+
+        train_df, holdout_df = _split_time(samples_df)
+        if len(train_df) < min_samples:
+            return {
+                'sandbox': selected_sandbox,
+                'status': 'insufficient_samples',
+                'samples': int(len(train_df)),
+                'min_required': min_samples,
+            }
+
+        model_path = get_model_path(selected_sandbox)
+
+        holdout_accuracy = None
+        holdout_ok = True
+        if not holdout_df.empty and len(holdout_df) >= min_holdout_samples:
+            train_df = _ensure_feature_cols(train_df.copy())
+            holdout_df = _ensure_feature_cols(holdout_df.copy())
+            X_train = train_df[FEATURE_COLUMNS].fillna(0).values
+            y_train = train_df['label'].fillna(0).astype(int).values
+            X_holdout = holdout_df[FEATURE_COLUMNS].fillna(0).values
+            y_holdout = holdout_df['label'].fillna(0).astype(int).values
+            if len(set(y_train)) >= 2 and len(set(y_holdout)) >= 2:
+                holdout_model = RandomForestClassifier(
+                    n_estimators=500,
+                    max_depth=5,
+                    min_samples_split=8,
+                    min_samples_leaf=10,
+                    random_state=42,
+                )
+                holdout_model.fit(X_train, y_train)
+                preds = holdout_model.predict(X_holdout)
+                holdout_accuracy = float((preds == y_holdout).mean())
+                holdout_ok = holdout_accuracy >= min_holdout_accuracy
+
+        payload = train_fusion_model_from_labels(samples_df.drop(columns=['entry_date']), model_path=model_path, save=False)
+        if not payload:
+            return {'sandbox': selected_sandbox, 'status': 'failed', 'samples': int(len(train_df)), 'trained': False}
+
+        model_version = get_model_version(payload, model_path)
+
+        symbol = os.getenv('BACKTEST_SYMBOL', 'SPY').strip().upper()
+        lookback_days = int(os.getenv('BACKTEST_LOOKBACK_DAYS', '90'))
+        engine = DataFusionEngine(symbol)
+        data = engine.fuse_all()
+        if data is None or data.empty:
+            return {'sandbox': selected_sandbox, 'status': 'no_data', 'samples': int(len(train_df)), 'trained': False}
+
+        current = load_or_train_model(data, model_path=model_path)
+        current_result = AIBacktester(data, current).run_simulation(lookback_days=lookback_days)
+        candidate_result = AIBacktester(data, payload).run_simulation(lookback_days=lookback_days)
+
+        improved = (
+            candidate_result.win_rate >= current_result.win_rate + min_win_improve
+            or candidate_result.sharpe_ratio > current_result.sharpe_ratio
+        )
+
+        paper_trades_count = trades.count()
+        paper_win_rate = (
+            trades.filter(outcome='WIN').count() / paper_trades_count if paper_trades_count else 0.0
+        )
+        paper_ok = paper_trades_count >= min_promote_trades and paper_win_rate >= min_promote_win_rate
+
+        if improved and paper_ok and holdout_ok:
+            save_model_payload(payload, model_path=model_path)
+            ModelRegistry.objects.filter(model_name=model_name, status='ACTIVE').update(status='ARCHIVED')
+            ModelRegistry.objects.update_or_create(
+                model_name=model_name,
+                model_version=model_version,
+                defaults={
+                    'model_path': str(model_path),
+                    'status': 'ACTIVE',
+                    'backtest_win_rate': candidate_result.win_rate,
+                    'backtest_sharpe': candidate_result.sharpe_ratio,
+                    'paper_win_rate': paper_win_rate,
+                    'paper_trades': paper_trades_count,
+                    'notes': {
+                        'sandbox': selected_sandbox,
+                        'current_win_rate': current_result.win_rate,
+                        'candidate_win_rate': candidate_result.win_rate,
+                        'current_sharpe': current_result.sharpe_ratio,
+                        'candidate_sharpe': candidate_result.sharpe_ratio,
+                        'holdout_accuracy': holdout_accuracy,
+                        'holdout_ok': holdout_ok,
+                        'holdout_days': holdout_days,
+                    },
+                },
+            )
         else:
-            fusion = DataFusionEngine(symbol)
-            fusion_df = fusion.fuse_all()
-            if fusion_df is None or fusion_df.empty:
+            ModelRegistry.objects.update_or_create(
+                model_name=model_name,
+                model_version=model_version,
+                defaults={
+                    'model_path': str(model_path),
+                    'status': 'CANDIDATE',
+                    'backtest_win_rate': candidate_result.win_rate,
+                    'backtest_sharpe': candidate_result.sharpe_ratio,
+                    'paper_win_rate': paper_win_rate,
+                    'paper_trades': paper_trades_count,
+                    'notes': {
+                        'sandbox': selected_sandbox,
+                        'current_win_rate': current_result.win_rate,
+                        'candidate_win_rate': candidate_result.win_rate,
+                        'current_sharpe': current_result.sharpe_ratio,
+                        'candidate_sharpe': candidate_result.sharpe_ratio,
+                        'paper_ok': paper_ok,
+                        'holdout_accuracy': holdout_accuracy,
+                        'holdout_ok': holdout_ok,
+                        'holdout_days': holdout_days,
+                    },
+                },
+            )
+
+        return {
+            'sandbox': selected_sandbox,
+            'status': 'ok' if (improved and paper_ok and holdout_ok) else 'skipped',
+            'samples': int(len(train_df)),
+            'trained': bool(improved and paper_ok and holdout_ok),
+            'current_win_rate': current_result.win_rate,
+            'candidate_win_rate': candidate_result.win_rate,
+            'paper_win_rate': paper_win_rate,
+            'paper_trades': paper_trades_count,
+            'holdout_accuracy': holdout_accuracy,
+            'holdout_ok': holdout_ok,
+        }
+
+    if sandbox == 'ALL':
+        results = []
+        for sb in ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY']:
+            results.append(_train_for_sandbox(sb))
+        payload = {'status': 'ok', 'results': results}
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+
+    result = _train_for_sandbox(sandbox)
+    _task_log_finish(log, 'SUCCESS', result)
+    return result
+
+
+def _calculate_max_drawdown(trades: list[PaperTrade]) -> float:
+    equity = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    for trade in trades:
+        equity += float(trade.pnl or 0)
+        if equity > peak:
+            peak = equity
+        if peak > 0:
+            dd = (equity - peak) / peak
+            if dd < max_drawdown:
+                max_drawdown = dd
+    return abs(max_drawdown)
+
+
+@shared_task
+def compute_model_evaluation_daily(as_of: str | None = None) -> dict[str, Any]:
+    """Compute daily win rate, drawdown, and calibration per model version."""
+    log = _task_log_start('compute_model_evaluation_daily')
+    if as_of:
+        try:
+            as_of_date = datetime.fromisoformat(as_of).date()
+        except ValueError:
+            as_of_date = timezone.now().date()
+    else:
+        as_of_date = timezone.now().date()
+
+    closed_today = PaperTrade.objects.filter(status='CLOSED', exit_date__date=as_of_date)
+    if not closed_today.exists():
+        payload = {'status': 'no_trades', 'as_of': str(as_of_date)}
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+
+    groups = closed_today.values('model_name', 'model_version', 'sandbox').distinct()
+    created = 0
+
+    for group in groups:
+        model_name = group.get('model_name') or 'BLUECHIP'
+        model_version = group.get('model_version') or ''
+        sandbox = group.get('sandbox') or ''
+
+        day_trades = closed_today.filter(
+            model_name=model_name,
+            model_version=model_version,
+            sandbox=sandbox,
+        )
+        trades_count = day_trades.count()
+        if trades_count == 0:
+            continue
+
+        wins = day_trades.filter(outcome='WIN').count()
+        total_pnl = float(sum([float(t.pnl or 0) for t in day_trades]))
+        avg_pnl = total_pnl / trades_count if trades_count else 0.0
+        win_rate = wins / trades_count if trades_count else 0.0
+
+        signals = []
+        outcomes = []
+        for trade in day_trades:
+            if trade.entry_signal is None:
                 continue
-            df = fusion_df.copy().sort_index()
-            if not isinstance(df.index, pd.DatetimeIndex):
-                df.index = pd.to_datetime(df.index)
+            signals.append(float(trade.entry_signal))
+            outcomes.append(1.0 if (trade.outcome == 'WIN' or float(trade.pnl or 0) > 0) else 0.0)
 
-            entry_ts = pd.to_datetime(trade.entry_date)
-            row = df[df.index <= entry_ts].tail(1)
-            if row.empty:
-                continue
-            sample = {col: float(row.iloc[0].get(col, 0.0)) for col in FEATURE_COLUMNS}
-        sample['label'] = 1 if float(trade.pnl or 0) > 0 else 0
-        samples.append(sample)
+        if signals:
+            brier = sum([(signals[i] - outcomes[i]) ** 2 for i in range(len(signals))]) / len(signals)
+            mean_pred = sum(signals) / len(signals)
+            mean_out = sum(outcomes) / len(outcomes)
+        else:
+            brier = None
+            mean_pred = None
+            mean_out = None
 
-    if len(samples) < min_samples:
-        return {'status': 'insufficient_samples', 'samples': len(samples), 'min_required': min_samples}
+        history_trades = list(
+            PaperTrade.objects.filter(
+                status='CLOSED',
+                model_name=model_name,
+                model_version=model_version,
+                sandbox=sandbox,
+                exit_date__date__lte=as_of_date,
+            ).order_by('exit_date')
+        )
+        max_drawdown = _calculate_max_drawdown(history_trades)
 
-    samples_df = pd.DataFrame(samples)
-    payload = train_fusion_model_from_labels(samples_df, save=False)
-    if not payload:
-        return {'status': 'failed', 'samples': len(samples), 'trained': False}
+        ModelEvaluationDaily.objects.update_or_create(
+            as_of=as_of_date,
+            model_name=model_name,
+            model_version=model_version,
+            sandbox=sandbox,
+            defaults={
+                'trades': trades_count,
+                'win_rate': win_rate,
+                'avg_pnl': avg_pnl,
+                'total_pnl': total_pnl,
+                'max_drawdown': max_drawdown,
+                'brier_score': brier,
+                'mean_predicted': mean_pred,
+                'mean_outcome': mean_out,
+            },
+        )
+        created += 1
 
-    symbol = os.getenv('BACKTEST_SYMBOL', 'SPY').strip().upper()
-    lookback_days = int(os.getenv('BACKTEST_LOOKBACK_DAYS', '90'))
-    engine = DataFusionEngine(symbol)
-    data = engine.fuse_all()
-    if data is None or data.empty:
-        return {'status': 'no_data', 'samples': len(samples), 'trained': False}
+    payload = {'status': 'ok', 'as_of': str(as_of_date), 'models': created}
+    _task_log_finish(log, 'SUCCESS', payload)
+    return payload
 
-    current = load_or_train_model(data)
-    current_result = AIBacktester(data, current).run_simulation(lookback_days=lookback_days)
-    candidate_result = AIBacktester(data, payload).run_simulation(lookback_days=lookback_days)
 
-    improved = (
-        candidate_result.win_rate >= current_result.win_rate + min_win_improve
-        or candidate_result.sharpe_ratio > current_result.sharpe_ratio
+@shared_task
+def compute_data_qa_daily(as_of: str | None = None) -> dict[str, Any]:
+    log = _task_log_start('compute_data_qa_daily')
+    if as_of:
+        try:
+            as_of_date = datetime.fromisoformat(as_of).date()
+        except ValueError:
+            as_of_date = timezone.now().date()
+    else:
+        as_of_date = timezone.now().date()
+
+    cutoff = timezone.now() - timedelta(days=2)
+    price_total = Stock.objects.count()
+    price_missing = Stock.objects.filter(latest_price__isnull=True).count()
+    price_stale = Stock.objects.filter(
+        models.Q(latest_price_updated_at__lt=cutoff) | models.Q(latest_price_updated_at__isnull=True)
+    ).count()
+    price_bad = Stock.objects.filter(latest_price__lte=0).count()
+
+    last_macro = MacroIndicator.objects.order_by('-date').first()
+    macro_days_stale = None
+    if last_macro:
+        macro_days_stale = (as_of_date - last_macro.date).days
+
+    news_cutoff = timezone.now() - timedelta(hours=24)
+    news_count = StockNews.objects.filter(fetched_at__gte=news_cutoff).count()
+    news_symbols = StockNews.objects.filter(fetched_at__gte=news_cutoff).values('stock_id').distinct().count()
+
+    anomaly_count = 0
+    for stock_id in PriceHistory.objects.values_list('stock_id', flat=True).distinct():
+        prices = list(
+            PriceHistory.objects.filter(stock_id=stock_id).order_by('-date')[:2].values_list('close_price', flat=True)
+        )
+        if len(prices) == 2:
+            prev, curr = float(prices[1] or 0), float(prices[0] or 0)
+            if prev > 0:
+                move = abs((curr - prev) / prev)
+                if move >= 0.3:
+                    anomaly_count += 1
+
+    metrics = {
+        'price_metrics': {
+            'total': price_total,
+            'missing': price_missing,
+            'stale': price_stale,
+            'non_positive': price_bad,
+        },
+        'macro_metrics': {
+            'last_date': str(last_macro.date) if last_macro else None,
+            'days_stale': macro_days_stale,
+        },
+        'news_metrics': {
+            'count_24h': news_count,
+            'unique_symbols_24h': news_symbols,
+        },
+        'anomaly_metrics': {
+            'large_moves_30pct': anomaly_count,
+        },
+    }
+
+    DataQADaily.objects.update_or_create(
+        as_of=as_of_date,
+        defaults=metrics,
     )
 
-    if improved:
-        save_model_payload(payload)
+    _task_log_finish(log, 'SUCCESS', {'as_of': str(as_of_date), **metrics})
+    return {'as_of': str(as_of_date), **metrics}
 
-    return {
-        'status': 'ok' if improved else 'skipped',
-        'samples': len(samples),
-        'trained': bool(improved),
-        'current_win_rate': current_result.win_rate,
-        'candidate_win_rate': candidate_result.win_rate,
-    }
+
+def _psi(expected: list[float], actual: list[float], bins: int = 10) -> float:
+    if not expected or not actual:
+        return 0.0
+    try:
+        import numpy as np
+        expected_arr = np.array(expected, dtype=float)
+        actual_arr = np.array(actual, dtype=float)
+        quantiles = np.linspace(0, 1, bins + 1)
+        breaks = np.quantile(expected_arr, quantiles)
+        breaks[0] = -float('inf')
+        breaks[-1] = float('inf')
+        psi = 0.0
+        for i in range(len(breaks) - 1):
+            exp_pct = ((expected_arr > breaks[i]) & (expected_arr <= breaks[i + 1])).mean()
+            act_pct = ((actual_arr > breaks[i]) & (actual_arr <= breaks[i + 1])).mean()
+            exp_pct = max(exp_pct, 1e-6)
+            act_pct = max(act_pct, 1e-6)
+            psi += (act_pct - exp_pct) * float(np.log(act_pct / exp_pct))
+        return float(psi)
+    except Exception:
+        return 0.0
+
+
+@shared_task
+def compute_continuous_evaluation_daily(as_of: str | None = None) -> dict[str, Any]:
+    log = _task_log_start('compute_continuous_evaluation_daily')
+    if as_of:
+        try:
+            as_of_date = datetime.fromisoformat(as_of).date()
+        except ValueError:
+            as_of_date = timezone.now().date()
+    else:
+        as_of_date = timezone.now().date()
+
+    window_days = int(os.getenv('EVAL_WINDOW_DAYS', '7'))
+    baseline_days = int(os.getenv('DRIFT_BASELINE_DAYS', '30'))
+    window_start = timezone.now().date() - timedelta(days=window_days)
+    baseline_start = timezone.now().date() - timedelta(days=baseline_days)
+
+    results = {'calibration': 0, 'drift': 0}
+    for model_name in ['BLUECHIP', 'PENNY']:
+        for sandbox in ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY']:
+            trades = PaperTrade.objects.filter(
+                status='CLOSED',
+                sandbox=sandbox,
+                model_name=model_name,
+                entry_date__date__gte=window_start,
+            )
+            if not trades.exists():
+                continue
+            model_version = trades.exclude(model_version='').values_list('model_version', flat=True).first() or ''
+
+            signals = []
+            outcomes = []
+            for trade in trades:
+                if trade.entry_signal is None:
+                    continue
+                signals.append(float(trade.entry_signal))
+                outcomes.append(1.0 if (trade.outcome == 'WIN' or float(trade.pnl or 0) > 0) else 0.0)
+            bins = []
+            if signals:
+                import numpy as np
+                edges = np.linspace(0, 1, 11)
+                for i in range(len(edges) - 1):
+                    idx = [j for j, s in enumerate(signals) if edges[i] <= s < edges[i + 1]]
+                    if not idx:
+                        continue
+                    avg_pred = float(np.mean([signals[j] for j in idx]))
+                    avg_out = float(np.mean([outcomes[j] for j in idx]))
+                    bins.append({'min': float(edges[i]), 'max': float(edges[i + 1]), 'avg_pred': avg_pred, 'avg_out': avg_out, 'count': len(idx)})
+                brier = float(np.mean([(signals[i] - outcomes[i]) ** 2 for i in range(len(signals))]))
+            else:
+                brier = None
+
+            ModelCalibrationDaily.objects.update_or_create(
+                as_of=as_of_date,
+                model_name=model_name,
+                model_version=model_version,
+                sandbox=sandbox,
+                defaults={'bins': bins, 'count': len(signals), 'brier_score': brier},
+            )
+            results['calibration'] += 1
+
+            baseline = PaperTrade.objects.filter(
+                status='CLOSED',
+                sandbox=sandbox,
+                model_name=model_name,
+                entry_date__date__gte=baseline_start,
+                entry_date__date__lt=window_start,
+            )
+            if not baseline.exists():
+                continue
+            features = ['Volatility', 'Momentum20', 'RSI14']
+            psi_metrics = {}
+            feature_stats = {}
+            for feat in features:
+                expected = [float((t.entry_features or {}).get(feat, 0.0)) for t in baseline]
+                actual = [float((t.entry_features or {}).get(feat, 0.0)) for t in trades]
+                psi_metrics[feat] = _psi(expected, actual)
+                feature_stats[feat] = {
+                    'baseline_mean': float(sum(expected) / len(expected)) if expected else 0.0,
+                    'current_mean': float(sum(actual) / len(actual)) if actual else 0.0,
+                }
+
+            ModelDriftDaily.objects.update_or_create(
+                as_of=as_of_date,
+                model_name=model_name,
+                model_version=model_version,
+                sandbox=sandbox,
+                defaults={'psi': psi_metrics, 'feature_stats': feature_stats},
+            )
+            results['drift'] += 1
+
+    _task_log_finish(log, 'SUCCESS', results)
+    return results
+
+
+@shared_task
+def auto_rollback_models_daily() -> dict[str, Any]:
+    log = _task_log_start('auto_rollback_models_daily')
+    results: dict[str, Any] = {'rolled_back': []}
+    rolled_models: set[str] = set()
+    for sandbox in ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY']:
+        model_name = 'PENNY' if sandbox == 'AI_PENNY' else 'BLUECHIP'
+        if model_name in rolled_models:
+            continue
+        min_win_rate = _sandbox_env_float(sandbox, 'ROLLBACK_MIN_WIN_RATE', '0.45')
+        max_brier = _sandbox_env_float(sandbox, 'ROLLBACK_MAX_BRIER', '0.35')
+        lookback_days = _sandbox_env_int(sandbox, 'ROLLBACK_LOOKBACK_DAYS', '3')
+        cutoff = timezone.now().date() - timedelta(days=lookback_days)
+
+        active = ModelRegistry.objects.filter(model_name=model_name, status='ACTIVE').order_by('-trained_at').first()
+        if not active:
+            continue
+        evals = ModelEvaluationDaily.objects.filter(
+            model_name=model_name,
+            model_version=active.model_version,
+            sandbox=sandbox,
+            as_of__gte=cutoff,
+        )
+        if not evals.exists():
+            continue
+        avg_win = float(evals.aggregate(avg=models.Avg('win_rate')).get('avg') or 0)
+        avg_brier = evals.aggregate(avg=models.Avg('brier_score')).get('avg')
+        avg_brier = float(avg_brier) if avg_brier is not None else None
+
+        degraded = avg_win < min_win_rate or (avg_brier is not None and avg_brier > max_brier)
+        if not degraded:
+            continue
+
+        fallback = ModelRegistry.objects.filter(model_name=model_name, status='ARCHIVED').order_by('-trained_at').first()
+        if not fallback:
+            continue
+
+        active.status = 'ARCHIVED'
+        active.save(update_fields=['status'])
+        fallback.status = 'ACTIVE'
+        fallback.save(update_fields=['status'])
+        rolled_models.add(model_name)
+        results['rolled_back'].append({
+            'model': model_name,
+            'sandbox': sandbox,
+            'from': active.model_version,
+            'to': fallback.model_version,
+            'avg_win_rate': avg_win,
+            'avg_brier': avg_brier,
+        })
+        _send_alert(
+            f"Model rollback: {model_name}",
+            f"Sandbox {sandbox} | {active.model_version} -> {fallback.model_version} | win_rate={avg_win:.2f}, brier={avg_brier}",
+        )
+
+    _task_log_finish(log, 'SUCCESS', results)
+    return results
+
+
+@shared_task
+def auto_retrain_on_drift_daily() -> dict[str, Any]:
+    log = _task_log_start('auto_retrain_on_drift_daily')
+    lookback_days = int(os.getenv('DRIFT_LOOKBACK_DAYS', '1'))
+    cutoff = timezone.now().date() - timedelta(days=lookback_days)
+    results: dict[str, Any] = {'retrained': []}
+
+    for sandbox in ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY']:
+        threshold = _sandbox_env_float(sandbox, 'DRIFT_PSI_THRESHOLD', '0.2')
+        entry = ModelDriftDaily.objects.filter(sandbox=sandbox, as_of__gte=cutoff).order_by('-as_of').first()
+        if not entry or not entry.psi:
+            continue
+        max_psi = max([float(v) for v in entry.psi.values()]) if entry.psi else 0.0
+        if max_psi < threshold:
+            continue
+        result = retrain_from_paper_trades_daily(sandbox_override=sandbox)
+        results['retrained'].append({
+            'sandbox': sandbox,
+            'psi': max_psi,
+            'threshold': threshold,
+            'result': result,
+        })
+
+    _task_log_finish(log, 'SUCCESS', results)
+    return results
+
+
+@shared_task
+def refresh_ai_bluechip_watchlist() -> dict[str, Any]:
+    """Populate AI bluechip sandbox watchlist from AI opportunities endpoint."""
+    if os.getenv('AI_BLUECHIP_AUTOFILL', 'true').lower() == 'false':
+        return {'status': 'disabled', 'sandbox': 'AI_BLUECHIP'}
+    base_url = os.getenv('BACKEND_INTERNAL_URL', 'http://backend:8000').rstrip('/')
+    limit = int(os.getenv('AI_BLUECHIP_WATCHLIST_SIZE', '25'))
+    min_score = float(os.getenv('AI_BLUECHIP_MIN_SCORE', '0.25'))
+    try:
+        resp = requests.get(
+            f"{base_url}/api/ai/opportunities/",
+            params={'limit': limit, 'min_score': min_score},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        payload = resp.json() or []
+        if isinstance(payload, dict):
+            payload = payload.get('results') or payload.get('data') or []
+        symbols = [
+            str(item.get('ticker') or '').strip().upper()
+            for item in payload
+            if isinstance(item, dict)
+        ]
+        symbols = [s for s in symbols if s]
+        SandboxWatchlist.objects.update_or_create(
+            sandbox='AI_BLUECHIP',
+            defaults={'symbols': symbols, 'source': 'ai/opportunities'},
+        )
+        return {'status': 'ok', 'sandbox': 'AI_BLUECHIP', 'count': len(symbols)}
+    except Exception as exc:
+        return {'status': 'error', 'sandbox': 'AI_BLUECHIP', 'error': str(exc)}
+
+
+@shared_task
+def refresh_ai_penny_watchlist() -> dict[str, Any]:
+    """Populate AI penny sandbox watchlist from penny analytics endpoint."""
+    if os.getenv('AI_PENNY_AUTOFILL', 'true').lower() == 'false':
+        return {'status': 'disabled', 'sandbox': 'AI_PENNY'}
+    base_url = os.getenv('BACKEND_INTERNAL_URL', 'http://backend:8000').rstrip('/')
+    limit = int(os.getenv('AI_PENNY_WATCHLIST_SIZE', '50'))
+    min_score = float(os.getenv('AI_PENNY_MIN_SCORE', '0'))
+    max_price = float(os.getenv('AI_PENNY_MAX_PRICE', '1.0'))
+    min_volume = float(os.getenv('AI_PENNY_MIN_VOLUME', '100000'))
+    try:
+        resp = requests.get(
+            f"{base_url}/api/penny-analytics/",
+            params={
+                'limit': limit,
+                'min_score': min_score,
+                'max_price': max_price,
+                'min_volume': min_volume,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        payload = resp.json() or []
+        if isinstance(payload, dict):
+            payload = payload.get('results') or payload.get('data') or []
+        symbols = [
+            str(item.get('stock_symbol') or item.get('symbol') or '').strip().upper()
+            for item in payload
+            if isinstance(item, dict)
+        ]
+        symbols = [s for s in symbols if s]
+        SandboxWatchlist.objects.update_or_create(
+            sandbox='AI_PENNY',
+            defaults={'symbols': symbols, 'source': 'penny-analytics'},
+        )
+        return {'status': 'ok', 'sandbox': 'AI_PENNY', 'count': len(symbols)}
+    except Exception as exc:
+        return {'status': 'error', 'sandbox': 'AI_PENNY', 'error': str(exc)}
 
 
 @shared_task

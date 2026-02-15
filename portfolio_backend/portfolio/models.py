@@ -80,25 +80,199 @@ class PaperTrade(models.Model):
 		('OPEN', 'OPEN'),
 		('CLOSED', 'CLOSED'),
 	)
+	SANDBOX_CHOICES = (
+		('WATCHLIST', 'WATCHLIST'),
+		('AI_BLUECHIP', 'AI_BLUECHIP'),
+		('AI_PENNY', 'AI_PENNY'),
+	)
 
 	ticker = models.CharField(max_length=10)
+	sandbox = models.CharField(max_length=20, choices=SANDBOX_CHOICES, default='WATCHLIST', db_index=True)
 	entry_price = models.DecimalField(max_digits=10, decimal_places=2)
 	quantity = models.IntegerField()
 	entry_date = models.DateTimeField(auto_now_add=True)
 	entry_signal = models.FloatField(null=True, blank=True)
 	entry_features = models.JSONField(null=True, blank=True)
+	entry_explanations = models.JSONField(null=True, blank=True)
+	model_name = models.CharField(max_length=20, default='BLUECHIP', blank=True)
+	model_version = models.CharField(max_length=120, default='', blank=True)
 	stop_loss = models.DecimalField(max_digits=10, decimal_places=2)
 	status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='OPEN')
 	pnl = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+	outcome = models.CharField(max_length=10, choices=(('WIN', 'WIN'), ('LOSS', 'LOSS')), null=True, blank=True)
 	exit_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
 	exit_date = models.DateTimeField(null=True, blank=True)
 	notes = models.TextField(blank=True, default='')
 
 	class Meta:
 		ordering = ['-entry_date']
+		indexes = [
+			models.Index(fields=['sandbox', 'status', 'entry_date'], name='papertrade_sbx_status_dt'),
+		]
 
 	def __str__(self) -> str:
-		return f"{self.ticker} {self.status}"
+		return f"{self.ticker} {self.status} ({self.sandbox})"
+
+
+class SandboxWatchlist(models.Model):
+	SANDBOX_CHOICES = (
+		('WATCHLIST', 'WATCHLIST'),
+		('AI_BLUECHIP', 'AI_BLUECHIP'),
+		('AI_PENNY', 'AI_PENNY'),
+	)
+
+	sandbox = models.CharField(max_length=20, choices=SANDBOX_CHOICES, unique=True)
+	symbols = models.JSONField(default=list, blank=True)
+	source = models.CharField(max_length=100, blank=True, default='')
+	updated_at = models.DateTimeField(auto_now=True)
+
+	class Meta:
+		ordering = ['sandbox']
+
+	def __str__(self) -> str:
+		return f"{self.sandbox} ({len(self.symbols or [])} symbols)"
+
+
+class ModelEvaluationDaily(models.Model):
+	MODEL_CHOICES = (
+		('BLUECHIP', 'BLUECHIP'),
+		('PENNY', 'PENNY'),
+	)
+
+	as_of = models.DateField(db_index=True)
+	model_name = models.CharField(max_length=20, choices=MODEL_CHOICES)
+	model_version = models.CharField(max_length=120, blank=True, default='')
+	sandbox = models.CharField(max_length=20, blank=True, default='')
+	trades = models.IntegerField(default=0)
+	win_rate = models.FloatField(default=0)
+	avg_pnl = models.FloatField(default=0)
+	total_pnl = models.FloatField(default=0)
+	max_drawdown = models.FloatField(default=0)
+	brier_score = models.FloatField(null=True, blank=True)
+	mean_predicted = models.FloatField(null=True, blank=True)
+	mean_outcome = models.FloatField(null=True, blank=True)
+	created_at = models.DateTimeField(auto_now_add=True)
+
+	class Meta:
+		unique_together = ('as_of', 'model_name', 'model_version', 'sandbox')
+		ordering = ['-as_of', 'model_name']
+		indexes = [
+			models.Index(fields=['as_of', 'sandbox'], name='modeleval_asof_sandbox'),
+		]
+
+	def __str__(self) -> str:
+		return f"{self.model_name} {self.as_of} ({self.sandbox})"
+
+
+class ModelRegistry(models.Model):
+	MODEL_CHOICES = (
+		('BLUECHIP', 'BLUECHIP'),
+		('PENNY', 'PENNY'),
+	)
+	STATUS_CHOICES = (
+		('ACTIVE', 'ACTIVE'),
+		('CANDIDATE', 'CANDIDATE'),
+		('ARCHIVED', 'ARCHIVED'),
+	)
+
+	model_name = models.CharField(max_length=20, choices=MODEL_CHOICES, db_index=True)
+	model_version = models.CharField(max_length=120, db_index=True)
+	model_path = models.CharField(max_length=255, blank=True, default='')
+	status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='CANDIDATE', db_index=True)
+	trained_at = models.DateTimeField(auto_now_add=True)
+	backtest_win_rate = models.FloatField(null=True, blank=True)
+	backtest_sharpe = models.FloatField(null=True, blank=True)
+	paper_win_rate = models.FloatField(null=True, blank=True)
+	paper_trades = models.IntegerField(null=True, blank=True)
+	notes = models.JSONField(default=dict, blank=True)
+
+	class Meta:
+		unique_together = ('model_name', 'model_version')
+		ordering = ['-trained_at']
+
+	def __str__(self) -> str:
+		return f"{self.model_name} {self.model_version} ({self.status})"
+
+
+class TaskRunLog(models.Model):
+	STATUS_CHOICES = (
+		('SUCCESS', 'SUCCESS'),
+		('FAILED', 'FAILED'),
+	)
+
+	task_name = models.CharField(max_length=120, db_index=True)
+	status = models.CharField(max_length=20, choices=STATUS_CHOICES, db_index=True)
+	started_at = models.DateTimeField(auto_now_add=True)
+	finished_at = models.DateTimeField(null=True, blank=True)
+	duration_ms = models.IntegerField(null=True, blank=True)
+	error = models.TextField(blank=True, default='')
+	payload = models.JSONField(default=dict, blank=True)
+
+	class Meta:
+		ordering = ['-started_at']
+
+	def __str__(self) -> str:
+		return f"{self.task_name} {self.status}"
+
+
+class DataQADaily(models.Model):
+	as_of = models.DateField(unique=True, db_index=True)
+	price_metrics = models.JSONField(default=dict, blank=True)
+	macro_metrics = models.JSONField(default=dict, blank=True)
+	news_metrics = models.JSONField(default=dict, blank=True)
+	anomaly_metrics = models.JSONField(default=dict, blank=True)
+	created_at = models.DateTimeField(auto_now_add=True)
+
+	class Meta:
+		ordering = ['-as_of']
+
+	def __str__(self) -> str:
+		return f"Data QA {self.as_of}"
+
+
+class ModelCalibrationDaily(models.Model):
+	MODEL_CHOICES = (
+		('BLUECHIP', 'BLUECHIP'),
+		('PENNY', 'PENNY'),
+	)
+
+	as_of = models.DateField(db_index=True)
+	model_name = models.CharField(max_length=20, choices=MODEL_CHOICES)
+	model_version = models.CharField(max_length=120, blank=True, default='')
+	sandbox = models.CharField(max_length=20, blank=True, default='')
+	bins = models.JSONField(default=list, blank=True)
+	count = models.IntegerField(default=0)
+	brier_score = models.FloatField(null=True, blank=True)
+	created_at = models.DateTimeField(auto_now_add=True)
+
+	class Meta:
+		unique_together = ('as_of', 'model_name', 'model_version', 'sandbox')
+		ordering = ['-as_of', 'model_name']
+
+	def __str__(self) -> str:
+		return f"Calibration {self.model_name} {self.as_of}"
+
+
+class ModelDriftDaily(models.Model):
+	MODEL_CHOICES = (
+		('BLUECHIP', 'BLUECHIP'),
+		('PENNY', 'PENNY'),
+	)
+
+	as_of = models.DateField(db_index=True)
+	model_name = models.CharField(max_length=20, choices=MODEL_CHOICES)
+	model_version = models.CharField(max_length=120, blank=True, default='')
+	sandbox = models.CharField(max_length=20, blank=True, default='')
+	psi = models.JSONField(default=dict, blank=True)
+	feature_stats = models.JSONField(default=dict, blank=True)
+	created_at = models.DateTimeField(auto_now_add=True)
+
+	class Meta:
+		unique_together = ('as_of', 'model_name', 'model_version', 'sandbox')
+		ordering = ['-as_of', 'model_name']
+
+	def __str__(self) -> str:
+		return f"Drift {self.model_name} {self.as_of}"
 
 
 class Portfolio(models.Model):

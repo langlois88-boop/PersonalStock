@@ -3,7 +3,8 @@ import io
 import json
 import os
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
+from typing import Any
 import unicodedata
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -43,8 +44,14 @@ from .models import (
 	Stock,
 	StockNews,
 	MacroIndicator,
+	DataQADaily,
+	ModelCalibrationDaily,
+	ModelDriftDaily,
+	ModelEvaluationDaily,
 	Transaction,
 	UserPreference,
+	TaskRunLog,
+	ModelRegistry,
 )
 from .serializers import (
 	AccountSerializer,
@@ -71,7 +78,7 @@ from .ai_module import run_predictions
 from .tasks import _fetch_yahoo_screener, _fetch_yfinance_screeners
 from .ai_scout import build_scout_summary
 from .ml_engine.engine.data_fusion import DataFusionEngine
-from .ml_engine.backtester import AIBacktester, load_or_train_model, FEATURE_COLUMNS
+from .ml_engine.backtester import AIBacktester, load_or_train_model, FEATURE_COLUMNS, get_model_path
 
 
 class StockViewSet(viewsets.ModelViewSet):
@@ -608,21 +615,41 @@ class StockNewsViewSet(viewsets.ReadOnlyModelViewSet):
 	def get_queryset(self):
 		queryset = super().get_queryset()
 		symbol = self.request.query_params.get('symbol')
+		source = self.request.query_params.get('source')
+		q = self.request.query_params.get('q')
 		days = self.request.query_params.get('days')
+		sentiment_min = self.request.query_params.get('sentiment_min')
+		sentiment_max = self.request.query_params.get('sentiment_max')
 		if symbol:
 			queryset = queryset.filter(stock__symbol__iexact=symbol)
+		if source:
+			queryset = queryset.filter(source__icontains=source)
+		if q:
+			queryset = queryset.filter(headline__icontains=q)
 		if days is None:
 			days = 5
 		try:
 			days = int(days)
 		except (TypeError, ValueError):
-			days = 5
+			raise ValidationError({'days': 'Invalid days.'})
 		days = max(1, min(days, 90))
 		cutoff = timezone.now() - timedelta(days=days)
 		queryset = queryset.filter(
 			models.Q(published_at__gte=cutoff)
 			| models.Q(published_at__isnull=True, fetched_at__gte=cutoff)
 		)
+		if sentiment_min is not None:
+			try:
+				sentiment_min = float(sentiment_min)
+			except ValueError:
+				raise ValidationError({'sentiment_min': 'Invalid sentiment_min.'})
+			queryset = queryset.filter(sentiment__gte=sentiment_min)
+		if sentiment_max is not None:
+			try:
+				sentiment_max = float(sentiment_max)
+			except ValueError:
+				raise ValidationError({'sentiment_max': 'Invalid sentiment_max.'})
+			queryset = queryset.filter(sentiment__lte=sentiment_max)
 		return queryset
 
 
@@ -685,6 +712,29 @@ class PredictionViewSet(viewsets.ModelViewSet):
 
 	def get_queryset(self):
 		queryset = super().get_queryset()
+		symbol = self.request.query_params.get('symbol')
+		reco = self.request.query_params.get('recommendation')
+		date_from = self.request.query_params.get('date_from')
+		date_to = self.request.query_params.get('date_to')
+		if symbol:
+			queryset = queryset.filter(stock__symbol__iexact=symbol)
+		if reco:
+			reco = reco.upper()
+			if reco not in {'BUY', 'HOLD', 'SELL'}:
+				raise ValidationError({'recommendation': 'Invalid recommendation.'})
+			queryset = queryset.filter(recommendation=reco)
+		if date_from:
+			try:
+				date_from = datetime.fromisoformat(date_from).date()
+			except ValueError:
+				raise ValidationError({'date_from': 'Invalid date_from.'})
+			queryset = queryset.filter(date__gte=date_from)
+		if date_to:
+			try:
+				date_to = datetime.fromisoformat(date_to).date()
+			except ValueError:
+				raise ValidationError({'date_to': 'Invalid date_to.'})
+			queryset = queryset.filter(date__lte=date_to)
 		return queryset.order_by('-date', 'stock__symbol')
 
 
@@ -695,8 +745,46 @@ class PaperTradeViewSet(viewsets.ReadOnlyModelViewSet):
 	def get_queryset(self):
 		queryset = super().get_queryset()
 		status = self.request.query_params.get('status')
+		sandbox = self.request.query_params.get('sandbox')
+		ticker = self.request.query_params.get('ticker')
+		model_name = self.request.query_params.get('model_name')
+		model_version = self.request.query_params.get('model_version')
+		outcome = self.request.query_params.get('outcome')
+		entry_from = self.request.query_params.get('entry_from')
+		entry_to = self.request.query_params.get('entry_to')
 		if status:
-			queryset = queryset.filter(status__iexact=status)
+			status = status.upper()
+			if status not in {'OPEN', 'CLOSED'}:
+				raise ValidationError({'status': 'Invalid status.'})
+			queryset = queryset.filter(status=status)
+		if sandbox:
+			sandbox = sandbox.upper()
+			if sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'}:
+				raise ValidationError({'sandbox': 'Invalid sandbox.'})
+			queryset = queryset.filter(sandbox=sandbox)
+		if ticker:
+			queryset = queryset.filter(ticker__iexact=ticker)
+		if model_name:
+			queryset = queryset.filter(model_name__iexact=model_name)
+		if model_version:
+			queryset = queryset.filter(model_version=model_version)
+		if outcome:
+			outcome = outcome.upper()
+			if outcome not in {'WIN', 'LOSS'}:
+				raise ValidationError({'outcome': 'Invalid outcome.'})
+			queryset = queryset.filter(outcome=outcome)
+		if entry_from:
+			try:
+				entry_from = datetime.fromisoformat(entry_from)
+			except ValueError:
+				raise ValidationError({'entry_from': 'Invalid entry_from.'})
+			queryset = queryset.filter(entry_date__gte=entry_from)
+		if entry_to:
+			try:
+				entry_to = datetime.fromisoformat(entry_to)
+			except ValueError:
+				raise ValidationError({'entry_to': 'Invalid entry_to.'})
+			queryset = queryset.filter(entry_date__lte=entry_to)
 		return queryset
 
 
@@ -719,9 +807,13 @@ class UserPreferenceViewSet(viewsets.ModelViewSet):
 
 class PaperTradeSummaryView(APIView):
 	def get(self, request):
+		sandbox = (request.query_params.get('sandbox') or '').strip().upper()
 		initial_capital = float(os.getenv('PAPER_CAPITAL', '10000'))
 		open_trades = PaperTrade.objects.filter(status='OPEN')
 		closed_trades = PaperTrade.objects.filter(status='CLOSED')
+		if sandbox:
+			open_trades = open_trades.filter(sandbox=sandbox)
+			closed_trades = closed_trades.filter(sandbox=sandbox)
 		closed_pnl = float(sum([float(t.pnl or 0) for t in closed_trades]))
 		open_value = 0.0
 		for t in open_trades:
@@ -730,6 +822,7 @@ class PaperTradeSummaryView(APIView):
 			
 		available = initial_capital + closed_pnl - open_value
 		return Response({
+			'sandbox': sandbox or 'ALL',
 			'initial_capital': initial_capital,
 			'available_capital': round(available, 2),
 			'open_value': round(open_value, 2),
@@ -737,6 +830,171 @@ class PaperTradeSummaryView(APIView):
 			'open_positions': PaperTradeSerializer(open_trades, many=True).data,
 			'closed_positions': PaperTradeSerializer(closed_trades[:25], many=True).data,
 		})
+
+
+class PaperTradeExplanationLogView(APIView):
+	def get(self, request):
+		sandbox = (request.query_params.get('sandbox') or '').strip().upper()
+		status = (request.query_params.get('status') or '').strip().upper()
+		page = max(int(request.query_params.get('page', 1)), 1)
+		page_size = max(min(int(request.query_params.get('page_size', 25)), 200), 1)
+		if sandbox and sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'}:
+			raise ValidationError({'sandbox': 'Invalid sandbox.'})
+		if status and status not in {'OPEN', 'CLOSED'}:
+			raise ValidationError({'status': 'Invalid status.'})
+		qs = PaperTrade.objects.all().order_by('-entry_date')
+		if sandbox:
+			qs = qs.filter(sandbox=sandbox)
+		if status:
+			qs = qs.filter(status=status)
+		total = qs.count()
+		start = (page - 1) * page_size
+		end = start + page_size
+		rows = PaperTradeSerializer(qs[start:end], many=True).data
+		return Response({
+			'count': total,
+			'page': page,
+			'page_size': page_size,
+			'results': rows,
+		})
+
+
+class ModelMonitoringSummaryView(APIView):
+	def get(self, request):
+		model_name = (request.query_params.get('model') or '').strip().upper()
+		sandbox = (request.query_params.get('sandbox') or '').strip().upper()
+		if model_name and model_name not in {'BLUECHIP', 'PENNY'}:
+			raise ValidationError({'model': 'Invalid model.'})
+		if sandbox and sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'}:
+			raise ValidationError({'sandbox': 'Invalid sandbox.'})
+
+		def _latest(qs, fields: list[str]) -> dict[str, Any] | None:
+			item = qs.order_by('-as_of').first()
+			if not item:
+				return None
+			return {field: getattr(item, field) for field in fields}
+
+		results = []
+		base = {
+			'models': [model_name] if model_name else ['BLUECHIP', 'PENNY'],
+			'sandboxes': [sandbox] if sandbox else ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'],
+		}
+		for m in base['models']:
+			for sb in base['sandboxes']:
+				cal = _latest(
+					ModelCalibrationDaily.objects.filter(model_name=m, sandbox=sb),
+					['as_of', 'model_version', 'brier_score', 'count', 'bins'],
+				)
+				drift = _latest(
+					ModelDriftDaily.objects.filter(model_name=m, sandbox=sb),
+					['as_of', 'model_version', 'psi', 'feature_stats'],
+				)
+				eval_entry = _latest(
+					ModelEvaluationDaily.objects.filter(model_name=m, sandbox=sb),
+					['as_of', 'model_version', 'trades', 'win_rate', 'avg_pnl', 'total_pnl', 'max_drawdown', 'brier_score'],
+				)
+				results.append({
+					'model_name': m,
+					'sandbox': sb,
+					'calibration': cal,
+					'drift': drift,
+					'evaluation': eval_entry,
+				})
+
+		return Response({'results': results})
+
+
+class PaperTradePerformanceView(APIView):
+	def _initial_capital(self, sandbox: str) -> float:
+		if sandbox == 'AI_BLUECHIP':
+			return float(os.getenv('AI_BLUECHIP_CAPITAL', os.getenv('PAPER_CAPITAL', '10000')))
+		if sandbox == 'AI_PENNY':
+			return float(os.getenv('AI_PENNY_CAPITAL', os.getenv('PAPER_CAPITAL', '10000')))
+		return float(os.getenv('PAPER_CAPITAL', '10000'))
+
+	def _max_drawdown(self, equity_curve: list[float]) -> float:
+		peak = None
+		max_dd = 0.0
+		for value in equity_curve:
+			peak = value if peak is None else max(peak, value)
+			if peak:
+				dd = (value - peak) / peak
+				max_dd = min(max_dd, dd)
+		return abs(max_dd)
+
+	def get(self, request):
+		sandbox_param = (request.query_params.get('sandbox') or '').strip().upper()
+		sandboxes = [sandbox_param] if sandbox_param else ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY']
+		results = []
+		for sandbox in sandboxes:
+			initial_capital = self._initial_capital(sandbox)
+			closed = PaperTrade.objects.filter(status='CLOSED', sandbox=sandbox).order_by('exit_date')
+			trades = closed.count()
+			wins = closed.filter(outcome='WIN').count()
+			win_rate = (wins / trades) * 100 if trades else 0.0
+			total_pnl = float(sum([float(t.pnl or 0) for t in closed]))
+			total_return_pct = (total_pnl / initial_capital) * 100 if initial_capital else 0.0
+			returns = []
+			equity = initial_capital
+			equity_curve = [equity]
+			for t in closed:
+				entry_value = float(t.entry_price) * float(t.quantity)
+				trade_return = float(t.pnl or 0) / entry_value if entry_value else 0.0
+				returns.append(trade_return)
+				equity += float(t.pnl or 0)
+				equity_curve.append(equity)
+			mean_ret = float(np.mean(returns)) if returns else 0.0
+			std_ret = float(np.std(returns)) if returns else 0.0
+			sharpe = (mean_ret / std_ret) * np.sqrt(len(returns)) if std_ret else 0.0
+			max_drawdown = self._max_drawdown(equity_curve)
+			results.append({
+				'sandbox': sandbox,
+				'initial_capital': round(initial_capital, 2),
+				'trades': trades,
+				'win_rate': round(win_rate, 2),
+				'total_return_pct': round(total_return_pct, 2),
+				'sharpe_ratio': round(float(sharpe), 3),
+				'max_drawdown': round(float(max_drawdown) * 100, 2),
+				'final_balance': round(equity, 2),
+			})
+
+		return Response({'results': results})
+
+
+class PaperTradeEquityCurveView(APIView):
+	def _initial_capital(self, sandbox: str) -> float:
+		if sandbox == 'AI_BLUECHIP':
+			return float(os.getenv('AI_BLUECHIP_CAPITAL', os.getenv('PAPER_CAPITAL', '10000')))
+		if sandbox == 'AI_PENNY':
+			return float(os.getenv('AI_PENNY_CAPITAL', os.getenv('PAPER_CAPITAL', '10000')))
+		return float(os.getenv('PAPER_CAPITAL', '10000'))
+
+	def get(self, request):
+		sandboxes = ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY']
+		curves: dict[str, dict[str, float]] = {s: {} for s in sandboxes}
+		all_dates: set[str] = set()
+
+		for sandbox in sandboxes:
+			capital = self._initial_capital(sandbox)
+			closed = PaperTrade.objects.filter(status='CLOSED', sandbox=sandbox).exclude(exit_date__isnull=True).order_by('exit_date')
+			for trade in closed:
+				date_key = trade.exit_date.date().isoformat()
+				capital += float(trade.pnl or 0)
+				curves[sandbox][date_key] = round(capital, 2)
+				all_dates.add(date_key)
+
+		ordered_dates = sorted(all_dates)
+		series = []
+		for sandbox in sandboxes:
+			capital = self._initial_capital(sandbox)
+			data = []
+			for date_key in ordered_dates:
+				if date_key in curves[sandbox]:
+					capital = curves[sandbox][date_key]
+				data.append(capital)
+			series.append({'sandbox': sandbox, 'equity_curve': data})
+
+		return Response({'dates': ordered_dates, 'series': series})
 
 
 class PennySignalViewSet(viewsets.ReadOnlyModelViewSet):
@@ -1190,6 +1448,135 @@ class PortfolioDashboardView(APIView):
 		})
 
 
+class AccountDashboardView(APIView):
+	def _price_at_or_before(self, stock: Stock, target_date: date) -> float | None:
+		row = PriceHistory.objects.filter(stock=stock, date__lte=target_date).order_by('-date').first()
+		if not row:
+			return None
+		return float(row.close_price)
+
+	def _current_price(self, stock: Stock) -> float:
+		if stock.latest_price is not None:
+			return float(stock.latest_price)
+		last = PriceHistory.objects.filter(stock=stock).order_by('-date').first()
+		return float(last.close_price) if last else 0.0
+
+	def get(self, request):
+		account_id = request.query_params.get('account_id')
+		accounts = Account.objects.all()
+		if account_id:
+			accounts = accounts.filter(id=account_id)
+
+		tx_qs = AccountTransaction.objects.select_related('account', 'stock').all().order_by('date')
+		if account_id:
+			tx_qs = tx_qs.filter(account_id=account_id)
+
+		position_map: dict[int, dict[str, dict[str, Any]]] = {}
+		for tx in tx_qs:
+			if tx.type == 'DIVIDEND':
+				continue
+			account_entry = position_map.setdefault(tx.account_id, {})
+			symbol_key = (tx.stock.symbol or '').strip().upper() or str(tx.stock_id)
+			entry = account_entry.setdefault(
+				symbol_key,
+				{'stock': tx.stock, 'shares': 0.0, 'buy_qty': 0.0, 'buy_cost': 0.0},
+			)
+			qty = float(tx.quantity or 0)
+			if tx.type == 'BUY':
+				entry['shares'] += qty
+				entry['buy_qty'] += qty
+				entry['buy_cost'] += qty * float(tx.price or 0)
+			elif tx.type == 'SELL':
+				avg_cost = (entry['buy_cost'] / entry['buy_qty']) if entry['buy_qty'] else 0.0
+				entry['shares'] -= qty
+				entry['buy_qty'] = max(0.0, entry['buy_qty'] - qty)
+				entry['buy_cost'] = max(0.0, entry['buy_cost'] - avg_cost * qty)
+
+		accounts_payload = []
+		all_positions = []
+		today = timezone.now().date()
+		weekly_date = today - timedelta(days=7)
+		monthly_date = today - timedelta(days=30)
+		annual_date = today - timedelta(days=365)
+
+		for account in accounts:
+			positions = []
+			total_value = 0.0
+			total_cost = 0.0
+			for payload in position_map.get(account.id, {}).values():
+				shares = float(payload['shares'] or 0)
+				if shares <= 0:
+					continue
+				stock = payload['stock']
+				buy_qty = float(payload.get('buy_qty') or 0)
+				buy_cost = float(payload.get('buy_cost') or 0)
+				avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
+				current = self._current_price(stock)
+				current_value = current * shares
+				cost_value = avg_cost * shares
+				total_value += current_value
+				total_cost += cost_value
+
+				weekly_price = self._price_at_or_before(stock, weekly_date)
+				monthly_price = self._price_at_or_before(stock, monthly_date)
+				annual_price = self._price_at_or_before(stock, annual_date)
+
+				weekly_return = ((current - weekly_price) / weekly_price * 100) if weekly_price else None
+				monthly_return = ((current - monthly_price) / monthly_price * 100) if monthly_price else None
+				annual_return = ((current - annual_price) / annual_price * 100) if annual_price else None
+
+				latest_two = list(PriceHistory.objects.filter(stock=stock).order_by('-date')[:2])
+				prev_close = float(latest_two[1].close_price) if len(latest_two) > 1 else None
+				day_change_pct = ((current - prev_close) / prev_close * 100) if prev_close else None
+
+				position_payload = {
+					'account_id': account.id,
+					'account_name': account.name,
+					'account_type': account.account_type,
+					'ticker': stock.symbol,
+					'name': stock.name,
+					'avg_cost': round(avg_cost, 4),
+					'shares': round(shares, 4),
+					'cost_value': round(cost_value, 2),
+					'current_price': round(current, 4),
+					'current_value': round(current_value, 2),
+					'weekly_return_pct': round(weekly_return, 2) if weekly_return is not None else None,
+					'monthly_return_pct': round(monthly_return, 2) if monthly_return is not None else None,
+					'annual_return_pct': round(annual_return, 2) if annual_return is not None else None,
+					'day_change_pct': round(day_change_pct, 2) if day_change_pct is not None else None,
+				}
+				positions.append(position_payload)
+				all_positions.append(position_payload)
+
+			accounts_payload.append({
+				'account_id': account.id,
+				'account_name': account.name,
+				'account_type': account.account_type,
+				'total_value': round(total_value, 2),
+				'total_cost': round(total_cost, 2),
+				'positions': positions,
+			})
+
+		gainer = None
+		loser = None
+		for pos in all_positions:
+			change = pos.get('day_change_pct')
+			if change is None:
+				continue
+			if gainer is None or change > gainer.get('day_change_pct', -9999):
+				gainer = pos
+			if loser is None or change < loser.get('day_change_pct', 9999):
+				loser = pos
+
+		return Response({
+			'accounts': accounts_payload,
+			'top_movers': {
+				'gainer': gainer,
+				'loser': loser,
+			},
+		})
+
+
 class StablePredictionView(APIView):
 	def get(self, request, symbol: str):
 		symbol = (symbol or '').strip().upper()
@@ -1396,7 +1783,10 @@ class BluechipHunterView(APIView):
 					fusion = DataFusionEngine(symbol)
 					fusion_df = fusion.fuse_all()
 					if fusion_df is not None and not fusion_df.empty:
-						bt_payload = load_or_train_model(fusion_df)
+						bt_payload = load_or_train_model(
+							fusion_df,
+							model_path=get_model_path('BLUECHIP'),
+						)
 						if bt_payload and bt_payload.get('model'):
 							last_row = fusion_df.tail(1).copy()
 							feature_list = bt_payload.get('features', FEATURE_COLUMNS)
@@ -1749,19 +2139,52 @@ class AIBacktesterView(APIView):
 		symbol = (request.query_params.get('symbol') or 'SPY').strip().upper()
 		days = int(request.query_params.get('days', 365))
 		days = max(60, min(days, 730))
+		universe = (request.query_params.get('universe') or 'BLUECHIP').strip().upper()
 
 		engine = DataFusionEngine(symbol)
 		data = engine.fuse_all()
 		if data is None or data.empty:
 			return Response({'error': 'No data available for backtest.'}, status=400)
 
-		model = load_or_train_model(data)
-		backtester = AIBacktester(data, model, symbol=symbol)
+		payload = load_or_train_model(data, model_path=get_model_path(universe))
+		backtester = AIBacktester(data, payload, symbol=symbol)
 		result = backtester.run_simulation(lookback_days=days)
+
+		feature_importance = []
+		model_version = ''
+		if payload and payload.get('model'):
+			model_version = str(payload.get('model_version') or '')
+			features = payload.get('features') or []
+			importances = getattr(payload['model'], 'feature_importances_', None)
+			if importances is not None and len(features) == len(importances):
+				feature_importance = sorted(
+					[
+						{'name': features[i], 'value': float(importances[i]) * 100}
+						for i in range(len(features))
+					],
+					key=lambda item: item['value'],
+					reverse=True,
+				)[:8]
+
+		macro_log = TaskRunLog.objects.filter(task_name='fetch_macro_daily').order_by('-started_at').first()
+		news_log = TaskRunLog.objects.filter(task_name='fetch_news_daily').order_by('-started_at').first()
+		logs = [
+			f"Backtester connected to Data Fusion Engine.",
+			f"Model version: {model_version or 'unknown'}",
+			f"Data rows used: {len(data)}",
+		]
+		if macro_log and macro_log.finished_at:
+			logs.append(f"Macro refresh: {macro_log.finished_at.isoformat()}")
+		if news_log and news_log.finished_at:
+			logs.append(f"News refresh: {news_log.finished_at.isoformat()}")
 
 		return Response({
 			'symbol': symbol,
 			'days': days,
+			'universe': universe,
+			'model_version': model_version,
+			'feature_importance': feature_importance,
+			'logs': logs,
 			'final_balance': result.final_balance,
 			'total_return_pct': result.total_return_pct,
 			'win_rate': result.win_rate,
@@ -1779,6 +2202,214 @@ class AIBacktesterView(APIView):
 				'equity_curve': result.raw_equity_curve,
 			},
 		})
+
+
+class HealthCheckView(APIView):
+	def get(self, request):
+		cutoff = timezone.now() - timedelta(days=2)
+		stale_prices = Stock.objects.filter(
+			models.Q(latest_price_updated_at__lt=cutoff) | models.Q(latest_price_updated_at__isnull=True)
+		).count()
+		last_macro = MacroIndicator.objects.order_by('-date').first()
+		last_news = StockNews.objects.order_by('-fetched_at').first()
+
+		task_names = [
+			'fetch_prices_hourly',
+			'fetch_news_daily',
+			'fetch_finnhub_news_daily',
+			'fetch_google_news_daily',
+			'fetch_macro_daily',
+			'ensure_data_pipeline_daily',
+			'retrain_from_paper_trades_daily',
+			'compute_model_evaluation_daily',
+			'compute_continuous_evaluation_daily',
+			'auto_retrain_on_drift_daily',
+			'auto_rollback_models_daily',
+		]
+		tasks = {}
+		for name in task_names:
+			last = TaskRunLog.objects.filter(task_name=name).order_by('-started_at').first()
+			tasks[name] = {
+				'status': last.status if last else 'UNKNOWN',
+				'started_at': last.started_at if last else None,
+				'finished_at': last.finished_at if last else None,
+				'duration_ms': last.duration_ms if last else None,
+				'error': last.error if last else None,
+			}
+
+		overall_status = 'ok' if stale_prices == 0 else 'degraded'
+		return Response({
+			'status': overall_status,
+			'stale_prices': stale_prices,
+			'last_macro_date': last_macro.date if last_macro else None,
+			'last_news_fetched_at': last_news.fetched_at if last_news else None,
+			'tasks': tasks,
+		})
+
+
+class DataQADailyView(APIView):
+	def get(self, request):
+		as_of = request.query_params.get('date')
+		if as_of:
+			try:
+				as_of_date = datetime.fromisoformat(as_of).date()
+			except ValueError:
+				return Response({'error': 'Invalid date format.'}, status=400)
+			entry = DataQADaily.objects.filter(as_of=as_of_date).first()
+		else:
+			entry = DataQADaily.objects.order_by('-as_of').first()
+
+		if not entry:
+			return Response({'status': 'no_data'}, status=200)
+
+		return Response({
+			'as_of': entry.as_of,
+			'price_metrics': entry.price_metrics,
+			'macro_metrics': entry.macro_metrics,
+			'news_metrics': entry.news_metrics,
+			'anomaly_metrics': entry.anomaly_metrics,
+		})
+
+
+class ModelCalibrationDailyView(APIView):
+	def get(self, request):
+		model_name = (request.query_params.get('model') or '').strip().upper()
+		sandbox = (request.query_params.get('sandbox') or '').strip().upper()
+		as_of = request.query_params.get('date')
+		qs = ModelCalibrationDaily.objects.all().order_by('-as_of')
+		if model_name:
+			qs = qs.filter(model_name=model_name)
+		if sandbox:
+			qs = qs.filter(sandbox=sandbox)
+		if as_of:
+			try:
+				as_of_date = datetime.fromisoformat(as_of).date()
+			except ValueError:
+				return Response({'error': 'Invalid date format.'}, status=400)
+			qs = qs.filter(as_of=as_of_date)
+
+		results = []
+		seen = set()
+		for entry in qs:
+			key = (entry.model_name, entry.sandbox)
+			if not as_of and not model_name and not sandbox:
+				if key in seen:
+					continue
+				seen.add(key)
+			results.append({
+				'model_name': entry.model_name,
+				'model_version': entry.model_version,
+				'sandbox': entry.sandbox,
+				'as_of': entry.as_of,
+				'bins': entry.bins,
+				'count': entry.count,
+				'brier_score': entry.brier_score,
+			})
+		return Response({'results': results})
+
+
+class ModelDriftDailyView(APIView):
+	def get(self, request):
+		model_name = (request.query_params.get('model') or '').strip().upper()
+		sandbox = (request.query_params.get('sandbox') or '').strip().upper()
+		as_of = request.query_params.get('date')
+		qs = ModelDriftDaily.objects.all().order_by('-as_of')
+		if model_name:
+			qs = qs.filter(model_name=model_name)
+		if sandbox:
+			qs = qs.filter(sandbox=sandbox)
+		if as_of:
+			try:
+				as_of_date = datetime.fromisoformat(as_of).date()
+			except ValueError:
+				return Response({'error': 'Invalid date format.'}, status=400)
+			qs = qs.filter(as_of=as_of_date)
+
+		results = []
+		seen = set()
+		for entry in qs:
+			key = (entry.model_name, entry.sandbox)
+			if not as_of and not model_name and not sandbox:
+				if key in seen:
+					continue
+				seen.add(key)
+			results.append({
+				'model_name': entry.model_name,
+				'model_version': entry.model_version,
+				'sandbox': entry.sandbox,
+				'as_of': entry.as_of,
+				'psi': entry.psi,
+				'feature_stats': entry.feature_stats,
+			})
+		return Response({'results': results})
+
+
+class ModelEvaluationDailyView(APIView):
+	def get(self, request):
+		model_name = (request.query_params.get('model') or '').strip().upper()
+		sandbox = (request.query_params.get('sandbox') or '').strip().upper()
+		as_of = request.query_params.get('date')
+		qs = ModelEvaluationDaily.objects.all().order_by('-as_of')
+		if model_name:
+			qs = qs.filter(model_name=model_name)
+		if sandbox:
+			qs = qs.filter(sandbox=sandbox)
+		if as_of:
+			try:
+				as_of_date = datetime.fromisoformat(as_of).date()
+			except ValueError:
+				return Response({'error': 'Invalid date format.'}, status=400)
+			qs = qs.filter(as_of=as_of_date)
+
+		results = []
+		seen = set()
+		for entry in qs:
+			key = (entry.model_name, entry.sandbox)
+			if not as_of and not model_name and not sandbox:
+				if key in seen:
+					continue
+				seen.add(key)
+			results.append({
+				'model_name': entry.model_name,
+				'model_version': entry.model_version,
+				'sandbox': entry.sandbox,
+				'as_of': entry.as_of,
+				'trades': entry.trades,
+				'win_rate': entry.win_rate,
+				'avg_pnl': entry.avg_pnl,
+				'total_pnl': entry.total_pnl,
+				'max_drawdown': entry.max_drawdown,
+				'brier_score': entry.brier_score,
+				'mean_predicted': entry.mean_predicted,
+				'mean_outcome': entry.mean_outcome,
+			})
+		return Response({'results': results})
+
+
+class ModelRegistryView(APIView):
+	def get(self, request):
+		model_name = (request.query_params.get('model') or '').strip().upper()
+		status = (request.query_params.get('status') or '').strip().upper()
+		qs = ModelRegistry.objects.all().order_by('-trained_at')
+		if model_name:
+			qs = qs.filter(model_name=model_name)
+		if status:
+			qs = qs.filter(status=status)
+		rows = []
+		for entry in qs:
+			rows.append({
+				'model_name': entry.model_name,
+				'model_version': entry.model_version,
+				'model_path': entry.model_path,
+				'status': entry.status,
+				'trained_at': entry.trained_at,
+				'backtest_win_rate': entry.backtest_win_rate,
+				'backtest_sharpe': entry.backtest_sharpe,
+				'paper_win_rate': entry.paper_win_rate,
+				'paper_trades': entry.paper_trades,
+				'notes': entry.notes,
+			})
+		return Response({'results': rows})
 
 
 class ForecastView(APIView):

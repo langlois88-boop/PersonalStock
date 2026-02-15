@@ -16,6 +16,10 @@ except ImportError:  # pragma: no cover
 	load_dotenv = None
 
 from django.core.asgi import get_asgi_application
+from channels.routing import ProtocolTypeRouter, URLRouter
+from channels.auth import AuthMiddlewareStack
+
+from .routing import websocket_urlpatterns
 
 if load_dotenv:
 	base_dir = Path(__file__).resolve().parent.parent
@@ -24,4 +28,11 @@ if load_dotenv:
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'portfolio_backend.settings')
 
-application = get_asgi_application()
+django_asgi_app = get_asgi_application()
+
+application = ProtocolTypeRouter({
+	'http': django_asgi_app,
+	'websocket': AuthMiddlewareStack(
+		URLRouter(websocket_urlpatterns)
+	),
+})
