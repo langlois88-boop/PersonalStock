@@ -8,6 +8,7 @@ import unicodedata
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 from django.db import models
+from django.db.utils import OperationalError
 from django.db.models import Prefetch
 from django.utils import timezone
 import finnhub
@@ -924,7 +925,10 @@ class PortfolioDashboardView(APIView):
 		if not portfolio:
 			portfolio = Portfolio.objects.first()
 		if not portfolio:
-			transactions = AccountTransaction.objects.select_related('stock').all()
+			try:
+				transactions = AccountTransaction.objects.select_related('stock').all()
+			except OperationalError:
+				transactions = []
 			if not transactions:
 				return Response({
 					'portfolio': None,
