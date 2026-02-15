@@ -924,20 +924,94 @@ class PortfolioDashboardView(APIView):
 		if not portfolio:
 			portfolio = Portfolio.objects.first()
 		if not portfolio:
+			transactions = AccountTransaction.objects.select_related('stock').all()
+			if not transactions:
+				return Response({
+					'portfolio': None,
+					'total_balance': 0,
+					'change_24h': 0,
+					'change_24h_pct': 0,
+					'change_7d': 0,
+					'change_7d_pct': 0,
+					'allocation': {
+						'stable_pct': 0,
+						'risky_pct': 0,
+						'stable_value': 0,
+						'risky_value': 0,
+					},
+					'holdings': [],
+					'chart': [],
+				}, status=200)
+
+			position_map = {}
+			for tx in transactions:
+				if tx.type == 'DIVIDEND':
+					continue
+				sign = 1 if tx.type == 'BUY' else -1
+				position_map.setdefault(tx.stock_id, {'stock': tx.stock, 'shares': 0.0})
+				position_map[tx.stock_id]['shares'] += float(tx.quantity or 0) * sign
+
+			items = []
+			total_value = 0.0
+			stable_value = 0.0
+			risky_value = 0.0
+			change_1d = 0.0
+			change_7d = 0.0
+
+			for payload in position_map.values():
+				shares = float(payload['shares'] or 0)
+				if shares <= 0:
+					continue
+				stock = payload['stock']
+				price = stock.latest_price
+				if price is None:
+					last = PriceHistory.objects.filter(stock=stock).order_by('-date').first()
+					price = float(last.close_price) if last else 0.0
+				price = float(price or 0)
+				value = shares * price
+				total_value += value
+
+				prev_1d = PriceHistory.objects.filter(stock=stock).order_by('-date')[1:2].first()
+				if prev_1d:
+					change_1d += (price - float(prev_1d.close_price)) * shares
+
+				prev_7d = PriceHistory.objects.filter(stock=stock).order_by('-date')[7:8].first()
+				if prev_7d:
+					change_7d += (price - float(prev_7d.close_price)) * shares
+
+				is_stable = price >= 5 or float(stock.dividend_yield or 0) >= 0.02
+				if is_stable:
+					stable_value += value
+				else:
+					risky_value += value
+
+				items.append({
+					'ticker': stock.symbol,
+					'name': stock.name,
+					'shares': shares,
+					'price': price,
+					'value': value,
+					'category': 'Stable' if is_stable else 'Risky',
+				})
+
+			allocation_pct = (stable_value / total_value * 100) if total_value else 0
+			change_1d_pct = (change_1d / (total_value - change_1d) * 100) if total_value else 0
+			change_7d_pct = (change_7d / (total_value - change_7d) * 100) if total_value else 0
+
 			return Response({
 				'portfolio': None,
-				'total_balance': 0,
-				'change_24h': 0,
-				'change_24h_pct': 0,
-				'change_7d': 0,
-				'change_7d_pct': 0,
+				'total_balance': round(total_value, 2),
+				'change_24h': round(change_1d, 2),
+				'change_24h_pct': round(change_1d_pct, 2),
+				'change_7d': round(change_7d, 2),
+				'change_7d_pct': round(change_7d_pct, 2),
 				'allocation': {
-					'stable_pct': 0,
-					'risky_pct': 0,
-					'stable_value': 0,
-					'risky_value': 0,
+					'stable_pct': round(allocation_pct, 2),
+					'risky_pct': round(100 - allocation_pct, 2),
+					'stable_value': round(stable_value, 2),
+					'risky_value': round(risky_value, 2),
 				},
-				'holdings': [],
+				'holdings': items,
 				'chart': [],
 			}, status=200)
 
