@@ -145,10 +145,17 @@ function GlobalPortfolio() {
                     </p>
                     <p className="text-xs text-slate-400">{row.name}</p>
                     <p className="text-xs text-slate-500">{Number(row.shares || 0).toFixed(2)} shares</p>
+                    <p className="text-xs text-slate-500">
+                      Cost: ${Number(row.cost_value || 0).toFixed(2)} @ ${Number(row.avg_cost || 0).toFixed(2)}
+                    </p>
                   </div>
                   <div className="text-right">
                     <p className="text-white">${Number(row.price || 0).toFixed(2)}</p>
                     <p className="text-xs text-slate-400">Value: ${Number(row.value || 0).toFixed(2)}</p>
+                    <p className={`text-xs ${Number(row.unrealized_pnl || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
+                      P/L: {Number(row.unrealized_pnl || 0) >= 0 ? '+' : ''}{Number(row.unrealized_pnl || 0).toFixed(2)}
+                      {' '}({Number(row.unrealized_pnl_pct || 0).toFixed(2)}%)
+                    </p>
                   </div>
                 </div>
               ))

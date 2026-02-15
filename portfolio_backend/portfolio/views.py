@@ -952,8 +952,15 @@ class PortfolioDashboardView(APIView):
 				if tx.type == 'DIVIDEND':
 					continue
 				sign = 1 if tx.type == 'BUY' else -1
-				position_map.setdefault(tx.stock_id, {'stock': tx.stock, 'shares': 0.0})
-				position_map[tx.stock_id]['shares'] += float(tx.quantity or 0) * sign
+				entry = position_map.setdefault(
+					tx.stock_id,
+					{'stock': tx.stock, 'shares': 0.0, 'buy_qty': 0.0, 'buy_cost': 0.0},
+				)
+				qty = float(tx.quantity or 0)
+				entry['shares'] += qty * sign
+				if tx.type == 'BUY':
+					entry['buy_qty'] += qty
+					entry['buy_cost'] += qty * float(tx.price or 0)
 
 			items = []
 			total_value = 0.0
@@ -967,12 +974,18 @@ class PortfolioDashboardView(APIView):
 				if shares <= 0:
 					continue
 				stock = payload['stock']
+				buy_qty = float(payload.get('buy_qty') or 0)
+				buy_cost = float(payload.get('buy_cost') or 0)
+				avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
 				price = stock.latest_price
 				if price is None:
 					last = PriceHistory.objects.filter(stock=stock).order_by('-date').first()
 					price = float(last.close_price) if last else 0.0
 				price = float(price or 0)
 				value = shares * price
+				cost_value = avg_cost * shares
+				unrealized = value - cost_value
+				unrealized_pct = (unrealized / cost_value * 100) if cost_value else 0
 				total_value += value
 
 				prev_1d = PriceHistory.objects.filter(stock=stock).order_by('-date')[1:2].first()
@@ -995,6 +1008,10 @@ class PortfolioDashboardView(APIView):
 					'shares': shares,
 					'price': price,
 					'value': value,
+					'avg_cost': round(avg_cost, 4),
+					'cost_value': round(cost_value, 2),
+					'unrealized_pnl': round(unrealized, 2),
+					'unrealized_pnl_pct': round(unrealized_pct, 2),
 					'category': 'Stable' if is_stable else 'Risky',
 				})
 
