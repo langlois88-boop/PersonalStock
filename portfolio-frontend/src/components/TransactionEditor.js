@@ -186,7 +186,7 @@ function TransactionEditor() {
                         <input
                           type="number"
                           min="0"
-                          step="0.01"
+                          step="0.000001"
                           value={editForm.price}
                           onChange={(e) => updateField('price', e.target.value)}
                         />

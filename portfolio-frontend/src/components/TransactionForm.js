@@ -284,7 +284,7 @@ function TransactionForm() {
           <input
             type="number"
             min="0"
-            step="0.01"
+            step="0.000001"
             value={form.price_per_share}
             onChange={(e) => updateForm('price_per_share', e.target.value)}
             required
