@@ -1044,6 +1044,7 @@ class PortfolioDashboardView(APIView):
 			account_transactions = AccountTransaction.objects.select_related('stock').all()
 		except OperationalError:
 			account_transactions = []
+		portfolio_transactions = Transaction.objects.select_related('stock').filter(portfolio=portfolio)
 
 		cost_map = {}
 		for tx in account_transactions:
@@ -1060,6 +1061,19 @@ class PortfolioDashboardView(APIView):
 			if tx.type == 'BUY':
 				entry['buy_qty'] += qty
 				entry['buy_cost'] += qty * float(tx.price or 0)
+
+		for tx in portfolio_transactions:
+			sign = 1 if tx.transaction_type == 'BUY' else -1
+			symbol_key = (tx.stock.symbol or '').upper() or str(tx.stock_id)
+			entry = cost_map.setdefault(
+				symbol_key,
+				{'shares': 0.0, 'buy_qty': 0.0, 'buy_cost': 0.0},
+			)
+			qty = float(tx.shares or 0)
+			entry['shares'] += qty * sign
+			if tx.transaction_type == 'BUY':
+				entry['buy_qty'] += qty
+				entry['buy_cost'] += qty * float(tx.price_per_share or 0)
 		items = []
 		total_value = 0.0
 		stable_value = 0.0
