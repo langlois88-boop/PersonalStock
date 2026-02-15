@@ -19,3 +19,4 @@ finnhub-python
 praw
 newsapi-python
 python-dotenv
+prophet
