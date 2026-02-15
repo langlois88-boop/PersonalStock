@@ -983,7 +983,8 @@ class PortfolioDashboardView(APIView):
 					last = PriceHistory.objects.filter(stock=stock).order_by('-date').first()
 					price = float(last.close_price) if last else 0.0
 				price = float(price or 0)
-				value = shares * price
+				effective_price = price if price > 0 else avg_cost
+				value = shares * effective_price
 				cost_value = avg_cost * shares
 				unrealized = value - cost_value
 				unrealized_pct = (unrealized / cost_value * 100) if cost_value else 0
@@ -997,7 +998,7 @@ class PortfolioDashboardView(APIView):
 				if prev_7d:
 					change_7d += (price - float(prev_7d.close_price)) * shares
 
-				is_stable = price >= 5 or float(stock.dividend_yield or 0) >= 0.02
+				is_stable = effective_price >= 5 or float(stock.dividend_yield or 0) >= 0.02
 				if is_stable:
 					stable_value += value
 				else:
@@ -1009,7 +1010,7 @@ class PortfolioDashboardView(APIView):
 					'sector': stock.sector,
 					'dividend_yield': float(stock.dividend_yield or 0),
 					'shares': shares,
-					'price': price,
+					'price': effective_price,
 					'value': value,
 					'avg_cost': round(avg_cost, 4),
 					'cost_value': round(cost_value, 2),
@@ -1088,8 +1089,6 @@ class PortfolioDashboardView(APIView):
 				last = PriceHistory.objects.filter(stock=stock).order_by('-date').first()
 				price = float(last.close_price) if last else 0.0
 			price = float(price or 0)
-			value = float(holding.shares or 0) * price
-			total_value += value
 			symbol_key = (stock.symbol or '').strip().upper() or str(stock.id)
 			cost_data = cost_map.get(symbol_key, {})
 			if not cost_data.get('buy_qty'):
@@ -1118,6 +1117,9 @@ class PortfolioDashboardView(APIView):
 			buy_qty = float(cost_data.get('buy_qty') or 0)
 			buy_cost = float(cost_data.get('buy_cost') or 0)
 			avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
+			effective_price = price if price > 0 else avg_cost
+			value = float(holding.shares or 0) * effective_price
+			total_value += value
 			cost_value = avg_cost * float(holding.shares or 0)
 			unrealized = value - cost_value
 			unrealized_pct = (unrealized / cost_value * 100) if cost_value else 0
@@ -1130,7 +1132,7 @@ class PortfolioDashboardView(APIView):
 			if prev_7d:
 				change_7d += (price - float(prev_7d.close_price)) * float(holding.shares or 0)
 
-			is_stable = price >= 5 or float(stock.dividend_yield or 0) >= 0.02
+			is_stable = effective_price >= 5 or float(stock.dividend_yield or 0) >= 0.02
 			if is_stable:
 				stable_value += value
 			else:
@@ -1142,7 +1144,7 @@ class PortfolioDashboardView(APIView):
 				'sector': stock.sector,
 				'dividend_yield': float(stock.dividend_yield or 0),
 				'shares': float(holding.shares or 0),
-				'price': price,
+				'price': effective_price,
 				'value': value,
 				'avg_cost': round(avg_cost, 4),
 				'cost_value': round(cost_value, 2),
@@ -1285,6 +1287,13 @@ class BluechipHunterView(APIView):
 		).split(',')
 		scr_ids = [s.strip() for s in scr_ids if s.strip()]
 
+		fallback_symbols = [
+			'AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'BRK-B', 'JPM', 'V', 'MA',
+			'UNH', 'XOM', 'COST', 'AVGO', 'LLY', 'ORCL', 'ADBE', 'CRM', 'NFLX', 'PEP',
+			'KO', 'WMT', 'HD', 'BAC', 'INTC', 'CSCO', 'AMD', 'QCOM', 'TXN', 'ABBV',
+			'PFE', 'MRK', 'JNJ', 'PG', 'NKE', 'TMO', 'LIN', 'MCD', 'DIS',
+		]
+
 		quotes: list[dict] = []
 		for scr_id in scr_ids:
 			quotes.extend(_fetch_yahoo_screener(scr_id, count=50))
@@ -1293,13 +1302,7 @@ class BluechipHunterView(APIView):
 			quotes = _fetch_yfinance_screeners(scr_ids, count=50)
 
 		if not quotes:
-			fallback = [
-				'AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'BRK-B', 'JPM', 'V', 'MA',
-				'UNH', 'XOM', 'COST', 'AVGO', 'LLY', 'ORCL', 'ADBE', 'CRM', 'NFLX', 'PEP',
-				'KO', 'WMT', 'HD', 'BAC', 'INTC', 'CSCO', 'AMD', 'QCOM', 'TXN', 'ABBV',
-				'PFE', 'MRK', 'JNJ', 'PG', 'NKE', 'TMO', 'LIN', 'MCD', 'DIS',
-			]
-			quotes = [{'symbol': symbol} for symbol in fallback]
+			quotes = [{'symbol': symbol} for symbol in fallback_symbols]
 
 		seen: set[str] = set()
 		candidates: list[dict] = []
@@ -1310,9 +1313,18 @@ class BluechipHunterView(APIView):
 			seen.add(symbol)
 			candidates.append(quote)
 
+		if not candidates:
+			seen.clear()
+			for symbol in fallback_symbols:
+				if symbol in seen or symbol in existing_symbols:
+					continue
+				seen.add(symbol)
+				candidates.append({'symbol': symbol})
+
 		model_path = Path(__file__).resolve().parent / 'ml_engine' / 'stable_brain_v1.pkl'
 		model = None
-		if model_path.exists():
+		fast_mode = os.getenv('BLUECHIP_FAST_MODE', 'true').lower() != 'false'
+		if model_path.exists() and not fast_mode:
 			try:
 				model = joblib.load(model_path)
 			except Exception:
@@ -1379,28 +1391,29 @@ class BluechipHunterView(APIView):
 				except Exception:
 					predicted = None
 
-			try:
-				fusion = DataFusionEngine(symbol)
-				fusion_df = fusion.fuse_all()
-				if fusion_df is not None and not fusion_df.empty:
-					bt_payload = load_or_train_model(fusion_df)
-					if bt_payload and bt_payload.get('model'):
-						last_row = fusion_df.tail(1).copy()
-						feature_list = bt_payload.get('features', FEATURE_COLUMNS)
-						for col in feature_list:
-							if col not in last_row.columns:
-								last_row[col] = 0.0
-							features = last_row[feature_list].fillna(0).values
-							backtest_signal = float(bt_payload['model'].predict_proba(features)[0][1])
-			except Exception:
-				backtest_signal = None
+			if not fast_mode:
+				try:
+					fusion = DataFusionEngine(symbol)
+					fusion_df = fusion.fuse_all()
+					if fusion_df is not None and not fusion_df.empty:
+						bt_payload = load_or_train_model(fusion_df)
+						if bt_payload and bt_payload.get('model'):
+							last_row = fusion_df.tail(1).copy()
+							feature_list = bt_payload.get('features', FEATURE_COLUMNS)
+							for col in feature_list:
+								if col not in last_row.columns:
+									last_row[col] = 0.0
+								features = last_row[feature_list].fillna(0).values
+								backtest_signal = float(bt_payload['model'].predict_proba(features)[0][1])
+				except Exception:
+					backtest_signal = None
 
 			if backtest_signal is not None and backtest_signal < min_backtest_signal:
 				continue
 
 			pred_score = _clamp(0.5 + (predicted or 0.0) * 10)
-			growth_pct = revenue_growth * 100
-			yield_pct = dividend_yield * 100
+			growth_pct = revenue_growth * 100 if revenue_growth <= 1 else revenue_growth
+			yield_pct = dividend_yield * 100 if dividend_yield <= 1 else dividend_yield
 			fundamental_score = _clamp(0.4 + (revenue_growth * 2) + (dividend_yield * 4))
 			ai_score = 100 * _clamp(
 				(0.45 * fundamental_score)
@@ -1421,6 +1434,28 @@ class BluechipHunterView(APIView):
 				'backtest_signal': round(backtest_signal, 4) if backtest_signal is not None else None,
 				'ai_score': ai_score,
 			})
+
+		if not results:
+			for quote in candidates[:limit]:
+				symbol = str(quote.get('symbol') or '').upper().strip()
+				if not symbol:
+					continue
+				name = quote.get('shortName') or quote.get('longName') or symbol
+				sector = quote.get('sector') or ''
+				price = float(quote.get('regularMarketPrice') or 0)
+				dividend_yield = float(quote.get('dividendYield') or 0)
+				revenue_growth = float(quote.get('revenueGrowth') or 0)
+				results.append({
+					'ticker': symbol,
+					'name': name,
+					'sector': sector,
+					'latest_price': price,
+					'dividend_yield': round(dividend_yield * 100, 2) if dividend_yield <= 1 else round(dividend_yield, 2),
+					'revenue_growth': round(revenue_growth * 100, 2) if revenue_growth <= 1 else round(revenue_growth, 2),
+					'predicted_20d_return': None,
+					'backtest_signal': None,
+					'ai_score': 70.0,
+				})
 
 		results.sort(key=lambda x: x.get('ai_score', 0), reverse=True)
 		return Response(results[:limit])

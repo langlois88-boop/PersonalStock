@@ -16,7 +16,8 @@ function OptimizerPage() {
 
     const dividendYield = Number(holding.dividend_yield || 0);
     const sector = holding.sector || 'Non défini';
-    const fundamentals = `Secteur ${sector} · Dividende ${(dividendYield * 100).toFixed(2)}%`;
+    const dividendPct = dividendYield > 1 ? dividendYield : dividendYield * 100;
+    const fundamentals = `Secteur ${sector} · Dividende ${dividendPct.toFixed(2)}%`;
 
     const confidence = Math.min(95, Math.max(55, Math.round(50 + Math.abs(pnlPct) * 3)));
     const reason = `P/L ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%).`;
