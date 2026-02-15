@@ -653,8 +653,18 @@ class AccountViewSet(viewsets.ModelViewSet):
 		else:
 			User = get_user_model()
 			user = User.objects.first()
-		if user is None:
-			raise ValidationError('No user available to assign account.')
+			if user is None:
+				username_field = User.USERNAME_FIELD
+				if username_field == User.EMAIL_FIELD:
+					identifier = 'local@example.com'
+				else:
+					identifier = 'local'
+				lookup = {username_field: identifier}
+				user = User.objects.filter(**lookup).first()
+				if user is None:
+					user = User(**lookup)
+					user.set_unusable_password()
+					user.save()
 		serializer.save(user=user)
 
 

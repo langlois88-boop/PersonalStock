@@ -3,22 +3,15 @@ import { Area, AreaChart, CartesianGrid, Pie, PieChart, ResponsiveContainer, Too
 import { motion } from 'framer-motion';
 import api from '../api/api';
 
-const fallback = {
-  total_balance: 238540,
-  change_24h: 1240,
-  change_24h_pct: 0.52,
-  change_7d: 4230,
-  change_7d_pct: 1.81,
-  allocation: { stable_pct: 62, risky_pct: 38 },
-  holdings: [
-    { ticker: 'AAPL', name: 'Apple', value: 76420, price: 189.12, category: 'Stable' },
-    { ticker: 'RY.TO', name: 'Royal Bank', value: 38210, price: 133.45, category: 'Stable' },
-    { ticker: 'FLT.V', name: 'Volatus', value: 12480, price: 0.31, category: 'Risky' },
-  ],
-  chart: Array.from({ length: 12 }).map((_, idx) => ({
-    date: `M-${11 - idx}`,
-    value: 210000 + idx * 2500,
-  })),
+const emptyState = {
+  total_balance: 0,
+  change_24h: 0,
+  change_24h_pct: 0,
+  change_7d: 0,
+  change_7d_pct: 0,
+  allocation: { stable_pct: 0, risky_pct: 0 },
+  holdings: [],
+  chart: [],
 };
 
 const StatCard = ({ title, value, subtitle, accent }) => (
@@ -35,13 +28,21 @@ const StatCard = ({ title, value, subtitle, accent }) => (
 );
 
 function GlobalPortfolio() {
-  const [data, setData] = useState(fallback);
+  const [data, setData] = useState(emptyState);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    setLoading(true);
+    setError('');
     api
       .get('dashboard/portfolio/')
       .then((res) => setData(res.data))
-      .catch(() => setData(fallback));
+      .catch(() => {
+        setError("Impossible de charger le portefeuille.");
+        setData(emptyState);
+      })
+      .finally(() => setLoading(false));
   }, []);
 
   const gaugeData = useMemo(
@@ -91,54 +92,68 @@ function GlobalPortfolio() {
         </div>
       </div>
 
+      {error && <p className="text-sm text-rose-400">{error}</p>}
+
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         <div className="xl:col-span-2 bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
           <h3 className="text-lg font-semibold text-white mb-4">Performance 1 an</h3>
           <div className="h-72">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={data.chart}>
-                <defs>
-                  <linearGradient id="colorValue" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#6366f1" stopOpacity={0.8} />
-                    <stop offset="95%" stopColor="#6366f1" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
-                <XAxis dataKey="date" stroke="#64748b" />
-                <YAxis stroke="#64748b" />
-                <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #1f2937' }} />
-                <Area type="monotone" dataKey="value" stroke="#6366f1" fillOpacity={1} fill="url(#colorValue)" />
-              </AreaChart>
-            </ResponsiveContainer>
+            {loading ? (
+              <p className="text-sm text-slate-400">Chargement…</p>
+            ) : data.chart && data.chart.length > 0 ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={data.chart}>
+                  <defs>
+                    <linearGradient id="colorValue" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#6366f1" stopOpacity={0.8} />
+                      <stop offset="95%" stopColor="#6366f1" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
+                  <XAxis dataKey="date" stroke="#64748b" />
+                  <YAxis stroke="#64748b" />
+                  <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #1f2937' }} />
+                  <Area type="monotone" dataKey="value" stroke="#6366f1" fillOpacity={1} fill="url(#colorValue)" />
+                </AreaChart>
+              </ResponsiveContainer>
+            ) : (
+              <p className="text-sm text-slate-400">Aucune donnée de performance.</p>
+            )}
           </div>
         </div>
 
         <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
           <h3 className="text-lg font-semibold text-white mb-4">Positions clés</h3>
           <div className="space-y-3">
-            {data.holdings?.map((row) => (
-              <div key={row.ticker} className="flex items-center justify-between bg-slate-950/40 p-3 rounded-xl">
-                <div>
-                  <p className="text-white font-semibold">
-                    {row.ticker}{' '}
-                    <span
-                      className={`text-[10px] px-2 py-0.5 rounded-full ${
-                        row.category === 'Stable'
-                          ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30'
-                          : 'bg-rose-500/10 text-rose-300 border border-rose-500/30'
-                      }`}
-                    >
-                      {row.category}
-                    </span>
-                  </p>
-                  <p className="text-xs text-slate-400">{row.name}</p>
+            {loading ? (
+              <p className="text-sm text-slate-400">Chargement…</p>
+            ) : data.holdings && data.holdings.length > 0 ? (
+              data.holdings.map((row) => (
+                <div key={row.ticker} className="flex items-center justify-between bg-slate-950/40 p-3 rounded-xl">
+                  <div>
+                    <p className="text-white font-semibold">
+                      {row.ticker}{' '}
+                      <span
+                        className={`text-[10px] px-2 py-0.5 rounded-full ${
+                          row.category === 'Stable'
+                            ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30'
+                            : 'bg-rose-500/10 text-rose-300 border border-rose-500/30'
+                        }`}
+                      >
+                        {row.category}
+                      </span>
+                    </p>
+                    <p className="text-xs text-slate-400">{row.name}</p>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-white">${Number(row.price || 0).toFixed(2)}</p>
+                    <p className="text-xs text-slate-400">${Number(row.value || 0).toFixed(0)}</p>
+                  </div>
                 </div>
-                <div className="text-right">
-                  <p className="text-white">${Number(row.price || 0).toFixed(2)}</p>
-                  <p className="text-xs text-slate-400">${Number(row.value || 0).toFixed(0)}</p>
-                </div>
-              </div>
-            ))}
+              ))
+            ) : (
+              <p className="text-sm text-slate-400">Aucune position enregistrée.</p>
+            )}
           </div>
         </div>
       </div>
