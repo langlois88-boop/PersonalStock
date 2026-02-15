@@ -25,7 +25,23 @@ services:
     build:
       context: ./portfolio_backend
       dockerfile: Dockerfile
-    command: celery -A portfolio_backend worker -B --loglevel=INFO --pool=solo
+    command: celery -A portfolio_backend worker --loglevel=INFO --pool=solo
+    env_file:
+      - ./deploy/.env
+    depends_on:
+      - redis
+      - backend
+    volumes:
+      - backend_media:/app/media
+      - backend_static:/app/staticfiles
+      - backend_db:/app/db
+    restart: unless-stopped
+
+  celery_beat:
+    build:
+      context: ./portfolio_backend
+      dockerfile: Dockerfile
+    command: celery -A portfolio_backend beat --loglevel=INFO
     env_file:
       - ./deploy/.env
     depends_on:
