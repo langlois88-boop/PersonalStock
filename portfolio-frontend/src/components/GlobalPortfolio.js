@@ -36,6 +36,7 @@ function GlobalPortfolio() {
   const [accountData, setAccountData] = useState({ accounts: [], top_movers: {} });
   const [accountLoading, setAccountLoading] = useState(true);
   const [selectedAccountId, setSelectedAccountId] = useState('ALL');
+  const [sortConfig, setSortConfig] = useState({ key: 'ticker', direction: 'asc' });
 
   useEffect(() => {
     setLoading(true);
@@ -102,6 +103,47 @@ function GlobalPortfolio() {
   const formatPct = (value) => {
     if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
     return `${Number(value).toFixed(2)}%`;
+  };
+
+  const toggleSort = (key) => {
+    setSortConfig((prev) => {
+      if (prev.key === key) {
+        return { key, direction: prev.direction === 'asc' ? 'desc' : 'asc' };
+      }
+      return { key, direction: 'asc' };
+    });
+  };
+
+  const sortIndicator = (key) => (sortConfig.key === key ? (sortConfig.direction === 'asc' ? '▲' : '▼') : '');
+
+  const getSortValue = (pos, key) => {
+    if (key === 'ticker') return (pos.ticker || '').toUpperCase();
+    return Number(pos?.[key] ?? 0);
+  };
+
+  const sortPositions = (positions) => {
+    const list = Array.isArray(positions) ? [...positions] : [];
+    list.sort((a, b) => {
+      const aVal = getSortValue(a, sortConfig.key);
+      const bVal = getSortValue(b, sortConfig.key);
+      if (typeof aVal === 'string' && typeof bVal === 'string') {
+        return sortConfig.direction === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+      }
+      return sortConfig.direction === 'asc' ? aVal - bVal : bVal - aVal;
+    });
+    return list;
+  };
+
+  const currentValueClass = (pos) => {
+    const cost = Number(pos.cost_value || 0);
+    const current = Number(pos.current_value || 0);
+    if (!cost) return 'text-slate-300';
+    const ratio = (current - cost) / cost;
+    if (ratio >= 0.08) return 'text-emerald-300';
+    if (ratio >= 0.02) return 'text-emerald-400';
+    if (ratio <= -0.08) return 'text-rose-300';
+    if (ratio <= -0.02) return 'text-rose-400';
+    return 'text-slate-300';
   };
 
   const confidence = data.confidence_meter || {};
@@ -358,27 +400,67 @@ function GlobalPortfolio() {
                     <table className="w-full text-xs text-slate-200">
                       <thead>
                         <tr className="text-slate-400">
-                          <th className="text-left py-2">Ticker</th>
-                          <th className="text-right py-2">Prix achat</th>
-                          <th className="text-right py-2">Quantité</th>
-                          <th className="text-right py-2">Valeur achat</th>
-                          <th className="text-right py-2">Prix actuel</th>
-                          <th className="text-right py-2">Valeur actuelle</th>
-                          <th className="text-right py-2">P/L %</th>
-                          <th className="text-right py-2">7j</th>
-                          <th className="text-right py-2">30j</th>
-                          <th className="text-right py-2">1a</th>
+                          <th className="text-left py-2">
+                            <button type="button" onClick={() => toggleSort('ticker')} className="text-left">
+                              Ticker {sortIndicator('ticker')}
+                            </button>
+                          </th>
+                          <th className="text-right py-2">
+                            <button type="button" onClick={() => toggleSort('avg_cost')} className="text-right">
+                              Prix achat {sortIndicator('avg_cost')}
+                            </button>
+                          </th>
+                          <th className="text-right py-2">
+                            <button type="button" onClick={() => toggleSort('shares')} className="text-right">
+                              Quantité {sortIndicator('shares')}
+                            </button>
+                          </th>
+                          <th className="text-right py-2">
+                            <button type="button" onClick={() => toggleSort('cost_value')} className="text-right">
+                              Valeur achat {sortIndicator('cost_value')}
+                            </button>
+                          </th>
+                          <th className="text-right py-2">
+                            <button type="button" onClick={() => toggleSort('current_price')} className="text-right">
+                              Prix actuel {sortIndicator('current_price')}
+                            </button>
+                          </th>
+                          <th className="text-right py-2">
+                            <button type="button" onClick={() => toggleSort('current_value')} className="text-right">
+                              Valeur actuelle {sortIndicator('current_value')}
+                            </button>
+                          </th>
+                          <th className="text-right py-2">
+                            <button type="button" onClick={() => toggleSort('unrealized_pnl_pct')} className="text-right">
+                              P/L % {sortIndicator('unrealized_pnl_pct')}
+                            </button>
+                          </th>
+                          <th className="text-right py-2">
+                            <button type="button" onClick={() => toggleSort('weekly_return_pct')} className="text-right">
+                              7j {sortIndicator('weekly_return_pct')}
+                            </button>
+                          </th>
+                          <th className="text-right py-2">
+                            <button type="button" onClick={() => toggleSort('monthly_return_pct')} className="text-right">
+                              30j {sortIndicator('monthly_return_pct')}
+                            </button>
+                          </th>
+                          <th className="text-right py-2">
+                            <button type="button" onClick={() => toggleSort('annual_return_pct')} className="text-right">
+                              1a {sortIndicator('annual_return_pct')}
+                            </button>
+                          </th>
                         </tr>
                       </thead>
                       <tbody>
-                        {(account.positions || []).map((pos) => (
+                        {sortPositions(account.positions || []).map((pos) => (
                           <tr key={`${account.account_id}-${pos.ticker}`} className="border-t border-slate-800">
                             <td className="py-2 font-semibold text-white">{pos.ticker}</td>
                             <td className="py-2 text-right">{formatMoney(pos.avg_cost)}</td>
                             <td className="py-2 text-right">{Number(pos.shares || 0).toFixed(2)}</td>
                             <td className="py-2 text-right">{formatMoney(pos.cost_value)}</td>
                             <td className="py-2 text-right">{formatMoney(pos.current_price)}</td>
-                            <td className="py-2 text-right">{formatMoney(pos.current_value)}</td>
+                            <td className={`py-2 text-right ${currentValueClass(pos)}`}>{formatMoney(pos.current_value)}</td>
                             <td className={`py-2 text-right ${Number(pos.unrealized_pnl_pct || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
                               {formatPct(pos.unrealized_pnl_pct)}
                             </td>
