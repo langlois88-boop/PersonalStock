@@ -291,6 +291,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.cleanup_task_run_logs',
         'schedule': crontab(minute=15, hour=2),
     },
+    'trading-journal-daily': {
+        'task': 'portfolio.tasks.generate_trading_journal_daily',
+        'schedule': crontab(minute=30, hour=20),
+    },
 }
 
 # Alerting / Email (dev defaults)

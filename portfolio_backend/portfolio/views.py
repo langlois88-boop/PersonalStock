@@ -1189,6 +1189,61 @@ class MacroIndicatorView(APIView):
 
 
 class PortfolioDashboardView(APIView):
+	def _build_confidence_meter(self) -> dict[str, Any] | None:
+		symbol = (os.getenv('CONFIDENCE_SYMBOL') or os.getenv('PAPER_WATCHLIST', 'SPY').split(',')[0]).strip().upper()
+		if not symbol:
+			return None
+		try:
+			fusion = DataFusionEngine(symbol)
+			fusion_df = fusion.fuse_all()
+			if fusion_df is None or fusion_df.empty:
+				return {'symbol': symbol, 'status': 'unavailable'}
+			payload = load_or_train_model(fusion_df, model_path=get_model_path('BLUECHIP'))
+			if not payload or not payload.get('model'):
+				return {'symbol': symbol, 'status': 'unavailable'}
+			last_row = fusion_df.tail(1).copy()
+			feature_list = payload.get('features') or FEATURE_COLUMNS
+			for col in feature_list:
+				if col not in last_row.columns:
+					last_row[col] = 0.0
+			features = last_row[feature_list].fillna(0).values
+			try:
+				signal = float(payload['model'].predict_proba(features)[0][1])
+			except Exception:
+				signal = 0.0
+			volume_z = float(last_row.iloc[0].get('VolumeZ', 0.0) or 0.0)
+			vol_regime = float(last_row.iloc[0].get('vol_regime', 0.0) or 0.0)
+			ai_score = round(signal * 100, 2)
+			min_score = float(os.getenv('CONFIDENCE_AI_SCORE_MIN', '80'))
+			min_volume_z = float(os.getenv('CONFIDENCE_VOLUME_Z_MIN', '0.5'))
+			max_vol_regime = float(os.getenv('CONFIDENCE_VOL_REGIME_MAX', '1.6'))
+			status = 'neutral'
+			label = 'Signal en attente'
+			if max_vol_regime and vol_regime >= max_vol_regime:
+				status = 'red'
+				label = 'Volatilité instable'
+			elif ai_score >= min_score and volume_z > min_volume_z:
+				status = 'green'
+				label = 'Signal confirmé'
+			elif ai_score >= min_score:
+				status = 'orange'
+				label = 'Attendre le volume'
+			return {
+				'symbol': symbol,
+				'ai_score': ai_score,
+				'volume_z': round(volume_z, 3),
+				'vol_regime': round(vol_regime, 3),
+				'status': status,
+				'label': label,
+				'thresholds': {
+					'ai_score_min': min_score,
+					'volume_z_min': min_volume_z,
+					'vol_regime_max': max_vol_regime,
+				},
+			}
+		except Exception:
+			return {'symbol': symbol, 'status': 'unavailable'}
+
 	def get(self, request):
 		portfolio_id = request.query_params.get('portfolio_id')
 		portfolio = None
@@ -1217,6 +1272,7 @@ class PortfolioDashboardView(APIView):
 					},
 					'holdings': [],
 					'chart': [],
+					'confidence_meter': self._build_confidence_meter(),
 				}, status=200)
 
 			position_map = {}
@@ -1310,6 +1366,7 @@ class PortfolioDashboardView(APIView):
 				},
 				'holdings': items,
 				'chart': [],
+				'confidence_meter': self._build_confidence_meter(),
 			}, status=200)
 
 		holdings = PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
@@ -1459,6 +1516,7 @@ class PortfolioDashboardView(APIView):
 			},
 			'holdings': items,
 			'chart': chart,
+			'confidence_meter': self._build_confidence_meter(),
 		})
 
 

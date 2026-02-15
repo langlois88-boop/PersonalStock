@@ -104,6 +104,21 @@ function GlobalPortfolio() {
     return `${Number(value).toFixed(2)}%`;
   };
 
+  const confidence = data.confidence_meter || {};
+  const confidenceStatus = confidence.status || 'unavailable';
+  const confidenceStyles = {
+    green: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200',
+    orange: 'border-amber-500/40 bg-amber-500/10 text-amber-200',
+    red: 'border-rose-500/40 bg-rose-500/10 text-rose-200',
+    neutral: 'border-slate-700 bg-slate-950/60 text-slate-300',
+    unavailable: 'border-slate-800 bg-slate-950/60 text-slate-400',
+  };
+  const confidenceLabel = confidence.label || 'Indisponible';
+  const confidenceSymbol = confidence.symbol || '—';
+  const confidenceAiScore = confidence.ai_score ?? null;
+  const confidenceVolumeZ = confidence.volume_z ?? null;
+  const confidenceVolRegime = confidence.vol_regime ?? null;
+
   const exportAccountsCsv = () => {
     const rows = [];
     const header = [
@@ -192,6 +207,21 @@ function GlobalPortfolio() {
               <p className="text-white text-lg font-semibold">{data.allocation?.stable_pct || 0}% Stable</p>
               <p className="text-xs text-slate-400">{data.allocation?.risky_pct || 0}% Risky</p>
             </div>
+          </div>
+        </div>
+      </div>
+
+      <div className={`border rounded-2xl p-4 backdrop-blur-md ${confidenceStyles[confidenceStatus] || confidenceStyles.unavailable}`}>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <p className="text-xs uppercase tracking-[0.2em]">Confidence Meter</p>
+            <p className="text-lg font-semibold">{confidenceLabel}</p>
+            <p className="text-xs opacity-80">Symbole: {confidenceSymbol}</p>
+          </div>
+          <div className="text-right text-xs space-y-1">
+            <p>IA Score: {confidenceAiScore === null ? '—' : `${confidenceAiScore.toFixed(2)}%`}</p>
+            <p>Volume Z: {confidenceVolumeZ === null ? '—' : confidenceVolumeZ.toFixed(2)}</p>
+            <p>Vol Regime: {confidenceVolRegime === null ? '—' : confidenceVolRegime.toFixed(2)}</p>
           </div>
         </div>
       </div>

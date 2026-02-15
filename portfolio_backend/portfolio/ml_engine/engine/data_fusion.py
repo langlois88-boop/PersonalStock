@@ -88,6 +88,11 @@ class DataFusionEngine:
         fused["Volatility"] = fused["Returns"].rolling(window=21, min_periods=10).std()
         fused["Momentum20"] = fused["Close"].pct_change(20)
         fused["vol_regime"] = fused["Volatility"] / fused["Volatility"].rolling(window=252, min_periods=60).mean()
+        if "Volume" not in fused.columns:
+            fused["Volume"] = 0.0
+        vol_mean = fused["Volume"].rolling(window=20, min_periods=10).mean()
+        vol_std = fused["Volume"].rolling(window=20, min_periods=10).std()
+        fused["VolumeZ"] = (fused["Volume"] - vol_mean) / vol_std.replace(0, pd.NA)
         fused["sector_code"] = _get_sector_code(self.ticker)
 
         delta = fused["Close"].diff()

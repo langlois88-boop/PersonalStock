@@ -16,21 +16,11 @@ MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_v1.pkl"
 BLUECHIP_MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_bluechip_v1.pkl"
 PENNY_MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_penny_v1.pkl"
 FEATURE_COLUMNS = [
-    "Returns",
-    "GS10",
-    "VIXCLS",
-    "CPIAUCSL",
-    "DCOILWTICO",
-    "sentiment_score",
-    "news_count",
-    "Volatility",
-    "vol_regime",
     "MA20",
-    "MA50",
-    "MA200",
-    "Momentum20",
-    "RSI14",
-    "sector_code",
+    "vol_regime",
+    "DCOILWTICO",
+    "CPIAUCSL",
+    "VolumeZ",
 ]
 
 
@@ -350,11 +340,14 @@ class AIBacktester:
             ma50 = float(row.get("MA50", 0.0))
             ma200 = float(row.get("MA200", 0.0))
             atr = float(row.get("ATR14", 0.0))
+            volume_z = float(row.get("VolumeZ", 0.0) or 0.0)
+            min_volume_z = float(os.getenv("VOLUME_ZSCORE_MIN", "0.5"))
 
             trend_ok = ma20 > ma50 if (ma20 and ma50) else True
             market_ok = price is not None and (not ma200 or price > ma200)
             sentiment_ok = sentiment > 0.1 or sentiment_constant
-            buy_ok = (ai_signal >= buy_threshold) and sentiment_ok and trend_ok
+            volume_ok = volume_z >= min_volume_z
+            buy_ok = (ai_signal >= buy_threshold) and sentiment_ok and trend_ok and volume_ok
             exit_ok = ai_signal < sell_threshold
 
             prev_pos = int(df.iloc[idx - 1]["position"])

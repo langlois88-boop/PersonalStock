@@ -27,6 +27,10 @@ from newsapi import NewsApiClient
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from transformers import pipeline
 from sklearn.ensemble import RandomForestClassifier
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfgen import canvas as pdf_canvas
 
 from .models import (
     Account,
@@ -1481,6 +1485,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     risk_pct = _env_float(prefix, 'RISK_PCT', '0.015')
     position_cap_pct = _env_float(prefix, 'POSITION_CAP_PCT', '0.10')
     initial_capital = _env_float(prefix, 'CAPITAL', '10000')
+    min_volume_z = _env_float(prefix, 'VOLUME_ZSCORE_MIN', '0.5')
 
     closed_trades = PaperTrade.objects.filter(status='CLOSED', sandbox=sandbox)
     closed_pnl = float(sum([float(t.pnl or 0) for t in closed_trades]))
@@ -1589,6 +1594,16 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         signal_payload = _signal(symbol)
         signal = signal_payload['signal'] if signal_payload else None
         if signal is None or signal < buy_threshold:
+            continue
+        volume_z = _safe_float((signal_payload or {}).get('features', {}).get('VolumeZ'))
+        if volume_z is not None and volume_z < min_volume_z:
+            ai_score = float(signal or 0) * 100
+            message = (
+                f"Non-Trade [{sandbox}]: {symbol} signal {ai_score:.2f}% "
+                f"volume_z {float(volume_z):.2f} < {min_volume_z:.2f}"
+            )
+            stock = Stock.objects.filter(symbol__iexact=symbol).first()
+            AlertEvent.objects.create(category='PAPER_NON_TRADE', message=message, stock=stock)
             continue
         price = _latest_price(symbol)
         if price is None:
@@ -1879,6 +1894,197 @@ def _calculate_max_drawdown(trades: list[PaperTrade]) -> float:
             if dd < max_drawdown:
                 max_drawdown = dd
     return abs(max_drawdown)
+
+
+def _journal_output_dir() -> str:
+    base_dir = str(getattr(settings, 'BASE_DIR', os.getcwd()))
+    return os.getenv('TRADING_JOURNAL_DIR', os.path.join(base_dir, 'reports'))
+
+
+def _wrap_text(text: str, max_width: float, font_name: str, font_size: int) -> list[str]:
+    words = str(text).split()
+    if not words:
+        return ['']
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        test = f"{current} {word}"
+        if pdfmetrics.stringWidth(test, font_name, font_size) <= max_width:
+            current = test
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def _draw_wrapped(
+    pdf: pdf_canvas.Canvas,
+    text: str,
+    x: float,
+    y: float,
+    max_width: float,
+    line_height: float,
+    font_name: str,
+    font_size: int,
+) -> float:
+    pdf.setFont(font_name, font_size)
+    for line in _wrap_text(text, max_width, font_name, font_size):
+        pdf.drawString(x, y, line)
+        y -= line_height
+    return y
+
+
+def _format_reason(explanations: Any, features: dict[str, Any] | None) -> str:
+    reasons = []
+    if isinstance(explanations, list) and explanations:
+        top = []
+        for item in explanations:
+            feature = str(item.get('feature') or '')
+            value = item.get('value')
+            contrib = item.get('contribution')
+            if feature:
+                top.append(f"{feature}={value} ({contrib}%)")
+        if top:
+            reasons.append("Poids du modèle: " + ", ".join(top))
+    if features:
+        focus_keys = ['MA20', 'vol_regime', 'DCOILWTICO', 'CPIAUCSL', 'VolumeZ']
+        parts = []
+        for key in focus_keys:
+            if key in features:
+                try:
+                    parts.append(f"{key}={float(features.get(key, 0.0)):.4f}")
+                except Exception:
+                    parts.append(f"{key}={features.get(key)}")
+        if parts:
+            reasons.append("Indicateurs: " + ", ".join(parts))
+    return " | ".join(reasons) if reasons else "Aucune raison détaillée."
+
+
+def _render_trade_journal_pdf(
+    sandbox: str,
+    as_of_date: datetime.date,
+    trades: list[PaperTrade],
+    closed_trades: list[PaperTrade],
+    non_trades: list[AlertEvent],
+) -> str:
+    output_dir = _journal_output_dir()
+    os.makedirs(output_dir, exist_ok=True)
+    filename = f"journal_{sandbox.lower()}_{as_of_date.isoformat()}.pdf"
+    path = os.path.join(output_dir, filename)
+    pdf = pdf_canvas.Canvas(path, pagesize=letter)
+    width, height = letter
+    margin_x = 0.8 * inch
+    y = height - 0.8 * inch
+
+    pdf.setFont('Helvetica-Bold', 16)
+    pdf.drawString(margin_x, y, f"Journal de Trading - {sandbox}")
+    y -= 18
+    pdf.setFont('Helvetica', 11)
+    pdf.drawString(margin_x, y, f"Date: {as_of_date.isoformat()}")
+    y -= 24
+
+    pdf.setFont('Helvetica-Bold', 12)
+    pdf.drawString(margin_x, y, "Nouveaux trades")
+    y -= 14
+    if not trades:
+        pdf.setFont('Helvetica', 10)
+        pdf.drawString(margin_x, y, "Aucun trade ouvert aujourd'hui.")
+        y -= 18
+    else:
+        for trade in trades:
+            header = (
+                f"{trade.ticker} | Entrée {float(trade.entry_price):.2f} | "
+                f"Qté {int(trade.quantity)} | Signal {float(trade.entry_signal or 0):.2f}"
+            )
+            y = _draw_wrapped(pdf, header, margin_x, y, width - 2 * margin_x, 14, 'Helvetica-Bold', 10)
+            reasons = _format_reason(trade.entry_explanations, trade.entry_features or {})
+            y = _draw_wrapped(pdf, reasons, margin_x, y, width - 2 * margin_x, 12, 'Helvetica', 9)
+            y -= 6
+            if y < 1.2 * inch:
+                pdf.showPage()
+                y = height - 0.8 * inch
+
+    pdf.setFont('Helvetica-Bold', 12)
+    pdf.drawString(margin_x, y, "Trades fermés")
+    y -= 14
+    if not closed_trades:
+        pdf.setFont('Helvetica', 10)
+        pdf.drawString(margin_x, y, "Aucun trade fermé aujourd'hui.")
+        y -= 18
+    else:
+        for trade in closed_trades:
+            pnl = float(trade.pnl or 0)
+            header = (
+                f"{trade.ticker} | Sortie {float(trade.exit_price or 0):.2f} | "
+                f"P&L {pnl:.2f} | Résultat {trade.outcome or 'N/A'}"
+            )
+            y = _draw_wrapped(pdf, header, margin_x, y, width - 2 * margin_x, 14, 'Helvetica-Bold', 10)
+            reasons = _format_reason(trade.entry_explanations, trade.entry_features or {})
+            y = _draw_wrapped(pdf, reasons, margin_x, y, width - 2 * margin_x, 12, 'Helvetica', 9)
+            y -= 6
+            if y < 1.2 * inch:
+                pdf.showPage()
+                y = height - 0.8 * inch
+
+    pdf.setFont('Helvetica-Bold', 12)
+    pdf.drawString(margin_x, y, "Non-Trades (volume insuffisant)")
+    y -= 14
+    if not non_trades:
+        pdf.setFont('Helvetica', 10)
+        pdf.drawString(margin_x, y, "Aucun non-trade aujourd'hui.")
+        y -= 18
+    else:
+        for event in non_trades:
+            y = _draw_wrapped(pdf, event.message, margin_x, y, width - 2 * margin_x, 12, 'Helvetica', 9)
+            y -= 4
+            if y < 1.2 * inch:
+                pdf.showPage()
+                y = height - 0.8 * inch
+
+    pdf.save()
+    return path
+
+
+@shared_task
+def generate_trading_journal_daily(as_of: str | None = None) -> dict[str, Any]:
+    """Generate daily trading journal PDFs for watchlist, bluechip, and penny sandboxes."""
+    log = _task_log_start('generate_trading_journal_daily')
+    if as_of:
+        try:
+            as_of_date = datetime.strptime(as_of, '%Y-%m-%d').date()
+        except Exception:
+            as_of_date = timezone.localdate()
+    else:
+        as_of_date = timezone.localdate()
+
+    results = []
+    for sandbox in ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY']:
+        trades = list(
+            PaperTrade.objects.filter(sandbox=sandbox, entry_date__date=as_of_date).order_by('entry_date')
+        )
+        closed_trades = list(
+            PaperTrade.objects.filter(sandbox=sandbox, exit_date__date=as_of_date).order_by('exit_date')
+        )
+        non_trades = list(
+            AlertEvent.objects.filter(
+                category='PAPER_NON_TRADE',
+                created_at__date=as_of_date,
+                message__icontains=f"[{sandbox}]",
+            ).order_by('created_at')
+        )
+        path = _render_trade_journal_pdf(sandbox, as_of_date, trades, closed_trades, non_trades)
+        results.append({
+            'sandbox': sandbox,
+            'file': path,
+            'trades': len(trades),
+            'closed_trades': len(closed_trades),
+            'non_trades': len(non_trades),
+        })
+
+    payload = {'status': 'ok', 'as_of': as_of_date.isoformat(), 'results': results}
+    _task_log_finish(log, 'SUCCESS', payload)
+    return payload
 
 
 @shared_task
