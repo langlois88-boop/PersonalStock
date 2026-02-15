@@ -255,7 +255,7 @@ function ScoutEyePage() {
             </div>
             <div
               className={`absolute z-20 hidden group-hover:block left-4 right-4 bg-slate-950 border border-slate-800 rounded-xl p-4 text-sm text-slate-200 shadow-xl ${
-                index >= lastRowStart ? 'bottom-full mb-2' : 'top-full mt-1'
+                lastRowStart > 0 && index >= lastRowStart ? 'bottom-full mb-2' : 'top-full mt-1'
               }`}
             >
               <p className="text-slate-100 font-semibold text-base">{card.ticker} · Infos clés</p>

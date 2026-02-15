@@ -1,49 +1,130 @@
 import { motion } from 'framer-motion';
+import { useEffect, useMemo, useState } from 'react';
 import AIRecommendations from './AIRecommendations';
-
-const actions = [
-  {
-    ticker: 'FLT.V',
-    signal: 'SELL',
-    confidence: 85,
-    reason: 'Dilution détectée + RSI > 70.',
-    aiNotes: ['Momentum court terme faible.', 'Pression vendeuse institutionnelle.', 'Risque de volatilité élevé.'],
-    details: {
-      dilution: 'Émission d’actions détectée le 2025-12-18 (+12% de flottant).',
-      dilutionSource: 'Filing SEDAR/SEDI: prospectus court.',
-      rsi: 'RSI 14j à 73 (zone surachetée, >70).',
-    },
-  },
-  {
-    ticker: 'ATD.TO',
-    signal: 'KEEP',
-    confidence: 92,
-    reason: 'Support macro solide + yield attractif.',
-    aiNotes: ['Flux de trésorerie stable.', 'Résilience en phase macro lente.', 'Risque de drawdown modéré.'],
-    details: {
-      dilution: 'Aucune dilution récente détectée.',
-      dilutionSource: 'Registre des émissions: N/A',
-      rsi: 'RSI 14j à 54 (zone neutre).',
-    },
-  },
-  {
-    ticker: 'ADA',
-    signal: 'SELL',
-    confidence: 60,
-    reason: 'Sentiment social en baisse.',
-    aiNotes: ['Corrélation marché élevée.', 'Momentum en perte.', 'Risque news-driven.'],
-    details: {
-      dilution: 'Offre secondaire détectée (press release 2025-11-22).',
-      dilutionSource: 'Communiqué + dépôt prospectus.',
-      rsi: 'RSI 14j à 68 (proche surachat).',
-    },
-  },
-];
+import api from '../api/api';
 
 function OptimizerPage() {
+  const [actions, setActions] = useState([]);
+  const [suggestions, setSuggestions] = useState([]);
+
+  const buildAction = (holding) => {
+    const pnlPct = Number(holding.unrealized_pnl_pct || 0);
+    const pnl = Number(holding.unrealized_pnl || 0);
+    let signal = 'KEEP';
+    if (pnlPct <= -7) signal = 'SELL';
+    if (pnlPct >= 3) signal = 'BUY MORE';
+
+    const confidence = Math.min(95, Math.max(55, Math.round(50 + Math.abs(pnlPct) * 3)));
+    const reason = `P/L ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%).`;
+
+    return {
+      ticker: holding.ticker,
+      signal,
+      confidence,
+      reason,
+      aiNotes: [
+        `Coût moyen ${Number(holding.avg_cost || 0).toFixed(2)}.`,
+        `Valeur book ${Number(holding.cost_value || 0).toFixed(2)}.`,
+        `Valeur marché ${Number(holding.value || 0).toFixed(2)}.`,
+      ],
+      details: {
+        dilution: 'Analyse fondamentale indisponible.',
+        dilutionSource: 'Source: transactions du compte.',
+        rsi: `Prix actuel ${Number(holding.price || 0).toFixed(2)}.`,
+      },
+      name: holding.name || holding.ticker,
+    };
+  };
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const loadActions = async () => {
+      try {
+        const res = await api.get('dashboard/portfolio/');
+        if (!isMounted) return;
+        const items = res.data?.holdings || [];
+        setActions(items.map(buildAction));
+      } catch (err) {
+        if (!isMounted) return;
+        setActions([]);
+      }
+    };
+
+    const loadSuggestions = async () => {
+      try {
+        const [bluechip, penny] = await Promise.all([
+          api.get('bluechip-hunter/', { params: { limit: 6 } }),
+          api.get('penny-scout/', { params: { limit: 6 } }),
+        ]);
+
+        if (!isMounted) return;
+        const existing = new Set((actions || []).map((item) => item.ticker));
+
+        const mapped = [];
+        const bluechipItems = Array.isArray(bluechip.data) ? bluechip.data : [];
+        bluechipItems.forEach((item) => {
+          if (!item?.ticker || existing.has(item.ticker)) return;
+          mapped.push({
+            ticker: item.ticker,
+            name: item.name || item.sector || 'Bluechip',
+            signal: 'ADD',
+            confidence: Math.round(Number(item.ai_score || 70)),
+            reason: `AI score ${Number(item.ai_score || 70).toFixed(0)}.`,
+            type: 'Bluechip',
+            drivers: ['Qualité défensive', 'Liquidité élevée', 'Rendement stable'],
+            metrics: [
+              { label: 'Prix', value: `$${Number(item.latest_price || 0).toFixed(2)}` },
+              { label: 'AI score', value: Number(item.ai_score || 70).toFixed(0) },
+            ],
+            risks: ['Risque macro global'],
+          });
+        });
+
+        const pennyItems = Array.isArray(penny.data) ? penny.data : [];
+        pennyItems.forEach((item) => {
+          if (!item?.ticker || existing.has(item.ticker)) return;
+          mapped.push({
+            ticker: item.ticker,
+            name: item.sector || 'Penny',
+            signal: 'ADD',
+            confidence: Math.round(Number(item.ai_score?.score || item.ai_score || 60)),
+            reason: 'Momentum spéculatif détecté.',
+            type: 'Penny',
+            drivers: ['Momentum court terme', 'Volume en hausse', 'Catalyseur news'],
+            metrics: [
+              { label: 'Prix', value: `$${Number(item.latest_price || 0).toFixed(2)}` },
+              { label: 'AI score', value: Number(item.ai_score?.score || item.ai_score || 60).toFixed(0) },
+            ],
+            risks: ['Volatilité élevée'],
+          });
+        });
+
+        setSuggestions(mapped.slice(0, 6));
+      } catch (err) {
+        if (!isMounted) return;
+        setSuggestions([]);
+      }
+    };
+
+    loadActions();
+    loadSuggestions();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [actions.length]);
+
+  const hasActions = useMemo(() => actions.length > 0, [actions.length]);
+
   return (
     <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
       <div className="xl:col-span-2 space-y-4">
+        {!hasActions ? (
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-slate-400">
+            Aucune position détectée. Ajoute des transactions pour obtenir des recommandations.
+          </div>
+        ) : null}
         {actions.map((item, idx) => (
           <motion.div
             key={item.ticker}
@@ -87,7 +168,9 @@ function OptimizerPage() {
                 className={`text-xs px-3 py-1 rounded-full ${
                   item.signal === 'SELL'
                     ? 'bg-rose-500/10 text-rose-400 border border-rose-500/30'
-                    : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                    : item.signal === 'BUY MORE'
+                      ? 'bg-indigo-500/10 text-indigo-300 border border-indigo-500/30'
+                      : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
                 }`}
               >
                 {item.signal}
@@ -109,7 +192,11 @@ function OptimizerPage() {
         ))}
         <button className="w-full py-3 bg-indigo-600 text-white rounded-xl">Rebalance</button>
       </div>
-      <AIRecommendations />
+      <AIRecommendations
+        items={suggestions}
+        title="Ajouts recommandés"
+        emptyMessage="Aucune suggestion pour le moment."
+      />
     </div>
   );
 }
