@@ -1,4 +1,14 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-personalstock}
+      POSTGRES_USER: ${DB_USER:-personalstock}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-personalstock}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -12,6 +22,7 @@ services:
     env_file:
       - ./deploy/.env
     depends_on:
+      - postgres
       - redis
     volumes:
       - backend_media:/app/media
@@ -29,6 +40,7 @@ services:
     env_file:
       - ./deploy/.env
     depends_on:
+      - postgres
       - redis
       - backend
     volumes:
@@ -45,6 +57,7 @@ services:
     env_file:
       - ./deploy/.env
     depends_on:
+      - postgres
       - redis
       - backend
     volumes:
@@ -64,6 +77,7 @@ services:
     restart: unless-stopped
 
 volumes:
+  postgres_data:
   redis_data:
   backend_media:
   backend_static:

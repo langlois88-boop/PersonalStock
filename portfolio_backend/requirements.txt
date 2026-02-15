@@ -21,3 +21,4 @@ newsapi-python
 python-dotenv
 prophet
 openai
+psycopg2-binary
