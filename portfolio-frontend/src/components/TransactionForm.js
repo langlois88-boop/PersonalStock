@@ -21,20 +21,33 @@ function TransactionForm() {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
 
+  const ensureArray = (value) => (Array.isArray(value) ? value : []);
+
   useEffect(() => {
-    api.get('accounts/').then((res) => {
-      setAccounts(res.data);
-      if (res.data.length) {
-        setForm((prev) => ({ ...prev, account: res.data[0].id }));
-      }
-    });
-    api.get('stocks/').then((res) => {
-      setStocks(res.data);
-      if (res.data.length) {
-        setForm((prev) => ({ ...prev, stock: res.data[0].id }));
-        setStockQuery(formatStockLabel(res.data[0].symbol, res.data[0].name));
-      }
-    });
+    api
+      .get('accounts/')
+      .then((res) => {
+        const list = Array.isArray(res.data) ? res.data : (res.data?.results || []);
+        const safe = ensureArray(list);
+        setAccounts(safe);
+        if (safe.length) {
+          setForm((prev) => ({ ...prev, account: safe[0].id }));
+        }
+      })
+      .catch(() => setAccounts([]));
+
+    api
+      .get('stocks/')
+      .then((res) => {
+        const list = Array.isArray(res.data) ? res.data : (res.data?.results || []);
+        const safe = ensureArray(list);
+        setStocks(safe);
+        if (safe.length) {
+          setForm((prev) => ({ ...prev, stock: safe[0].id }));
+          setStockQuery(formatStockLabel(safe[0].symbol, safe[0].name));
+        }
+      })
+      .catch(() => setStocks([]));
   }, []);
 
   useEffect(() => {
@@ -51,7 +64,7 @@ function TransactionForm() {
         .get('stocks/search/', { params: { q: stockQuery } })
         .then((res) => {
           const list = res.data?.results || [];
-          setStockOptions(list);
+          setStockOptions(ensureArray(list));
         })
         .catch(() => {
           setStockOptions([]);
@@ -187,10 +200,10 @@ function TransactionForm() {
             value={form.account}
             onChange={(e) => updateForm('account', Number(e.target.value))}
           >
-            {accounts.length === 0 ? (
+            {ensureArray(accounts).length === 0 ? (
               <option value="">No account available</option>
             ) : (
-              accounts.map((account) => (
+              ensureArray(accounts).map((account) => (
                 <option key={account.id} value={account.id}>
                   {account.name} ({account.account_type})
                 </option>
@@ -231,10 +244,10 @@ function TransactionForm() {
             </div>
           ) : null}
           <datalist id="stock-options">
-            {stocks.map((s) => (
+            {ensureArray(stocks).map((s) => (
               <option key={`local-${s.id}`} value={formatStockLabel(s.symbol, s.name)} />
             ))}
-            {stockOptions.map((s) => (
+            {ensureArray(stockOptions).map((s) => (
               <option
                 key={`remote-${s.symbol}`}
                 value={formatStockLabel(s.symbol, s.name || '')}
