@@ -809,8 +809,19 @@ class PaperTradeSummaryView(APIView):
 	def get(self, request):
 		sandbox = (request.query_params.get('sandbox') or '').strip().upper()
 		initial_capital = float(os.getenv('PAPER_CAPITAL', '10000'))
-		open_trades = PaperTrade.objects.filter(status='OPEN')
-		closed_trades = PaperTrade.objects.filter(status='CLOSED')
+		try:
+			open_trades = PaperTrade.objects.filter(status='OPEN')
+			closed_trades = PaperTrade.objects.filter(status='CLOSED')
+		except OperationalError:
+			return Response({
+				'sandbox': sandbox or 'ALL',
+				'initial_capital': initial_capital,
+				'available_capital': round(initial_capital, 2),
+				'open_value': 0,
+				'closed_pnl': 0,
+				'open_positions': [],
+				'closed_positions': [],
+			})
 		if sandbox:
 			open_trades = open_trades.filter(sandbox=sandbox)
 			closed_trades = closed_trades.filter(sandbox=sandbox)
