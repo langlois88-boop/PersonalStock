@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 import api from '../api/api';
 
 function TransactionForm() {
-  const [portfolios, setPortfolios] = useState([]);
+  const [accounts, setAccounts] = useState([]);
   const [stocks, setStocks] = useState([]);
   const [stockQuery, setStockQuery] = useState('');
   const [stockOptions, setStockOptions] = useState([]);
@@ -11,7 +11,7 @@ function TransactionForm() {
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState('');
   const [form, setForm] = useState({
-    portfolio: '',
+    account: '',
     stock: '',
     shares: '',
     price_per_share: '',
@@ -22,10 +22,10 @@ function TransactionForm() {
   const [error, setError] = useState('');
 
   useEffect(() => {
-    api.get('portfolios/').then((res) => {
-      setPortfolios(res.data);
+    api.get('accounts/').then((res) => {
+      setAccounts(res.data);
       if (res.data.length) {
-        setForm((prev) => ({ ...prev, portfolio: res.data[0].id }));
+        setForm((prev) => ({ ...prev, account: res.data[0].id }));
       }
     });
     api.get('stocks/').then((res) => {
@@ -106,11 +106,13 @@ function TransactionForm() {
     }
 
     api
-      .post('transactions/', {
-        ...form,
+      .post('account-transactions/', {
+        account: form.account,
         stock: stockId,
-        shares: Number(form.shares),
-        price_per_share: Number(form.price_per_share),
+        date: form.date,
+        type: form.transaction_type,
+        quantity: Number(form.shares),
+        price: Number(form.price_per_share),
       })
       .then(() => {
         setMessage('Transaction saved.');
@@ -180,16 +182,20 @@ function TransactionForm() {
     <div className="portfolio-card">
       <form className="transaction-form" onSubmit={submit}>
         <label>
-          Portfolio
+          Account
           <select
-            value={form.portfolio}
-            onChange={(e) => updateForm('portfolio', Number(e.target.value))}
+            value={form.account}
+            onChange={(e) => updateForm('account', Number(e.target.value))}
           >
-            {portfolios.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
-              </option>
-            ))}
+            {accounts.length === 0 ? (
+              <option value="">No account available</option>
+            ) : (
+              accounts.map((account) => (
+                <option key={account.id} value={account.id}>
+                  {account.name} ({account.account_type})
+                </option>
+              ))
+            )}
           </select>
         </label>
 
