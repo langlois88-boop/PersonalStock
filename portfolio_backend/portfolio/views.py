@@ -812,7 +812,26 @@ class PaperTradeSummaryView(APIView):
 		try:
 			open_trades = PaperTrade.objects.filter(status='OPEN')
 			closed_trades = PaperTrade.objects.filter(status='CLOSED')
-		except OperationalError:
+			if sandbox:
+				open_trades = open_trades.filter(sandbox=sandbox)
+				closed_trades = closed_trades.filter(sandbox=sandbox)
+
+			closed_pnl = float(sum([float(t.pnl or 0) for t in closed_trades]))
+			open_value = 0.0
+			for t in open_trades:
+				open_value += float(t.entry_price) * float(t.quantity)
+
+			available = initial_capital + closed_pnl - open_value
+			return Response({
+				'sandbox': sandbox or 'ALL',
+				'initial_capital': initial_capital,
+				'available_capital': round(available, 2),
+				'open_value': round(open_value, 2),
+				'closed_pnl': round(closed_pnl, 2),
+				'open_positions': PaperTradeSerializer(open_trades, many=True).data,
+				'closed_positions': PaperTradeSerializer(closed_trades[:25], many=True).data,
+			})
+		except Exception:
 			return Response({
 				'sandbox': sandbox or 'ALL',
 				'initial_capital': initial_capital,
@@ -822,25 +841,6 @@ class PaperTradeSummaryView(APIView):
 				'open_positions': [],
 				'closed_positions': [],
 			})
-		if sandbox:
-			open_trades = open_trades.filter(sandbox=sandbox)
-			closed_trades = closed_trades.filter(sandbox=sandbox)
-		closed_pnl = float(sum([float(t.pnl or 0) for t in closed_trades]))
-		open_value = 0.0
-		for t in open_trades:
-			open_value += float(t.entry_price) * float(t.quantity)
-			
-			
-		available = initial_capital + closed_pnl - open_value
-		return Response({
-			'sandbox': sandbox or 'ALL',
-			'initial_capital': initial_capital,
-			'available_capital': round(available, 2),
-			'open_value': round(open_value, 2),
-			'closed_pnl': round(closed_pnl, 2),
-			'open_positions': PaperTradeSerializer(open_trades, many=True).data,
-			'closed_positions': PaperTradeSerializer(closed_trades[:25], many=True).data,
-		})
 
 
 class PaperTradeExplanationLogView(APIView):
@@ -885,34 +885,37 @@ class ModelMonitoringSummaryView(APIView):
 				return None
 			return {field: getattr(item, field) for field in fields}
 
-		results = []
-		base = {
-			'models': [model_name] if model_name else ['BLUECHIP', 'PENNY'],
-			'sandboxes': [sandbox] if sandbox else ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'],
-		}
-		for m in base['models']:
-			for sb in base['sandboxes']:
-				cal = _latest(
-					ModelCalibrationDaily.objects.filter(model_name=m, sandbox=sb),
-					['as_of', 'model_version', 'brier_score', 'count', 'bins'],
-				)
-				drift = _latest(
-					ModelDriftDaily.objects.filter(model_name=m, sandbox=sb),
-					['as_of', 'model_version', 'psi', 'feature_stats'],
-				)
-				eval_entry = _latest(
-					ModelEvaluationDaily.objects.filter(model_name=m, sandbox=sb),
-					['as_of', 'model_version', 'trades', 'win_rate', 'avg_pnl', 'total_pnl', 'max_drawdown', 'brier_score'],
-				)
-				results.append({
-					'model_name': m,
-					'sandbox': sb,
-					'calibration': cal,
-					'drift': drift,
-					'evaluation': eval_entry,
-				})
+		try:
+			results = []
+			base = {
+				'models': [model_name] if model_name else ['BLUECHIP', 'PENNY'],
+				'sandboxes': [sandbox] if sandbox else ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'],
+			}
+			for m in base['models']:
+				for sb in base['sandboxes']:
+					cal = _latest(
+						ModelCalibrationDaily.objects.filter(model_name=m, sandbox=sb),
+						['as_of', 'model_version', 'brier_score', 'count', 'bins'],
+					)
+					drift = _latest(
+						ModelDriftDaily.objects.filter(model_name=m, sandbox=sb),
+						['as_of', 'model_version', 'psi', 'feature_stats'],
+					)
+					eval_entry = _latest(
+						ModelEvaluationDaily.objects.filter(model_name=m, sandbox=sb),
+						['as_of', 'model_version', 'trades', 'win_rate', 'avg_pnl', 'total_pnl', 'max_drawdown', 'brier_score'],
+					)
+					results.append({
+						'model_name': m,
+						'sandbox': sb,
+						'calibration': cal,
+						'drift': drift,
+						'evaluation': eval_entry,
+					})
 
-		return Response({'results': results})
+			return Response({'results': results})
+		except OperationalError:
+			return Response({'results': []})
 
 
 class PaperTradePerformanceView(APIView):
@@ -2218,11 +2221,16 @@ class AIBacktesterView(APIView):
 class HealthCheckView(APIView):
 	def get(self, request):
 		cutoff = timezone.now() - timedelta(days=2)
-		stale_prices = Stock.objects.filter(
-			models.Q(latest_price_updated_at__lt=cutoff) | models.Q(latest_price_updated_at__isnull=True)
-		).count()
-		last_macro = MacroIndicator.objects.order_by('-date').first()
-		last_news = StockNews.objects.order_by('-fetched_at').first()
+		try:
+			stale_prices = Stock.objects.filter(
+				models.Q(latest_price_updated_at__lt=cutoff) | models.Q(latest_price_updated_at__isnull=True)
+			).count()
+			last_macro = MacroIndicator.objects.order_by('-date').first()
+			last_news = StockNews.objects.order_by('-fetched_at').first()
+		except OperationalError:
+			stale_prices = 0
+			last_macro = None
+			last_news = None
 
 		task_names = [
 			'fetch_prices_hourly',
@@ -2238,15 +2246,25 @@ class HealthCheckView(APIView):
 			'auto_rollback_models_daily',
 		]
 		tasks = {}
-		for name in task_names:
-			last = TaskRunLog.objects.filter(task_name=name).order_by('-started_at').first()
-			tasks[name] = {
-				'status': last.status if last else 'UNKNOWN',
-				'started_at': last.started_at if last else None,
-				'finished_at': last.finished_at if last else None,
-				'duration_ms': last.duration_ms if last else None,
-				'error': last.error if last else None,
-			}
+		try:
+			for name in task_names:
+				last = TaskRunLog.objects.filter(task_name=name).order_by('-started_at').first()
+				tasks[name] = {
+					'status': last.status if last else 'UNKNOWN',
+					'started_at': last.started_at if last else None,
+					'finished_at': last.finished_at if last else None,
+					'duration_ms': last.duration_ms if last else None,
+					'error': last.error if last else None,
+				}
+		except OperationalError:
+			for name in task_names:
+				tasks[name] = {
+					'status': 'UNKNOWN',
+					'started_at': None,
+					'finished_at': None,
+					'duration_ms': None,
+					'error': 'Task logs unavailable',
+				}
 
 		overall_status = 'ok' if stale_prices == 0 else 'degraded'
 		return Response({
