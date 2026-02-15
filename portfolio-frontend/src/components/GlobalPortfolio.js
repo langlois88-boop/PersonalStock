@@ -2,8 +2,6 @@ import { useEffect, useMemo, useState } from 'react';
 import { Area, AreaChart, CartesianGrid, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { motion } from 'framer-motion';
 import api from '../api/api';
-import AnalyticsLabPage from './AnalyticsLabPage';
-import LivePaperTrading from './LivePaperTrading';
 import UnifiedAlerts from './UnifiedAlerts';
 
 const emptyState = {
@@ -400,21 +398,6 @@ function GlobalPortfolio() {
         </div>
       </div>
 
-      <div className="space-y-4">
-        <div className="flex items-center justify-between">
-          <h2 className="text-xl font-semibold text-white">Analytics & ML Lab</h2>
-          <span className="text-xs text-slate-400">All panels</span>
-        </div>
-        <AnalyticsLabPage />
-      </div>
-
-      <div className="space-y-4">
-        <div className="flex items-center justify-between">
-          <h2 className="text-xl font-semibold text-white">Live Paper Trading</h2>
-          <span className="text-xs text-slate-400">All panels</span>
-        </div>
-        <LivePaperTrading />
-      </div>
     </div>
   );
 }
