@@ -924,7 +924,22 @@ class PortfolioDashboardView(APIView):
 		if not portfolio:
 			portfolio = Portfolio.objects.first()
 		if not portfolio:
-			return Response({'error': 'No portfolio found.'}, status=404)
+			return Response({
+				'portfolio': None,
+				'total_balance': 0,
+				'change_24h': 0,
+				'change_24h_pct': 0,
+				'change_7d': 0,
+				'change_7d_pct': 0,
+				'allocation': {
+					'stable_pct': 0,
+					'risky_pct': 0,
+					'stable_value': 0,
+					'risky_value': 0,
+				},
+				'holdings': [],
+				'chart': [],
+			}, status=200)
 
 		holdings = PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
 		items = []
