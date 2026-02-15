@@ -15,7 +15,15 @@ function ManagePortfolioPage() {
     setAccountError('');
     api
       .get('accounts/')
-      .then((res) => setAccounts(res.data || []))
+      .then((res) => {
+        const payload = res?.data;
+        const nextAccounts = Array.isArray(payload)
+          ? payload
+          : Array.isArray(payload?.results)
+            ? payload.results
+            : [];
+        setAccounts(nextAccounts);
+      })
       .catch(() => setAccountError('Impossible de charger les comptes.'))
       .finally(() => setLoadingAccounts(false));
   };
