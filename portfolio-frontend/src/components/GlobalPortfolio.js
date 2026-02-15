@@ -144,10 +144,11 @@ function GlobalPortfolio() {
                       </span>
                     </p>
                     <p className="text-xs text-slate-400">{row.name}</p>
+                    <p className="text-xs text-slate-500">{Number(row.shares || 0).toFixed(2)} shares</p>
                   </div>
                   <div className="text-right">
                     <p className="text-white">${Number(row.price || 0).toFixed(2)}</p>
-                    <p className="text-xs text-slate-400">${Number(row.value || 0).toFixed(0)}</p>
+                    <p className="text-xs text-slate-400">Value: ${Number(row.value || 0).toFixed(2)}</p>
                   </div>
                 </div>
               ))
