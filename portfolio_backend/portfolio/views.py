@@ -952,8 +952,9 @@ class PortfolioDashboardView(APIView):
 				if tx.type == 'DIVIDEND':
 					continue
 				sign = 1 if tx.type == 'BUY' else -1
+				symbol_key = (tx.stock.symbol or '').upper() or str(tx.stock_id)
 				entry = position_map.setdefault(
-					tx.stock_id,
+					symbol_key,
 					{'stock': tx.stock, 'shares': 0.0, 'buy_qty': 0.0, 'buy_cost': 0.0},
 				)
 				qty = float(tx.quantity or 0)
@@ -1049,8 +1050,9 @@ class PortfolioDashboardView(APIView):
 			if tx.type == 'DIVIDEND':
 				continue
 			sign = 1 if tx.type == 'BUY' else -1
+			symbol_key = (tx.stock.symbol or '').upper() or str(tx.stock_id)
 			entry = cost_map.setdefault(
-				tx.stock_id,
+				symbol_key,
 				{'shares': 0.0, 'buy_qty': 0.0, 'buy_cost': 0.0},
 			)
 			qty = float(tx.quantity or 0)
@@ -1074,7 +1076,8 @@ class PortfolioDashboardView(APIView):
 			price = float(price or 0)
 			value = float(holding.shares or 0) * price
 			total_value += value
-			cost_data = cost_map.get(stock.id, {})
+			symbol_key = (stock.symbol or '').upper() or str(stock.id)
+			cost_data = cost_map.get(symbol_key, {})
 			buy_qty = float(cost_data.get('buy_qty') or 0)
 			buy_cost = float(cost_data.get('buy_cost') or 0)
 			avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
