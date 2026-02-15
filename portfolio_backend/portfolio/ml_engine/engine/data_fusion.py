@@ -21,6 +21,11 @@ class DataFusionEngine:
     def get_market_data(self) -> pd.DataFrame:
         df = yf.download(self.ticker, start=self.start_date, end=self.end_date, progress=False)
         if df is None or df.empty:
+            try:
+                df = yf.Ticker(self.ticker).history(period="2y", auto_adjust=False)
+            except Exception:
+                df = pd.DataFrame()
+        if df is None or df.empty:
             return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
             tickers = df.columns.get_level_values(-1)
@@ -77,17 +82,17 @@ class DataFusionEngine:
         fused["sentiment_score"] = sentiment.get("news_sentiment", 0.0)
         fused["news_count"] = sentiment.get("news_count", 0)
 
-        fused["MA20"] = fused["Close"].rolling(window=20).mean()
-        fused["MA50"] = fused["Close"].rolling(window=50).mean()
-        fused["MA200"] = fused["Close"].rolling(window=200).mean()
-        fused["Volatility"] = fused["Returns"].rolling(window=21).std()
+        fused["MA20"] = fused["Close"].rolling(window=20, min_periods=10).mean()
+        fused["MA50"] = fused["Close"].rolling(window=50, min_periods=20).mean()
+        fused["MA200"] = fused["Close"].rolling(window=200, min_periods=60).mean()
+        fused["Volatility"] = fused["Returns"].rolling(window=21, min_periods=10).std()
         fused["Momentum20"] = fused["Close"].pct_change(20)
-        fused["vol_regime"] = fused["Volatility"] / fused["Volatility"].rolling(window=252).mean()
+        fused["vol_regime"] = fused["Volatility"] / fused["Volatility"].rolling(window=252, min_periods=60).mean()
         fused["sector_code"] = _get_sector_code(self.ticker)
 
         delta = fused["Close"].diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        gain = delta.clip(lower=0).rolling(14, min_periods=7).mean()
+        loss = (-delta.clip(upper=0)).rolling(14, min_periods=7).mean()
         rs = gain / loss.replace(0, pd.NA)
         fused["RSI14"] = 100 - (100 / (1 + rs))
 
