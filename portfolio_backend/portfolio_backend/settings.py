@@ -223,6 +223,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.generate_portfolio_digest',
         'schedule': crontab(minute=0, hour=9, day_of_week='sun'),
     },
+    'morning-scout-report-daily': {
+        'task': 'portfolio.tasks.send_morning_scout_report',
+        'schedule': crontab(minute=0, hour=9),
+    },
     'update-user-preferences-daily': {
         'task': 'portfolio.tasks.update_user_preferences',
         'schedule': crontab(minute=30, hour=9),

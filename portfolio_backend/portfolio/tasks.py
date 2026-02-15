@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from functools import lru_cache
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from math import isfinite
 from typing import Any
 
@@ -1473,6 +1474,133 @@ def _get_watchlist(sandbox: str, prefix: str, default: str) -> list[str]:
     return _env_list(prefix, 'WATCHLIST', default)
 
 
+def _coerce_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (list, tuple, pd.Series)) and value:
+            value = value[0]
+        parsed = pd.to_datetime(value, errors='coerce')
+        if parsed is None or pd.isna(parsed):
+            return None
+        if hasattr(parsed, 'to_pydatetime'):
+            parsed = parsed.to_pydatetime()
+        if isinstance(parsed, datetime):
+            return parsed.date()
+        if isinstance(parsed, date):
+            return parsed
+    except Exception:
+        return None
+    return None
+
+
+def _get_earnings_date(ticker: yf.Ticker) -> date | None:
+    try:
+        calendar = ticker.calendar
+        if calendar is None:
+            return None
+        if isinstance(calendar, pd.DataFrame):
+            if 'Earnings Date' in calendar.index:
+                return _coerce_date(calendar.loc['Earnings Date'][0])
+            if 'Earnings Date' in calendar.columns:
+                return _coerce_date(calendar['Earnings Date'].iloc[0])
+        if isinstance(calendar, dict):
+            return _coerce_date(calendar.get('Earnings Date'))
+    except Exception:
+        return None
+    return None
+
+
+def _is_blacklisted(symbol: str) -> tuple[bool, str]:
+    try:
+        ticker = yf.Ticker(symbol)
+    except Exception:
+        return False, ''
+
+    try:
+        earnings_date = _get_earnings_date(ticker)
+        if earnings_date:
+            cutoff = (timezone.now() + timedelta(days=2)).date()
+            if earnings_date <= cutoff:
+                return True, 'Earnings upcoming'
+    except Exception:
+        pass
+
+    try:
+        hist = ticker.history(period='2d', interval='1d', timeout=10)
+        if hist is not None and len(hist) >= 2 and 'Close' in hist:
+            prev = _safe_float(hist['Close'].iloc[-2])
+            last = _safe_float(hist['Close'].iloc[-1])
+            if prev and last:
+                change = abs((last - prev) / prev)
+                if change > 0.15:
+                    return True, 'High Volatility Spike'
+    except Exception:
+        pass
+
+    return False, ''
+
+
+def _get_vix_level() -> float | None:
+    try:
+        hist = yf.Ticker('^VIX').history(period='5d', interval='1d', timeout=10)
+        if hist is not None and not hist.empty and 'Close' in hist:
+            return _safe_float(hist['Close'].iloc[-1])
+    except Exception:
+        return None
+    return None
+
+
+def _model_signal(symbol: str, universe: str, model_path: str | Path) -> dict[str, Any] | None:
+    try:
+        fusion = DataFusionEngine(symbol)
+        fusion_df = fusion.fuse_all()
+        if fusion_df is None or fusion_df.empty:
+            return None
+        payload = load_or_train_model(fusion_df, model_path=model_path)
+        if not payload or not payload.get('model'):
+            return None
+        last_row = fusion_df.tail(1).copy()
+        feature_list = payload.get('features') or []
+        for col in feature_list:
+            if col not in last_row.columns:
+                last_row[col] = 0.0
+        features = last_row[feature_list].fillna(0).values
+        signal = float(payload['model'].predict_proba(features)[0][1])
+        signal = apply_feature_weighting_to_signal(signal, last_row.iloc[0], symbol)
+        feature_snapshot = {col: float(last_row.iloc[0].get(col, 0.0)) for col in FEATURE_COLUMNS}
+        explanations = []
+        try:
+            importances = getattr(payload['model'], 'feature_importances_', None)
+            if importances is not None and len(importances) == len(feature_list):
+                weights = []
+                for i, col in enumerate(feature_list):
+                    value = float(last_row.iloc[0].get(col, 0.0))
+                    weight = abs(value) * float(importances[i])
+                    weights.append((col, value, weight))
+                total = sum([w[2] for w in weights]) or 1.0
+                top_n = int(os.getenv('TRADE_EXPLANATION_TOP_N', '5'))
+                explanations = [
+                    {
+                        'feature': col,
+                        'value': value,
+                        'contribution': round((weight / total) * 100, 2),
+                    }
+                    for col, value, weight in sorted(weights, key=lambda item: item[2], reverse=True)[:top_n]
+                ]
+        except Exception:
+            explanations = []
+        return {
+            'signal': signal,
+            'features': feature_snapshot,
+            'explanations': explanations,
+            'model_version': get_model_version(payload, model_path),
+            'model_name': universe,
+        }
+    except Exception:
+        return None
+
+
 def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, Any]:
     """Execute live paper trades for a specific sandbox using model signals and risk rules."""
     watchlist = _get_watchlist(sandbox, prefix, 'SPY,AAPL,MSFT,NVDA,AMZN')
@@ -1486,6 +1614,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     position_cap_pct = _env_float(prefix, 'POSITION_CAP_PCT', '0.10')
     initial_capital = _env_float(prefix, 'CAPITAL', '10000')
     min_volume_z = _env_float(prefix, 'VOLUME_ZSCORE_MIN', '0.5')
+    break_even_pct = _env_float(prefix, 'BREAK_EVEN_PCT', '0.015')
 
     closed_trades = PaperTrade.objects.filter(status='CLOSED', sandbox=sandbox)
     closed_pnl = float(sum([float(t.pnl or 0) for t in closed_trades]))
@@ -1519,53 +1648,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             return 0.0
 
     def _signal(symbol: str) -> dict[str, Any] | None:
-        try:
-            fusion = DataFusionEngine(symbol)
-            fusion_df = fusion.fuse_all()
-            if fusion_df is None or fusion_df.empty:
-                return None
-            payload = load_or_train_model(fusion_df, model_path=model_path)
-            if not payload or not payload.get('model'):
-                return None
-            last_row = fusion_df.tail(1).copy()
-            feature_list = payload.get('features') or []
-            for col in feature_list:
-                if col not in last_row.columns:
-                    last_row[col] = 0.0
-            features = last_row[feature_list].fillna(0).values
-            signal = float(payload['model'].predict_proba(features)[0][1])
-            signal = apply_feature_weighting_to_signal(signal, last_row.iloc[0], symbol)
-            feature_snapshot = {col: float(last_row.iloc[0].get(col, 0.0)) for col in FEATURE_COLUMNS}
-            explanations = []
-            try:
-                importances = getattr(payload['model'], 'feature_importances_', None)
-                if importances is not None and len(importances) == len(feature_list):
-                    weights = []
-                    for i, col in enumerate(feature_list):
-                        value = float(last_row.iloc[0].get(col, 0.0))
-                        weight = abs(value) * float(importances[i])
-                        weights.append((col, value, weight))
-                    total = sum([w[2] for w in weights]) or 1.0
-                    top_n = int(os.getenv('TRADE_EXPLANATION_TOP_N', '5'))
-                    explanations = [
-                        {
-                            'feature': col,
-                            'value': value,
-                            'contribution': round((weight / total) * 100, 2),
-                        }
-                        for col, value, weight in sorted(weights, key=lambda item: item[2], reverse=True)[:top_n]
-                    ]
-            except Exception:
-                explanations = []
-            return {
-                'signal': signal,
-                'features': feature_snapshot,
-                'explanations': explanations,
-                'model_version': get_model_version(payload, model_path),
-                'model_name': universe,
-            }
-        except Exception:
-            return None
+        return _model_signal(symbol, universe, model_path)
 
     created = 0
     closed = 0
@@ -1576,7 +1659,9 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             continue
         signal_payload = _signal(symbol)
         signal = signal_payload['signal'] if signal_payload else None
-        new_stop = max(float(trade.stop_loss), price * (1 - trail_pct))
+        entry_price = float(trade.entry_price or 0)
+        break_even_stop = entry_price if entry_price and price >= (entry_price * (1 + break_even_pct)) else 0.0
+        new_stop = max(float(trade.stop_loss), price * (1 - trail_pct), break_even_stop)
         trade.stop_loss = new_stop
         should_close = price <= new_stop or (signal is not None and signal < sell_threshold)
         if should_close:
@@ -1651,6 +1736,132 @@ def execute_paper_trades_ai_bluechip() -> dict[str, Any]:
 @shared_task
 def execute_paper_trades_ai_penny() -> dict[str, Any]:
     return _execute_paper_trades_for_sandbox('AI_PENNY', 'AI_PENNY')
+
+
+@shared_task
+def send_morning_scout_report() -> dict[str, Any]:
+    log = _task_log_start('send_morning_scout_report')
+    try:
+        email_to = settings.ALERT_EMAIL_TO
+        if not email_to:
+            result = {'status': 'skipped', 'reason': 'no alert email configured'}
+            _task_log_finish(log, 'SUCCESS', result)
+            return result
+
+        vix_threshold = float(os.getenv('VIX_STRESS_THRESHOLD', '30'))
+        vix_level = _get_vix_level()
+        market_stress = vix_level is not None and vix_level >= vix_threshold
+        if market_stress:
+            _send_alert(
+                '⚠️ Market Stress High - Trading Restricted',
+                f"VIX {float(vix_level or 0):.2f} >= {vix_threshold:.2f}",
+            )
+
+        sandboxes = [
+            ('WATCHLIST', 'PAPER', 'BLUECHIP', 'SPY,AAPL,MSFT,NVDA,AMZN'),
+            ('AI_BLUECHIP', 'AI_BLUECHIP', 'BLUECHIP', 'SPY,AAPL,MSFT,NVDA,AMZN'),
+            ('AI_PENNY', 'AI_PENNY', 'PENNY', 'SIRI,PLUG,SOFI,RIOT,MARA'),
+        ]
+
+        lines: list[str] = []
+        today = timezone.now().date()
+        lines.append(f"Rapport du matin - {today}")
+        if market_stress:
+            lines.append(
+                f"⚠️ Market Stress High - Trading Restricted (VIX {float(vix_level or 0):.2f} >= {vix_threshold:.2f})"
+            )
+        lines.append('')
+
+        payload_summary: dict[str, Any] = {}
+
+        for sandbox, prefix, universe, default_watchlist in sandboxes:
+            watchlist = _get_watchlist(sandbox, prefix, default_watchlist)
+            model_path = get_model_path(universe)
+            buy_threshold = _env_float(prefix, 'BUY_THRESHOLD', '0.82')
+            min_volume_z = _env_float(prefix, 'VOLUME_ZSCORE_MIN', '0.5')
+
+            validated: list[dict[str, Any]] = []
+            excluded: list[tuple[str, str]] = []
+
+            for symbol in watchlist:
+                if not _is_valid_symbol(symbol):
+                    continue
+                signal_payload = _model_signal(symbol, universe, model_path)
+                if not signal_payload:
+                    continue
+                signal = float(signal_payload.get('signal') or 0.0)
+                if signal < buy_threshold:
+                    continue
+                volume_z = _safe_float((signal_payload.get('features') or {}).get('VolumeZ'))
+                if volume_z is not None and volume_z < min_volume_z:
+                    continue
+                blacklisted, reason = _is_blacklisted(symbol)
+                if blacklisted:
+                    excluded.append((symbol, reason))
+                    continue
+
+                explanations = signal_payload.get('explanations') or []
+                top_reason = ', '.join(
+                    [f"{item['feature']} {item['contribution']}%" for item in explanations[:3]]
+                )
+                validated.append(
+                    {
+                        'symbol': symbol,
+                        'signal': round(signal, 4),
+                        'volume_z': None if volume_z is None else round(float(volume_z), 2),
+                        'reason': top_reason,
+                    }
+                )
+
+            lines.append(f"=== {sandbox} ===")
+            lines.append('Validées:')
+            if validated:
+                for entry in validated:
+                    extra = f" | {entry['reason']}" if entry['reason'] else ''
+                    vol_txt = (
+                        f" | VolumeZ {entry['volume_z']:.2f}" if entry['volume_z'] is not None else ''
+                    )
+                    lines.append(
+                        f"- {entry['symbol']} | signal {entry['signal']:.2f}{vol_txt}{extra}"
+                    )
+            else:
+                lines.append('- Aucune')
+
+            lines.append('Exclues aujourd’hui:')
+            if excluded:
+                for symbol, reason in excluded:
+                    lines.append(f"- {symbol}: {reason}")
+            else:
+                lines.append('- Aucune')
+
+            lines.append('')
+
+            payload_summary[sandbox] = {
+                'validated': len(validated),
+                'excluded': len(excluded),
+                'watchlist': len(watchlist),
+            }
+
+        subject = f"Daily AI Scout Report - {today}"
+        send_mail(
+            subject=subject,
+            message='\n'.join(lines).strip(),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email_to],
+            fail_silently=True,
+        )
+
+        payload = {
+            'status': 'sent',
+            'vix': None if vix_level is None else round(float(vix_level), 2),
+            'market_stress': market_stress,
+            'summary': payload_summary,
+        }
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
 
 
 @shared_task
