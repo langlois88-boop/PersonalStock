@@ -228,6 +228,7 @@ def fetch_news_daily(days: int = 1, page_size: int = 10, language: str = 'en') -
 
     created = 0
     seen = 0
+    updated = 0
 
     try:
         for stock in Stock.objects.all().order_by('symbol'):
