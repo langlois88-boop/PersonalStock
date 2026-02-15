@@ -364,6 +364,7 @@ function GlobalPortfolio() {
                           <th className="text-right py-2">Valeur achat</th>
                           <th className="text-right py-2">Prix actuel</th>
                           <th className="text-right py-2">Valeur actuelle</th>
+                          <th className="text-right py-2">P/L %</th>
                           <th className="text-right py-2">7j</th>
                           <th className="text-right py-2">30j</th>
                           <th className="text-right py-2">1a</th>
@@ -378,6 +379,9 @@ function GlobalPortfolio() {
                             <td className="py-2 text-right">{formatMoney(pos.cost_value)}</td>
                             <td className="py-2 text-right">{formatMoney(pos.current_price)}</td>
                             <td className="py-2 text-right">{formatMoney(pos.current_value)}</td>
+                            <td className={`py-2 text-right ${Number(pos.unrealized_pnl_pct || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
+                              {formatPct(pos.unrealized_pnl_pct)}
+                            </td>
                             <td className={`py-2 text-right ${Number(pos.weekly_return_pct || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
                               {formatPct(pos.weekly_return_pct)}
                             </td>

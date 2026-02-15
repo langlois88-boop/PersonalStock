@@ -1586,6 +1586,7 @@ class AccountDashboardView(APIView):
 				current = self._current_price(stock)
 				current_value = current * shares
 				cost_value = avg_cost * shares
+				unrealized_pct = ((current_value - cost_value) / cost_value * 100) if cost_value else None
 				total_value += current_value
 				total_cost += cost_value
 
@@ -1612,6 +1613,7 @@ class AccountDashboardView(APIView):
 					'cost_value': round(cost_value, 2),
 					'current_price': round(current, 4),
 					'current_value': round(current_value, 2),
+					'unrealized_pnl_pct': round(unrealized_pct, 2) if unrealized_pct is not None else None,
 					'weekly_return_pct': round(weekly_return, 2) if weekly_return is not None else None,
 					'monthly_return_pct': round(monthly_return, 2) if monthly_return is not None else None,
 					'annual_return_pct': round(annual_return, 2) if annual_return is not None else None,
