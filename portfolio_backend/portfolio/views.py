@@ -952,7 +952,7 @@ class PortfolioDashboardView(APIView):
 				if tx.type == 'DIVIDEND':
 					continue
 				sign = 1 if tx.type == 'BUY' else -1
-				symbol_key = (tx.stock.symbol or '').upper() or str(tx.stock_id)
+				symbol_key = (tx.stock.symbol or '').strip().upper() or str(tx.stock_id)
 				entry = position_map.setdefault(
 					symbol_key,
 					{'stock': tx.stock, 'shares': 0.0, 'buy_qty': 0.0, 'buy_cost': 0.0},
@@ -1051,7 +1051,7 @@ class PortfolioDashboardView(APIView):
 			if tx.type == 'DIVIDEND':
 				continue
 			sign = 1 if tx.type == 'BUY' else -1
-			symbol_key = (tx.stock.symbol or '').upper() or str(tx.stock_id)
+			symbol_key = (tx.stock.symbol or '').strip().upper() or str(tx.stock_id)
 			entry = cost_map.setdefault(
 				symbol_key,
 				{'shares': 0.0, 'buy_qty': 0.0, 'buy_cost': 0.0},
@@ -1064,7 +1064,7 @@ class PortfolioDashboardView(APIView):
 
 		for tx in portfolio_transactions:
 			sign = 1 if tx.transaction_type == 'BUY' else -1
-			symbol_key = (tx.stock.symbol or '').upper() or str(tx.stock_id)
+			symbol_key = (tx.stock.symbol or '').strip().upper() or str(tx.stock_id)
 			entry = cost_map.setdefault(
 				symbol_key,
 				{'shares': 0.0, 'buy_qty': 0.0, 'buy_cost': 0.0},
@@ -1090,8 +1090,31 @@ class PortfolioDashboardView(APIView):
 			price = float(price or 0)
 			value = float(holding.shares or 0) * price
 			total_value += value
-			symbol_key = (stock.symbol or '').upper() or str(stock.id)
+			symbol_key = (stock.symbol or '').strip().upper() or str(stock.id)
 			cost_data = cost_map.get(symbol_key, {})
+			if not cost_data.get('buy_qty'):
+				buy_qty = 0.0
+				buy_cost = 0.0
+				try:
+					fallback_account = AccountTransaction.objects.select_related('stock').filter(
+						stock__symbol__iexact=stock.symbol
+					)
+					except OperationalError:
+						fallback_account = []
+					for tx in fallback_account:
+						if tx.type != 'BUY':
+							continue
+						qty = float(tx.quantity or 0)
+						buy_qty += qty
+						buy_cost += qty * float(tx.price or 0)
+					fallback_portfolio = portfolio_transactions.filter(stock__symbol__iexact=stock.symbol)
+					for tx in fallback_portfolio:
+						if tx.transaction_type != 'BUY':
+							continue
+						qty = float(tx.shares or 0)
+						buy_qty += qty
+						buy_cost += qty * float(tx.price_per_share or 0)
+					cost_data = {'buy_qty': buy_qty, 'buy_cost': buy_cost}
 			buy_qty = float(cost_data.get('buy_qty') or 0)
 			buy_cost = float(cost_data.get('buy_cost') or 0)
 			avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
