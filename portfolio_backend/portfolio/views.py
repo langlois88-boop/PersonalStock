@@ -34,29 +34,27 @@ from .models import (
 	AlertEvent,
 	Dividend,
 	DripSnapshot,
-	Portfolio,
-	PortfolioDigest,
-	PortfolioHolding,
-	PennySignal,
-	PennyStockSnapshot,
-	PennyStockUniverse,
-	PriceHistory,
-	Prediction,
-	PaperTrade,
-	Stock,
-	StockNews,
-	MacroIndicator,
-	DataQADaily,
-	ModelCalibrationDaily,
-	ModelDriftDaily,
-	ModelEvaluationDaily,
-	Transaction,
-	UserPreference,
-	TaskRunLog,
-	ModelRegistry,
+		portfolio = None
+		if portfolio_id:
+			portfolio = Portfolio.objects.filter(id=portfolio_id).first()
+		if not portfolio:
+			portfolio = Portfolio.objects.first()
 )
-from .serializers import (
-	AccountSerializer,
+		symbols: list[str] = []
+		if portfolio:
+			holdings = PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
+			symbols = [h.stock.symbol for h in holdings if h.stock and h.stock.symbol]
+			if not symbols:
+				transactions = (
+					AccountTransaction.objects.select_related('stock', 'account')
+					.filter(account__portfolio=portfolio)
+				)
+				symbols = [tx.stock.symbol for tx in transactions if tx.stock and tx.stock.symbol]
+				symbols = list(dict.fromkeys(symbols))
+		else:
+			transactions = AccountTransaction.objects.select_related('stock', 'account').all()
+			symbols = [tx.stock.symbol for tx in transactions if tx.stock and tx.stock.symbol]
+			symbols = list(dict.fromkeys(symbols))
 	AccountTransactionSerializer,
 	AlertEventSerializer,
 	DividendSerializer,
@@ -1901,7 +1899,7 @@ class PortfolioNewsView(APIView):
 			holdings_news = fallback_news
 
 		return Response({
-			'portfolio': {'id': portfolio.id, 'name': portfolio.name},
+			'portfolio': {'id': portfolio.id, 'name': portfolio.name} if portfolio else None,
 			'symbols': symbols,
 			'sectors': sectors,
 			'holdings': self._serialize_news(list(holdings_news)),
