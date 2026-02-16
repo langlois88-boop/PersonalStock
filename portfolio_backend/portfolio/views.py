@@ -2785,34 +2785,36 @@ class PortfolioOptimizerView(APIView):
 			portfolio = Portfolio.objects.filter(id=portfolio_id).first()
 		if not portfolio:
 			portfolio = Portfolio.objects.first()
-		if not portfolio:
-			return Response({
-				'portfolio': None,
-				'as_of': timezone.now().isoformat(),
-				'actions': [],
-				'suggestions': [],
-				'params': {
-					'lookback_days': lookback_days,
-					'buy_threshold': buy_threshold,
-					'sell_threshold': sell_threshold,
-					'min_win_rate': min_win_rate,
-				},
-			}, status=200)
+		portfolio_payload = {'id': portfolio.id, 'name': portfolio.name} if portfolio else None
 
-		holdings = list(PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio))
+		holdings = list(PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)) if portfolio else []
 		if not holdings:
-			transactions = (
-				AccountTransaction.objects.select_related('stock', 'account')
-				.filter(account__portfolio=portfolio)
-			)
 			stocks_by_symbol: dict[str, Stock] = {}
+			if portfolio:
+				transactions = Transaction.objects.select_related('stock').filter(portfolio=portfolio)
+			else:
+				transactions = Transaction.objects.select_related('stock').all()
 			for tx in transactions:
 				if not tx.stock or not tx.stock.symbol:
 					continue
 				symbol = tx.stock.symbol.strip().upper()
 				if symbol and symbol not in stocks_by_symbol:
 					stocks_by_symbol[symbol] = tx.stock
-				holdings = [SimpleNamespace(stock=stock) for stock in stocks_by_symbol.values()]
+			if not stocks_by_symbol:
+				if portfolio:
+					account_transactions = (
+						AccountTransaction.objects.select_related('stock', 'account')
+						.filter(account__portfolio=portfolio)
+					)
+				else:
+					account_transactions = AccountTransaction.objects.select_related('stock', 'account').all()
+				for tx in account_transactions:
+					if not tx.stock or not tx.stock.symbol:
+						continue
+					symbol = tx.stock.symbol.strip().upper()
+					if symbol and symbol not in stocks_by_symbol:
+						stocks_by_symbol[symbol] = tx.stock
+			holdings = [SimpleNamespace(stock=stock) for stock in stocks_by_symbol.values()]
 
 		actions: list[dict[str, Any]] = []
 		existing = set()
@@ -2848,9 +2850,26 @@ class PortfolioOptimizerView(APIView):
 
 		suggestions.sort(key=lambda item: item.get('confidence', 0), reverse=True)
 		max_suggestions = int(os.getenv('OPTIMIZER_SUGGESTIONS_LIMIT', '8'))
+		if not actions and not suggestions:
+			fallback = []
+			for symbol in bluechip_candidates + penny_candidates:
+				fallback.append({
+					'ticker': symbol,
+					'name': symbol,
+					'signal': 'ADD',
+					'confidence': 50,
+					'reason': 'Modèle indisponible; suggestion basée sur l’univers par défaut.',
+					'drivers': ['Univers par défaut', 'Données de marché manquantes'],
+					'metrics': [],
+					'risks': ['Données insuffisantes'],
+					'type': 'Bluechip' if symbol in bluechip_candidates else 'Penny',
+				})
+				if len(fallback) >= max_suggestions:
+					break
+			suggestions = suggestions or fallback
 
 		return Response({
-			'portfolio': {'id': portfolio.id, 'name': portfolio.name},
+			'portfolio': portfolio_payload,
 			'as_of': timezone.now().isoformat(),
 			'actions': actions,
 			'suggestions': suggestions[:max_suggestions],
