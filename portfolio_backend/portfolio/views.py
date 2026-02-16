@@ -2630,7 +2630,7 @@ class PortfolioOptimizerView(APIView):
 
 	def _confidence(self, signal: float, win_rate: float | None) -> int:
 		signal_pct = signal * 100
-		win_pct = (win_rate or 0) * 100
+		win_pct = (win_rate or 0)
 		confidence = (signal_pct * 0.7) + (win_pct * 0.3)
 		return int(round(self._clamp(confidence, 45, 95)))
 
@@ -2668,7 +2668,7 @@ class PortfolioOptimizerView(APIView):
 		if volume_z is not None:
 			metrics.append({'label': 'Volume Z', 'value': f"{float(volume_z or 0):.2f}"})
 		if result:
-			metrics.append({'label': 'Win rate', 'value': f"{result.win_rate * 100:.1f}%"})
+			metrics.append({'label': 'Win rate', 'value': f"{result.win_rate:.1f}%"})
 			metrics.append({'label': 'Sharpe', 'value': f"{result.sharpe_ratio:.2f}"})
 			metrics.append({'label': 'Max DD', 'value': f"{result.max_drawdown * 100:.1f}%"})
 		return metrics
@@ -2717,7 +2717,7 @@ class PortfolioOptimizerView(APIView):
 
 		reason = f"Signal modèle {signal * 100:.1f}%"
 		if result:
-			reason = f"{reason} · Win rate backtest {result.win_rate * 100:.1f}%"
+			reason = f"{reason} · Win rate backtest {result.win_rate:.1f}%"
 		advice = []
 		if action == 'BUY MORE':
 			advice = [
@@ -2761,7 +2761,7 @@ class PortfolioOptimizerView(APIView):
 			name = stock.name
 		reason = f"Signal modèle {signal * 100:.1f}%"
 		if result:
-			reason = f"{reason} · Win rate backtest {result.win_rate * 100:.1f}%"
+			reason = f"{reason} · Win rate backtest {result.win_rate:.1f}%"
 		return {
 			'ticker': symbol,
 			'name': name,
