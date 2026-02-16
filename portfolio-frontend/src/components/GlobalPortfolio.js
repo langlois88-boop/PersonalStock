@@ -66,6 +66,9 @@ function GlobalPortfolio() {
   }, [selectedAccountId]);
 
   useEffect(() => {
+    const wsEnabled = (process.env.REACT_APP_WS_UPDATES || '').toLowerCase() === 'true';
+    if (!wsEnabled) return undefined;
+
     let socket;
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const wsUrl = `${protocol}://${window.location.hostname}:8001/ws/updates/`;
@@ -80,6 +83,13 @@ function GlobalPortfolio() {
           }
         } catch (err) {
           // ignore parse errors
+        }
+      };
+      socket.onerror = () => {
+        try {
+          socket.close();
+        } catch (err) {
+          // ignore socket errors
         }
       };
     } catch (err) {
@@ -620,8 +630,18 @@ function GlobalPortfolio() {
           </div>
         </div>
 
+        {loading ? (
+          <div className="flex items-center gap-2 text-sm text-slate-400">
+            <span className="h-4 w-4 rounded-full border-2 border-slate-600 border-t-indigo-400 animate-spin" />
+            Chargement du portfolio…
+          </div>
+        ) : null}
+
         {newsLoading ? (
-          <p className="text-sm text-slate-400">Chargement…</p>
+          <div className="flex items-center gap-2 text-sm text-slate-400">
+            <span className="h-4 w-4 rounded-full border-2 border-slate-600 border-t-indigo-400 animate-spin" />
+            Chargement des actualités…
+          </div>
         ) : (
           <div className="space-y-6">
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
