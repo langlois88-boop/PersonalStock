@@ -1350,6 +1350,95 @@ class PortfolioDashboardView(APIView):
 		except Exception:
 			return {'symbol': symbol, 'status': 'unavailable'}
 
+	def _build_holdings_from_account_transactions(self, transactions: list[AccountTransaction]) -> dict[str, Any]:
+		position_map: dict[str, dict[str, Any]] = {}
+		for tx in transactions:
+			if tx.type == 'DIVIDEND':
+				continue
+			sign = 1 if tx.type == 'BUY' else -1
+			symbol_key = (tx.stock.symbol or '').strip().upper() or str(tx.stock_id)
+			entry = position_map.setdefault(
+				symbol_key,
+				{'stock': tx.stock, 'shares': 0.0, 'buy_qty': 0.0, 'buy_cost': 0.0},
+			)
+			qty = float(tx.quantity or 0)
+			entry['shares'] += qty * sign
+			if tx.type == 'BUY':
+				entry['buy_qty'] += qty
+				entry['buy_cost'] += qty * float(tx.price or 0)
+
+		items = []
+		total_value = 0.0
+		stable_value = 0.0
+		risky_value = 0.0
+		change_1d = 0.0
+		change_7d = 0.0
+
+		for payload in position_map.values():
+			shares = float(payload['shares'] or 0)
+			if shares <= 0:
+				continue
+			stock = payload['stock']
+			volume_z = self._get_volume_z(stock.symbol)
+			rel_strength = self._sector_relative_strength(stock)
+			earnings_blacklisted, earnings_date = self._earnings_blacklist(stock.symbol)
+			buy_qty = float(payload.get('buy_qty') or 0)
+			buy_cost = float(payload.get('buy_cost') or 0)
+			avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
+			price = stock.latest_price
+			if price is None:
+				last = PriceHistory.objects.filter(stock=stock).order_by('-date').first()
+				price = float(last.close_price) if last else 0.0
+			price = float(price or 0)
+			effective_price = price if price > 0 else avg_cost
+			value = shares * effective_price
+			cost_value = avg_cost * shares
+			unrealized = value - cost_value
+			unrealized_pct = (unrealized / cost_value * 100) if cost_value else 0
+			total_value += value
+
+			prev_1d = PriceHistory.objects.filter(stock=stock).order_by('-date')[1:2].first()
+			if prev_1d:
+				change_1d += (price - float(prev_1d.close_price)) * shares
+
+			prev_7d = PriceHistory.objects.filter(stock=stock).order_by('-date')[7:8].first()
+			if prev_7d:
+				change_7d += (price - float(prev_7d.close_price)) * shares
+
+			is_stable = effective_price >= 5 or float(stock.dividend_yield or 0) >= 0.02
+			if is_stable:
+				stable_value += value
+			else:
+				risky_value += value
+
+			items.append({
+				'ticker': stock.symbol,
+				'name': stock.name,
+				'sector': stock.sector,
+				'dividend_yield': float(stock.dividend_yield or 0),
+				'shares': shares,
+				'price': effective_price,
+				'value': value,
+				'avg_cost': round(avg_cost, 4),
+				'cost_value': round(cost_value, 2),
+				'unrealized_pnl': round(unrealized, 2),
+				'unrealized_pnl_pct': round(unrealized_pct, 2),
+				'volume_z': round(volume_z, 2) if volume_z is not None else None,
+				'relative_strength': rel_strength,
+				'earnings_blacklisted': earnings_blacklisted,
+				'earnings_date': earnings_date.isoformat() if earnings_date else None,
+				'category': 'Stable' if is_stable else 'Risky',
+			})
+
+		return {
+			'items': items,
+			'total_value': total_value,
+			'stable_value': stable_value,
+			'risky_value': risky_value,
+			'change_1d': change_1d,
+			'change_7d': change_7d,
+		}
+
 	def get(self, request):
 		portfolio_id = request.query_params.get('portfolio_id')
 		portfolio = None
@@ -1381,84 +1470,13 @@ class PortfolioDashboardView(APIView):
 					'confidence_meter': self._build_confidence_meter(),
 				}, status=200)
 
-			position_map = {}
-			for tx in transactions:
-				if tx.type == 'DIVIDEND':
-					continue
-				sign = 1 if tx.type == 'BUY' else -1
-				symbol_key = (tx.stock.symbol or '').strip().upper() or str(tx.stock_id)
-				entry = position_map.setdefault(
-					symbol_key,
-					{'stock': tx.stock, 'shares': 0.0, 'buy_qty': 0.0, 'buy_cost': 0.0},
-				)
-				qty = float(tx.quantity or 0)
-				entry['shares'] += qty * sign
-				if tx.type == 'BUY':
-					entry['buy_qty'] += qty
-					entry['buy_cost'] += qty * float(tx.price or 0)
-
-			items = []
-			total_value = 0.0
-			stable_value = 0.0
-			risky_value = 0.0
-			change_1d = 0.0
-			change_7d = 0.0
-
-			for payload in position_map.values():
-				shares = float(payload['shares'] or 0)
-				if shares <= 0:
-					continue
-				stock = payload['stock']
-				volume_z = self._get_volume_z(stock.symbol)
-				rel_strength = self._sector_relative_strength(stock)
-				earnings_blacklisted, earnings_date = self._earnings_blacklist(stock.symbol)
-				buy_qty = float(payload.get('buy_qty') or 0)
-				buy_cost = float(payload.get('buy_cost') or 0)
-				avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
-				price = stock.latest_price
-				if price is None:
-					last = PriceHistory.objects.filter(stock=stock).order_by('-date').first()
-					price = float(last.close_price) if last else 0.0
-				price = float(price or 0)
-				effective_price = price if price > 0 else avg_cost
-				value = shares * effective_price
-				cost_value = avg_cost * shares
-				unrealized = value - cost_value
-				unrealized_pct = (unrealized / cost_value * 100) if cost_value else 0
-				total_value += value
-
-				prev_1d = PriceHistory.objects.filter(stock=stock).order_by('-date')[1:2].first()
-				if prev_1d:
-					change_1d += (price - float(prev_1d.close_price)) * shares
-
-				prev_7d = PriceHistory.objects.filter(stock=stock).order_by('-date')[7:8].first()
-				if prev_7d:
-					change_7d += (price - float(prev_7d.close_price)) * shares
-
-				is_stable = effective_price >= 5 or float(stock.dividend_yield or 0) >= 0.02
-				if is_stable:
-					stable_value += value
-				else:
-					risky_value += value
-
-				items.append({
-					'ticker': stock.symbol,
-					'name': stock.name,
-					'sector': stock.sector,
-					'dividend_yield': float(stock.dividend_yield or 0),
-					'shares': shares,
-					'price': effective_price,
-					'value': value,
-					'avg_cost': round(avg_cost, 4),
-					'cost_value': round(cost_value, 2),
-					'unrealized_pnl': round(unrealized, 2),
-					'unrealized_pnl_pct': round(unrealized_pct, 2),
-					'volume_z': round(volume_z, 2) if volume_z is not None else None,
-					'relative_strength': rel_strength,
-					'earnings_blacklisted': earnings_blacklisted,
-					'earnings_date': earnings_date.isoformat() if earnings_date else None,
-					'category': 'Stable' if is_stable else 'Risky',
-				})
+			fallback = self._build_holdings_from_account_transactions(list(transactions))
+			items = fallback['items']
+			total_value = fallback['total_value']
+			stable_value = fallback['stable_value']
+			risky_value = fallback['risky_value']
+			change_1d = fallback['change_1d']
+			change_7d = fallback['change_7d']
 
 			allocation_pct = (stable_value / total_value * 100) if total_value else 0
 			change_1d_pct = (change_1d / (total_value - change_1d) * 100) if total_value else 0
@@ -1601,6 +1619,15 @@ class PortfolioDashboardView(APIView):
 				'earnings_date': earnings_date.isoformat() if earnings_date else None,
 				'category': 'Stable' if is_stable else 'Risky',
 			})
+
+		if not items and account_transactions:
+			fallback = self._build_holdings_from_account_transactions(list(account_transactions))
+			items = fallback['items']
+			total_value = fallback['total_value']
+			stable_value = fallback['stable_value']
+			risky_value = fallback['risky_value']
+			change_1d = fallback['change_1d']
+			change_7d = fallback['change_7d']
 
 		allocation_pct = (stable_value / total_value * 100) if total_value else 0
 		change_1d_pct = (change_1d / (total_value - change_1d) * 100) if total_value else 0
