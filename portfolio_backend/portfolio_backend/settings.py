@@ -32,6 +32,7 @@ ALLOWED_HOSTS = [
     'localhost',
     '127.0.0.1',
     '192.168.2.92',
+    '100.88.73.110',
 ]
 
 
@@ -66,6 +67,7 @@ CORS_ALLOWED_ORIGINS = [
     'http://localhost:3000',
     'http://localhost:3001',
     'http://192.168.2.92:3001',
+    'http://100.88.73.110:3001',
 ]
 
 # Dev LAN convenience
