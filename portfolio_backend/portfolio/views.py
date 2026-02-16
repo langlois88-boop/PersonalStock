@@ -1890,6 +1890,15 @@ class PortfolioNewsView(APIView):
 			sentiment__lte=-sentiment_threshold,
 		).order_by('sentiment', '-published_at')[:sentiment_limit]
 
+		if (
+			not holdings_news
+			and not sector_news
+			and not positive_news
+			and not negative_news
+		):
+			fallback_news = StockNews.objects.order_by('-published_at')[:limit]
+			holdings_news = fallback_news
+
 		return Response({
 			'portfolio': {'id': portfolio.id, 'name': portfolio.name},
 			'symbols': symbols,
