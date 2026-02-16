@@ -1358,7 +1358,7 @@ class PortfolioDashboardView(APIView):
 		flag = request.query_params.get('enrich')
 		if flag is not None:
 			return str(flag).strip().lower() in {'1', 'true', 'yes', 'y'}
-		return os.getenv('DASHBOARD_ENRICH', '0').strip().lower() in {'1', 'true', 'yes', 'y'}
+		return False
 
 	def _build_holdings_from_account_transactions(
 		self,
