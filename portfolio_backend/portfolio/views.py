@@ -2712,6 +2712,8 @@ class PortfolioOptimizerView(APIView):
 			action = 'BUY MORE'
 		elif signal <= sell_threshold:
 			action = 'SELL'
+		elif universe == 'PENNY' and result and result.win_rate < 35 and signal < buy_threshold:
+			action = 'SELL'
 		else:
 			action = 'KEEP'
 
@@ -2776,7 +2778,7 @@ class PortfolioOptimizerView(APIView):
 
 	def get(self, request):
 		portfolio_id = request.query_params.get('portfolio_id')
-		lookback_days = int(os.getenv('OPTIMIZER_LOOKBACK_DAYS', '180'))
+		lookback_days = int(os.getenv('OPTIMIZER_LOOKBACK_DAYS', '90'))
 		buy_threshold = float(os.getenv('OPTIMIZER_BUY_THRESHOLD', '0.64'))
 		sell_threshold = float(os.getenv('OPTIMIZER_SELL_THRESHOLD', '0.35'))
 		min_win_rate = float(os.getenv('OPTIMIZER_MIN_WIN_RATE', '0.52'))
