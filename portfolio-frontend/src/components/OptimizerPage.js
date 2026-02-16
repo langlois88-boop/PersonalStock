@@ -27,17 +27,62 @@ function OptimizerPage() {
     if (pnlPct > -7 && pnlPct < 3) drivers.push('Performance proche du coût moyen.');
     drivers.push(holding.category === 'Stable' ? 'Profil défensif/stable.' : 'Profil plus volatil.');
 
+    const volumeZ = Number(holding.volume_z);
+    const hasVolumeZ = Number.isFinite(volumeZ);
+    const volumeZMin = 0.5;
+    if (hasVolumeZ) {
+      drivers.push(volumeZ >= volumeZMin ? 'Volume Z-Score valide.' : 'Volume Z-Score sous le seuil.');
+    }
+
+    const relStrength = holding.relative_strength || {};
+    const rsOutperform = relStrength.outperform;
+    if (rsOutperform === true) {
+      drivers.push('Surperforme le secteur (30j).');
+    } else if (rsOutperform === false) {
+      drivers.push('Sous-performe le secteur (30j).');
+    }
+
     const metrics = [
       { label: 'Prix', value: `$${Number(holding.price || 0).toFixed(2)}` },
       { label: 'Coût moyen', value: `$${Number(holding.avg_cost || 0).toFixed(2)}` },
       { label: 'P/L', value: `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)` },
     ];
+    if (hasVolumeZ) {
+      metrics.push({
+        label: 'Volume Z',
+        value: `${volumeZ.toFixed(2)} (cible ≥ ${volumeZMin})`,
+      });
+    }
+    if (relStrength?.stock_return_30d !== null && relStrength?.stock_return_30d !== undefined) {
+      metrics.push({
+        label: 'Perf 30j',
+        value: `${Number(relStrength.stock_return_30d).toFixed(2)}%`,
+      });
+    }
+    if (relStrength?.sector_median_30d !== null && relStrength?.sector_median_30d !== undefined) {
+      metrics.push({
+        label: 'Secteur 30j',
+        value: `${Number(relStrength.sector_median_30d).toFixed(2)}%`,
+      });
+    }
 
     const risks = [];
     if (holding.category !== 'Stable' || Math.abs(pnlPct) >= 10) {
       risks.push('Volatilité élevée');
     }
     risks.push('Risque macro global');
+    if (holding.earnings_blacklisted) {
+      risks.push(`Earnings cette semaine (${holding.earnings_date || 'date inconnue'})`);
+    }
+    if (hasVolumeZ && volumeZ < volumeZMin) {
+      risks.push('Volume insuffisant pour confirmer le signal');
+    }
+
+    const advice = [];
+    if (signal === 'BUY MORE') {
+      advice.push('Acheter au maximum 50% de la position initiale.');
+      advice.push('Déplacer le Trailing Stop-Loss de toute la position à 10.50$.');
+    }
 
     return {
       ticker: holding.ticker,
@@ -47,6 +92,7 @@ function OptimizerPage() {
       drivers,
       metrics,
       risks,
+      advice,
       details: {
         fundamentals,
         fundamentalsSource: 'Source: profil du stock.',
@@ -181,6 +227,16 @@ function OptimizerPage() {
               <p className="text-slate-100 font-semibold text-base">{item.ticker} · Détails IA</p>
               <p className="text-slate-300 mt-1">{item.reason}</p>
               <div className="mt-3 space-y-2">
+                {item.advice?.length ? (
+                  <div>
+                    <p className="text-[11px] uppercase tracking-widest text-slate-500">Conseils</p>
+                    <ul className="mt-1 list-disc list-inside text-sm text-amber-200">
+                      {item.advice.map((note) => (
+                        <li key={note}>{note}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
                 <div>
                   <p className="text-[11px] uppercase tracking-widest text-slate-500">Pourquoi</p>
                   <ul className="mt-1 list-disc list-inside text-sm">

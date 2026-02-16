@@ -1189,6 +1189,104 @@ class MacroIndicatorView(APIView):
 
 
 class PortfolioDashboardView(APIView):
+	def _safe_float(self, value: Any) -> float | None:
+		try:
+			if value is None:
+				return None
+			return float(value)
+		except (TypeError, ValueError):
+			return None
+
+	def _price_at_or_before(self, stock: Stock, target_date: date) -> float | None:
+		row = PriceHistory.objects.filter(stock=stock, date__lte=target_date).order_by('-date').first()
+		if not row:
+			return None
+		return self._safe_float(row.close_price)
+
+	def _get_volume_z(self, symbol: str) -> float | None:
+		try:
+			fusion = DataFusionEngine(symbol)
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				return None
+			return self._safe_float(frame.tail(1).iloc[0].get('VolumeZ'))
+		except Exception:
+			return None
+
+	def _coerce_date(self, value: Any) -> date | None:
+		if value is None:
+			return None
+		try:
+			if isinstance(value, (list, tuple, pd.Series)) and value:
+				value = value[0]
+			parsed = pd.to_datetime(value, errors='coerce')
+			if parsed is None or pd.isna(parsed):
+				return None
+			if hasattr(parsed, 'to_pydatetime'):
+				parsed = parsed.to_pydatetime()
+			if isinstance(parsed, datetime):
+				return parsed.date()
+			if isinstance(parsed, date):
+				return parsed
+		except Exception:
+			return None
+		return None
+
+	def _earnings_date(self, symbol: str) -> date | None:
+		try:
+			calendar = yf.Ticker(symbol).calendar
+			if calendar is None:
+				return None
+			if isinstance(calendar, pd.DataFrame):
+				if 'Earnings Date' in calendar.index:
+					return self._coerce_date(calendar.loc['Earnings Date'][0])
+				if 'Earnings Date' in calendar.columns:
+					return self._coerce_date(calendar['Earnings Date'].iloc[0])
+			if isinstance(calendar, dict):
+				return self._coerce_date(calendar.get('Earnings Date'))
+		except Exception:
+			return None
+		return None
+
+	def _earnings_blacklist(self, symbol: str, days: int = 7) -> tuple[bool, date | None]:
+		try:
+			earnings_date = self._earnings_date(symbol)
+			if not earnings_date:
+				return False, None
+			cutoff = (timezone.now() + timedelta(days=days)).date()
+			return earnings_date <= cutoff, earnings_date
+		except Exception:
+			return False, None
+
+	def _sector_relative_strength(self, stock: Stock, days: int = 30) -> dict[str, Any]:
+		today = timezone.now().date()
+		start = today - timedelta(days=days)
+		stock_now = self._safe_float(stock.latest_price)
+		if stock_now is None or stock_now <= 0:
+			stock_now = self._price_at_or_before(stock, today)
+		stock_then = self._price_at_or_before(stock, start)
+		stock_ret = None
+		if stock_now and stock_then:
+			stock_ret = ((stock_now - stock_then) / stock_then) * 100
+		sector_returns = []
+		if stock.sector:
+			peers = Stock.objects.filter(sector=stock.sector).exclude(id=stock.id)[:50]
+			for peer in peers:
+				peer_now = self._safe_float(peer.latest_price)
+				if peer_now is None or peer_now <= 0:
+					peer_now = self._price_at_or_before(peer, today)
+				peer_then = self._price_at_or_before(peer, start)
+				if peer_now and peer_then:
+					sector_returns.append(((peer_now - peer_then) / peer_then) * 100)
+		sector_median = float(np.median(sector_returns)) if sector_returns else None
+		outperform = None
+		if stock_ret is not None and sector_median is not None:
+			outperform = stock_ret >= sector_median
+		return {
+			'stock_return_30d': round(stock_ret, 2) if stock_ret is not None else None,
+			'sector_median_30d': round(sector_median, 2) if sector_median is not None else None,
+			'outperform': outperform,
+		}
 	def _build_confidence_meter(self) -> dict[str, Any] | None:
 		symbol = (os.getenv('CONFIDENCE_SYMBOL') or os.getenv('PAPER_WATCHLIST', 'SPY').split(',')[0]).strip().upper()
 		if not symbol:
@@ -1303,6 +1401,9 @@ class PortfolioDashboardView(APIView):
 				if shares <= 0:
 					continue
 				stock = payload['stock']
+				volume_z = self._get_volume_z(stock.symbol)
+				rel_strength = self._sector_relative_strength(stock)
+				earnings_blacklisted, earnings_date = self._earnings_blacklist(stock.symbol)
 				buy_qty = float(payload.get('buy_qty') or 0)
 				buy_cost = float(payload.get('buy_cost') or 0)
 				avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
@@ -1344,6 +1445,10 @@ class PortfolioDashboardView(APIView):
 					'cost_value': round(cost_value, 2),
 					'unrealized_pnl': round(unrealized, 2),
 					'unrealized_pnl_pct': round(unrealized_pct, 2),
+					'volume_z': round(volume_z, 2) if volume_z is not None else None,
+					'relative_strength': rel_strength,
+					'earnings_blacklisted': earnings_blacklisted,
+					'earnings_date': earnings_date.isoformat() if earnings_date else None,
 					'category': 'Stable' if is_stable else 'Risky',
 				})
 
@@ -1413,6 +1518,9 @@ class PortfolioDashboardView(APIView):
 
 		for holding in holdings:
 			stock = holding.stock
+			volume_z = self._get_volume_z(stock.symbol)
+			rel_strength = self._sector_relative_strength(stock)
+			earnings_blacklisted, earnings_date = self._earnings_blacklist(stock.symbol)
 			price = stock.latest_price
 			if price is None:
 				last = PriceHistory.objects.filter(stock=stock).order_by('-date').first()
@@ -1479,6 +1587,10 @@ class PortfolioDashboardView(APIView):
 				'cost_value': round(cost_value, 2),
 				'unrealized_pnl': round(unrealized, 2),
 				'unrealized_pnl_pct': round(unrealized_pct, 2),
+				'volume_z': round(volume_z, 2) if volume_z is not None else None,
+				'relative_strength': rel_strength,
+				'earnings_blacklisted': earnings_blacklisted,
+				'earnings_date': earnings_date.isoformat() if earnings_date else None,
 				'category': 'Stable' if is_stable else 'Risky',
 			})
 
