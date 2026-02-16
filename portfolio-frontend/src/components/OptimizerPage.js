@@ -10,17 +10,31 @@ function OptimizerPage() {
   useEffect(() => {
     let isMounted = true;
 
+    const applyPayload = (payload) => {
+      if (!isMounted) return;
+      setActions(Array.isArray(payload?.actions) ? payload.actions : []);
+      setSuggestions(Array.isArray(payload?.suggestions) ? payload.suggestions : []);
+    };
+
     const loadOptimizer = async () => {
       try {
         const res = await api.get('optimizer/');
-        if (!isMounted) return;
-        const payload = res.data || {};
-        setActions(Array.isArray(payload.actions) ? payload.actions : []);
-        setSuggestions(Array.isArray(payload.suggestions) ? payload.suggestions : []);
+        const payload = res?.data || {};
+        if (Array.isArray(payload.actions)) {
+          applyPayload(payload);
+          return;
+        }
       } catch (err) {
-        if (!isMounted) return;
-        setActions([]);
-        setSuggestions([]);
+        // fall through to direct fetch
+      }
+
+      try {
+        const fallbackUrl = `${window.location.protocol}//${window.location.hostname}:8001/api/optimizer/`;
+        const fallbackRes = await fetch(fallbackUrl);
+        const fallbackPayload = await fallbackRes.json();
+        applyPayload(fallbackPayload);
+      } catch (err) {
+        applyPayload({ actions: [], suggestions: [] });
       }
     };
 
