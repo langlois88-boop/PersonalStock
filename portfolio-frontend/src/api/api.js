@@ -1,9 +1,19 @@
 import axios from 'axios';
 import { pushApiError } from './errorStore';
 
-const apiBaseUrl =
+const normalizeApiBase = (base) => {
+	if (!base) return base;
+	const trimmed = String(base).replace(/\/+$/, '');
+	if (trimmed.endsWith('/api')) {
+		return `${trimmed}/`;
+	}
+	return `${trimmed}/api/`;
+};
+
+const apiBaseUrl = normalizeApiBase(
 	process.env.REACT_APP_API_BASE_URL ||
-	`${window.location.protocol}//${window.location.hostname}:8001/api/`;
+		`${window.location.protocol}//${window.location.hostname}:8001`
+);
 
 const api = axios.create({ baseURL: apiBaseUrl, timeout: 10000 });
 
