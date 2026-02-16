@@ -45,10 +45,19 @@ class Command(BaseCommand):
 
         total_created = 0
         total_seen = 0
+        total_skipped = 0
+
+        def _is_supported_symbol(symbol: str) -> bool:
+            symbol = symbol.strip().upper()
+            return symbol.isalnum()
 
         for stock in Stock.objects.all().order_by("symbol"):
+            symbol = (stock.symbol or '').strip().upper()
+            if not _is_supported_symbol(symbol):
+                total_skipped += 1
+                continue
             try:
-                news = client.company_news(stock.symbol, _from=str(from_dt), to=str(to_dt))
+                news = client.company_news(symbol, _from=str(from_dt), to=str(to_dt))
             except FinnhubAPIException as exc:
                 if getattr(exc, "status_code", None) == 401:
                     self.stderr.write(
@@ -62,7 +71,7 @@ class Command(BaseCommand):
                 )
                 continue
 
-            self.stdout.write(f"{stock.symbol}: {len(news)} articles")
+            self.stdout.write(f"{symbol}: {len(news)} articles")
 
             for item in news:
                 total_seen += 1
@@ -99,3 +108,5 @@ class Command(BaseCommand):
                 f"Done. Seen {total_seen} articles, created {total_created} new rows."
             )
         )
+        if total_skipped:
+            self.stdout.write(self.style.WARNING(f"Skipped {total_skipped} non-US symbols."))
