@@ -34,27 +34,32 @@ from .models import (
 	AlertEvent,
 	Dividend,
 	DripSnapshot,
-		portfolio = None
-		if portfolio_id:
-			portfolio = Portfolio.objects.filter(id=portfolio_id).first()
-		if not portfolio:
-			portfolio = Portfolio.objects.first()
+	Portfolio,
+	PortfolioDigest,
+	PortfolioHolding,
+	Stock,
+	StockNews,
+	Transaction,
+	PriceHistory,
+	Prediction,
+	PaperTrade,
+	UserPreference,
+	MacroIndicator,
+	PennyStockUniverse,
+	PennyStockSnapshot,
+	PennySignal,
+	NewsArticle,
+	DividendHistory,
+	SandboxWatchlist,
+	ModelEvaluationDaily,
+	ModelRegistry,
+	TaskRunLog,
+	DataQADaily,
+	ModelCalibrationDaily,
+	ModelDriftDaily,
 )
-		symbols: list[str] = []
-		if portfolio:
-			holdings = PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
-			symbols = [h.stock.symbol for h in holdings if h.stock and h.stock.symbol]
-			if not symbols:
-				transactions = (
-					AccountTransaction.objects.select_related('stock', 'account')
-					.filter(account__portfolio=portfolio)
-				)
-				symbols = [tx.stock.symbol for tx in transactions if tx.stock and tx.stock.symbol]
-				symbols = list(dict.fromkeys(symbols))
-		else:
-			transactions = AccountTransaction.objects.select_related('stock', 'account').all()
-			symbols = [tx.stock.symbol for tx in transactions if tx.stock and tx.stock.symbol]
-			symbols = list(dict.fromkeys(symbols))
+from .serializers import (
+	AccountSerializer,
 	AccountTransactionSerializer,
 	AlertEventSerializer,
 	DividendSerializer,
@@ -1846,29 +1851,20 @@ class PortfolioNewsView(APIView):
 			portfolio = Portfolio.objects.filter(id=portfolio_id).first()
 		if not portfolio:
 			portfolio = Portfolio.objects.first()
-		if not portfolio:
-			return Response({
-				'portfolio': None,
-				'symbols': [],
-				'sectors': [],
-				'holdings': [],
-				'sectors_news': [],
-				'sentiment': {
-					'positive': [],
-					'negative': [],
-				},
-				'thresholds': {
-					'sentiment': sentiment_threshold,
-				},
-			}, status=200)
 
-		holdings = PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
-		symbols = [h.stock.symbol for h in holdings if h.stock and h.stock.symbol]
-		if not symbols:
-			transactions = (
-				AccountTransaction.objects.select_related('stock', 'account')
-				.filter(account__portfolio=portfolio)
-			)
+		symbols: list[str] = []
+		if portfolio:
+			holdings = PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
+			symbols = [h.stock.symbol for h in holdings if h.stock and h.stock.symbol]
+			if not symbols:
+				transactions = (
+					AccountTransaction.objects.select_related('stock', 'account')
+					.filter(account__portfolio=portfolio)
+				)
+				symbols = [tx.stock.symbol for tx in transactions if tx.stock and tx.stock.symbol]
+				symbols = list(dict.fromkeys(symbols))
+		else:
+			transactions = AccountTransaction.objects.select_related('stock', 'account').all()
 			symbols = [tx.stock.symbol for tx in transactions if tx.stock and tx.stock.symbol]
 			symbols = list(dict.fromkeys(symbols))
 		if symbol:
