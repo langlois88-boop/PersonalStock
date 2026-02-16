@@ -68,6 +68,9 @@ CORS_ALLOWED_ORIGINS = [
     'http://192.168.2.92:3001',
 ]
 
+# Dev LAN convenience
+CORS_ALLOW_ALL_ORIGINS = True
+
 ROOT_URLCONF = 'portfolio_backend.urls'
 
 TEMPLATES = [
