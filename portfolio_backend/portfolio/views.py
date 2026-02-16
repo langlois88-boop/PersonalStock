@@ -1350,7 +1350,17 @@ class PortfolioDashboardView(APIView):
 		except Exception:
 			return {'symbol': symbol, 'status': 'unavailable'}
 
-	def _build_holdings_from_account_transactions(self, transactions: list[AccountTransaction]) -> dict[str, Any]:
+	def _should_enrich(self, request) -> bool:
+		flag = request.query_params.get('enrich')
+		if flag is not None:
+			return str(flag).strip().lower() in {'1', 'true', 'yes', 'y'}
+		return os.getenv('DASHBOARD_ENRICH', '0').strip().lower() in {'1', 'true', 'yes', 'y'}
+
+	def _build_holdings_from_account_transactions(
+		self,
+		transactions: list[AccountTransaction],
+		enrich: bool,
+	) -> dict[str, Any]:
 		position_map: dict[str, dict[str, Any]] = {}
 		for tx in transactions:
 			if tx.type == 'DIVIDEND':
@@ -1379,9 +1389,12 @@ class PortfolioDashboardView(APIView):
 			if shares <= 0:
 				continue
 			stock = payload['stock']
-			volume_z = self._get_volume_z(stock.symbol)
-			rel_strength = self._sector_relative_strength(stock)
-			earnings_blacklisted, earnings_date = self._earnings_blacklist(stock.symbol)
+			volume_z = self._get_volume_z(stock.symbol) if enrich else None
+			rel_strength = self._sector_relative_strength(stock) if enrich else None
+			if enrich:
+				earnings_blacklisted, earnings_date = self._earnings_blacklist(stock.symbol)
+			else:
+				earnings_blacklisted, earnings_date = False, None
 			buy_qty = float(payload.get('buy_qty') or 0)
 			buy_cost = float(payload.get('buy_cost') or 0)
 			avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
@@ -1441,6 +1454,7 @@ class PortfolioDashboardView(APIView):
 
 	def get(self, request):
 		portfolio_id = request.query_params.get('portfolio_id')
+		enrich = self._should_enrich(request)
 		portfolio = None
 		if portfolio_id:
 			portfolio = Portfolio.objects.filter(id=portfolio_id).first()
@@ -1470,7 +1484,7 @@ class PortfolioDashboardView(APIView):
 					'confidence_meter': self._build_confidence_meter(),
 				}, status=200)
 
-			fallback = self._build_holdings_from_account_transactions(list(transactions))
+			fallback = self._build_holdings_from_account_transactions(list(transactions), enrich)
 			items = fallback['items']
 			total_value = fallback['total_value']
 			stable_value = fallback['stable_value']
@@ -1544,9 +1558,12 @@ class PortfolioDashboardView(APIView):
 
 		for holding in holdings:
 			stock = holding.stock
-			volume_z = self._get_volume_z(stock.symbol)
-			rel_strength = self._sector_relative_strength(stock)
-			earnings_blacklisted, earnings_date = self._earnings_blacklist(stock.symbol)
+			volume_z = self._get_volume_z(stock.symbol) if enrich else None
+			rel_strength = self._sector_relative_strength(stock) if enrich else None
+			if enrich:
+				earnings_blacklisted, earnings_date = self._earnings_blacklist(stock.symbol)
+			else:
+				earnings_blacklisted, earnings_date = False, None
 			price = stock.latest_price
 			if price is None:
 				last = PriceHistory.objects.filter(stock=stock).order_by('-date').first()
@@ -1621,7 +1638,7 @@ class PortfolioDashboardView(APIView):
 			})
 
 		if not items and account_transactions:
-			fallback = self._build_holdings_from_account_transactions(list(account_transactions))
+			fallback = self._build_holdings_from_account_transactions(list(account_transactions), enrich)
 			items = fallback['items']
 			total_value = fallback['total_value']
 			stable_value = fallback['stable_value']
