@@ -6,6 +6,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, date
 from typing import Any
 import unicodedata
+from types import SimpleNamespace
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 from django.db import models
@@ -2804,7 +2805,21 @@ class PortfolioOptimizerView(APIView):
 				},
 			}, status=200)
 
-		holdings = PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
+		holdings = list(PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio))
+		if not holdings:
+			transactions = (
+				AccountTransaction.objects.select_related('stock', 'account')
+				.filter(account__portfolio=portfolio)
+			)
+			stocks_by_symbol: dict[str, Stock] = {}
+			for tx in transactions:
+				if not tx.stock or not tx.stock.symbol:
+					continue
+				symbol = tx.stock.symbol.strip().upper()
+				if symbol and symbol not in stocks_by_symbol:
+					stocks_by_symbol[symbol] = tx.stock
+				holdings = [SimpleNamespace(stock=stock) for stock in stocks_by_symbol.values()]
+
 		actions: list[dict[str, Any]] = []
 		existing = set()
 		for holding in holdings:
