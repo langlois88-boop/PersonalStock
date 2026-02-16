@@ -174,45 +174,6 @@ function AIRecommendations({ items, title = 'AI Portfolio Optimizer', emptyMessa
               <p className="text-xs text-slate-300 bg-slate-900/50 p-2 rounded-md italic">
                 " {item.reason} "
               </p>
-
-              <div className="mt-3 grid gap-3">
-                <div>
-                  <p className="text-[11px] uppercase tracking-widest text-slate-500">Pourquoi</p>
-                  <ul className="mt-1 text-xs text-slate-200 list-disc list-inside space-y-1">
-                    {item.drivers?.map((note) => (
-                      <li key={note}>{note}</li>
-                    ))}
-                  </ul>
-                </div>
-
-                <div>
-                  <p className="text-[11px] uppercase tracking-widest text-slate-500">Signaux clés</p>
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    {item.metrics?.map((metric) => (
-                      <span
-                        key={`${item.ticker}-${metric.label}`}
-                        className="text-[11px] px-2 py-1 rounded-lg bg-slate-900/60 border border-slate-700 text-slate-200"
-                      >
-                        <span className="text-slate-400">{metric.label}:</span> {metric.value}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-
-                <div>
-                  <p className="text-[11px] uppercase tracking-widest text-slate-500">Risques</p>
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    {item.risks?.map((risk) => (
-                      <span
-                        key={`${item.ticker}-${risk}`}
-                        className="text-[11px] px-2 py-1 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-300"
-                      >
-                        {risk}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              </div>
             </div>
           ))
         )}

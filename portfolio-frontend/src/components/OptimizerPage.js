@@ -21,23 +21,39 @@ function OptimizerPage() {
 
     const confidence = Math.min(95, Math.max(55, Math.round(50 + Math.abs(pnlPct) * 3)));
     const reason = `P/L ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%).`;
+    const drivers = [];
+    if (pnlPct >= 3) drivers.push('Momentum positif sur la position.');
+    if (pnlPct <= -7) drivers.push('Perte au-delà du seuil de tolérance.');
+    if (pnlPct > -7 && pnlPct < 3) drivers.push('Performance proche du coût moyen.');
+    drivers.push(holding.category === 'Stable' ? 'Profil défensif/stable.' : 'Profil plus volatil.');
+
+    const metrics = [
+      { label: 'Prix', value: `$${Number(holding.price || 0).toFixed(2)}` },
+      { label: 'Coût moyen', value: `$${Number(holding.avg_cost || 0).toFixed(2)}` },
+      { label: 'P/L', value: `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)` },
+    ];
+
+    const risks = [];
+    if (holding.category !== 'Stable' || Math.abs(pnlPct) >= 10) {
+      risks.push('Volatilité élevée');
+    }
+    risks.push('Risque macro global');
 
     return {
       ticker: holding.ticker,
       signal,
       confidence,
       reason,
-      aiNotes: [
-        `Coût moyen ${Number(holding.avg_cost || 0).toFixed(2)}.`,
-        `Valeur book ${Number(holding.cost_value || 0).toFixed(2)}.`,
-        `Valeur marché ${Number(holding.value || 0).toFixed(2)}.`,
-      ],
+      drivers,
+      metrics,
+      risks,
       details: {
         fundamentals,
         fundamentalsSource: 'Source: profil du stock.',
         rsi: `Prix actuel ${Number(holding.price || 0).toFixed(2)}.`,
       },
       name: holding.name || holding.ticker,
+      type: holding.category === 'Stable' ? 'Bluechip' : 'Watchlist',
     };
   };
 
@@ -136,37 +152,17 @@ function OptimizerPage() {
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.3, delay: idx * 0.05 }}
-            className="bg-slate-900 border border-slate-800 rounded-2xl p-5 relative"
+            className="bg-slate-900 border border-slate-800 rounded-2xl p-5 relative group/action"
           >
             <div className="flex items-start justify-between">
               <div>
-                <div className="relative inline-block group/ticker">
+                <div className="flex items-center gap-2">
                   <p className="text-white text-lg font-semibold">{item.ticker}</p>
-                  <div className="absolute z-20 hidden group-hover/ticker:block left-0 top-full mt-2 w-80 bg-slate-950 border border-slate-800 rounded-xl p-4 text-sm text-slate-200 shadow-xl">
-                    <p className="text-slate-100 font-semibold text-base">{item.ticker} · Décision IA</p>
-                    <p className="text-slate-300 mt-1">{item.reason}</p>
-                    <div className="mt-3 space-y-2">
-                      <div>
-                        <p className="text-slate-400">Pourquoi</p>
-                        <ul className="text-slate-200 text-sm list-disc list-inside">
-                          {item.aiNotes.map((note) => (
-                            <li key={note}>{note}</li>
-                          ))}
-                        </ul>
-                      </div>
-                      <div>
-                        <p className="text-slate-400">Fondamentaux</p>
-                        <p className="text-slate-200">{item.details.fundamentals}</p>
-                        <p className="text-slate-500 text-xs">Source: {item.details.fundamentalsSource}</p>
-                      </div>
-                      <div>
-                        <p className="text-slate-400">RSI</p>
-                        <p className="text-slate-200">{item.details.rsi}</p>
-                        <p className="text-slate-500 text-xs">Seuils: <span className="text-slate-400">&gt;70 suracheté</span> · <span className="text-slate-400">&lt;30 survendu</span></p>
-                      </div>
-                    </div>
-                  </div>
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-700 text-slate-300 border border-slate-600">
+                    {item.type}
+                  </span>
                 </div>
+                <p className="text-xs text-slate-400">{item.name}</p>
                 <p className="text-xs text-slate-400">{item.reason}</p>
               </div>
               <span
@@ -180,6 +176,38 @@ function OptimizerPage() {
               >
                 {item.signal}
               </span>
+            </div>
+            <div className="absolute z-20 hidden group-hover/action:block left-4 top-full mt-3 w-[22rem] bg-slate-950 border border-slate-800 rounded-xl p-4 text-sm text-slate-200 shadow-xl">
+              <p className="text-slate-100 font-semibold text-base">{item.ticker} · Détails IA</p>
+              <p className="text-slate-300 mt-1">{item.reason}</p>
+              <div className="mt-3 space-y-2">
+                <div>
+                  <p className="text-[11px] uppercase tracking-widest text-slate-500">Pourquoi</p>
+                  <ul className="mt-1 list-disc list-inside text-sm">
+                    {item.drivers?.map((note) => (
+                      <li key={note}>{note}</li>
+                    ))}
+                  </ul>
+                </div>
+                <div>
+                  <p className="text-[11px] uppercase tracking-widest text-slate-500">Signaux clés</p>
+                  <ul className="mt-1 space-y-1">
+                    {item.metrics?.map((metric) => (
+                      <li key={`${item.ticker}-${metric.label}`}>
+                        <span className="text-slate-400">{metric.label}:</span> {metric.value}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+                <div>
+                  <p className="text-[11px] uppercase tracking-widest text-slate-500">Risques</p>
+                  <ul className="mt-1 list-disc list-inside space-y-1 text-rose-300">
+                    {item.risks?.map((risk) => (
+                      <li key={`${item.ticker}-${risk}`}>{risk}</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
             </div>
             <div className="mt-4">
               <div className="flex justify-between text-xs text-slate-400">
