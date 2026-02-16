@@ -3,9 +3,9 @@ import { pushApiError } from './errorStore';
 
 const apiBaseUrl =
 	process.env.REACT_APP_API_BASE_URL ||
-	`${window.location.protocol}//${window.location.hostname}:8001/api/`;
+	`${window.location.protocol}//${window.location.hostname}:8000/api/`;
 
-const api = axios.create({ baseURL: apiBaseUrl });
+const api = axios.create({ baseURL: apiBaseUrl, timeout: 10000 });
 
 api.interceptors.response.use(
 	(response) => response,

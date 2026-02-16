@@ -1804,7 +1804,18 @@ class PortfolioNewsView(APIView):
 		if not portfolio:
 			portfolio = Portfolio.objects.first()
 		if not portfolio:
-			return Response({'error': 'portfolio not found'}, status=404)
+			return Response({
+				'portfolio': None,
+				'as_of': timezone.now().isoformat(),
+				'actions': [],
+				'suggestions': [],
+				'params': {
+					'lookback_days': lookback_days,
+					'buy_threshold': buy_threshold,
+					'sell_threshold': sell_threshold,
+					'min_win_rate': min_win_rate,
+				},
+			}, status=200)
 
 		holdings = PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
 		symbols = [h.stock.symbol for h in holdings if h.stock and h.stock.symbol]
@@ -2714,7 +2725,15 @@ class PortfolioOptimizerView(APIView):
 		if not portfolio:
 			portfolio = Portfolio.objects.first()
 		if not portfolio:
-			return Response({'error': 'portfolio not found'}, status=404)
+			return Response({
+				'portfolio': None,
+				'symbols': [],
+				'sectors': [],
+				'holdings': [],
+				'sectors_news': [],
+				'sentiment': {'positive': [], 'negative': []},
+				'thresholds': {'sentiment': sentiment_threshold},
+			}, status=200)
 
 		lookback_days = int(os.getenv('OPTIMIZER_LOOKBACK_DAYS', '180'))
 		buy_threshold = float(os.getenv('OPTIMIZER_BUY_THRESHOLD', '0.64'))
