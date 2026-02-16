@@ -663,6 +663,10 @@ def check_alerts() -> dict[str, int]:
 
     today = timezone.now().date()
 
+    def _is_crypto_symbol(symbol: str) -> bool:
+        symbol = (symbol or '').upper()
+        return symbol.endswith('-CAD') or symbol.endswith('-USD')
+
     for stock in Stock.objects.all().order_by('symbol'):
         # Price drop alert (uses last two stored closes)
         recent_prices = list(
@@ -682,7 +686,11 @@ def check_alerts() -> dict[str, int]:
                     )
 
         # Absolute price threshold alert
-        if stock.latest_price is not None and stock.latest_price >= price_threshold:
+        if (
+            stock.latest_price is not None
+            and stock.latest_price >= price_threshold
+            and not _is_crypto_symbol(stock.symbol)
+        ):
             send_alert(
                 subject=f"Price alert: {stock.symbol}",
                 message=f"{stock.symbol} hit ${stock.latest_price:.2f} (threshold ${price_threshold:.2f}).",

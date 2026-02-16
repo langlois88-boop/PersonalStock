@@ -37,6 +37,10 @@ function GlobalPortfolio() {
   const [accountLoading, setAccountLoading] = useState(true);
   const [selectedAccountId, setSelectedAccountId] = useState('ALL');
   const [sortConfig, setSortConfig] = useState({ key: 'ticker', direction: 'asc' });
+  const [news, setNews] = useState({ holdings: [], sectors_news: [], sentiment: { positive: [], negative: [] } });
+  const [newsLoading, setNewsLoading] = useState(false);
+  const [newsSymbol, setNewsSymbol] = useState('ALL');
+  const [newsVisible, setNewsVisible] = useState({ holdings: 6, sectors: 6, positive: 6, negative: 6 });
 
   useEffect(() => {
     setLoading(true);
@@ -87,6 +91,22 @@ function GlobalPortfolio() {
     };
   }, []);
 
+  useEffect(() => {
+    setNewsLoading(true);
+    const params = newsSymbol !== 'ALL'
+      ? { symbol: newsSymbol, limit: 12, sector_limit: 12, sentiment_limit: 12 }
+      : { limit: 12, sector_limit: 12, sentiment_limit: 12 };
+    api
+      .get('dashboard/news/', { params })
+      .then((res) => setNews(res.data || { holdings: [], sectors_news: [], sentiment: { positive: [], negative: [] } }))
+      .catch(() => setNews({ holdings: [], sectors_news: [], sentiment: { positive: [], negative: [] } }))
+      .finally(() => setNewsLoading(false));
+  }, [newsSymbol, data.holdings?.length]);
+
+  useEffect(() => {
+    setNewsVisible({ holdings: 6, sectors: 6, positive: 6, negative: 6 });
+  }, [newsSymbol]);
+
   const gaugeData = useMemo(
     () => [
       { name: 'Stable', value: data.allocation?.stable_pct || 0, fill: '#6366f1' },
@@ -103,6 +123,20 @@ function GlobalPortfolio() {
   const formatPct = (value) => {
     if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
     return `${Number(value).toFixed(2)}%`;
+  };
+
+  const formatDate = (value) => {
+    if (!value) return '—';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '—';
+    return date.toLocaleDateString('fr-CA', { month: 'short', day: 'numeric' });
+  };
+
+  const sentimentBadge = (value) => {
+    if (value === null || value === undefined) return 'text-slate-400';
+    if (value >= 0.35) return 'text-emerald-300';
+    if (value <= -0.35) return 'text-rose-300';
+    return 'text-slate-400';
   };
 
   const toggleSort = (key) => {
@@ -145,6 +179,29 @@ function GlobalPortfolio() {
     if (ratio <= -0.02) return 'text-rose-400';
     return 'text-slate-300';
   };
+
+  const renderNewsItem = (item) => (
+    <a
+      key={`${item.url}-${item.ticker}`}
+      href={item.url}
+      target="_blank"
+      rel="noreferrer"
+      className="block rounded-xl border border-slate-800 bg-slate-950/60 p-3 hover:border-indigo-500/40 transition"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-sm text-white font-semibold truncate">{item.headline}</p>
+        <span className={`text-xs ${sentimentBadge(item.sentiment)}`}>
+          {item.sentiment === null || item.sentiment === undefined ? '—' : item.sentiment.toFixed(2)}
+        </span>
+      </div>
+      <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
+        <span className="text-slate-300">{item.ticker}</span>
+        {item.sector ? <span>· {item.sector}</span> : null}
+        {item.source ? <span>· {item.source}</span> : null}
+        <span>· {formatDate(item.published_at)}</span>
+      </div>
+    </a>
+  );
 
   const confidence = data.confidence_meter || {};
   const confidenceStatus = confidence.status || 'unavailable';
@@ -319,7 +376,14 @@ function GlobalPortfolio() {
                   <div key={row.ticker} className="flex items-center justify-between bg-slate-950/40 p-3 rounded-xl">
                     <div>
                       <p className="text-white font-semibold">
-                        {row.ticker}{' '}
+                        <a
+                          href={`https://finance.yahoo.com/quote/${row.ticker}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="hover:text-indigo-300"
+                        >
+                          {row.ticker}
+                        </a>{' '}
                         <span
                           className={`text-[10px] px-2 py-0.5 rounded-full ${
                             row.category === 'Stable'
@@ -455,7 +519,16 @@ function GlobalPortfolio() {
                       <tbody>
                         {sortPositions(account.positions || []).map((pos) => (
                           <tr key={`${account.account_id}-${pos.ticker}`} className="border-t border-slate-800">
-                            <td className="py-2 font-semibold text-white">{pos.ticker}</td>
+                            <td className="py-2 font-semibold text-white">
+                              <a
+                                href={`https://finance.yahoo.com/quote/${pos.ticker}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="hover:text-indigo-300"
+                              >
+                                {pos.ticker}
+                              </a>
+                            </td>
                             <td className="py-2 text-right">{formatMoney(pos.avg_cost)}</td>
                             <td className="py-2 text-right">{Number(pos.shares || 0).toFixed(2)}</td>
                             <td className="py-2 text-right">{formatMoney(pos.cost_value)}</td>
@@ -512,6 +585,114 @@ function GlobalPortfolio() {
             </div>
           )}
         </div>
+      </div>
+
+      <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <h3 className="text-lg font-semibold text-white">Actualités liées au portefeuille</h3>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-slate-400">Filtre</span>
+            <select
+              value={newsSymbol}
+              onChange={(event) => setNewsSymbol(event.target.value)}
+              className="bg-slate-950/60 border border-slate-800 text-slate-200 text-xs rounded-lg px-2 py-1"
+            >
+              <option value="ALL">Tous les titres</option>
+              {(data.holdings || []).map((row) => (
+                <option key={row.ticker} value={row.ticker}>
+                  {row.ticker}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {newsLoading ? (
+          <p className="text-sm text-slate-400">Chargement…</p>
+        ) : (
+          <div className="space-y-6">
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+              <div>
+                <p className="text-sm text-slate-300 mb-2">News sur mes actions</p>
+                <div className="space-y-3">
+                  {(news.holdings || []).length ? (
+                    news.holdings.slice(0, newsVisible.holdings).map(renderNewsItem)
+                  ) : (
+                    <p className="text-xs text-slate-500">Aucune news disponible.</p>
+                  )}
+                </div>
+                {(news.holdings || []).length > newsVisible.holdings ? (
+                  <button
+                    type="button"
+                    onClick={() => setNewsVisible((prev) => ({ ...prev, holdings: prev.holdings + 6 }))}
+                    className="mt-3 text-xs text-indigo-300 hover:text-indigo-200"
+                  >
+                    Afficher plus →
+                  </button>
+                ) : null}
+              </div>
+              <div>
+                <p className="text-sm text-slate-300 mb-2">News sur les secteurs</p>
+                <div className="space-y-3">
+                  {(news.sectors_news || []).length ? (
+                    news.sectors_news.slice(0, newsVisible.sectors).map(renderNewsItem)
+                  ) : (
+                    <p className="text-xs text-slate-500">Aucune news secteur disponible.</p>
+                  )}
+                </div>
+                {(news.sectors_news || []).length > newsVisible.sectors ? (
+                  <button
+                    type="button"
+                    onClick={() => setNewsVisible((prev) => ({ ...prev, sectors: prev.sectors + 6 }))}
+                    className="mt-3 text-xs text-indigo-300 hover:text-indigo-200"
+                  >
+                    Afficher plus →
+                  </button>
+                ) : null}
+              </div>
+            </div>
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+              <div>
+                <p className="text-sm text-emerald-300 mb-2">Sentiment positif fort</p>
+                <div className="space-y-3">
+                  {(news.sentiment?.positive || []).length ? (
+                    news.sentiment.positive.slice(0, newsVisible.positive).map(renderNewsItem)
+                  ) : (
+                    <p className="text-xs text-slate-500">Aucune news positive forte.</p>
+                  )}
+                </div>
+                {(news.sentiment?.positive || []).length > newsVisible.positive ? (
+                  <button
+                    type="button"
+                    onClick={() => setNewsVisible((prev) => ({ ...prev, positive: prev.positive + 6 }))}
+                    className="mt-3 text-xs text-emerald-300 hover:text-emerald-200"
+                  >
+                    Afficher plus →
+                  </button>
+                ) : null}
+              </div>
+              <div>
+                <p className="text-sm text-rose-300 mb-2">Sentiment négatif fort</p>
+                <div className="space-y-3">
+                  {(news.sentiment?.negative || []).length ? (
+                    news.sentiment.negative.slice(0, newsVisible.negative).map(renderNewsItem)
+                  ) : (
+                    <p className="text-xs text-slate-500">Aucune news négative forte.</p>
+                  )}
+                </div>
+                {(news.sentiment?.negative || []).length > newsVisible.negative ? (
+                  <button
+                    type="button"
+                    onClick={() => setNewsVisible((prev) => ({ ...prev, negative: prev.negative + 6 }))}
+                    className="mt-3 text-xs text-rose-300 hover:text-rose-200"
+                  >
+                    Afficher plus →
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
     </div>

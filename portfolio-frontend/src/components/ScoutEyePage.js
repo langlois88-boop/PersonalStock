@@ -27,6 +27,29 @@ const metricWeights = [
   { key: 'revenueGrowth', meanKey: 'revenueGrowthMean', label: 'Revenue Growth', unit: '%', stable: 10, penny: 35, reason: 'On veut voir une explosion des ventes.' },
 ];
 
+const pickFallbackBase = (ticker, type) => {
+  const poolType = type === 'bluechip' ? 'value' : type;
+  const pool = mockCards.filter((card) => card.type === poolType);
+  if (!pool.length) return mockCards[0];
+  const hash = String(ticker || '')
+    .split('')
+    .reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+  return pool[hash % pool.length];
+};
+
+const buildRoeNote = (roe, roeMean, fallback) => {
+  if (!Number.isFinite(roe) || !Number.isFinite(roeMean)) return fallback || 'Données indisponibles.';
+  if (roe >= roeMean * 1.1) return 'Au-dessus de la moyenne du secteur.';
+  if (roe <= roeMean * 0.9) return 'En-dessous de la moyenne du secteur.';
+  return 'Proche de la moyenne.';
+};
+
+const isCryptoSymbol = (symbol) => {
+  if (!symbol) return false;
+  const upper = String(symbol).toUpperCase();
+  return upper.endsWith('-CAD') || upper.endsWith('-USD');
+};
+
 function ScoutEyePage() {
   const [tab, setTab] = useState('penny');
   const [pennyCards, setPennyCards] = useState(mockCards.filter((card) => card.type === 'penny'));
@@ -50,13 +73,38 @@ function ScoutEyePage() {
       roeNote: overrides.roeNote ?? base.roeNote ?? 'Données indisponibles pour le moment.',
     });
 
+    const enrichFundamentals = async (cards) => {
+      const symbols = cards.map((card) => card.ticker).filter(Boolean);
+      if (!symbols.length) return cards;
+      try {
+        const res = await api.get('scout/fundamentals/', { params: { symbols: symbols.join(',') } });
+        const map = res.data?.results || {};
+        return cards.map((card) => {
+          const fund = map[card.ticker];
+          if (!fund) return card;
+          const roe = fund.roe ?? card.roe;
+          return buildCard(card, {
+            sector: fund.sector || card.sector,
+            price: Number(fund.price ?? card.price),
+            roe: fund.roe ?? card.roe,
+            currentRatio: fund.current_ratio ?? card.currentRatio,
+            dividendYield: fund.dividend_yield ?? card.dividendYield,
+            revenueGrowth: fund.revenue_growth ?? card.revenueGrowth,
+            roeNote: buildRoeNote(roe, card.roeMean, card.roeNote),
+          });
+        });
+      } catch (err) {
+        return cards;
+      }
+    };
+
     const loadPenny = async () => {
       try {
         const res = await api.get('penny-scout/', { params: { limit: 15 } });
         if (!isMounted) return;
         const data = Array.isArray(res.data) ? res.data : [];
         const mapped = data.map((item) => {
-          const base = mockCards.find((card) => card.ticker === item.ticker) || mockCards[0];
+          const base = mockCards.find((card) => card.ticker === item.ticker) || pickFallbackBase(item.ticker, 'penny');
           const aiScore = Number(
             item.ai_score?.score ??
             (item.ai_score?.confidence != null ? item.ai_score.confidence * 100 : 0)
@@ -70,7 +118,8 @@ function ScoutEyePage() {
             confidence: Math.round(aiScore),
           });
         });
-        setPennyCards(mapped.sort((a, b) => (b.score || 0) - (a.score || 0)));
+        const enriched = await enrichFundamentals(mapped);
+        setPennyCards(enriched.sort((a, b) => (b.score || 0) - (a.score || 0)));
       } catch (err) {
         // Keep mock data on failure
       }
@@ -85,14 +134,16 @@ function ScoutEyePage() {
 
         const mapped = await Promise.all(
           stable.slice(0, 15).map(async (item) => {
-            const base = mockCards.find((card) => card.ticker === item.ticker) || mockCards[8];
+            const base = mockCards.find((card) => card.ticker === item.ticker) || pickFallbackBase(item.ticker, 'value');
             let aiScore = 50;
-            try {
-              const pred = await api.get(`predict/stable/${item.ticker}/`);
-              const predicted = Number(pred.data?.predicted_20d_return ?? 0);
-              aiScore = Math.max(0, Math.min(100, Math.round(50 + predicted * 1000)));
-            } catch (err) {
-              aiScore = 50;
+            if (!isCryptoSymbol(item.ticker)) {
+              try {
+                const pred = await api.get(`predict/stable/${item.ticker}/`);
+                const predicted = Number(pred.data?.predicted_20d_return ?? 0);
+                aiScore = Math.max(0, Math.min(100, Math.round(50 + predicted * 1000)));
+              } catch (err) {
+                aiScore = 50;
+              }
             }
 
             return buildCard(base, {
@@ -106,7 +157,8 @@ function ScoutEyePage() {
           })
         );
 
-        setStableCards(mapped);
+        const enriched = await enrichFundamentals(mapped);
+        setStableCards(enriched);
       } catch (err) {
         // Keep mock data on failure
       }
@@ -122,7 +174,7 @@ function ScoutEyePage() {
           .map((card) => buildCard(card, { type: 'bluechip' }));
 
         const mapped = data.map((item) => {
-          const base = mockCards.find((card) => card.ticker === item.ticker) || mockCards[8];
+          const base = mockCards.find((card) => card.ticker === item.ticker) || pickFallbackBase(item.ticker, 'bluechip');
           return buildCard(base, {
             ticker: item.ticker,
             type: 'bluechip',
@@ -134,7 +186,8 @@ function ScoutEyePage() {
             confidence: Math.round(Number(item.ai_score ?? base.confidence)),
           });
         });
-        const sortedBluechip = (mapped.length ? mapped : fallback)
+        const enriched = await enrichFundamentals(mapped.length ? mapped : fallback);
+        const sortedBluechip = enriched
           .sort((a, b) => (b.score || 0) - (a.score || 0));
         setBluechipCards(sortedBluechip);
       } catch (err) {

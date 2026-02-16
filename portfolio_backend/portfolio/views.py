@@ -25,6 +25,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 
 from .models import (
 	Account,
@@ -78,7 +79,14 @@ from .ai_module import run_predictions
 from .tasks import _fetch_yahoo_screener, _fetch_yfinance_screeners
 from .ai_scout import build_scout_summary
 from .ml_engine.engine.data_fusion import DataFusionEngine
-from .ml_engine.backtester import AIBacktester, load_or_train_model, FEATURE_COLUMNS, get_model_path
+from .ml_engine.backtester import (
+	AIBacktester,
+	BacktestResult,
+	load_or_train_model,
+	FEATURE_COLUMNS,
+	get_model_path,
+	apply_feature_weighting_to_signal,
+)
 
 
 class StockViewSet(viewsets.ModelViewSet):
@@ -1763,6 +1771,77 @@ class AccountDashboardView(APIView):
 		})
 
 
+class PortfolioNewsView(APIView):
+	def _serialize_news(self, items: list[StockNews]) -> list[dict[str, Any]]:
+		results = []
+		for news in items:
+			stock = news.stock
+			results.append({
+				'ticker': stock.symbol if stock else None,
+				'headline': news.headline,
+				'url': news.url,
+				'published_at': news.published_at.isoformat() if news.published_at else None,
+				'sentiment': float(news.sentiment) if news.sentiment is not None else None,
+				'source': news.source,
+				'sector': stock.sector if stock else None,
+			})
+		return results
+
+	def get(self, request):
+		portfolio_id = request.query_params.get('portfolio_id')
+		symbol = (request.query_params.get('symbol') or '').strip().upper()
+		limit = int(request.query_params.get('limit', 10))
+		limit = max(1, min(limit, 50))
+		sector_limit = int(request.query_params.get('sector_limit', 10))
+		sector_limit = max(1, min(sector_limit, 50))
+		sentiment_limit = int(request.query_params.get('sentiment_limit', 6))
+		sentiment_limit = max(1, min(sentiment_limit, 20))
+		sentiment_threshold = float(request.query_params.get('sentiment_threshold', 0.35))
+
+		portfolio = None
+		if portfolio_id:
+			portfolio = Portfolio.objects.filter(id=portfolio_id).first()
+		if not portfolio:
+			portfolio = Portfolio.objects.first()
+		if not portfolio:
+			return Response({'error': 'portfolio not found'}, status=404)
+
+		holdings = PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
+		symbols = [h.stock.symbol for h in holdings if h.stock and h.stock.symbol]
+		if symbol:
+			symbols = [symbol]
+
+		sectors = list(
+			Stock.objects.filter(symbol__in=symbols).exclude(sector='').values_list('sector', flat=True).distinct()
+		)
+
+		holdings_news = StockNews.objects.filter(stock__symbol__in=symbols).order_by('-published_at')[:limit]
+		sector_news = StockNews.objects.filter(stock__sector__in=sectors).order_by('-published_at')[:sector_limit]
+		positive_news = StockNews.objects.filter(
+			stock__sector__in=sectors,
+			sentiment__gte=sentiment_threshold,
+		).order_by('-sentiment', '-published_at')[:sentiment_limit]
+		negative_news = StockNews.objects.filter(
+			stock__sector__in=sectors,
+			sentiment__lte=-sentiment_threshold,
+		).order_by('sentiment', '-published_at')[:sentiment_limit]
+
+		return Response({
+			'portfolio': {'id': portfolio.id, 'name': portfolio.name},
+			'symbols': symbols,
+			'sectors': sectors,
+			'holdings': self._serialize_news(list(holdings_news)),
+			'sectors_news': self._serialize_news(list(sector_news)),
+			'sentiment': {
+				'positive': self._serialize_news(list(positive_news)),
+				'negative': self._serialize_news(list(negative_news)),
+			},
+			'thresholds': {
+				'sentiment': sentiment_threshold,
+			},
+		})
+
+
 class StablePredictionView(APIView):
 	def get(self, request, symbol: str):
 		symbol = (symbol or '').strip().upper()
@@ -2270,6 +2349,55 @@ class AIScoutBatchView(APIView):
 		return Response({'results': results})
 
 
+class ScoutFundamentalsView(APIView):
+	def _to_float(self, value: Any) -> float | None:
+		try:
+			if value is None:
+				return None
+			return float(value)
+		except (TypeError, ValueError):
+			return None
+
+	def _percent(self, value: Any) -> float | None:
+		parsed = self._to_float(value)
+		if parsed is None:
+			return None
+		return round(parsed * 100, 2) if parsed <= 1 else round(parsed, 2)
+
+	def get(self, request):
+		raw = request.query_params.get('symbols', '')
+		symbols = [s.strip().upper() for s in str(raw).split(',') if s.strip()]
+		symbols = symbols[:50]
+		results: dict[str, Any] = {}
+		for symbol in symbols:
+			cache_key = f"scout:fundamentals:{symbol}"
+			cached = cache.get(cache_key)
+			if cached:
+				results[symbol] = cached
+				continue
+
+			info = {}
+			try:
+				info = yf.Ticker(symbol).info or {}
+			except Exception:
+				info = {}
+
+			payload = {
+				'ticker': symbol,
+				'name': info.get('shortName') or info.get('longName') or symbol,
+				'sector': info.get('sector') or '',
+				'price': self._to_float(info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')),
+				'roe': self._percent(info.get('returnOnEquity')),
+				'current_ratio': self._to_float(info.get('currentRatio')),
+				'dividend_yield': self._percent(info.get('dividendYield')),
+				'revenue_growth': self._percent(info.get('revenueGrowth')),
+			}
+			cache.set(cache_key, payload, timeout=60 * 60 * 6)
+			results[symbol] = payload
+
+		return Response({'results': results})
+
+
 class BacktestView(APIView):
 	def get(self, request):
 		portfolio_id = request.query_params.get('portfolio_id')
@@ -2386,6 +2514,259 @@ class AIBacktesterView(APIView):
 				'sharpe_ratio': result.raw_sharpe_ratio,
 				'max_drawdown': result.raw_max_drawdown,
 				'equity_curve': result.raw_equity_curve,
+			},
+		})
+
+
+class PortfolioOptimizerView(APIView):
+	def _clamp(self, value: float, low: float, high: float) -> float:
+		return max(low, min(high, value))
+
+	def _model_bundle(self, symbol: str, universe: str) -> tuple[pd.DataFrame, dict] | tuple[None, None]:
+		try:
+			fusion = DataFusionEngine(symbol)
+			fusion_df = fusion.fuse_all()
+			if fusion_df is None or fusion_df.empty:
+				return None, None
+			payload = load_or_train_model(fusion_df, model_path=get_model_path(universe))
+			if not payload or not payload.get('model'):
+				return None, None
+			return fusion_df, payload
+		except Exception:
+			return None, None
+
+	def _latest_signal(self, df: pd.DataFrame, payload: dict, symbol: str) -> tuple[float, pd.Series]:
+		last_row = df.tail(1).copy()
+		feature_list = payload.get('features') or FEATURE_COLUMNS
+		for col in feature_list:
+			if col not in last_row.columns:
+				last_row[col] = 0.0
+		features = last_row[feature_list].fillna(0).values
+		try:
+			signal = float(payload['model'].predict_proba(features)[0][1])
+		except Exception:
+			signal = 0.0
+		signal = apply_feature_weighting_to_signal(signal, last_row.iloc[0], symbol)
+		return signal, last_row.iloc[0]
+
+	def _backtest(self, df: pd.DataFrame, payload: dict, symbol: str, lookback_days: int, buy_threshold: float, sell_threshold: float) -> BacktestResult | None:
+		try:
+			backtester = AIBacktester(df, payload, symbol=symbol)
+			return backtester.run_simulation(
+				lookback_days=lookback_days,
+				buy_threshold=buy_threshold,
+				sell_threshold=sell_threshold,
+			)
+		except Exception:
+			return None
+
+	def _confidence(self, signal: float, win_rate: float | None) -> int:
+		signal_pct = signal * 100
+		win_pct = (win_rate or 0) * 100
+		confidence = (signal_pct * 0.7) + (win_pct * 0.3)
+		return int(round(self._clamp(confidence, 45, 95)))
+
+	def _build_drivers(self, signal: float, buy_threshold: float, sell_threshold: float, row: pd.Series) -> list[str]:
+		drivers: list[str] = []
+		if signal >= buy_threshold:
+			drivers.append('Signal modèle au-dessus du seuil d’achat.')
+		elif signal <= sell_threshold:
+			drivers.append('Signal modèle sous le seuil de vente.')
+		else:
+			drivers.append('Signal modèle neutre.')
+
+		volume_z = float(row.get('VolumeZ', 0.0) or 0.0)
+		min_volume_z = float(os.getenv('VOLUME_ZSCORE_MIN', '0.5'))
+		if volume_z >= min_volume_z:
+			drivers.append('Volume validé par le Z-Score.')
+		else:
+			drivers.append('Volume faible selon le Z-Score.')
+
+		rsi = float(row.get('RSI14', 0.0) or 0.0)
+		if rsi:
+			if rsi >= 70:
+				drivers.append('RSI en zone de surachat.')
+			elif rsi <= 30:
+				drivers.append('RSI en zone de survente.')
+		return drivers
+
+	def _build_metrics(self, row: pd.Series, signal: float, result: BacktestResult | None) -> list[dict[str, str]]:
+		metrics = [
+			{'label': 'Signal', 'value': f"{signal * 100:.1f}%"},
+		]
+		if 'Close' in row:
+			metrics.append({'label': 'Prix', 'value': f"${float(row.get('Close') or 0):.2f}"})
+		volume_z = row.get('VolumeZ')
+		if volume_z is not None:
+			metrics.append({'label': 'Volume Z', 'value': f"{float(volume_z or 0):.2f}"})
+		if result:
+			metrics.append({'label': 'Win rate', 'value': f"{result.win_rate * 100:.1f}%"})
+			metrics.append({'label': 'Sharpe', 'value': f"{result.sharpe_ratio:.2f}"})
+			metrics.append({'label': 'Max DD', 'value': f"{result.max_drawdown * 100:.1f}%"})
+		return metrics
+
+	def _build_risks(self, row: pd.Series, result: BacktestResult | None) -> list[str]:
+		risks: list[str] = []
+		volume_z = float(row.get('VolumeZ', 0.0) or 0.0)
+		min_volume_z = float(os.getenv('VOLUME_ZSCORE_MIN', '0.5'))
+		if volume_z < min_volume_z:
+			risks.append('Volume insuffisant pour confirmer le signal')
+		if result:
+			if result.win_rate < 0.5:
+				risks.append('Win rate historique faible')
+			if result.max_drawdown <= -0.2:
+				risks.append('Drawdown historique élevé')
+		return risks or ['Risque macro global']
+
+	def _build_action(self, holding: PortfolioHolding, universe: str, lookback_days: int, buy_threshold: float, sell_threshold: float) -> dict[str, Any] | None:
+		symbol = (holding.stock.symbol or '').strip().upper()
+		if not symbol:
+			return None
+		data, payload = self._model_bundle(symbol, universe)
+		if data is None or payload is None:
+			return {
+				'ticker': symbol,
+				'name': holding.stock.name,
+				'signal': 'KEEP',
+				'confidence': 50,
+				'reason': 'Données insuffisantes pour le backtester.',
+				'drivers': ['Historique incomplet'],
+				'metrics': [],
+				'risks': ['Données insuffisantes'],
+				'advice': [],
+				'type': 'Bluechip' if universe == 'BLUECHIP' else 'Watchlist',
+			}
+
+		signal, row = self._latest_signal(data, payload, symbol)
+		result = self._backtest(data, payload, symbol, lookback_days, buy_threshold, sell_threshold)
+		confidence = self._confidence(signal, result.win_rate if result else None)
+		if signal >= buy_threshold:
+			action = 'BUY MORE'
+		elif signal <= sell_threshold:
+			action = 'SELL'
+		else:
+			action = 'KEEP'
+
+		reason = f"Signal modèle {signal * 100:.1f}%"
+		if result:
+			reason = f"{reason} · Win rate backtest {result.win_rate * 100:.1f}%"
+		advice = []
+		if action == 'BUY MORE':
+			advice = [
+				'Renforcer progressivement (backtester validé).',
+				'Surveiller le volume et ajuster le trailing stop.',
+			]
+		elif action == 'SELL':
+			advice = ['Réduire l’exposition si la tendance reste faible.']
+
+		return {
+			'ticker': symbol,
+			'name': holding.stock.name or symbol,
+			'signal': action,
+			'confidence': confidence,
+			'reason': reason,
+			'drivers': self._build_drivers(signal, buy_threshold, sell_threshold, row),
+			'metrics': self._build_metrics(row, signal, result),
+			'risks': self._build_risks(row, result),
+			'advice': advice,
+			'type': 'Bluechip' if universe == 'BLUECHIP' else 'Watchlist',
+		}
+
+	def _candidate_symbols(self, env_key: str, fallback: str) -> list[str]:
+		raw = os.getenv(env_key, fallback)
+		return [s.strip().upper() for s in str(raw).split(',') if s.strip()]
+
+	def _build_suggestion(self, symbol: str, universe: str, lookback_days: int, buy_threshold: float, sell_threshold: float, min_win_rate: float) -> dict[str, Any] | None:
+		data, payload = self._model_bundle(symbol, universe)
+		if data is None or payload is None:
+			return None
+		signal, row = self._latest_signal(data, payload, symbol)
+		if signal < buy_threshold:
+			return None
+		result = self._backtest(data, payload, symbol, lookback_days, buy_threshold, sell_threshold)
+		if result and result.win_rate < min_win_rate:
+			return None
+		confidence = self._confidence(signal, result.win_rate if result else None)
+		name = symbol
+		stock = Stock.objects.filter(symbol__iexact=symbol).first()
+		if stock and stock.name:
+			name = stock.name
+		reason = f"Signal modèle {signal * 100:.1f}%"
+		if result:
+			reason = f"{reason} · Win rate backtest {result.win_rate * 100:.1f}%"
+		return {
+			'ticker': symbol,
+			'name': name,
+			'signal': 'ADD',
+			'confidence': confidence,
+			'reason': reason,
+			'drivers': self._build_drivers(signal, buy_threshold, sell_threshold, row),
+			'metrics': self._build_metrics(row, signal, result),
+			'risks': self._build_risks(row, result),
+			'type': 'Bluechip' if universe == 'BLUECHIP' else 'Penny',
+		}
+
+	def get(self, request):
+		portfolio_id = request.query_params.get('portfolio_id')
+		portfolio = None
+		if portfolio_id:
+			portfolio = Portfolio.objects.filter(id=portfolio_id).first()
+		if not portfolio:
+			portfolio = Portfolio.objects.first()
+		if not portfolio:
+			return Response({'error': 'portfolio not found'}, status=404)
+
+		lookback_days = int(os.getenv('OPTIMIZER_LOOKBACK_DAYS', '180'))
+		buy_threshold = float(os.getenv('OPTIMIZER_BUY_THRESHOLD', '0.64'))
+		sell_threshold = float(os.getenv('OPTIMIZER_SELL_THRESHOLD', '0.35'))
+		min_win_rate = float(os.getenv('OPTIMIZER_MIN_WIN_RATE', '0.52'))
+
+		holdings = PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
+		actions: list[dict[str, Any]] = []
+		existing = set()
+		for holding in holdings:
+			symbol = (holding.stock.symbol or '').strip().upper()
+			if not symbol:
+				continue
+			existing.add(symbol)
+			is_stable = float(holding.stock.latest_price or 0) >= 5 or float(holding.stock.dividend_yield or 0) >= 0.02
+			universe = 'BLUECHIP' if is_stable else 'PENNY'
+			action = self._build_action(holding, universe, lookback_days, buy_threshold, sell_threshold)
+			if action:
+				actions.append(action)
+
+		bluechip_candidates = self._candidate_symbols(
+			'OPTIMIZER_UNIVERSE_BLUECHIP',
+			'SPY,AAPL,MSFT,NVDA,AMZN,GOOGL,TSLA,AVGO,LLY',
+		)
+		penny_candidates = self._candidate_symbols('OPTIMIZER_UNIVERSE_PENNY', '')
+		suggestions: list[dict[str, Any]] = []
+		for symbol in bluechip_candidates:
+			if symbol in existing:
+				continue
+			suggestion = self._build_suggestion(symbol, 'BLUECHIP', lookback_days, buy_threshold, sell_threshold, min_win_rate)
+			if suggestion:
+				suggestions.append(suggestion)
+		for symbol in penny_candidates:
+			if symbol in existing:
+				continue
+			suggestion = self._build_suggestion(symbol, 'PENNY', lookback_days, buy_threshold, sell_threshold, min_win_rate)
+			if suggestion:
+				suggestions.append(suggestion)
+
+		suggestions.sort(key=lambda item: item.get('confidence', 0), reverse=True)
+		max_suggestions = int(os.getenv('OPTIMIZER_SUGGESTIONS_LIMIT', '8'))
+
+		return Response({
+			'portfolio': {'id': portfolio.id, 'name': portfolio.name},
+			'as_of': timezone.now().isoformat(),
+			'actions': actions,
+			'suggestions': suggestions[:max_suggestions],
+			'params': {
+				'lookback_days': lookback_days,
+				'buy_threshold': buy_threshold,
+				'sell_threshold': sell_threshold,
+				'min_win_rate': min_win_rate,
 			},
 		})
 
