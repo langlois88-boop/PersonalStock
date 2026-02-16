@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 
 import finnhub
+from finnhub.exceptions import FinnhubAPIException
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -25,9 +26,12 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         api_key = os.getenv("FINNHUB_API_KEY")
         if not api_key:
-            raise CommandError(
-                "Missing FINNHUB_API_KEY env var. Example: export FINNHUB_API_KEY='...'"
+            self.stdout.write(
+                self.style.WARNING(
+                    "Skipping Finnhub fetch: FINNHUB_API_KEY env var is missing."
+                )
             )
+            return
 
         days = int(options["days"])
         if days < 1:
@@ -43,7 +47,21 @@ class Command(BaseCommand):
         total_seen = 0
 
         for stock in Stock.objects.all().order_by("symbol"):
-            news = client.company_news(stock.symbol, _from=str(from_dt), to=str(to_dt))
+            try:
+                news = client.company_news(stock.symbol, _from=str(from_dt), to=str(to_dt))
+            except FinnhubAPIException as exc:
+                if getattr(exc, "status_code", None) == 401:
+                    self.stderr.write(
+                        self.style.ERROR(
+                            "Finnhub API key was rejected (401). Update FINNHUB_API_KEY and retry."
+                        )
+                    )
+                    break
+                self.stderr.write(
+                    self.style.WARNING(f"Finnhub error for {stock.symbol}: {exc}")
+                )
+                continue
+
             self.stdout.write(f"{stock.symbol}: {len(news)} articles")
 
             for item in news:
@@ -59,7 +77,7 @@ class Command(BaseCommand):
 
                 published_at = None
                 if item.get("datetime"):
-                    published_at = datetime.fromtimestamp(item["datetime"], tz=timezone.utc)
+                    published_at = datetime.fromtimestamp(item["datetime"], tz=dt_timezone.utc)
 
                 _, created = StockNews.objects.get_or_create(
                     url=url,

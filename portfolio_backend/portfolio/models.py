@@ -317,7 +317,7 @@ class NewsArticle(models.Model):
 	symbol = models.CharField(max_length=10)
 	title = models.CharField(max_length=300)
 	description = models.TextField(blank=True)
-	url = models.URLField(unique=True)
+	url = models.URLField(unique=True, max_length=500)
 	source = models.CharField(max_length=100, blank=True)
 	published_at = models.DateTimeField(null=True, blank=True)
 	fetched_at = models.DateTimeField(auto_now_add=True)
@@ -330,7 +330,7 @@ class NewsArticle(models.Model):
 class StockNews(models.Model):
 	stock = models.ForeignKey(Stock, on_delete=models.CASCADE)
 	headline = models.CharField(max_length=300)
-	url = models.URLField(unique=True)
+	url = models.URLField(unique=True, max_length=500)
 	published_at = models.DateTimeField(null=True, blank=True)
 	sentiment = models.FloatField(null=True, blank=True)
 	source = models.CharField(max_length=100, blank=True)

@@ -28,10 +28,16 @@ from newsapi import NewsApiClient
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from transformers import pipeline
 from sklearn.ensemble import RandomForestClassifier
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.units import inch
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfgen import canvas as pdf_canvas
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfgen import canvas as pdf_canvas
+except Exception:  # pragma: no cover - optional dependency
+    letter = (612.0, 792.0)
+    inch = 72.0
+    pdfmetrics = None
+    pdf_canvas = None
 
 from .models import (
     Account,
@@ -1923,7 +1929,12 @@ def retrain_from_paper_trades_daily(sandbox_override: str | None = None) -> dict
     def _train_for_sandbox(selected_sandbox: str) -> dict[str, Any]:
         model_name = 'PENNY' if selected_sandbox == 'AI_PENNY' else 'BLUECHIP'
         trades = (
-            PaperTrade.objects.filter(status='CLOSED', entry_date__gte=cutoff, sandbox=selected_sandbox)
+            PaperTrade.objects.filter(
+                status='CLOSED',
+                sandbox=selected_sandbox,
+                model_name=model_name,
+                entry_date__gte=cutoff,
+            )
             .exclude(exit_date__isnull=True)
             .order_by('entry_date')
         )
@@ -2128,7 +2139,12 @@ def _wrap_text(text: str, max_width: float, font_name: str, font_size: int) -> l
     current = words[0]
     for word in words[1:]:
         test = f"{current} {word}"
-        if pdfmetrics.stringWidth(test, font_name, font_size) <= max_width:
+        if pdfmetrics is None:
+            approx_width = len(test) * font_size * 0.5
+            fits = approx_width <= max_width
+        else:
+            fits = pdfmetrics.stringWidth(test, font_name, font_size) <= max_width
+        if fits:
             current = test
         else:
             lines.append(current)
@@ -2187,6 +2203,8 @@ def _render_trade_journal_pdf(
     closed_trades: list[PaperTrade],
     non_trades: list[AlertEvent],
 ) -> str:
+    if pdf_canvas is None:
+        raise RuntimeError('reportlab is required to render trading journal PDFs')
     output_dir = _journal_output_dir()
     os.makedirs(output_dir, exist_ok=True)
     filename = f"journal_{sandbox.lower()}_{as_of_date.isoformat()}.pdf"

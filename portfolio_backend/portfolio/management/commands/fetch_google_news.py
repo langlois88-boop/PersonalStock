@@ -45,9 +45,10 @@ class Command(BaseCommand):
 
             for entry in feed.entries:
                 total_seen += 1
-                link = entry.get("link")
+                link = (entry.get("link") or "").strip()
                 if not link:
                     continue
+                link = link[:500]
 
                 headline = (entry.get("title") or "").strip()[:300] or link
                 summary = (entry.get("summary") or "").strip()

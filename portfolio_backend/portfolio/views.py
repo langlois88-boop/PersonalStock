@@ -2765,6 +2765,10 @@ class PortfolioOptimizerView(APIView):
 
 	def get(self, request):
 		portfolio_id = request.query_params.get('portfolio_id')
+		lookback_days = int(os.getenv('OPTIMIZER_LOOKBACK_DAYS', '180'))
+		buy_threshold = float(os.getenv('OPTIMIZER_BUY_THRESHOLD', '0.64'))
+		sell_threshold = float(os.getenv('OPTIMIZER_SELL_THRESHOLD', '0.35'))
+		min_win_rate = float(os.getenv('OPTIMIZER_MIN_WIN_RATE', '0.52'))
 		portfolio = None
 		if portfolio_id:
 			portfolio = Portfolio.objects.filter(id=portfolio_id).first()
@@ -2773,18 +2777,16 @@ class PortfolioOptimizerView(APIView):
 		if not portfolio:
 			return Response({
 				'portfolio': None,
-				'symbols': [],
-				'sectors': [],
-				'holdings': [],
-				'sectors_news': [],
-				'sentiment': {'positive': [], 'negative': []},
-				'thresholds': {'sentiment': sentiment_threshold},
+				'as_of': timezone.now().isoformat(),
+				'actions': [],
+				'suggestions': [],
+				'params': {
+					'lookback_days': lookback_days,
+					'buy_threshold': buy_threshold,
+					'sell_threshold': sell_threshold,
+					'min_win_rate': min_win_rate,
+				},
 			}, status=200)
-
-		lookback_days = int(os.getenv('OPTIMIZER_LOOKBACK_DAYS', '180'))
-		buy_threshold = float(os.getenv('OPTIMIZER_BUY_THRESHOLD', '0.64'))
-		sell_threshold = float(os.getenv('OPTIMIZER_SELL_THRESHOLD', '0.35'))
-		min_win_rate = float(os.getenv('OPTIMIZER_MIN_WIN_RATE', '0.52'))
 
 		holdings = PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
 		actions: list[dict[str, Any]] = []

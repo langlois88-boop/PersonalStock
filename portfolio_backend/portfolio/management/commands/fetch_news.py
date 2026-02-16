@@ -8,6 +8,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
 from newsapi import NewsApiClient
+from newsapi.newsapi_exception import NewsAPIException
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 from portfolio.models import Stock, StockNews
@@ -39,9 +40,12 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         api_key = os.getenv("NEWSAPI_KEY")
         if not api_key:
-            raise CommandError(
-                "Missing NEWSAPI_KEY env var. Example: export NEWSAPI_KEY='...'")
-
+            self.stdout.write(
+                self.style.WARNING(
+                    "Skipping NewsAPI fetch: NEWSAPI_KEY env var is missing."
+                )
+            )
+            return
         days: int = options["days"]
         page_size: int = options["page_size"]
         language: str = options["language"]
@@ -68,8 +72,20 @@ class Command(BaseCommand):
                     from_param=from_iso,
                     page_size=page_size,
                 )
+            except NewsAPIException as exc:
+                message = str(exc)
+                if "apiKeyInvalid" in message or "API key" in message:
+                    self.stderr.write(
+                        self.style.ERROR(
+                            "NewsAPI key was rejected. Update NEWSAPI_KEY and retry."
+                        )
+                    )
+                    break
+                self.stderr.write(self.style.WARNING(f"NewsAPI error for {stock.symbol}: {exc}"))
+                continue
             except Exception as exc:
-                raise CommandError(f"NewsAPI error for {stock.symbol}: {exc}")
+                self.stderr.write(self.style.WARNING(f"NewsAPI error for {stock.symbol}: {exc}"))
+                continue
 
             articles = result.get("articles") or []
             self.stdout.write(f"{stock.symbol}: {len(articles)} articles")
