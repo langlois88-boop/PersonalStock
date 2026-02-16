@@ -1806,14 +1806,16 @@ class PortfolioNewsView(APIView):
 		if not portfolio:
 			return Response({
 				'portfolio': None,
-				'as_of': timezone.now().isoformat(),
-				'actions': [],
-				'suggestions': [],
-				'params': {
-					'lookback_days': lookback_days,
-					'buy_threshold': buy_threshold,
-					'sell_threshold': sell_threshold,
-					'min_win_rate': min_win_rate,
+				'symbols': [],
+				'sectors': [],
+				'holdings': [],
+				'sectors_news': [],
+				'sentiment': {
+					'positive': [],
+					'negative': [],
+				},
+				'thresholds': {
+					'sentiment': sentiment_threshold,
 				},
 			}, status=200)
 
