@@ -139,6 +139,19 @@ function GlobalPortfolio() {
     return 'text-slate-400';
   };
 
+  const topHoldings = useMemo(() => {
+    const list = Array.isArray(data.holdings) ? [...data.holdings] : [];
+    const withValue = list.map((row) => {
+      const livePrice = livePrices?.[row.ticker];
+      const price = Number(livePrice ?? row.price ?? 0);
+      const shares = Number(row.shares || 0);
+      const value = price * shares;
+      return { ...row, _positionValue: value };
+    });
+    withValue.sort((a, b) => (b._positionValue || 0) - (a._positionValue || 0));
+    return withValue.slice(0, 4);
+  }, [data.holdings, livePrices]);
+
   const toggleSort = (key) => {
     setSortConfig((prev) => {
       if (prev.key === key) {
@@ -363,8 +376,8 @@ function GlobalPortfolio() {
           <div className="space-y-3">
             {loading ? (
               <p className="text-sm text-slate-400">Chargement…</p>
-            ) : data.holdings && data.holdings.length > 0 ? (
-              data.holdings.map((row) => {
+            ) : topHoldings && topHoldings.length > 0 ? (
+              topHoldings.map((row) => {
                 const livePrice = livePrices?.[row.ticker];
                 const price = Number(livePrice ?? row.price ?? 0);
                 const shares = Number(row.shares || 0);
