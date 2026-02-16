@@ -1865,6 +1865,13 @@ class PortfolioNewsView(APIView):
 
 		holdings = PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
 		symbols = [h.stock.symbol for h in holdings if h.stock and h.stock.symbol]
+		if not symbols:
+			transactions = (
+				AccountTransaction.objects.select_related('stock', 'account')
+				.filter(account__portfolio=portfolio)
+			)
+			symbols = [tx.stock.symbol for tx in transactions if tx.stock and tx.stock.symbol]
+			symbols = list(dict.fromkeys(symbols))
 		if symbol:
 			symbols = [symbol]
 
