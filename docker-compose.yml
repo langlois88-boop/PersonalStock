@@ -28,6 +28,7 @@ services:
       - backend_media:/app/media
       - backend_static:/app/staticfiles
       - backend_db:/app/db
+      - backend_models:/app/portfolio/ml_engine
     ports:
       - "8001:8000"
     restart: unless-stopped
@@ -47,6 +48,7 @@ services:
       - backend_media:/app/media
       - backend_static:/app/staticfiles
       - backend_db:/app/db
+      - backend_models:/app/portfolio/ml_engine
     restart: unless-stopped
 
   celery_beat:
@@ -64,6 +66,7 @@ services:
       - backend_media:/app/media
       - backend_static:/app/staticfiles
       - backend_db:/app/db
+      - backend_models:/app/portfolio/ml_engine
     restart: unless-stopped
 
   frontend:
@@ -82,3 +85,4 @@ volumes:
   backend_media:
   backend_static:
   backend_db:
+  backend_models:
