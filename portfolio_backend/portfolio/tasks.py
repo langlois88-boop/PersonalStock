@@ -2007,7 +2007,9 @@ def send_morning_scout_report() -> dict[str, Any]:
                         .order_by('-published_at')[:2]
                     )
                     if news_items:
-                        news_map[stock.symbol] = [item.headline for item in news_items]
+                        news_map[stock.symbol] = [
+                            f"{item.headline} ({item.url})" for item in news_items
+                        ]
 
                 headers = ['Symbole', 'Qté', 'Prix', 'Achat', 'Valeur', 'PnL', 'Jour', 'Projection', 'Reco']
                 lines.extend(_format_table(headers, table_rows))
@@ -2078,7 +2080,9 @@ def send_morning_scout_report() -> dict[str, Any]:
                         .order_by('-published_at')[:2]
                     )
                     if news_items:
-                        news_map[stock.symbol] = [item.headline for item in news_items]
+                        news_map[stock.symbol] = [
+                            f"{item.headline} ({item.url})" for item in news_items
+                        ]
 
                 headers = ['Symbole', 'Qté', 'Prix', 'Achat', 'Valeur', 'PnL', 'Jour', 'Projection', 'Reco']
                 lines.extend(_format_table(headers, table_rows))
