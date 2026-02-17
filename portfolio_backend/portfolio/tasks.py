@@ -1805,6 +1805,40 @@ def send_morning_scout_report() -> dict[str, Any]:
                 return total_cost / total_shares
             return None
 
+        def _positions_from_account(account: Account) -> list[dict[str, Any]]:
+            txs = (
+                AccountTransaction.objects.filter(account=account)
+                .select_related('stock')
+                .order_by('date')
+            )
+            positions: dict[int, dict[str, Any]] = {}
+            for tx in txs:
+                stock = tx.stock
+                if not stock:
+                    continue
+                pos = positions.setdefault(
+                    stock.id,
+                    {'stock': stock, 'shares': 0.0, 'cost': 0.0},
+                )
+                shares = float(tx.quantity or 0)
+                price = float(tx.price or 0)
+                if tx.type == 'BUY':
+                    pos['cost'] += shares * price
+                    pos['shares'] += shares
+                elif tx.type == 'SELL' and pos['shares'] > 0:
+                    avg_cost = pos['cost'] / pos['shares'] if pos['shares'] else 0.0
+                    pos['cost'] -= shares * avg_cost
+                    pos['shares'] = max(0.0, pos['shares'] - shares)
+
+            results: list[dict[str, Any]] = []
+            for pos in positions.values():
+                if pos['shares'] > 0:
+                    pos['avg_cost'] = pos['cost'] / pos['shares'] if pos['shares'] else None
+                    results.append(pos)
+
+            results.sort(key=lambda x: (x['stock'].symbol or ''))
+            return results
+
         lines: list[str] = []
         today = timezone.now().date()
         lines.append(f"Rapport du matin - {today}")
@@ -1950,6 +1984,67 @@ def send_morning_scout_report() -> dict[str, Any]:
                         for item in news_items:
                             lines.append(f"  • {item.headline}")
                 lines.append('')
+
+        # Account details (fallback if no portfolios)
+        if not portfolios.exists():
+            accounts = Account.objects.all().order_by('name')
+            if accounts.exists():
+                lines.append('=== Comptes ===')
+                for account in accounts:
+                    lines.append(f"{account.name} ({account.account_type}):")
+                    positions = _positions_from_account(account)
+                    if not positions:
+                        lines.append('- Aucun titre')
+                        lines.append('')
+                        continue
+
+                    for pos in positions:
+                        stock = pos['stock']
+                        shares = float(pos['shares'] or 0)
+                        avg_cost = pos.get('avg_cost')
+                        latest_price = (
+                            float(stock.latest_price)
+                            if stock.latest_price is not None
+                            else None
+                        )
+                        value_now = latest_price * shares if latest_price is not None else None
+                        cost_now = avg_cost * shares if avg_cost is not None else None
+                        pnl = (value_now - cost_now) if value_now is not None and cost_now is not None else None
+
+                        prediction = (
+                            Prediction.objects.filter(stock=stock)
+                            .order_by('-date')
+                            .first()
+                        )
+                        projection = (
+                            _fmt_money(prediction.predicted_price)
+                            if prediction else 'n/a'
+                        )
+                        reco = prediction.recommendation if prediction else 'n/a'
+
+                        open_price = 'n/a'
+                        day_low = _fmt_money(stock.day_low) if stock.day_low is not None else 'n/a'
+                        day_high = _fmt_money(stock.day_high) if stock.day_high is not None else 'n/a'
+
+                        lines.append(
+                            f"- {stock.symbol}: qty {shares:.2f} | "
+                            f"prix {_fmt_money(latest_price)} | "
+                            f"achat {_fmt_money(avg_cost)} | "
+                            f"valeur {_fmt_money(value_now)} | "
+                            f"PnL {_fmt_money(pnl)} | "
+                            f"ouverture {open_price} | "
+                            f"jour {day_low}/{day_high} | "
+                            f"projection {projection} | reco {reco}"
+                        )
+
+                        news_items = (
+                            StockNews.objects.filter(stock=stock)
+                            .order_by('-published_at')[:2]
+                        )
+                        if news_items:
+                            for item in news_items:
+                                lines.append(f"  • {item.headline}")
+                    lines.append('')
 
         lines.append('Notes: simulation uniquement. Les recommandations sont indicatives.')
 
