@@ -1784,6 +1784,27 @@ def send_morning_scout_report() -> dict[str, Any]:
                 return 'n/a'
             return f"${float(value):,.2f}"
 
+        def _fmt_qty(value: float | None) -> str:
+            if value is None:
+                return 'n/a'
+            return f"{float(value):,.2f}"
+
+        def _format_table(headers: list[str], rows: list[list[str]]) -> list[str]:
+            if not rows:
+                return []
+            col_count = len(headers)
+            widths = [len(h) for h in headers]
+            for row in rows:
+                for idx in range(col_count):
+                    widths[idx] = max(widths[idx], len(str(row[idx])))
+            header_line = ' | '.join(headers[i].ljust(widths[i]) for i in range(col_count))
+            sep_line = '-+-'.join('-' * widths[i] for i in range(col_count))
+            data_lines = [
+                ' | '.join(str(row[i]).ljust(widths[i]) for i in range(col_count))
+                for row in rows
+            ]
+            return [header_line, sep_line, *data_lines]
+
         def _avg_cost_for_stock(portfolio: Portfolio, stock: Stock) -> float | None:
             txs = (
                 Transaction.objects.filter(portfolio=portfolio, stock=stock)
@@ -1934,6 +1955,8 @@ def send_morning_scout_report() -> dict[str, Any]:
                     lines.append('')
                     continue
 
+                table_rows: list[list[str]] = []
+                news_map: dict[str, list[str]] = {}
                 for holding in holdings:
                     stock = holding.stock
                     shares = float(holding.shares or 0)
@@ -1965,15 +1988,18 @@ def send_morning_scout_report() -> dict[str, Any]:
                     day_low = _fmt_money(stock.day_low) if stock.day_low is not None else 'n/a'
                     day_high = _fmt_money(stock.day_high) if stock.day_high is not None else 'n/a'
 
-                    lines.append(
-                        f"- {stock.symbol}: qty {shares:.2f} | "
-                        f"prix {_fmt_money(latest_price)} | "
-                        f"achat {_fmt_money(avg_cost)} | "
-                        f"valeur {_fmt_money(value_now)} | "
-                        f"PnL {_fmt_money(pnl)} | "
-                        f"ouverture {open_price} | "
-                        f"jour {day_low}/{day_high} | "
-                        f"projection {projection} | reco {reco}"
+                    table_rows.append(
+                        [
+                            stock.symbol,
+                            _fmt_qty(shares),
+                            _fmt_money(latest_price),
+                            _fmt_money(avg_cost),
+                            _fmt_money(value_now),
+                            _fmt_money(pnl),
+                            f"{day_low}/{day_high}",
+                            projection,
+                            reco,
+                        ]
                     )
 
                     news_items = (
@@ -1981,8 +2007,14 @@ def send_morning_scout_report() -> dict[str, Any]:
                         .order_by('-published_at')[:2]
                     )
                     if news_items:
-                        for item in news_items:
-                            lines.append(f"  • {item.headline}")
+                        news_map[stock.symbol] = [item.headline for item in news_items]
+
+                headers = ['Symbole', 'Qté', 'Prix', 'Achat', 'Valeur', 'PnL', 'Jour', 'Projection', 'Reco']
+                lines.extend(_format_table(headers, table_rows))
+                if news_map:
+                    for symbol, headlines in news_map.items():
+                        for headline in headlines:
+                            lines.append(f"  • {symbol}: {headline}")
                 lines.append('')
 
         # Account details
@@ -1997,6 +2029,8 @@ def send_morning_scout_report() -> dict[str, Any]:
                     lines.append('')
                     continue
 
+                table_rows = []
+                news_map: dict[str, list[str]] = {}
                 for pos in positions:
                     stock = pos['stock']
                     shares = float(pos['shares'] or 0)
@@ -2025,15 +2059,18 @@ def send_morning_scout_report() -> dict[str, Any]:
                     day_low = _fmt_money(stock.day_low) if stock.day_low is not None else 'n/a'
                     day_high = _fmt_money(stock.day_high) if stock.day_high is not None else 'n/a'
 
-                    lines.append(
-                        f"- {stock.symbol}: qty {shares:.2f} | "
-                        f"prix {_fmt_money(latest_price)} | "
-                        f"achat {_fmt_money(avg_cost)} | "
-                        f"valeur {_fmt_money(value_now)} | "
-                        f"PnL {_fmt_money(pnl)} | "
-                        f"ouverture {open_price} | "
-                        f"jour {day_low}/{day_high} | "
-                        f"projection {projection} | reco {reco}"
+                    table_rows.append(
+                        [
+                            stock.symbol,
+                            _fmt_qty(shares),
+                            _fmt_money(latest_price),
+                            _fmt_money(avg_cost),
+                            _fmt_money(value_now),
+                            _fmt_money(pnl),
+                            f"{day_low}/{day_high}",
+                            projection,
+                            reco,
+                        ]
                     )
 
                     news_items = (
@@ -2041,8 +2078,14 @@ def send_morning_scout_report() -> dict[str, Any]:
                         .order_by('-published_at')[:2]
                     )
                     if news_items:
-                        for item in news_items:
-                            lines.append(f"  • {item.headline}")
+                        news_map[stock.symbol] = [item.headline for item in news_items]
+
+                headers = ['Symbole', 'Qté', 'Prix', 'Achat', 'Valeur', 'PnL', 'Jour', 'Projection', 'Reco']
+                lines.extend(_format_table(headers, table_rows))
+                if news_map:
+                    for symbol, headlines in news_map.items():
+                        for headline in headlines:
+                            lines.append(f"  • {symbol}: {headline}")
                 lines.append('')
 
         lines.append('Notes: simulation uniquement. Les recommandations sont indicatives.')
