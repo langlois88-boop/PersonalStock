@@ -52,7 +52,9 @@ from .models import (
     ModelRegistry,
     ModelEvaluationDaily,
     Portfolio,
+    PortfolioHolding,
     PortfolioDigest,
+    Transaction,
     PennyStockSnapshot,
     PennyStockUniverse,
     PennySignal,
@@ -1777,6 +1779,32 @@ def send_morning_scout_report() -> dict[str, Any]:
             ('AI_PENNY', 'AI_PENNY', 'PENNY', 'SIRI,PLUG,SOFI,RIOT,MARA'),
         ]
 
+        def _fmt_money(value: float | None) -> str:
+            if value is None:
+                return 'n/a'
+            return f"${float(value):,.2f}"
+
+        def _avg_cost_for_stock(portfolio: Portfolio, stock: Stock) -> float | None:
+            txs = (
+                Transaction.objects.filter(portfolio=portfolio, stock=stock)
+                .order_by('date')
+            )
+            total_shares = 0.0
+            total_cost = 0.0
+            for tx in txs:
+                shares = float(tx.shares or 0)
+                price = float(tx.price_per_share or 0)
+                if tx.transaction_type == 'BUY':
+                    total_cost += shares * price
+                    total_shares += shares
+                elif tx.transaction_type == 'SELL' and total_shares > 0:
+                    avg_cost = total_cost / total_shares if total_shares else 0.0
+                    total_cost -= shares * avg_cost
+                    total_shares = max(0.0, total_shares - shares)
+            if total_shares > 0:
+                return total_cost / total_shares
+            return None
+
         lines: list[str] = []
         today = timezone.now().date()
         lines.append(f"Rapport du matin - {today}")
@@ -1855,6 +1883,75 @@ def send_morning_scout_report() -> dict[str, Any]:
                 'excluded': len(excluded),
                 'watchlist': len(watchlist),
             }
+
+        # Portfolio details
+        portfolios = Portfolio.objects.all()
+        if portfolios.exists():
+            lines.append('=== Portefeuilles ===')
+            for portfolio in portfolios:
+                lines.append(f"{portfolio.name}:")
+                holdings = (
+                    PortfolioHolding.objects.select_related('stock')
+                    .filter(portfolio=portfolio)
+                    .order_by('stock__symbol')
+                )
+                if not holdings:
+                    lines.append('- Aucun titre')
+                    lines.append('')
+                    continue
+
+                for holding in holdings:
+                    stock = holding.stock
+                    shares = float(holding.shares or 0)
+                    if shares <= 0:
+                        continue
+
+                    latest_price = (
+                        float(stock.latest_price)
+                        if stock.latest_price is not None
+                        else None
+                    )
+                    avg_cost = _avg_cost_for_stock(portfolio, stock)
+                    value_now = latest_price * shares if latest_price is not None else None
+                    cost_now = avg_cost * shares if avg_cost is not None else None
+                    pnl = (value_now - cost_now) if value_now is not None and cost_now is not None else None
+
+                    prediction = (
+                        Prediction.objects.filter(stock=stock)
+                        .order_by('-date')
+                        .first()
+                    )
+                    projection = (
+                        _fmt_money(prediction.predicted_price)
+                        if prediction else 'n/a'
+                    )
+                    reco = prediction.recommendation if prediction else 'n/a'
+
+                    open_price = 'n/a'
+                    day_low = _fmt_money(stock.day_low) if stock.day_low is not None else 'n/a'
+                    day_high = _fmt_money(stock.day_high) if stock.day_high is not None else 'n/a'
+
+                    lines.append(
+                        f"- {stock.symbol}: qty {shares:.2f} | "
+                        f"prix {_fmt_money(latest_price)} | "
+                        f"achat {_fmt_money(avg_cost)} | "
+                        f"valeur {_fmt_money(value_now)} | "
+                        f"PnL {_fmt_money(pnl)} | "
+                        f"ouverture {open_price} | "
+                        f"jour {day_low}/{day_high} | "
+                        f"projection {projection} | reco {reco}"
+                    )
+
+                    news_items = (
+                        StockNews.objects.filter(stock=stock)
+                        .order_by('-published_at')[:2]
+                    )
+                    if news_items:
+                        for item in news_items:
+                            lines.append(f"  • {item.headline}")
+                lines.append('')
+
+        lines.append('Notes: simulation uniquement. Les recommandations sont indicatives.')
 
         subject = f"Daily AI Scout Report - {today}"
         send_mail(
