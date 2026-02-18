@@ -527,7 +527,7 @@ function GlobalPortfolio() {
                   checked={focusFilter}
                   onChange={(event) => setFocusFilter(event.target.checked)}
                 />
-                Focus 1M$ (masquer Win Rate < 45%)
+                Focus 1M$ (masquer Win Rate &lt; 45%)
               </label>
               <select
                 value={selectedAccountId}
