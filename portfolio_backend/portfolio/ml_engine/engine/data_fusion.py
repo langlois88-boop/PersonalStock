@@ -150,6 +150,8 @@ class DataFusionEngine:
         rs = gain / loss.replace(0, pd.NA)
         fused["RSI14"] = 100 - (100 / (1 + rs))
 
+        if self.fast_mode:
+            return fused.dropna(subset=["Close"])
         return fused.dropna()
 
     def _fetch_fred_series(self, series_id: str, api_key: str) -> Optional[pd.DataFrame]:

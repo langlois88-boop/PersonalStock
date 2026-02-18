@@ -226,7 +226,13 @@ function GlobalPortfolio() {
   const wave2Budget = 2300;
   const wave2Amount = Number((wave2Budget * 0.25).toFixed(2));
 
-  const updateRiskStatus = (rsi, sharpe, tickerType) => {
+  const updateRiskStatus = (rsi, sharpe, tickerType, tickerSymbol) => {
+    const etfSymbols = ['TEC.TO', 'VFV', 'VFV.TO'];
+    const symbol = String(tickerSymbol || '').toUpperCase();
+    const isEtf = etfSymbols.includes(symbol);
+    if (isEtf && rsi !== null && rsi !== undefined && rsi < 30) {
+      return { label: '📦 ACCUMULATION PILIER', className: 'bg-emerald-500/20 text-emerald-200 border-emerald-400/40' };
+    }
     if (tickerType === 'Bluechip') {
       if (rsi !== null && rsi !== undefined && rsi < 30) {
         return { label: '🔥 OPPORTUNITÉ (RSI BAS)', className: 'bg-emerald-500/20 text-emerald-200 border-emerald-400/40' };
@@ -569,7 +575,12 @@ function GlobalPortfolio() {
                 <div className="flex items-center justify-between">
                   <p className="text-white font-semibold">{item.ticker}</p>
                   {(() => {
-                    const badge = updateRiskStatus(item.rsi, item.model_sharpe, item.category === 'Stable' ? 'Bluechip' : 'Other');
+                    const badge = updateRiskStatus(
+                      item.rsi,
+                      item.model_sharpe,
+                      item.category === 'Stable' ? 'Bluechip' : 'Other',
+                      item.ticker,
+                    );
                     if (!badge) return null;
                     return (
                       <span className={`text-[10px] px-2 py-0.5 rounded-full border ${badge.className}`}>

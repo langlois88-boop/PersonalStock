@@ -15,7 +15,18 @@ function OptimizerPage() {
       if (score >= 50) return 'text-sky-300';
       return 'text-rose-400';
     };
+    const isEtfOversold = (item) => {
+      const symbol = String(item?.ticker || '').toUpperCase();
+      const isEtf = ['TEC.TO', 'VFV', 'VFV.TO'].includes(symbol);
+      const rsiRaw = item?.rsi ?? item?.current_rsi ?? item?.current_rsi_value ?? item?.rsi_14;
+      const rsi = Number(rsiRaw);
+      if (!isEtf || !Number.isFinite(rsi)) return false;
+      return rsi < 30;
+    };
     const signalLabel = (item) => {
+      if (isEtfOversold(item)) {
+        return { text: '✅ BUY (Vague 1)', className: 'bg-emerald-500/20 text-emerald-200 border border-emerald-500/40' };
+      }
       const score = normalizeScore(item.ai_score ?? item.confidence);
       const volumeZ = Number(item.volume_z ?? 0);
       const unrealizedPct = Number(item.unrealized_pnl_pct ?? 0);
@@ -165,7 +176,11 @@ function OptimizerPage() {
                 );
               })()}
             </div>
-            {item.speculative ? (
+            {isEtfOversold(item) ? (
+              <div className="mt-2 inline-flex items-center gap-2 text-xs px-2 py-1 rounded-full border border-emerald-500/40 bg-emerald-500/10 text-emerald-200">
+                📦 ACCUMULATION PILIER
+              </div>
+            ) : item.speculative ? (
               <div className="mt-2 inline-flex items-center gap-2 text-xs px-2 py-1 rounded-full border border-rose-500/40 bg-rose-500/10 text-rose-200">
                 ⚠️ SPÉCULATIF
               </div>

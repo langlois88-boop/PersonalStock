@@ -1378,7 +1378,11 @@ class PortfolioDashboardView(APIView):
 					stock = Stock.objects.filter(symbol__iexact=symbol).first()
 					return self._rsi_from_history(stock)
 				return None
-			return self._safe_float(frame.tail(1).iloc[0].get('RSI14'))
+			last_val = self._safe_float(frame.tail(1).iloc[0].get('RSI14'))
+			if last_val is None and self._fast_mode():
+				stock = Stock.objects.filter(symbol__iexact=symbol).first()
+				return self._rsi_from_history(stock)
+			return last_val
 		except Exception:
 			return None
 
@@ -1391,8 +1395,11 @@ class PortfolioDashboardView(APIView):
 					stock = Stock.objects.filter(symbol__iexact=symbol).first()
 					return self._rsi_history_from_history(stock, window=window)
 				return []
-			values = frame['RSI14'].tail(window).tolist()
-			return [float(v) for v in values if v is not None]
+			values = [float(v) for v in frame['RSI14'].tail(window).tolist() if v is not None and not pd.isna(v)]
+			if not values and self._fast_mode():
+				stock = Stock.objects.filter(symbol__iexact=symbol).first()
+				return self._rsi_history_from_history(stock, window=window)
+			return values
 		except Exception:
 			return []
 
@@ -1605,8 +1612,6 @@ class PortfolioDashboardView(APIView):
 		symbol = (os.getenv('CONFIDENCE_SYMBOL') or os.getenv('PAPER_WATCHLIST', 'SPY').split(',')[0]).strip().upper()
 		if not symbol:
 			return None
-		if self._fast_mode():
-			return {'symbol': symbol, 'status': 'unavailable'}
 		try:
 			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			fusion_df = fusion.fuse_all()
@@ -1625,8 +1630,12 @@ class PortfolioDashboardView(APIView):
 				signal = float(payload['model'].predict_proba(features)[0][1])
 			except Exception:
 				signal = 0.0
-			volume_z = float(last_row.iloc[0].get('VolumeZ', 0.0) or 0.0)
-			vol_regime = float(last_row.iloc[0].get('vol_regime', 0.0) or 0.0)
+			volume_z = self._safe_float(last_row.iloc[0].get('VolumeZ', 0.0))
+			vol_regime = self._safe_float(last_row.iloc[0].get('vol_regime', 0.0))
+			if volume_z is None:
+				volume_z = 0.0
+			if vol_regime is None:
+				vol_regime = 0.0
 			ai_score = round(signal * 100, 2)
 			stats = None
 			try:
@@ -2183,7 +2192,15 @@ class AccountDashboardView(APIView):
 					stock = Stock.objects.filter(symbol__iexact=symbol).first()
 					return self._rsi_from_history(stock)
 				return None
-			return float(frame.tail(1).iloc[0].get('RSI14'))
+			last_val = frame.tail(1).iloc[0].get('RSI14')
+			try:
+				last_val = float(last_val)
+			except (TypeError, ValueError):
+				last_val = None
+			if last_val is None and self._fast_mode():
+				stock = Stock.objects.filter(symbol__iexact=symbol).first()
+				return self._rsi_from_history(stock)
+			return last_val
 		except Exception:
 			return None
 
@@ -3979,6 +3996,7 @@ class PortfolioOptimizerView(APIView):
 			'speculative': is_speculative,
 			'altman_z': altman_z,
 			'volume_z': round(volume_z, 2),
+			'rsi': round(rsi_value, 2) if rsi_value is not None else None,
 			'unrealized_pnl_pct': round(float(unrealized_pct), 2) if unrealized_pct is not None else None,
 			'win_rate': round(float(win_rate), 2) if result else None,
 			'sharpe': round(float(sharpe), 2) if result else None,
@@ -4034,6 +4052,7 @@ class PortfolioOptimizerView(APIView):
 			'altman_z': altman_z,
 			'speculative': is_speculative,
 			'volume_z': round(float(row.get('VolumeZ', 0.0) or 0.0), 2),
+			'rsi': round(float(row.get('RSI14', 0.0) or 0.0), 2),
 			'win_rate': round(float(result.win_rate), 2) if result else None,
 			'sharpe': round(float(result.sharpe_ratio), 2) if result else None,
 			'price': round(float(row.get('Close', 0.0) or 0.0), 4),
