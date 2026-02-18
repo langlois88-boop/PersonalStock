@@ -151,7 +151,9 @@ def _to_cad_price(symbol: str, price: float | None, info: dict[str, Any]) -> flo
         for s in str(os.getenv('FORCE_CAD_TICKERS', '')).split(',')
         if s.strip()
     })
-    if not symbol_upper.endswith('.TO') and symbol_upper not in force_list:
+    if symbol_upper in force_list:
+        return float(price) * _usd_cad_rate()
+    if not symbol_upper.endswith('.TO'):
         return price
     currency = (info.get('currency') or info.get('financialCurrency') or '').upper()
     if currency == 'USD':
