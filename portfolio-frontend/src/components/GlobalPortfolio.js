@@ -223,10 +223,10 @@ function GlobalPortfolio() {
     return 'text-slate-300';
   };
 
-  const updateRiskStatus = (rsi, sharpe, tickerType) => {
+  const wave2Budget = 2300;
+  const wave2Amount = Number((wave2Budget * 0.25).toFixed(2));
 
-      const wave2Budget = 2300;
-      const wave2Amount = Number((wave2Budget * 0.25).toFixed(2));
+  const updateRiskStatus = (rsi, sharpe, tickerType) => {
     if (tickerType === 'Bluechip') {
       if (rsi !== null && rsi !== undefined && rsi < 30) {
         return { label: '🔥 OPPORTUNITÉ (RSI BAS)', className: 'bg-emerald-500/20 text-emerald-200 border-emerald-400/40' };
