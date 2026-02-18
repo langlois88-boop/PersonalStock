@@ -459,7 +459,7 @@ function GlobalPortfolio() {
                 const costValue = Number(row.cost_value || 0);
                 const unrealized = value - costValue;
                 const unrealizedPct = costValue ? (unrealized / costValue) * 100 : 0;
-                const underperform = unrealizedPct <= -15;
+                const underperform = unrealizedPct <= -10;
                 const isAvgo = row.ticker === 'AVGO';
                 const rsiValue = isAvgo ? 49.9 : row.rsi;
                 const volumeZ = row.volume_z;

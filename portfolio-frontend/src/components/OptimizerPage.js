@@ -11,22 +11,28 @@ function OptimizerPage() {
     };
     const scoreColor = (value) => {
       const score = normalizeScore(value);
-      if (score >= 85) return 'text-emerald-400';
-      if (score >= 70) return 'text-sky-300';
-      return 'text-amber-300';
+      if (score >= 70) return 'text-emerald-400';
+      if (score >= 50) return 'text-sky-300';
+      return 'text-rose-400';
     };
     const signalLabel = (item) => {
       const score = normalizeScore(item.ai_score ?? item.confidence);
       const volumeZ = Number(item.volume_z ?? 0);
       const winRateRaw = Number(item.win_rate ?? 0);
       const winRate = winRateRaw <= 1 ? winRateRaw * 100 : winRateRaw;
-      if ((item.ticker || '').toUpperCase() === 'AVGO' && volumeZ < 0) {
+      if (winRate && winRate < 50) {
+        return { text: 'STATISTIQUEMENT FAIBLE', className: 'bg-slate-700 text-slate-200 border border-slate-500/40' };
+      }
+      if (score > 70 && volumeZ > 0) {
+        return { text: 'ACHETER', className: 'bg-emerald-500/20 text-emerald-200 border border-emerald-500/40' };
+      }
+      if (score > 60 && volumeZ < 0) {
         return { text: 'ATTENDRE VOLUME', className: 'bg-amber-500/20 text-amber-200 border border-amber-500/40' };
       }
-      if (winRate && winRate < 50) return { text: 'STATISTIQUEMENT FAIBLE', className: 'bg-slate-700 text-slate-200 border border-slate-500/40' };
-      if (score >= 85 && volumeZ > 0.5) return { text: 'STRONG BUY', className: 'bg-emerald-500/20 text-emerald-200 border border-emerald-500/40' };
-      if (score >= 70) return { text: 'HOLD / KEEP', className: 'bg-sky-500/20 text-sky-200 border border-sky-500/40' };
-      return { text: 'WAITING', className: 'bg-amber-500/20 text-amber-200 border border-amber-500/40' };
+      if (score >= 50) {
+        return { text: 'HOLD / KEEP', className: 'bg-sky-500/20 text-sky-200 border border-sky-500/40' };
+      }
+      return { text: 'WAITING', className: 'bg-slate-700/40 text-slate-300 border border-slate-600' };
     };
   const [actions, setActions] = useState([]);
   const [suggestions, setSuggestions] = useState([]);
