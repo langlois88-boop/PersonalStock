@@ -13,15 +13,60 @@ from ..collectors.news_rss import fetch_news_sentiment
 
 
 class DataFusionEngine:
-    def __init__(self, ticker: str):
+    def __init__(self, ticker: str, fast_mode: bool = False):
         self.ticker = (ticker or "").upper().strip()
         self.end_date = datetime.utcnow()
         self.start_date = self.end_date - timedelta(days=365)
+        self.fast_mode = bool(
+            fast_mode
+            or str(os.getenv("DATAFUSION_FAST_MODE", "")).strip().lower() in {"1", "true", "yes", "y"}
+        )
+
+    def _get_market_data_from_db(self) -> pd.DataFrame:
+        try:
+            from ...models import Stock, PriceHistory
+        except Exception:
+            return pd.DataFrame()
+        stock = Stock.objects.filter(symbol__iexact=self.ticker).first()
+        if not stock:
+            return pd.DataFrame()
+        rows = list(PriceHistory.objects.filter(stock=stock).order_by("date"))
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(
+            [{"Date": row.date, "Close": float(row.close_price)} for row in rows if row.close_price is not None]
+        )
+        if df.empty:
+            return pd.DataFrame()
+        df = df.set_index("Date")
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df[~df.index.isna()]
+        df["Volume"] = 0.0
+        df["Returns"] = df["Close"].pct_change()
+        return df
 
     def get_market_data(self) -> pd.DataFrame:
-        df = yf.download(self.ticker, start=self.start_date, end=self.end_date, progress=False)
+        if self.fast_mode:
+            return self._get_market_data_from_db()
+        try:
+            df = yf.download(
+                self.ticker,
+                start=self.start_date,
+                end=self.end_date,
+                progress=False,
+                timeout=8,
+            )
+        except TypeError:
+            df = yf.download(
+                self.ticker,
+                start=self.start_date,
+                end=self.end_date,
+                progress=False,
+            )
         if df is None or df.empty:
             try:
+                df = yf.Ticker(self.ticker).history(period="2y", auto_adjust=False, timeout=8)
+            except TypeError:
                 df = yf.Ticker(self.ticker).history(period="2y", auto_adjust=False)
             except Exception:
                 df = pd.DataFrame()
@@ -75,12 +120,16 @@ class DataFusionEngine:
         if market.empty:
             return pd.DataFrame()
 
-        macro = self.get_macro_data()
-        fused = market.join(macro, how="left").ffill()
-
-        sentiment = fetch_news_sentiment(self.ticker)
-        fused["sentiment_score"] = sentiment.get("news_sentiment", 0.0)
-        fused["news_count"] = sentiment.get("news_count", 0)
+        if self.fast_mode:
+            fused = market.copy()
+            fused["sentiment_score"] = 0.0
+            fused["news_count"] = 0
+        else:
+            macro = self.get_macro_data()
+            fused = market.join(macro, how="left").ffill()
+            sentiment = fetch_news_sentiment(self.ticker)
+            fused["sentiment_score"] = sentiment.get("news_sentiment", 0.0)
+            fused["news_count"] = sentiment.get("news_count", 0)
 
         fused["MA20"] = fused["Close"].rolling(window=20, min_periods=10).mean()
         fused["MA50"] = fused["Close"].rolling(window=50, min_periods=20).mean()

@@ -1341,6 +1341,9 @@ class PortfolioDashboardView(APIView):
 		except (TypeError, ValueError):
 			return None
 
+	def _fast_mode(self) -> bool:
+		return str(os.getenv('DASHBOARD_FAST_MODE', '1')).strip().lower() in {'1', 'true', 'yes', 'y'}
+
 	def _current_drawdown(self, values: list[float]) -> float:
 		if not values:
 			return 0.0
@@ -1358,7 +1361,7 @@ class PortfolioDashboardView(APIView):
 
 	def _get_volume_z(self, symbol: str) -> float | None:
 		try:
-			fusion = DataFusionEngine(symbol)
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty:
 				return None
@@ -1368,7 +1371,7 @@ class PortfolioDashboardView(APIView):
 
 	def _get_rsi(self, symbol: str) -> float | None:
 		try:
-			fusion = DataFusionEngine(symbol)
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty:
 				return None
@@ -1378,7 +1381,7 @@ class PortfolioDashboardView(APIView):
 
 	def _get_rsi_history(self, symbol: str, window: int = 5) -> list[float]:
 		try:
-			fusion = DataFusionEngine(symbol)
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty or 'RSI14' not in frame:
 				return []
@@ -1389,7 +1392,7 @@ class PortfolioDashboardView(APIView):
 
 	def _get_ma20(self, symbol: str) -> float | None:
 		try:
-			fusion = DataFusionEngine(symbol)
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty:
 				return None
@@ -1398,8 +1401,10 @@ class PortfolioDashboardView(APIView):
 			return None
 
 	def _ai_score(self, symbol: str) -> tuple[float | None, str | None]:
+		if self._fast_mode():
+			return None, None
 		try:
-			fusion = DataFusionEngine(symbol)
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty:
 				return None, None
@@ -1431,8 +1436,10 @@ class PortfolioDashboardView(APIView):
 			return None
 
 	def _model_stats(self, symbol: str) -> dict[str, float | None]:
+		if self._fast_mode():
+			return {'win_rate': None, 'sharpe': None}
 		try:
-			fusion = DataFusionEngine(symbol)
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty:
 				return {'win_rate': None, 'sharpe': None}
@@ -1486,6 +1493,8 @@ class PortfolioDashboardView(APIView):
 		return None
 
 	def _earnings_blacklist(self, symbol: str, days: int = 7) -> tuple[bool, date | None]:
+		if self._fast_mode():
+			return False, None
 		try:
 			earnings_date = self._earnings_date(symbol)
 			if not earnings_date:
@@ -1528,8 +1537,10 @@ class PortfolioDashboardView(APIView):
 		symbol = (os.getenv('CONFIDENCE_SYMBOL') or os.getenv('PAPER_WATCHLIST', 'SPY').split(',')[0]).strip().upper()
 		if not symbol:
 			return None
+		if self._fast_mode():
+			return {'symbol': symbol, 'status': 'unavailable'}
 		try:
-			fusion = DataFusionEngine(symbol)
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			fusion_df = fusion.fuse_all()
 			if fusion_df is None or fusion_df.empty:
 				return {'symbol': symbol, 'status': 'unavailable'}
@@ -2058,6 +2069,9 @@ class PortfolioDashboardView(APIView):
 
 
 class AccountDashboardView(APIView):
+	def _fast_mode(self) -> bool:
+		return str(os.getenv('DASHBOARD_FAST_MODE', '1')).strip().lower() in {'1', 'true', 'yes', 'y'}
+
 	def _price_at_or_before(self, stock: Stock, target_date: date) -> float | None:
 		row = PriceHistory.objects.filter(stock=stock, date__lte=target_date).order_by('-date').first()
 		if not row:
@@ -2072,7 +2086,7 @@ class AccountDashboardView(APIView):
 
 	def _get_rsi(self, symbol: str) -> float | None:
 		try:
-			fusion = DataFusionEngine(symbol)
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty:
 				return None
@@ -2082,7 +2096,7 @@ class AccountDashboardView(APIView):
 
 	def _get_volume_z(self, symbol: str) -> float | None:
 		try:
-			fusion = DataFusionEngine(symbol)
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty:
 				return None
@@ -2092,7 +2106,7 @@ class AccountDashboardView(APIView):
 
 	def _get_ma20(self, symbol: str) -> float | None:
 		try:
-			fusion = DataFusionEngine(symbol)
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty:
 				return None
@@ -2101,8 +2115,10 @@ class AccountDashboardView(APIView):
 			return None
 
 	def _ai_score(self, symbol: str) -> tuple[float | None, str | None]:
+		if self._fast_mode():
+			return None, None
 		try:
-			fusion = DataFusionEngine(symbol)
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty:
 				return None, None
@@ -2134,8 +2150,10 @@ class AccountDashboardView(APIView):
 			return None
 
 	def _model_stats(self, symbol: str) -> dict[str, float | None]:
+		if self._fast_mode():
+			return {'win_rate': None, 'sharpe': None}
 		try:
-			fusion = DataFusionEngine(symbol)
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty:
 				return {'win_rate': None, 'sharpe': None}
