@@ -134,6 +134,24 @@ def _is_valid_price(value: float | None) -> bool:
     return value is not None and isfinite(value) and value > 0
 
 
+def _usd_cad_rate() -> float:
+    try:
+        return float(getattr(settings, 'USD_CAD_RATE', os.getenv('USD_CAD_RATE', '1.36')))
+    except (TypeError, ValueError):
+        return 1.36
+
+
+def _to_cad_price(symbol: str, price: float | None, info: dict[str, Any]) -> float | None:
+    if price is None:
+        return None
+    if not symbol.upper().endswith('.TO'):
+        return price
+    currency = (info.get('currency') or info.get('financialCurrency') or '').upper()
+    if currency == 'USD':
+        return float(price) * _usd_cad_rate()
+    return price
+
+
 def _backfill_latest_price(stock: Stock) -> bool:
     last = PriceHistory.objects.filter(stock=stock).order_by('-date').first()
     if last and _is_valid_price(float(last.close_price or 0)):
@@ -198,6 +216,10 @@ def fetch_prices_hourly() -> dict[str, float]:
                 div_yield = info.get('trailingAnnualDividendYield')
             div_yield = float(div_yield) if div_yield is not None else None
 
+            price = _to_cad_price(stock.symbol, price, info)
+            day_low = _to_cad_price(stock.symbol, day_low, info)
+            day_high = _to_cad_price(stock.symbol, day_high, info)
+
             stock.latest_price = price
             stock.day_low = day_low
             stock.day_high = day_high
@@ -211,10 +233,12 @@ def fetch_prices_hourly() -> dict[str, float]:
             stock.save(update_fields=['latest_price', 'day_low', 'day_high', 'sector', 'dividend_yield', 'latest_price_updated_at'])
 
             for dt, row in data.iterrows():
+                close_price = float(row['Close'])
+                close_price = _to_cad_price(stock.symbol, close_price, info)
                 PriceHistory.objects.update_or_create(
                     stock=stock,
                     date=dt.date(),
-                    defaults={'close_price': float(row['Close'])},
+                    defaults={'close_price': close_price},
                 )
 
             prices[stock.symbol] = price
@@ -632,12 +656,23 @@ def check_alerts() -> dict[str, int]:
     capital_threshold = settings.ALERT_CAPITAL_THRESHOLD
     email_to = settings.ALERT_EMAIL_TO
     sms_to = settings.ALERT_SMS_TO
+    cooldown_hours = getattr(settings, 'ALERT_COOLDOWN_HOURS', 12)
 
     hits = 0
 
     def send_alert(subject: str, message: str, category: str, stock: Stock | None = None,
                    portfolio: Portfolio | None = None):
         nonlocal hits
+        if cooldown_hours and cooldown_hours > 0:
+            cutoff = timezone.now() - timedelta(hours=cooldown_hours)
+            recent = AlertEvent.objects.filter(
+                category=category,
+                stock=stock,
+                portfolio=portfolio,
+                created_at__gte=cutoff,
+            ).exists()
+            if recent:
+                return
         hits += 1
 
         AlertEvent.objects.create(
@@ -1238,6 +1273,7 @@ def run_penny_ai_scout() -> dict[str, int]:
     created = 0
     updated = 0
     today = timezone.now().date()
+    seen = len(universe)
 
     for item in universe[:max_symbols]:
         symbol = (item.get('symbol') or '').strip().upper()
@@ -1427,8 +1463,10 @@ def run_penny_ai_scout() -> dict[str, int]:
 
         if was_created:
             created += 1
+        else:
+            updated += 1
 
-    return {'created': created, 'seen': seen}
+    return {'created': created, 'updated': updated, 'seen': seen}
 
 
 @shared_task
@@ -1626,18 +1664,65 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     sell_threshold = _env_float(prefix, 'SELL_THRESHOLD', '0.4')
     trail_pct = _env_float(prefix, 'TRAIL_PCT', '0.04')
     atr_mult = _env_float(prefix, 'ATR_MULT', '1.5')
+    trail_profit_trigger = _env_float(prefix, 'TRAIL_PROFIT_TRIGGER_PCT', '0.15')
+    trail_atr_mult = _env_float(prefix, 'TRAIL_ATR_MULT', '1.5')
     risk_pct = _env_float(prefix, 'RISK_PCT', '0.015')
     position_cap_pct = _env_float(prefix, 'POSITION_CAP_PCT', '0.10')
     initial_capital = _env_float(prefix, 'CAPITAL', '10000')
     min_volume_z = _env_float(prefix, 'VOLUME_ZSCORE_MIN', '0.5')
     break_even_pct = _env_float(prefix, 'BREAK_EVEN_PCT', '0.015')
+    reinforce_min_score = _env_float(prefix, 'REINFORCE_MIN_SCORE', '0.85')
+    min_altman_z = _env_float(prefix, 'MIN_ALTMAN_Z', '2.0')
+    min_win_rate = _env_float(prefix, 'MIN_WIN_RATE', '0.40')
+    monthly_contribution = _env_float(prefix, 'MONTHLY_CONTRIBUTION', '2300')
+    max_position_cap_pct = 0.02 if sandbox == 'AI_PENNY' else None
+    take_profit_volume_days = int(os.getenv(
+        f'{prefix}_TAKE_PROFIT_VOLUME_Z_DAYS',
+        os.getenv('PAPER_TAKE_PROFIT_VOLUME_Z_DAYS', '3'),
+    ))
 
     closed_trades = PaperTrade.objects.filter(status='CLOSED', sandbox=sandbox)
     closed_pnl = float(sum([float(t.pnl or 0) for t in closed_trades]))
-    open_trades = {t.ticker: t for t in PaperTrade.objects.filter(status='OPEN', sandbox=sandbox)}
-    open_value = sum([float(t.entry_price) * float(t.quantity) for t in open_trades.values()])
+    open_trades_list = list(PaperTrade.objects.filter(status='OPEN', sandbox=sandbox))
+    open_trades_by_symbol: dict[str, list[PaperTrade]] = {}
+    for trade in open_trades_list:
+        open_trades_by_symbol.setdefault(trade.ticker, []).append(trade)
+    open_value = sum([float(t.entry_price) * float(t.quantity) for t in open_trades_list])
+
+    if sandbox == 'AI_BLUECHIP':
+        first_trade = (
+            PaperTrade.objects.filter(sandbox=sandbox)
+            .exclude(entry_date__isnull=True)
+            .order_by('entry_date')
+            .first()
+        )
+        if first_trade:
+            today = timezone.localdate()
+            start = first_trade.entry_date.date()
+            months = max(0, (today.year - start.year) * 12 + (today.month - start.month))
+            initial_capital += months * monthly_contribution
+
+    if max_position_cap_pct is not None:
+        position_cap_pct = min(position_cap_pct, max_position_cap_pct)
+
+    if sandbox == 'AI_BLUECHIP':
+        buy_threshold = 0.85
+        sell_threshold = 0.65
+        trail_pct = 0.05
+        min_volume_z = max(min_volume_z, 0.5)
+
     capital = initial_capital + closed_pnl
     available = max(0.0, capital - open_value)
+
+    def _penny_blocked() -> bool:
+        if sandbox != 'AI_PENNY':
+            return False
+        trades = closed_trades.count()
+        if trades <= 0:
+            return False
+        wins = closed_trades.filter(outcome='WIN').count()
+        win_rate = (wins / trades) if trades else 0.0
+        return win_rate < min_win_rate
 
     def _latest_price(symbol: str) -> float | None:
         try:
@@ -1663,38 +1748,97 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         except Exception:
             return 0.0
 
+    def _volume_z_negative_streak(symbol: str, days: int) -> tuple[bool, float | None]:
+        if days <= 0:
+            return False, None
+        try:
+            fusion = DataFusionEngine(symbol)
+            frame = fusion.fuse_all()
+            if frame is None or frame.empty or 'VolumeZ' not in frame:
+                return False, None
+            series = frame['VolumeZ'].tail(days)
+            if series.empty or len(series) < days:
+                last_value = _safe_float(series.iloc[-1]) if len(series) else None
+                return False, last_value
+            values = [_safe_float(v) for v in series]
+            if any(v is None for v in values):
+                return False, _safe_float(values[-1]) if values else None
+            return all(v < 0 for v in values), _safe_float(values[-1])
+        except Exception:
+            return False, None
+
     def _signal(symbol: str) -> dict[str, Any] | None:
         return _model_signal(symbol, universe, model_path)
 
     created = 0
     closed = 0
 
-    for symbol, trade in open_trades.items():
+    for symbol, trades in open_trades_by_symbol.items():
         price = _latest_price(symbol)
         if price is None:
             continue
         signal_payload = _signal(symbol)
         signal = signal_payload['signal'] if signal_payload else None
-        entry_price = float(trade.entry_price or 0)
-        break_even_stop = entry_price if entry_price and price >= (entry_price * (1 + break_even_pct)) else 0.0
-        new_stop = max(float(trade.stop_loss), price * (1 - trail_pct), break_even_stop)
-        trade.stop_loss = new_stop
-        should_close = price <= new_stop or (signal is not None and signal < sell_threshold)
-        if should_close:
-            trade.status = 'CLOSED'
-            trade.exit_price = price
-            trade.exit_date = timezone.now()
-            trade.pnl = float(price - float(trade.entry_price)) * float(trade.quantity)
-            trade.outcome = 'WIN' if float(trade.pnl or 0) > 0 else 'LOSS'
-            closed += 1
-        trade.save(update_fields=['stop_loss', 'status', 'exit_price', 'exit_date', 'pnl', 'outcome'])
+        for trade in trades:
+            entry_price = float(trade.entry_price or 0)
+            profit_pct = (price - entry_price) / entry_price if entry_price else 0.0
+            if profit_pct > 0 and take_profit_volume_days > 0:
+                negative_streak, latest_volume_z = _volume_z_negative_streak(symbol, take_profit_volume_days)
+                if negative_streak:
+                    cooldown_hours = getattr(settings, 'ALERT_COOLDOWN_HOURS', 12)
+                    cutoff = timezone.now() - timedelta(hours=cooldown_hours)
+                    stock = Stock.objects.filter(symbol__iexact=symbol).first()
+                    existing = AlertEvent.objects.filter(
+                        category='TAKE_PROFIT_SUGGESTION',
+                        stock=stock,
+                        created_at__gte=cutoff,
+                    ).exists()
+                    if not existing:
+                        latest_z_text = f"{latest_volume_z:.2f}" if latest_volume_z is not None else 'n/a'
+                        message = (
+                            f"Suggestion take profit partiel: {symbol} profit {profit_pct * 100:.2f}% "
+                            f"avec VolumeZ négatif depuis {take_profit_volume_days} jours (dernier {latest_z_text})."
+                        )
+                        AlertEvent.objects.create(category='TAKE_PROFIT_SUGGESTION', message=message, stock=stock)
+            break_even_stop = entry_price if entry_price and price >= (entry_price * (1 + break_even_pct)) else 0.0
+            atr = _atr(symbol)
+            dynamic_atr_stop = 0.0
+            if profit_pct >= trail_profit_trigger and atr > 0:
+                dynamic_atr_stop = price - (trail_atr_mult * atr)
+            new_stop = max(
+                float(trade.stop_loss),
+                price * (1 - trail_pct),
+                break_even_stop,
+                dynamic_atr_stop,
+            )
+            trade.stop_loss = new_stop
+            stop_hit = price <= new_stop
+            signal_exit = signal is not None and signal < sell_threshold
+            should_close = stop_hit or signal_exit
+            if should_close:
+                trade.status = 'CLOSED'
+                trade.exit_price = price
+                trade.exit_date = timezone.now()
+                trade.pnl = float(price - float(trade.entry_price)) * float(trade.quantity)
+                trade.outcome = 'WIN' if float(trade.pnl or 0) > 0 else 'LOSS'
+                volume_z = _safe_float((signal_payload or {}).get('features', {}).get('VolumeZ'))
+                exit_reason = 'Stop Loss' if stop_hit else 'Signal IA'
+                volume_note = f" VolumeZ {volume_z:.2f}." if volume_z is not None else ''
+                trade.notes = (
+                    f"Trade fermé à cause de {exit_reason}. Cause probable : Volume trop faible lors de l'entrée." + volume_note
+                )
+                closed += 1
+            trade.save(update_fields=['stop_loss', 'status', 'exit_price', 'exit_date', 'pnl', 'outcome', 'notes'])
 
     for symbol in watchlist:
-        if symbol in open_trades:
-            continue
+        existing_trades = open_trades_by_symbol.get(symbol, [])
         signal_payload = _signal(symbol)
         signal = signal_payload['signal'] if signal_payload else None
         if signal is None or signal < buy_threshold:
+            continue
+        if existing_trades and signal < reinforce_min_score:
+            continue
+        if sandbox == 'AI_PENNY' and _penny_blocked():
             continue
         volume_z = _safe_float((signal_payload or {}).get('features', {}).get('VolumeZ'))
         if volume_z is not None and volume_z < min_volume_z:
@@ -1706,6 +1850,13 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             stock = Stock.objects.filter(symbol__iexact=symbol).first()
             AlertEvent.objects.create(category='PAPER_NON_TRADE', message=message, stock=stock)
             continue
+        if sandbox == 'AI_PENNY':
+            altman_z = _safe_float(
+                (signal_payload or {}).get('features', {}).get('AltmanZ')
+                or (signal_payload or {}).get('features', {}).get('AltmanZScore')
+            )
+            if altman_z is None or altman_z <= min_altman_z:
+                continue
         price = _latest_price(symbol)
         if price is None:
             continue
@@ -2936,8 +3087,12 @@ def refresh_ai_bluechip_watchlist() -> dict[str, Any]:
     try:
         resp = requests.get(
             f"{base_url}/api/ai/opportunities/",
-            params={'limit': limit, 'min_score': min_score},
-            timeout=20,
+            params={
+                'limit': limit,
+                'min_score': min_score,
+                'include_universe': 'false',
+            },
+            timeout=60,
         )
         resp.raise_for_status()
         payload = resp.json() or []

@@ -1,4 +1,4 @@
-import { AlertCircle, CheckCircle2, Minus, TrendingDown, TrendingUp } from 'lucide-react';
+import { AlertCircle, CheckCircle2 } from 'lucide-react';
 
 const recommendations = [
   {
@@ -60,22 +60,35 @@ const recommendations = [
   },
 ];
 
-const badgeStyles = (signal) => {
-  if (signal === 'SELL') {
-    return 'bg-red-500/10 text-red-500 border border-red-500/20';
-  }
-  if (signal === 'KEEP') {
-    return 'bg-emerald-500/10 text-emerald-500 border border-emerald-500/20';
-  }
-  if (signal === 'ADD') {
-    return 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/20';
-  }
-  return 'bg-amber-500/10 text-amber-500 border border-amber-500/20';
-};
-
-function AIRecommendations({ items, title = 'AI Portfolio Optimizer', emptyMessage = 'Aucune recommandation disponible.' }) {
+function AIRecommendations({ items = [], title, emptyMessage, onRefresh, isRefreshing = false }) {
   const list = items?.length ? items : recommendations;
-  const isEmpty = items && items.length === 0;
+  const filtered = list.filter((item) => {
+    const winRate = Number(item.win_rate ?? item.winRate ?? NaN);
+    const sharpe = Number(item.sharpe ?? item.sharpe_ratio ?? NaN);
+    if (!Number.isFinite(winRate) || !Number.isFinite(sharpe)) return false;
+    return winRate >= 50 && sharpe >= 1.0;
+  });
+  const isEmpty = filtered.length === 0;
+  const normalizeScore = (value) => {
+    const raw = Number(value || 0);
+    if (!Number.isFinite(raw)) return 0;
+    return raw <= 1 ? raw * 100 : raw;
+  };
+  const signalLabel = (item) => {
+    const winRate = Number(item.win_rate ?? 0);
+    const score = normalizeScore(item.ai_score ?? item.confidence);
+    const volumeZ = Number(item.volume_z ?? 0);
+    if (winRate && winRate < 50) return { text: 'STATISTIQUEMENT FAIBLE', className: 'bg-slate-700 text-slate-200' };
+    if (score >= 85 && volumeZ > 0.5) return { text: 'STRONG BUY', className: 'bg-emerald-500 text-white' };
+    if (score >= 70) return { text: 'HOLD / KEEP', className: 'bg-sky-500 text-white' };
+    return { text: 'WAITING', className: 'bg-slate-600 text-slate-200' };
+  };
+  const confidenceColor = (scorePct) => {
+    const score = Number(scorePct || 0);
+    if (score >= 85) return 'bg-emerald-500';
+    if (score >= 70) return 'bg-sky-500';
+    return 'bg-amber-500';
+  };
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
       <div className="flex items-center justify-between mb-6">
@@ -92,7 +105,7 @@ function AIRecommendations({ items, title = 'AI Portfolio Optimizer', emptyMessa
             {emptyMessage}
           </div>
         ) : (
-          list.map((item, index) => (
+          filtered.map((item, index) => (
             <div
               key={index}
               className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-4 transition-all hover:border-indigo-500/50"
@@ -149,26 +162,38 @@ function AIRecommendations({ items, title = 'AI Portfolio Optimizer', emptyMessa
                   <p className="text-sm text-slate-400">{item.name}</p>
                 </div>
 
-                <div className={`px-4 py-1.5 rounded-lg font-black text-xs flex items-center gap-1.5 ${badgeStyles(item.signal)}`}>
-                  {item.signal === 'SELL' && <TrendingDown size={14} />}
-                  {item.signal === 'KEEP' && <TrendingUp size={14} />}
-                  {item.signal === 'HOLD' && <Minus size={14} />}
-                  {item.signal === 'ADD' && <TrendingUp size={14} />}
-                  {item.signal}
-                </div>
+                {(() => {
+                  const label = signalLabel(item);
+                  return (
+                    <div className={`px-4 py-1.5 rounded-lg font-black text-xs flex items-center gap-1.5 ${label.className}`}>
+                      {label.text}
+                    </div>
+                  );
+                })()}
               </div>
+              {item.speculative ? (
+                <div className="mb-2 inline-flex items-center gap-2 text-xs px-2 py-1 rounded-full border border-rose-500/40 bg-rose-500/10 text-rose-200">
+                  ⚠️ SPÉCULATIF
+                </div>
+              ) : null}
 
               <div className="mb-3">
                 <div className="flex justify-between text-xs mb-1.5">
                   <span className="text-slate-400">Confiance de l'IA</span>
-                  <span className="text-indigo-400 font-medium">{item.confidence}%</span>
+                  <span className="text-indigo-400 font-medium">
+                    {normalizeScore(item.ai_score ?? item.confidence).toFixed(0)}%
+                  </span>
                 </div>
                 <div className="w-full bg-slate-700 h-1.5 rounded-full overflow-hidden">
                   <div
-                    className="bg-indigo-500 h-full rounded-full transition-all duration-1000"
-                    style={{ width: `${item.confidence}%` }}
+                    className={`${confidenceColor(normalizeScore(item.ai_score ?? item.confidence))} h-full rounded-full transition-all duration-1000`}
+                    style={{ width: `${normalizeScore(item.ai_score ?? item.confidence)}%` }}
                   ></div>
                 </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2 text-[11px] text-slate-300">
+                <div>Volume Z: {item.volume_z ?? '—'}</div>
+                <div>Sharpe: {item.sharpe ?? '—'}</div>
               </div>
 
               <p className="text-xs text-slate-300 bg-slate-900/50 p-2 rounded-md italic">
@@ -179,9 +204,14 @@ function AIRecommendations({ items, title = 'AI Portfolio Optimizer', emptyMessa
         )}
       </div>
 
-      <button className="w-full mt-6 py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-sm font-semibold transition-colors flex items-center justify-center gap-2">
+      <button
+        className="w-full mt-6 py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-sm font-semibold transition-colors flex items-center justify-center gap-2 disabled:opacity-60"
+        type="button"
+        onClick={onRefresh}
+        disabled={!onRefresh || isRefreshing}
+      >
         <CheckCircle2 size={18} />
-        Appliquer les recommandations
+        {isRefreshing ? 'Actualisation…' : 'Appliquer les recommandations'}
       </button>
     </div>
   );

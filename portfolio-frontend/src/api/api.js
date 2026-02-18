@@ -15,7 +15,7 @@ const apiBaseUrl = normalizeApiBase(
 		`${window.location.protocol}//${window.location.hostname}:8001`
 );
 
-const api = axios.create({ baseURL: apiBaseUrl, timeout: 10000 });
+const api = axios.create({ baseURL: apiBaseUrl, timeout: 30000 });
 
 api.interceptors.response.use(
 	(response) => response,

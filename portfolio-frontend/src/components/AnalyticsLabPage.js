@@ -64,10 +64,9 @@ function AnalyticsLabPage() {
     const loadBacktest = async () => {
       try {
         const backtestParams = { symbol: 'SPY', days: 365, universe };
-        const performanceParams = sandboxFilter === 'ALL' ? {} : { sandbox: sandboxFilter };
         const [backtestData, sandboxData, curveData, healthData] = await Promise.all([
           cachedGet('backtester/', backtestParams, 60000),
-          cachedGet('paper-trades/performance/', performanceParams, 30000),
+          cachedGet('paper-trades/performance/', {}, 30000),
           cachedGet('paper-trades/equity/', {}, 60000),
           cachedGet('health/', {}, 60000),
         ]);
@@ -120,13 +119,17 @@ function AnalyticsLabPage() {
     const lastValue = curve[curve.length - 1];
     const cagr = lastValue > 0 ? Math.pow(lastValue, 1 / years) - 1 : 0;
 
+    const monthlyContribution = 2300;
+    const monthlyRate = cagr / 12;
+    let projected = lastValue;
     const projectionPoints = Array.from({ length: 60 }, (_, i) => {
       const month = i + 1;
+      projected = projected * (1 + monthlyRate) + monthlyContribution;
       return {
         date: `+${month}m`,
         buyHold: null,
         strategy: null,
-        projection: lastValue * Math.pow(1 + cagr, month / 12),
+        projection: projected,
       };
     });
 
@@ -147,10 +150,20 @@ function AnalyticsLabPage() {
     });
   }, [sandboxCurve, sandboxFilter]);
 
+  const paperSharpe = useMemo(() => {
+    if (!sandboxStats?.length) return null;
+    const selected = sandboxFilter === 'ALL'
+      ? sandboxStats.find((stat) => stat.sandbox === 'WATCHLIST')
+      : sandboxStats.find((stat) => stat.sandbox === sandboxFilter);
+    if (!selected) return null;
+    return selected.sharpe_ratio ?? null;
+  }, [sandboxStats, sandboxFilter]);
+
   const reportMetrics = [
     { label: 'Win Rate', value: formatPct(backtest?.win_rate, 2) },
     { label: 'Total Return', value: formatPct(backtest?.total_return_pct, 2) },
     { label: 'Sharpe Ratio', value: formatNumber(backtest?.sharpe_ratio, 3) },
+    { label: 'Sharpe réel (paper)', value: paperSharpe === null ? '—' : formatNumber(paperSharpe, 3) },
     { label: 'Max Drawdown', value: formatPct((backtest?.max_drawdown ?? 0) * 100, 2) },
     { label: 'Final Balance', value: formatMoney(backtest?.final_balance) },
   ];
@@ -181,6 +194,22 @@ function AnalyticsLabPage() {
     AI_BLUECHIP: 'Sandbox 2 · AI Bluechip',
     AI_PENNY: 'Sandbox 3 · AI Penny',
   };
+
+  const orderedSandboxStats = useMemo(() => {
+    const map = new Map((sandboxStats || []).map((stat) => [stat.sandbox, stat]));
+    return ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'].map((key) => (
+      map.get(key) || {
+        sandbox: key,
+        initial_capital: 0,
+        trades: 0,
+        win_rate: 0,
+        total_return_pct: 0,
+        sharpe_ratio: 0,
+        max_drawdown: 0,
+        final_balance: 0,
+      }
+    ));
+  }, [sandboxStats]);
 
   const exportPerformanceCsv = () => {
     if (!sandboxStats.length) return;
@@ -329,6 +358,9 @@ function AnalyticsLabPage() {
                   {(sandboxFilter === 'ALL' || sandboxFilter === 'AI_PENNY') && (
                     <Line type="monotone" dataKey="AI_PENNY" name="Sandbox 3 · AI Penny" stroke="#f59e0b" strokeWidth={2} dot={false} />
                   )}
+                  {sandboxCurve?.series?.some((entry) => entry.sandbox === 'SPY_BUY_HOLD') && (
+                    <Line type="monotone" dataKey="SPY_BUY_HOLD" name="SPY Buy & Hold" stroke="#e2e8f0" strokeWidth={2} strokeDasharray="4 4" dot={false} />
+                  )}
                 </LineChart>
               </ResponsiveContainer>
             )}
@@ -369,7 +401,7 @@ function AnalyticsLabPage() {
             <p className="text-slate-400 text-sm">No sandbox results yet.</p>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              {sandboxStats.map((stat) => (
+              {orderedSandboxStats.map((stat) => (
                 <div key={stat.sandbox} className="bg-slate-950/60 border border-slate-800 rounded-2xl p-4">
                   <p className="text-xs text-slate-400 uppercase tracking-[0.2em]">
                     {sandboxLabels[stat.sandbox] || stat.sandbox}
@@ -388,7 +420,15 @@ function AnalyticsLabPage() {
         </div>
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 h-72">
           <div className="mb-4">
-            <p className="text-white font-semibold">Feature Importance</p>
+            <p className="text-white font-semibold">
+              Feature Importance
+              <span
+                className="ml-2 text-xs text-slate-400 cursor-help"
+                title="VolumeZ est le signal dominant pour éviter d'acheter quand le volume est faible."
+              >
+                ⓘ
+              </span>
+            </p>
             <p className="text-xs text-slate-400 mt-1">{calibrationSummary}</p>
           </div>
           {loading ? (

@@ -11,7 +11,9 @@ from django.utils import timezone
 from openai import OpenAI
 from openai import APIError, RateLimitError, AuthenticationError
 
-from .models import PriceHistory, Stock, StockNews
+from .models import PriceHistory, Stock, StockNews, AlertEvent
+from .ml_engine.engine.data_fusion import DataFusionEngine
+from .ml_engine.backtester import AIBacktester, load_or_train_model, get_model_path
 
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -166,6 +168,31 @@ def build_scout_summary(symbol: str, allow_llm: bool = True) -> dict[str, Any]:
     if sector_value and str(sector_value).strip().lower() == "unknown":
         sector_value = info.get("sector")
 
+    backtest_win_rate = None
+    try:
+        fusion = DataFusionEngine(symbol)
+        df = fusion.fuse_all()
+        if df is not None and not df.empty:
+            payload_model = load_or_train_model(df, model_path=get_model_path('BLUECHIP'))
+            if payload_model and payload_model.get('model'):
+                result = AIBacktester(df, payload_model, symbol=symbol).run_simulation(lookback_days=180)
+                backtest_win_rate = float(result.win_rate)
+    except Exception:
+        backtest_win_rate = None
+
+    if backtest_win_rate is not None and backtest_win_rate >= 60:
+        cutoff = timezone.now() - timedelta(hours=12)
+        existing = AlertEvent.objects.filter(
+            category='SCOUT_HIGH_PROB',
+            message__icontains=symbol,
+            created_at__gte=cutoff,
+        ).exists()
+        if not existing:
+            AlertEvent.objects.create(
+                category='SCOUT_HIGH_PROB',
+                message=f"🔥 Signal de Haute Probabilité détecté : {symbol} (Backtest {backtest_win_rate:.1f}%)",
+            )
+
     payload = {
         "symbol": symbol,
         "name": (stock.name if stock else info.get("shortName") or info.get("longName")),
@@ -182,6 +209,7 @@ def build_scout_summary(symbol: str, allow_llm: bool = True) -> dict[str, Any]:
         "price_change_3m": change_3m,
         "price_change_6m": change_6m,
         "news_sentiment": news_sentiment,
+        "backtest_win_rate": backtest_win_rate,
         "headlines": [
             (n.headline if hasattr(n, "headline") else n.get("title"))
             for n in news_items

@@ -83,6 +83,10 @@ from .ai_module import run_predictions
 from .tasks import _fetch_yahoo_screener, _fetch_yfinance_screeners
 from .ai_scout import build_scout_summary
 from .ml_engine.engine.data_fusion import DataFusionEngine
+from .ml_engine.collectors.news_rss import fetch_news_sentiment
+
+import feedparser
+from textblob import TextBlob
 from .ml_engine.backtester import (
 	AIBacktester,
 	BacktestResult,
@@ -91,6 +95,109 @@ from .ml_engine.backtester import (
 	get_model_path,
 	apply_feature_weighting_to_signal,
 )
+
+
+def generate_expert_advice(metrics: dict[str, float | None]) -> list[str]:
+	advice = []
+	sharpe = metrics.get('sharpe')
+	win_rate = metrics.get('win_rate')
+	max_drawdown = metrics.get('max_drawdown')
+	if sharpe is not None and sharpe < 1.0:
+		advice.append('⚠️ Risque trop élevé pour le rendement attendu.')
+	if win_rate is not None and win_rate < 50:
+		advice.append('❌ Stratégie de type pile ou face. Améliorez le filtrage.')
+	if max_drawdown is not None and max_drawdown > 10:
+		advice.append('🚨 Danger de perte en capital importante. Resserrez les Stops.')
+	return advice
+
+
+def _portfolio_return_snapshot() -> dict[str, float | None]:
+	portfolio = Portfolio.objects.first()
+	if not portfolio:
+		return {'portfolio_total_return_pct': None, 'portfolio_cost': None, 'portfolio_value': None}
+	holdings = PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
+	if not holdings.exists():
+		return {'portfolio_total_return_pct': None, 'portfolio_cost': None, 'portfolio_value': None}
+	cost_map: dict[str, dict[str, float]] = {}
+	for tx in Transaction.objects.filter(portfolio=portfolio):
+		symbol_key = (tx.stock.symbol or '').strip().upper() or str(tx.stock_id)
+		entry = cost_map.setdefault(symbol_key, {'shares': 0.0, 'buy_qty': 0.0, 'buy_cost': 0.0})
+		qty = float(tx.shares or 0)
+		sign = 1 if tx.transaction_type == 'BUY' else -1
+		entry['shares'] += qty * sign
+		if tx.transaction_type == 'BUY':
+			entry['buy_qty'] += qty
+			entry['buy_cost'] += qty * float(tx.price_per_share or 0)
+	current_value = 0.0
+	cost_value = 0.0
+	for holding in holdings:
+		stock = holding.stock
+		price = float(stock.latest_price or 0)
+		if price <= 0:
+			last = PriceHistory.objects.filter(stock=stock).order_by('-date').first()
+			price = float(last.close_price) if last else 0.0
+		symbol_key = (stock.symbol or '').strip().upper() or str(stock.id)
+		cost_data = cost_map.get(symbol_key, {})
+		buy_qty = float(cost_data.get('buy_qty') or 0)
+		buy_cost = float(cost_data.get('buy_cost') or 0)
+		avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
+		shares = float(holding.shares or 0)
+		current_value += price * shares
+		cost_value += avg_cost * shares
+	return_pct = ((current_value - cost_value) / cost_value * 100) if cost_value else None
+	return {
+		'portfolio_total_return_pct': round(float(return_pct), 2) if return_pct is not None else None,
+		'portfolio_cost': round(cost_value, 2),
+		'portfolio_value': round(current_value, 2),
+	}
+
+
+def _news_sentiment_24h(symbol: str) -> tuple[float, int, int]:
+	symbol = (symbol or '').strip().upper()
+	if not symbol:
+		return 0.0, 0, 0
+	stock = Stock.objects.filter(symbol__iexact=symbol).first()
+	now = timezone.now()
+	start_24 = now - timedelta(hours=24)
+	start_48 = now - timedelta(hours=48)
+	qs = StockNews.objects.filter(stock=stock) if stock else StockNews.objects.filter(stock__symbol__iexact=symbol)
+	current_qs = qs.filter(published_at__gte=start_24)
+	prev_qs = qs.filter(published_at__gte=start_48, published_at__lt=start_24)
+	current_count = current_qs.count()
+	prev_count = prev_qs.count()
+	if current_count > 0:
+		avg_sentiment = current_qs.aggregate(avg=models.Avg('sentiment')).get('avg') or 0.0
+		return float(avg_sentiment), current_count, prev_count
+	result = fetch_news_sentiment(symbol, days=1)
+	return float(result.get('news_sentiment') or 0.0), int(result.get('news_count') or 0), prev_count
+
+
+def _rss_sentiment_window(ticker: str, hours: int, offset_hours: int = 0) -> float:
+	if not ticker:
+		return 0.0
+	now = datetime.utcnow() - timedelta(hours=offset_hours)
+	start = now - timedelta(hours=hours)
+	rss_url = (
+		f"https://news.google.com/rss/search?q={ticker}+stock+when:1d"
+		"&hl=en-CA&gl=CA&ceid=CA:en"
+	)
+	feed = feedparser.parse(rss_url)
+	entries = feed.entries or []
+	scores = []
+	for entry in entries:
+		published = getattr(entry, 'published_parsed', None)
+		if not published:
+			continue
+		published_dt = datetime(*published[:6])
+		if published_dt < start or published_dt > now:
+			continue
+		title = getattr(entry, 'title', '')
+		if not title:
+			continue
+		scores.append(TextBlob(title).sentiment.polarity)
+	if not scores:
+		return 0.0
+	return float(sum(scores) / len(scores))
 
 
 class StockViewSet(viewsets.ModelViewSet):
@@ -830,8 +937,13 @@ class PaperTradeSummaryView(APIView):
 
 			closed_pnl = float(sum([float(t.pnl or 0) for t in closed_trades]))
 			open_value = 0.0
+			total_risk = 0.0
 			for t in open_trades:
 				open_value += float(t.entry_price) * float(t.quantity)
+				entry_price = float(t.entry_price or 0)
+				stop_loss = float(t.stop_loss or 0)
+				if entry_price and stop_loss and entry_price > stop_loss:
+					total_risk += (entry_price - stop_loss) * float(t.quantity)
 
 			available = initial_capital + closed_pnl - open_value
 			return Response({
@@ -839,6 +951,7 @@ class PaperTradeSummaryView(APIView):
 				'initial_capital': initial_capital,
 				'available_capital': round(available, 2),
 				'open_value': round(open_value, 2),
+				'total_risk': round(total_risk, 2),
 				'closed_pnl': round(closed_pnl, 2),
 				'open_positions': PaperTradeSerializer(open_trades, many=True).data,
 				'closed_positions': PaperTradeSerializer(closed_trades[:25], many=True).data,
@@ -849,6 +962,7 @@ class PaperTradeSummaryView(APIView):
 				'initial_capital': initial_capital,
 				'available_capital': round(initial_capital, 2),
 				'open_value': 0,
+				'total_risk': 0,
 				'closed_pnl': 0,
 				'open_positions': [],
 				'closed_positions': [],
@@ -1019,6 +1133,24 @@ class PaperTradeEquityCurveView(APIView):
 					capital = curves[sandbox][date_key]
 				data.append(capital)
 			series.append({'sandbox': sandbox, 'equity_curve': data})
+
+		if ordered_dates:
+			try:
+				start = datetime.fromisoformat(ordered_dates[0]).date()
+				end = datetime.fromisoformat(ordered_dates[-1]).date() + timedelta(days=1)
+				hist = yf.Ticker('SPY').history(start=start.isoformat(), end=end.isoformat(), interval='1d')
+				if hist is not None and not hist.empty and 'Close' in hist:
+					spy_map = {idx.date().isoformat(): float(val) for idx, val in hist['Close'].items()}
+					first_price = spy_map.get(ordered_dates[0])
+					if first_price:
+						base_capital = float(os.getenv('PAPER_CAPITAL', '10000'))
+						spy_curve = []
+						for date_key in ordered_dates:
+							price = spy_map.get(date_key, first_price)
+							spy_curve.append(round(base_capital * (price / first_price), 2))
+						series.append({'sandbox': 'SPY_BUY_HOLD', 'equity_curve': spy_curve})
+			except Exception:
+				pass
 
 		return Response({'dates': ordered_dates, 'series': series})
 
@@ -1209,6 +1341,15 @@ class PortfolioDashboardView(APIView):
 		except (TypeError, ValueError):
 			return None
 
+	def _current_drawdown(self, values: list[float]) -> float:
+		if not values:
+			return 0.0
+		peak = max(values)
+		current = values[-1]
+		if not peak:
+			return 0.0
+		return (current - peak) / peak
+
 	def _price_at_or_before(self, stock: Stock, target_date: date) -> float | None:
 		row = PriceHistory.objects.filter(stock=stock, date__lte=target_date).order_by('-date').first()
 		if not row:
@@ -1224,6 +1365,52 @@ class PortfolioDashboardView(APIView):
 			return self._safe_float(frame.tail(1).iloc[0].get('VolumeZ'))
 		except Exception:
 			return None
+
+	def _get_rsi(self, symbol: str) -> float | None:
+		try:
+			fusion = DataFusionEngine(symbol)
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				return None
+			return self._safe_float(frame.tail(1).iloc[0].get('RSI14'))
+		except Exception:
+			return None
+
+	def _get_ma20(self, symbol: str) -> float | None:
+		try:
+			fusion = DataFusionEngine(symbol)
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				return None
+			return self._safe_float(frame.tail(1).iloc[0].get('MA20'))
+		except Exception:
+			return None
+
+	def _stop_price(self, price: float) -> float | None:
+		try:
+			return round(float(price) * 0.95, 4) if price else None
+		except Exception:
+			return None
+
+	def _model_stats(self, symbol: str) -> dict[str, float | None]:
+		try:
+			fusion = DataFusionEngine(symbol)
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				return {'win_rate': None, 'sharpe': None}
+			stock = Stock.objects.filter(symbol__iexact=symbol).first()
+			is_stable = False
+			if stock:
+				is_stable = float(stock.latest_price or 0) >= 5 or float(stock.dividend_yield or 0) >= 0.02
+			universe = 'BLUECHIP' if is_stable else 'PENNY'
+			payload = load_or_train_model(frame, model_path=get_model_path(universe))
+			if not payload or not payload.get('model'):
+				return {'win_rate': None, 'sharpe': None}
+			backtester = AIBacktester(frame, payload, symbol=symbol)
+			result = backtester.run_simulation(lookback_days=90)
+			return {'win_rate': float(result.win_rate), 'sharpe': float(result.sharpe_ratio)}
+		except Exception:
+			return {'win_rate': None, 'sharpe': None}
 
 	def _coerce_date(self, value: Any) -> date | None:
 		if value is None:
@@ -1324,9 +1511,21 @@ class PortfolioDashboardView(APIView):
 			volume_z = float(last_row.iloc[0].get('VolumeZ', 0.0) or 0.0)
 			vol_regime = float(last_row.iloc[0].get('vol_regime', 0.0) or 0.0)
 			ai_score = round(signal * 100, 2)
+			stats = None
+			try:
+				backtester = AIBacktester(fusion_df, payload, symbol=symbol)
+				result = backtester.run_simulation(lookback_days=90)
+				stats = {'win_rate': float(result.win_rate), 'sharpe': float(result.sharpe_ratio)}
+			except Exception:
+				stats = {'win_rate': None, 'sharpe': None}
 			min_score = float(os.getenv('CONFIDENCE_AI_SCORE_MIN', '80'))
 			min_volume_z = float(os.getenv('CONFIDENCE_VOLUME_Z_MIN', '0.5'))
 			max_vol_regime = float(os.getenv('CONFIDENCE_VOL_REGIME_MAX', '1.6'))
+			note = None
+			recent_closed = list(PaperTrade.objects.filter(status='CLOSED').order_by('-exit_date')[:3])
+			if len(recent_closed) == 3 and all(t.outcome == 'LOSS' for t in recent_closed):
+				ai_score = max(0.0, ai_score - 10)
+				note = 'Le marché a changé de régime (Volatilité haute), réduisez la taille de vos positions.'
 			status = 'neutral'
 			label = 'Signal en attente'
 			if max_vol_regime and vol_regime >= max_vol_regime:
@@ -1343,8 +1542,11 @@ class PortfolioDashboardView(APIView):
 				'ai_score': ai_score,
 				'volume_z': round(volume_z, 3),
 				'vol_regime': round(vol_regime, 3),
+				'win_rate': stats.get('win_rate') if stats else None,
+				'sharpe': stats.get('sharpe') if stats else None,
 				'status': status,
 				'label': label,
+				'note': note,
 				'thresholds': {
 					'ai_score_min': min_score,
 					'volume_z_min': min_volume_z,
@@ -1394,6 +1596,9 @@ class PortfolioDashboardView(APIView):
 				continue
 			stock = payload['stock']
 			volume_z = self._get_volume_z(stock.symbol) if enrich else None
+			rsi = self._get_rsi(stock.symbol) if enrich else None
+			ma20 = self._get_ma20(stock.symbol) if enrich else None
+			stats = self._model_stats(stock.symbol) if enrich else {'win_rate': None, 'sharpe': None}
 			rel_strength = self._sector_relative_strength(stock) if enrich else None
 			if enrich:
 				earnings_blacklisted, earnings_date = self._earnings_blacklist(stock.symbol)
@@ -1428,6 +1633,17 @@ class PortfolioDashboardView(APIView):
 			else:
 				risky_value += value
 
+			ai_score, trend = self._ai_score(stock.symbol) if enrich else (None, None)
+			exit_strategy = None
+			if enrich and ai_score is not None and volume_z is not None and trend == 'descending':
+				if volume_z < 0 and ai_score < 65:
+					stop_loss = round(effective_price * 0.97, 2)
+					exit_strategy = {
+						'action': 'VENDRE 50%',
+						'instructions': f"Vendre la moitié maintenant. Placer un Stop-Loss à {stop_loss}$ sur le solde pour 15 jours.",
+						'reason': 'Divergence Volume/Prix + Baisse du score IA.',
+					}
+
 			items.append({
 				'ticker': stock.symbol,
 				'name': stock.name,
@@ -1441,6 +1657,13 @@ class PortfolioDashboardView(APIView):
 				'unrealized_pnl': round(unrealized, 2),
 				'unrealized_pnl_pct': round(unrealized_pct, 2),
 				'volume_z': round(volume_z, 2) if volume_z is not None else None,
+				'ai_score': round(float(ai_score), 2) if ai_score is not None else None,
+				'rsi': round(rsi, 2) if rsi is not None else None,
+				'ma20': round(ma20, 4) if ma20 is not None else None,
+				'stop_price': self._stop_price(effective_price),
+				'exit_strategy': exit_strategy,
+				'model_win_rate': round(float(stats.get('win_rate') or 0), 2) if stats.get('win_rate') is not None else None,
+				'model_sharpe': round(float(stats.get('sharpe') or 0), 2) if stats.get('sharpe') is not None else None,
 				'relative_strength': rel_strength,
 				'earnings_blacklisted': earnings_blacklisted,
 				'earnings_date': earnings_date.isoformat() if earnings_date else None,
@@ -1477,6 +1700,7 @@ class PortfolioDashboardView(APIView):
 					'change_24h_pct': 0,
 					'change_7d': 0,
 					'change_7d_pct': 0,
+					'current_drawdown': 0,
 					'allocation': {
 						'stable_pct': 0,
 						'risky_pct': 0,
@@ -1484,6 +1708,7 @@ class PortfolioDashboardView(APIView):
 						'risky_value': 0,
 					},
 					'holdings': [],
+					'archives': [],
 					'chart': [],
 					'confidence_meter': self._build_confidence_meter(),
 				}, status=200)
@@ -1507,6 +1732,7 @@ class PortfolioDashboardView(APIView):
 				'change_24h_pct': round(change_1d_pct, 2),
 				'change_7d': round(change_7d, 2),
 				'change_7d_pct': round(change_7d_pct, 2),
+				'current_drawdown': 0,
 				'allocation': {
 					'stable_pct': round(allocation_pct, 2),
 					'risky_pct': round(100 - allocation_pct, 2),
@@ -1514,6 +1740,7 @@ class PortfolioDashboardView(APIView):
 					'risky_value': round(risky_value, 2),
 				},
 				'holdings': items,
+				'archives': [],
 				'chart': [],
 				'confidence_meter': self._build_confidence_meter(),
 			}, status=200)
@@ -1563,6 +1790,9 @@ class PortfolioDashboardView(APIView):
 		for holding in holdings:
 			stock = holding.stock
 			volume_z = self._get_volume_z(stock.symbol) if enrich else None
+			rsi = self._get_rsi(stock.symbol) if enrich else None
+			ma20 = self._get_ma20(stock.symbol) if enrich else None
+			stats = self._model_stats(stock.symbol) if enrich else {'win_rate': None, 'sharpe': None}
 			rel_strength = self._sector_relative_strength(stock) if enrich else None
 			if enrich:
 				earnings_blacklisted, earnings_date = self._earnings_blacklist(stock.symbol)
@@ -1635,6 +1865,11 @@ class PortfolioDashboardView(APIView):
 				'unrealized_pnl': round(unrealized, 2),
 				'unrealized_pnl_pct': round(unrealized_pct, 2),
 				'volume_z': round(volume_z, 2) if volume_z is not None else None,
+				'rsi': round(rsi, 2) if rsi is not None else None,
+				'ma20': round(ma20, 4) if ma20 is not None else None,
+				'stop_price': self._stop_price(effective_price),
+				'model_win_rate': round(float(stats.get('win_rate') or 0), 2) if stats.get('win_rate') is not None else None,
+				'model_sharpe': round(float(stats.get('sharpe') or 0), 2) if stats.get('sharpe') is not None else None,
 				'relative_strength': rel_strength,
 				'earnings_blacklisted': earnings_blacklisted,
 				'earnings_date': earnings_date.isoformat() if earnings_date else None,
@@ -1649,6 +1884,23 @@ class PortfolioDashboardView(APIView):
 			risky_value = fallback['risky_value']
 			change_1d = fallback['change_1d']
 			change_7d = fallback['change_7d']
+
+		archived = []
+		if items:
+			kept = []
+			for item in items:
+				win_rate = item.get('model_win_rate')
+				if win_rate is not None and float(win_rate) < 45:
+					archived.append(item)
+					value = float(item.get('value') or 0)
+					total_value = max(0.0, total_value - value)
+					if item.get('category') == 'Stable':
+						stable_value = max(0.0, stable_value - value)
+					else:
+						risky_value = max(0.0, risky_value - value)
+				else:
+					kept.append(item)
+			items = kept
 
 		allocation_pct = (stable_value / total_value * 100) if total_value else 0
 		change_1d_pct = (change_1d / (total_value - change_1d) * 100) if total_value else 0
@@ -1669,6 +1921,9 @@ class PortfolioDashboardView(APIView):
 				for i in range(12)
 			]
 
+		chart_values = [float(point.get('value') or 0) for point in chart if point.get('value') is not None]
+		current_drawdown = self._current_drawdown(chart_values)
+
 		return Response({
 			'portfolio': {'id': portfolio.id, 'name': portfolio.name},
 			'total_balance': round(total_value, 2),
@@ -1676,6 +1931,7 @@ class PortfolioDashboardView(APIView):
 			'change_24h_pct': round(change_1d_pct, 2),
 			'change_7d': round(change_7d, 2),
 			'change_7d_pct': round(change_7d_pct, 2),
+			'current_drawdown': round(float(current_drawdown) * 100, 2),
 			'allocation': {
 				'stable_pct': round(allocation_pct, 2),
 				'risky_pct': round(100 - allocation_pct, 2),
@@ -1683,6 +1939,7 @@ class PortfolioDashboardView(APIView):
 				'risky_value': round(risky_value, 2),
 			},
 			'holdings': items,
+			'archives': archived,
 			'chart': chart,
 			'confidence_meter': self._build_confidence_meter(),
 		})
@@ -1700,6 +1957,238 @@ class AccountDashboardView(APIView):
 			return float(stock.latest_price)
 		last = PriceHistory.objects.filter(stock=stock).order_by('-date').first()
 		return float(last.close_price) if last else 0.0
+
+	def _get_rsi(self, symbol: str) -> float | None:
+		try:
+			fusion = DataFusionEngine(symbol)
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				return None
+			return float(frame.tail(1).iloc[0].get('RSI14'))
+		except Exception:
+			return None
+
+	def _get_volume_z(self, symbol: str) -> float | None:
+		try:
+			fusion = DataFusionEngine(symbol)
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				return None
+			return float(frame.tail(1).iloc[0].get('VolumeZ'))
+		except Exception:
+			return None
+
+	def _get_ma20(self, symbol: str) -> float | None:
+		try:
+			fusion = DataFusionEngine(symbol)
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				return None
+			return float(frame.tail(1).iloc[0].get('MA20'))
+		except Exception:
+			return None
+
+	def _ai_score(self, symbol: str) -> tuple[float | None, str | None]:
+		try:
+			fusion = DataFusionEngine(symbol)
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				return None, None
+			payload = load_or_train_model(frame, model_path=get_model_path('BLUECHIP'))
+			if not payload or not payload.get('model'):
+				return None, None
+			last_row = frame.tail(2).copy()
+			feature_list = payload.get('features') or FEATURE_COLUMNS
+			for col in feature_list:
+				if col not in last_row.columns:
+					last_row[col] = 0.0
+			features = last_row[feature_list].fillna(0).values
+			signal = float(payload['model'].predict_proba(features[-1:])[0][1])
+			ai_score = round(signal * 100, 2)
+			trend = None
+			if len(last_row) >= 2:
+				ma20_now = float(last_row.iloc[-1].get('MA20') or 0)
+				ma20_prev = float(last_row.iloc[-2].get('MA20') or 0)
+				rsi_now = float(last_row.iloc[-1].get('RSI14') or 0)
+				trend = 'descending' if ma20_now < ma20_prev or rsi_now < 50 else 'ascending'
+			return ai_score, trend
+		except Exception:
+			return None, None
+
+	def _stop_price(self, price: float) -> float | None:
+		try:
+			return round(float(price) * 0.95, 4) if price else None
+		except Exception:
+			return None
+
+	def _model_stats(self, symbol: str) -> dict[str, float | None]:
+		try:
+			fusion = DataFusionEngine(symbol)
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				return {'win_rate': None, 'sharpe': None}
+			stock = Stock.objects.filter(symbol__iexact=symbol).first()
+			is_stable = False
+			if stock:
+				is_stable = float(stock.latest_price or 0) >= 5 or float(stock.dividend_yield or 0) >= 0.02
+			universe = 'BLUECHIP' if is_stable else 'PENNY'
+			payload = load_or_train_model(frame, model_path=get_model_path(universe))
+			if not payload or not payload.get('model'):
+				return {'win_rate': None, 'sharpe': None}
+			backtester = AIBacktester(frame, payload, symbol=symbol)
+			result = backtester.run_simulation(lookback_days=90)
+			return {'win_rate': float(result.win_rate), 'sharpe': float(result.sharpe_ratio)}
+		except Exception:
+			return {'win_rate': None, 'sharpe': None}
+
+	def _macro_snapshot(self) -> dict[str, Any]:
+		try:
+			dxy = yf.Ticker('DX-Y.NYB').history(period='5d', interval='1d')
+			oil = yf.Ticker('CL=F').history(period='5d', interval='1d')
+			gold = yf.Ticker('GC=F').history(period='5d', interval='1d')
+			def _latest_change(frame):
+				if frame is None or frame.empty or 'Close' not in frame:
+					return None, None
+				closes = frame['Close'].dropna()
+				if len(closes) < 2:
+					return float(closes.iloc[-1]), None
+				return float(closes.iloc[-1]), float((closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2] * 100)
+			dxy_price, dxy_change = _latest_change(dxy)
+			oil_price, oil_change = _latest_change(oil)
+			gold_price, gold_change = _latest_change(gold)
+			tech_risk = bool(dxy_change is not None and dxy_change > 0.5) or bool(gold_change is not None and gold_change > 0.5)
+			return {
+				'dxy': dxy_price,
+				'dxy_change_pct': dxy_change,
+				'oil': oil_price,
+				'oil_change_pct': oil_change,
+				'gold': gold_price,
+				'gold_change_pct': gold_change,
+				'tech_risk': tech_risk,
+			}
+		except Exception:
+			return {}
+
+	def _pyramid_steps(self, symbol: str, price: float, avg_cost: float, volume_z: float | None, rsi: float | None, ma20: float | None) -> dict[str, Any]:
+		ai_score, _ = self._ai_score(symbol)
+		macro = self._macro_snapshot()
+		tech_risk = macro.get('tech_risk')
+		oil_change = macro.get('oil_change_pct')
+		if symbol.upper() == 'ATD.TO' and oil_change is not None and oil_change < 0:
+			ai_score = (ai_score or 0) + 5
+		is_tech = (Stock.objects.filter(symbol__iexact=symbol).values_list('sector', flat=True).first() or '').lower() == 'technology'
+		macro_veto = bool(tech_risk and is_tech)
+		vague_amount = 2300 * 0.25
+		steps = []
+		step1_ok = ai_score is not None and ai_score >= 85 and (volume_z is not None and volume_z > 0.5)
+		steps.append({'label': 'Vague 1 (Éclaireur)', 'condition': 'AI Score > 85% & Volume Z > 0.5', 'amount': vague_amount, 'status': 'READY' if step1_ok else 'WAITING'})
+		step2_ok = price >= (avg_cost * 1.02) and (volume_z is not None and volume_z >= 0)
+		if step2_ok:
+			stock = Stock.objects.filter(symbol__iexact=symbol).first()
+			cutoff = timezone.now() - timedelta(hours=24)
+			existing = AlertEvent.objects.filter(
+				category='PYRAMID_WAVE_2',
+				stock=stock,
+				created_at__gte=cutoff,
+			).exists()
+			if not existing:
+				AlertEvent.objects.create(
+					category='PYRAMID_WAVE_2',
+					stock=stock,
+					message=f"🚀 VAGUE 2 VALIDÉE : {symbol} prix +2% avec Volume Z stable.",
+				)
+		steps.append({'label': 'Vague 2 (Confirmation)', 'condition': 'Prix > Achat + 2% & Volume Z stable', 'amount': vague_amount, 'status': 'READY' if step2_ok and not macro_veto else 'WAITING'})
+		step3_ok = (ma20 is not None and price > ma20) and (rsi is not None and rsi < 70)
+		steps.append({'label': 'Vague 3 (Tendance)', 'condition': 'Prix > MA20 & RSI < 70', 'amount': vague_amount, 'status': 'READY' if step3_ok and not macro_veto else 'WAITING'})
+		step4_ok = price >= avg_cost
+		steps.append({'label': 'Vague 4 (Finale)', 'condition': 'Stop-loss au point mort (Break-even)', 'amount': vague_amount, 'status': 'READY' if step4_ok else 'LOCKED'})
+		progress = 25 * sum(1 for step in steps if step['status'] == 'READY')
+		next_step = next((step for step in steps if step['status'] != 'READY'), steps[-1])
+		return {
+			'progress_pct': min(progress, 100),
+			'next_step': next_step,
+			'steps': steps,
+			'macro_veto': macro_veto,
+		}
+
+	def _insider_summary(self, symbol: str) -> dict[str, Any] | None:
+		api_key = os.getenv('FMP_API_KEY')
+		if not api_key:
+			return None
+		url = f"https://financialmodelingprep.com/api/v4/insider-trading?symbol={symbol}&limit=50&apikey={api_key}"
+		try:
+			resp = requests.get(url, timeout=10)
+			if resp.status_code != 200:
+				return None
+			items = resp.json() or []
+		except Exception:
+			return None
+		if not isinstance(items, list) or not items:
+			return None
+		cutoff = timezone.now() - timedelta(days=90)
+		total_buy = 0.0
+		for item in items:
+			date_str = item.get('transactionDate') or item.get('date')
+			if date_str:
+				try:
+					if datetime.fromisoformat(date_str).date() < cutoff.date():
+						continue
+				except Exception:
+					pass
+			trans_type = (item.get('transactionType') or '').lower()
+			if 'purchase' not in trans_type and 'buy' not in trans_type:
+				continue
+			amount = item.get('transactionValue')
+			if amount is None:
+				price = float(item.get('price') or 0)
+				shares = float(item.get('securitiesTransacted') or 0)
+				amount = price * shares
+			try:
+				total_buy += float(amount or 0)
+			except Exception:
+				continue
+		return {
+			'total_buy': round(total_buy, 2),
+			'insiders_buying': total_buy >= 50000,
+		}
+
+	def _institutional_summary(self, symbol: str) -> dict[str, Any] | None:
+		try:
+			ticker = yf.Ticker(symbol)
+			inst = getattr(ticker, 'institutional_holders', None)
+			if inst is None or inst.empty:
+				inst = getattr(ticker, 'major_holders', None)
+			if inst is None or inst.empty:
+				return None
+			holders = []
+			accumulation = 0
+			exit_warning = False
+			if 'Holder' in inst.columns:
+				for _, row in inst.head(5).iterrows():
+					change = row.get('Change')
+					change_val = None
+					try:
+						change_val = float(change)
+					except Exception:
+						change_val = None
+					if change_val is not None:
+						if change_val > 0:
+							accumulation += 1
+						if change_val <= -0.1:
+							exit_warning = True
+					holders.append({
+						'holder': row.get('Holder'),
+						'shares': row.get('Shares') or row.get('TotalShares') or row.get('Shares Outstanding'),
+						'change': change,
+					})
+			return {
+				'holders': holders,
+				'accumulation_count': accumulation,
+				'whale_signal': accumulation >= 2,
+				'exit_warning': exit_warning,
+			}
+		except Exception:
+			return None
 
 	def get(self, request):
 		account_id = request.query_params.get('account_id')
@@ -1743,6 +2232,7 @@ class AccountDashboardView(APIView):
 			positions = []
 			total_value = 0.0
 			total_cost = 0.0
+			macro_snapshot = self._macro_snapshot()
 			for payload in position_map.get(account.id, {}).values():
 				shares = float(payload['shares'] or 0)
 				if shares <= 0:
@@ -1752,6 +2242,13 @@ class AccountDashboardView(APIView):
 				buy_cost = float(payload.get('buy_cost') or 0)
 				avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
 				current = self._current_price(stock)
+				rsi = self._get_rsi(stock.symbol)
+				ma20 = self._get_ma20(stock.symbol)
+				volume_z = self._get_volume_z(stock.symbol)
+				stats = self._model_stats(stock.symbol)
+				pyramid = self._pyramid_steps(stock.symbol, current, avg_cost, volume_z=volume_z, rsi=rsi, ma20=ma20)
+				insider = self._insider_summary(stock.symbol)
+				institutional = self._institutional_summary(stock.symbol)
 				current_value = current * shares
 				cost_value = avg_cost * shares
 				unrealized_pct = ((current_value - cost_value) / cost_value * 100) if cost_value else None
@@ -1781,6 +2278,15 @@ class AccountDashboardView(APIView):
 					'cost_value': round(cost_value, 2),
 					'current_price': round(current, 4),
 					'current_value': round(current_value, 2),
+					'rsi': round(rsi, 2) if rsi is not None else None,
+					'ma20': round(ma20, 4) if ma20 is not None else None,
+					'volume_z': round(volume_z, 2) if volume_z is not None else None,
+					'stop_price': self._stop_price(current),
+					'pyramid': pyramid,
+					'insider': insider,
+					'institutional': institutional,
+					'model_win_rate': round(float(stats.get('win_rate') or 0), 2) if stats.get('win_rate') is not None else None,
+					'model_sharpe': round(float(stats.get('sharpe') or 0), 2) if stats.get('sharpe') is not None else None,
 					'unrealized_pnl_pct': round(unrealized_pct, 2) if unrealized_pct is not None else None,
 					'weekly_return_pct': round(weekly_return, 2) if weekly_return is not None else None,
 					'monthly_return_pct': round(monthly_return, 2) if monthly_return is not None else None,
@@ -1797,6 +2303,7 @@ class AccountDashboardView(APIView):
 				'total_value': round(total_value, 2),
 				'total_cost': round(total_cost, 2),
 				'positions': positions,
+				'macro': macro_snapshot,
 			})
 
 		gainer = None
@@ -1907,6 +2414,76 @@ class PortfolioNewsView(APIView):
 			'thresholds': {
 				'sentiment': sentiment_threshold,
 			},
+		})
+
+
+class SentimentScannerView(APIView):
+	def _sentiment_payload(self, symbol: str) -> dict[str, Any]:
+		avg_sentiment, count_24h, count_prev = _news_sentiment_24h(symbol)
+		hype_ratio = (count_24h / max(count_prev, 1)) if count_24h else 0.0
+		hype_level = 'HIGH_HYPE' if hype_ratio > 2.0 else 'ORGANIC'
+		mood = 'NEUTRAL'
+		if avg_sentiment >= 0.6:
+			mood = 'BULLISH'
+		elif avg_sentiment <= 0.4:
+			mood = 'BEARISH'
+		recommendation = 'STABLE'
+		if hype_level == 'HIGH_HYPE' and mood == 'BULLISH':
+			recommendation = "⚠️ EUPHORIA: Don't FOMO. Tighten stops."
+		elif hype_level == 'ORGANIC' and mood == 'BEARISH':
+			recommendation = '💎 VALUE PLAY: Look for entry signals.'
+		hype_detected = False
+		if count_prev > 0:
+			hype_detected = count_24h > (count_prev * 1.5)
+		else:
+			hype_detected = count_24h >= 10
+		return {
+			'symbol': symbol,
+			'sentiment_score': round(float(avg_sentiment), 3),
+			'news_count_24h': int(count_24h),
+			'news_count_prev_24h': int(count_prev),
+			'hype_ratio': round(float(hype_ratio), 2),
+			'hype_detected': hype_detected,
+			'hype_level': hype_level,
+			'market_mood': mood,
+			'recommendation': recommendation,
+		}
+
+	def get(self, request):
+		tickers_param = request.query_params.get('tickers')
+		limit = int(request.query_params.get('limit', 8))
+		limit = max(1, min(limit, 25))
+		if tickers_param:
+			symbols = [s.strip().upper() for s in tickers_param.split(',') if s.strip()]
+		else:
+			portfolio = Portfolio.objects.first()
+			if portfolio:
+				symbols = list(
+					PortfolioHolding.objects.filter(portfolio=portfolio)
+					.values_list('stock__symbol', flat=True)
+				)
+			else:
+				symbols = list(Stock.objects.order_by('symbol').values_list('symbol', flat=True))
+			symbols = [s for s in symbols if s][:limit]
+
+		results = [self._sentiment_payload(symbol) for symbol in symbols]
+
+		btc_score = _rss_sentiment_window('Bitcoin', hours=4, offset_hours=0)
+		btc_prev = _rss_sentiment_window('Bitcoin', hours=4, offset_hours=4)
+		tech_score = _rss_sentiment_window('TEC.TO', hours=24, offset_hours=0)
+		risk_off = btc_prev != 0 and ((btc_score - btc_prev) / abs(btc_prev)) <= -0.2
+		divergence = abs(btc_score - tech_score) > 0.3
+		market_vitals = {
+			'btc_sentiment': round(float(btc_score), 3),
+			'btc_prev_4h': round(float(btc_prev), 3),
+			'tech_sentiment': round(float(tech_score), 3),
+			'btc_drop_20pct_4h': bool(risk_off),
+			'divergence': bool(divergence),
+		}
+
+		return Response({
+			'results': results,
+			'market_vitals': market_vitals,
 		})
 
 
@@ -2531,6 +3108,27 @@ class AIBacktesterView(APIView):
 		payload = load_or_train_model(data, model_path=get_model_path(universe))
 		backtester = AIBacktester(data, payload, symbol=symbol)
 		result = backtester.run_simulation(lookback_days=days)
+		portfolio_snapshot = _portfolio_return_snapshot()
+		paper_stats = None
+		try:
+			closed = PaperTrade.objects.filter(status='CLOSED')
+			trades = closed.count()
+			wins = closed.filter(outcome='WIN').count()
+			win_rate = (wins / trades) * 100 if trades else 0.0
+			returns = []
+			for t in closed:
+				entry_value = float(t.entry_price) * float(t.quantity)
+				trade_return = float(t.pnl or 0) / entry_value if entry_value else 0.0
+				returns.append(trade_return)
+			mean_ret = float(np.mean(returns)) if returns else 0.0
+			std_ret = float(np.std(returns)) if returns else 0.0
+			sharpe = (mean_ret / std_ret) * np.sqrt(len(returns)) if std_ret else 0.0
+			paper_stats = {
+				'paper_win_rate': round(win_rate, 2),
+				'paper_sharpe': round(float(sharpe), 3),
+			}
+		except Exception:
+			paper_stats = None
 
 		feature_importance = []
 		model_version = ''
@@ -2571,7 +3169,20 @@ class AIBacktesterView(APIView):
 			'total_return_pct': result.total_return_pct,
 			'win_rate': result.win_rate,
 			'sharpe_ratio': result.sharpe_ratio,
+			'sortino_ratio': result.sortino_ratio,
+			'profit_factor': result.profit_factor,
+			'recovery_factor': result.recovery_factor,
+			'monte_carlo_ruin_pct': result.monte_carlo_ruin_pct,
 			'max_drawdown': result.max_drawdown,
+			'expert_advice': generate_expert_advice({
+				'sharpe': result.sharpe_ratio,
+				'win_rate': result.win_rate,
+				'max_drawdown': result.max_drawdown * 100,
+			}),
+			'paper_vs_portfolio': {
+				**(portfolio_snapshot or {}),
+				**(paper_stats or {}),
+			},
 			'equity_curve': result.equity_curve,
 			'buy_hold_curve': result.buy_hold_curve,
 			'dates': result.dates,
@@ -2589,6 +3200,116 @@ class AIBacktesterView(APIView):
 class PortfolioOptimizerView(APIView):
 	def _clamp(self, value: float, low: float, high: float) -> float:
 		return max(low, min(high, value))
+
+	def _to_float(self, value: Any) -> float | None:
+		try:
+			if value is None:
+				return None
+			return float(value)
+		except (TypeError, ValueError):
+			return None
+
+	def _percent(self, value: Any) -> float | None:
+		parsed = self._to_float(value)
+		if parsed is None:
+			return None
+		return round(parsed * 100, 2) if parsed <= 1 else round(parsed, 2)
+
+	def _df_value(self, df: pd.DataFrame | None, labels: list[str]) -> float | None:
+		if df is None or df.empty:
+			return None
+		for label in labels:
+			if label in df.index:
+				return self._to_float(df.loc[label].iloc[0])
+		return None
+
+	def _fundamentals_snapshot(self, symbol: str) -> dict[str, Any]:
+		info = {}
+		try:
+			info = yf.Ticker(symbol).info or {}
+		except Exception:
+			info = {}
+
+		sector = info.get('sector') or ''
+		revenue_growth = self._percent(info.get('revenueGrowth'))
+		current_ratio = self._to_float(info.get('currentRatio'))
+		dividend_yield = self._percent(info.get('dividendYield'))
+		market_cap = self._to_float(info.get('marketCap'))
+		free_cashflow = self._to_float(info.get('freeCashflow'))
+		dividend_rate = self._to_float(info.get('dividendRate'))
+		shares_outstanding = self._to_float(info.get('sharesOutstanding'))
+		yield_safety = None
+		if free_cashflow and dividend_rate and shares_outstanding:
+			annual_dividends = dividend_rate * shares_outstanding
+			if annual_dividends:
+				yield_safety = free_cashflow / annual_dividends
+
+		total_return_12y = None
+		try:
+			ticker = yf.Ticker(symbol)
+			hist = ticker.history(period='13y', interval='1d')
+			if hist is not None and not hist.empty and 'Close' in hist:
+				price_now = float(hist['Close'].iloc[-1])
+				start_idx = max(0, len(hist) - 252 * 12)
+				price_then = float(hist['Close'].iloc[start_idx]) if len(hist) > start_idx else None
+				dividends = ticker.dividends
+				div_sum = 0.0
+				if dividends is not None and not dividends.empty:
+					cutoff = hist.index[start_idx]
+					div_sum = float(dividends[dividends.index >= cutoff].sum())
+				if price_then and price_then > 0:
+					total_return_12y = (price_now - price_then + div_sum) / price_then
+		except Exception:
+			total_return_12y = None
+		altman_z = None
+		try:
+			ticker = yf.Ticker(symbol)
+			balance = ticker.balance_sheet
+			financials = ticker.financials
+			total_assets = self._df_value(balance, ['Total Assets', 'Total assets'])
+			total_liab = self._df_value(balance, ['Total Liab', 'Total Liabilities', 'Total Liabilities Net Minority Interest'])
+			retained = self._df_value(balance, ['Retained Earnings'])
+			current_assets = self._df_value(balance, ['Total Current Assets', 'Current Assets'])
+			current_liab = self._df_value(balance, ['Total Current Liabilities', 'Current Liabilities'])
+			ebit = self._df_value(financials, ['EBIT', 'Ebit'])
+			sales = self._df_value(financials, ['Total Revenue', 'Total revenue'])
+			if sales is None:
+				sales = self._to_float(info.get('totalRevenue'))
+			market_cap = self._to_float(info.get('marketCap'))
+			working_cap = None
+			if current_assets is not None and current_liab is not None:
+				working_cap = current_assets - current_liab
+			if (
+				total_assets
+				and total_liab
+				and retained is not None
+				and ebit is not None
+				and sales is not None
+				and market_cap
+				and working_cap is not None
+			):
+				altman_z = (
+					1.2 * (working_cap / total_assets)
+					+ 1.4 * (retained / total_assets)
+					+ 3.3 * (ebit / total_assets)
+					+ 0.6 * (market_cap / total_liab)
+					+ 1.0 * (sales / total_assets)
+				)
+		except Exception:
+			altman_z = None
+
+		return {
+			'sector': sector,
+			'revenue_growth': revenue_growth,
+			'current_ratio': current_ratio,
+			'dividend_yield': dividend_yield,
+			'market_cap': market_cap,
+			'free_cashflow': free_cashflow,
+			'dividend_rate': dividend_rate,
+			'yield_safety': yield_safety,
+			'total_return_12y': total_return_12y,
+			'altman_z': altman_z,
+		}
 
 	def _model_bundle(self, symbol: str, universe: str) -> tuple[pd.DataFrame, dict] | tuple[None, None]:
 		try:
@@ -2634,6 +3355,49 @@ class PortfolioOptimizerView(APIView):
 		confidence = (signal_pct * 0.7) + (win_pct * 0.3)
 		return int(round(self._clamp(confidence, 45, 95)))
 
+	def _sma(self, series: pd.Series | None, window: int) -> float | None:
+		if series is None or series.empty or window <= 0:
+			return None
+		if len(series) < window:
+			return None
+		try:
+			return float(series.tail(window).mean())
+		except Exception:
+			return None
+
+	def _correlation_with_nasdaq(self, symbol: str) -> float | None:
+		try:
+			if not symbol:
+				return None
+			hist_symbol = yf.Ticker(symbol).history(period='120d', interval='1d')
+			hist_nasdaq = yf.Ticker('^IXIC').history(period='120d', interval='1d')
+			if hist_symbol is None or hist_nasdaq is None:
+				return None
+			if hist_symbol.empty or hist_nasdaq.empty:
+				return None
+			series_symbol = hist_symbol['Close'].pct_change().dropna()
+			series_nasdaq = hist_nasdaq['Close'].pct_change().dropna()
+			aligned = pd.concat([series_symbol, series_nasdaq], axis=1, join='inner').dropna()
+			if aligned.shape[0] < 20:
+				return None
+			return float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
+		except Exception:
+			return None
+
+	def _distance_to_ma(self, price: float, ma: float | None) -> float | None:
+		if ma is None or not ma:
+			return None
+		try:
+			return ((price - ma) / ma) * 100
+		except Exception:
+			return None
+
+	def set_trailing_stop(self, trigger_price: float) -> float:
+		try:
+			return round(float(trigger_price) * 0.95, 4)
+		except Exception:
+			return 0.0
+
 	def _build_drivers(self, signal: float, buy_threshold: float, sell_threshold: float, row: pd.Series) -> list[str]:
 		drivers: list[str] = []
 		if signal >= buy_threshold:
@@ -2658,12 +3422,26 @@ class PortfolioOptimizerView(APIView):
 				drivers.append('RSI en zone de survente.')
 		return drivers
 
-	def _build_metrics(self, row: pd.Series, signal: float, result: BacktestResult | None) -> list[dict[str, str]]:
+	def _build_metrics(self, df: pd.DataFrame, row: pd.Series, symbol: str, signal: float, result: BacktestResult | None, fundamentals: dict[str, Any] | None = None) -> list[dict[str, str]]:
 		metrics = [
 			{'label': 'Signal', 'value': f"{signal * 100:.1f}%"},
 		]
 		if 'Close' in row:
-			metrics.append({'label': 'Prix', 'value': f"${float(row.get('Close') or 0):.2f}"})
+			price_value = float(row.get('Close') or 0)
+			metrics.append({'label': 'Prix', 'value': f"${price_value:.2f}"})
+			ma20 = self._sma(df.get('Close'), 20) if df is not None else None
+			if ma20 is not None:
+				metrics.append({'label': 'MA20', 'value': f"${ma20:.2f}"})
+				distance = self._distance_to_ma(price_value, ma20)
+				if distance is not None:
+					metrics.append({'label': 'Distance MA20', 'value': f"{distance:.1f}%"})
+			sma200 = self._sma(df.get('Close'), 200) if df is not None else None
+			if sma200 is not None:
+				metrics.append({'label': 'SMA200', 'value': f"${sma200:.2f}"})
+				metrics.append({'label': 'Trailing stop (5%)', 'value': f"${self.set_trailing_stop(price_value):.2f}"})
+		rsi_value = row.get('RSI14')
+		if rsi_value is not None:
+			metrics.append({'label': 'RSI', 'value': f"{float(rsi_value or 0):.1f}"})
 		volume_z = row.get('VolumeZ')
 		if volume_z is not None:
 			metrics.append({'label': 'Volume Z', 'value': f"{float(volume_z or 0):.2f}"})
@@ -2671,6 +3449,25 @@ class PortfolioOptimizerView(APIView):
 			metrics.append({'label': 'Win rate', 'value': f"{result.win_rate:.1f}%"})
 			metrics.append({'label': 'Sharpe', 'value': f"{result.sharpe_ratio:.2f}"})
 			metrics.append({'label': 'Max DD', 'value': f"{result.max_drawdown * 100:.1f}%"})
+		if fundamentals:
+			altman_z = fundamentals.get('altman_z')
+			if altman_z is not None:
+				metrics.append({'label': 'Altman Z', 'value': f"{float(altman_z):.2f}"})
+			dividend_yield = fundamentals.get('dividend_yield')
+			if dividend_yield is not None:
+				metrics.append({'label': 'Dividend Yield', 'value': f"{float(dividend_yield):.2f}%"})
+			yield_safety = fundamentals.get('yield_safety')
+			if yield_safety is not None:
+				metrics.append({'label': 'Yield Safety', 'value': f"{float(yield_safety):.2f}x"})
+			total_return_12y = fundamentals.get('total_return_12y')
+			if total_return_12y is not None:
+				metrics.append({'label': 'Total Return 12y', 'value': f"{float(total_return_12y) * 100:.1f}%"})
+
+		etf_symbols = [s.strip().upper() for s in os.getenv('ETF_SYMBOLS', 'TEC.TO').split(',') if s.strip()]
+		if symbol.upper() in etf_symbols:
+			corr = self._correlation_with_nasdaq(symbol)
+			if corr is not None:
+				metrics.append({'label': 'Corr NASDAQ', 'value': f"{corr:.2f}"})
 		return metrics
 
 	def _build_risks(self, row: pd.Series, result: BacktestResult | None) -> list[str]:
@@ -2708,6 +3505,25 @@ class PortfolioOptimizerView(APIView):
 		signal, row = self._latest_signal(data, payload, symbol)
 		result = self._backtest(data, payload, symbol, lookback_days, buy_threshold, sell_threshold)
 		confidence = self._confidence(signal, result.win_rate if result else None)
+		win_rate = result.win_rate if result else 0
+		sharpe = result.sharpe_ratio if result else 0
+		volume_z = float(row.get('VolumeZ', 0.0) or 0.0)
+		min_volume_z = float(os.getenv('VOLUME_ZSCORE_MIN', '0.5'))
+		rsi_value = float(row.get('RSI14', 0.0) or 0.0)
+		price_value = float(row.get('Close', 0.0) or 0.0)
+		ma20 = self._sma(data.get('Close') if data is not None else None, 20)
+		sma200 = self._sma(data.get('Close') if data is not None else None, 200)
+		etf_symbols = [s.strip().upper() for s in os.getenv('ETF_SYMBOLS', 'TEC.TO').split(',') if s.strip()]
+		is_etf = symbol.upper() in etf_symbols
+		is_speculative = bool(result and (result.win_rate < 50 or result.sharpe_ratio < 1.0))
+		fundamentals = self._fundamentals_snapshot(symbol)
+		sector = (fundamentals.get('sector') or holding.stock.sector or '')
+		revenue_growth = fundamentals.get('revenue_growth')
+		altman_z = fundamentals.get('altman_z')
+		dividend_yield = fundamentals.get('dividend_yield')
+		market_cap = fundamentals.get('market_cap')
+		is_healthcare = 'health' in str(sector).lower()
+		price_above_ma20 = ma20 is None or price_value > ma20
 		if signal >= buy_threshold:
 			action = 'BUY MORE'
 		elif signal <= sell_threshold:
@@ -2717,28 +3533,104 @@ class PortfolioOptimizerView(APIView):
 		else:
 			action = 'KEEP'
 
+		if confidence < 70 or win_rate == 0:
+			action = 'KEEP'
+		if is_speculative:
+			action = 'KEEP'
+		if action == 'BUY MORE' and confidence < 80:
+			action = 'KEEP'
+		if universe == 'PENNY' and is_healthcare and revenue_growth is not None and revenue_growth < 0:
+			action = 'KEEP'
+		if action == 'BUY MORE' and not price_above_ma20:
+			action = 'KEEP'
+
 		reason = f"Signal modèle {signal * 100:.1f}%"
 		if result:
 			reason = f"{reason} · Win rate backtest {result.win_rate:.1f}%"
 		advice = []
-		if action == 'BUY MORE':
-			advice = [
-				'Renforcer progressivement (backtester validé).',
-				'Surveiller le volume et ajuster le trailing stop.',
-			]
-		elif action == 'SELL':
-			advice = ['Réduire l’exposition si la tendance reste faible.']
+		advice_color = 'Red'
+		ai_score = float(signal or 0.0)
+		performance_shield = bool(result and (result.sharpe_ratio < 0 or result.win_rate < 45))
+		if performance_shield:
+			advice = ['❌ AVOID (Risque élevé)', 'Le modèle manque de précision historique sur ce ticker.']
+			advice_color = 'Red'
+			action = 'KEEP'
+		elif win_rate < 50:
+			advice = ['⚠️ SPÉCULATIF (win rate < 50%).']
+			advice_color = 'Red'
+		elif ai_score >= 0.90:
+			advice = ['🚀 STRONG BUY (Conviction)']
+			advice_color = 'DeepGreen'
+		elif ai_score >= 0.85:
+			advice = ['✅ BUY (Accumuler)']
+			advice_color = 'BrightGreen'
+		elif ai_score >= 0.70:
+			advice = ['✋ HOLD (Patienter/Dividendes)']
+			advice_color = 'Blue'
+		elif ai_score >= 0.50:
+			advice = ['⚠️ NEUTRAL (Observation)']
+			advice_color = 'Yellow'
+		else:
+			advice = ['❌ AVOID / SELL (Protection)']
+			advice_color = 'Red'
+
+		if volume_z < 0 and ai_score >= 0.85:
+			advice = ['✋ HOLD (Attendre confirmation volume)']
+			advice_color = 'Cyan'
+
+		if confidence < 70 or win_rate == 0:
+			advice = ['NE PAS TOUCHER (Données insuffisantes).']
+			advice_color = 'Red'
+		elif action != 'BUY MORE' and confidence < 80:
+			advice = ['✋ HOLD / NEUTRAL (score < 80%).']
+			advice_color = 'Yellow'
+		if universe == 'PENNY' and is_healthcare and revenue_growth is not None and revenue_growth < 0:
+			advice = ['Revenue Growth négatif: éviter de renforcer.']
+			advice_color = 'Red'
+		if is_etf and win_rate > 55 and rsi_value < 35:
+			advice = ['Accumulation Stratégique.']
+			advice_color = 'BrightGreen'
+			if sma200 is not None and price_value > sma200:
+				advice.append('Accumulation sécuritaire (au-dessus SMA200).')
+		if dividend_yield is not None and dividend_yield > 5 and action != 'SELL':
+			advice.append('Dividende maintenu: priorité au revenu.')
+		if action == 'SELL' and (dividend_yield is not None and dividend_yield > 5) and signal > sell_threshold:
+			action = 'KEEP'
+
+		alerts: list[str] = []
+		try:
+			if data is not None and 'Close' in data and 'VolumeZ' in data:
+				close_series = data['Close'].tail(3)
+				vol_series = data['VolumeZ'].tail(3)
+				if len(close_series) == 3 and len(vol_series) == 3:
+					price_up = close_series.iloc[2] > close_series.iloc[1] > close_series.iloc[0]
+					vol_weak = (vol_series < -0.5).all()
+					if price_up and vol_weak:
+						alerts.append('⚠️ Divergence détectée : Hausse non supportée par le volume. Remontez vos Stops.')
+		except Exception:
+			pass
 
 		return {
 			'ticker': symbol,
 			'name': holding.stock.name or symbol,
 			'signal': action,
 			'confidence': confidence,
+			'ai_score': round(signal * 100, 2),
 			'reason': reason,
 			'drivers': self._build_drivers(signal, buy_threshold, sell_threshold, row),
-			'metrics': self._build_metrics(row, signal, result),
+			'metrics': self._build_metrics(data, row, symbol, signal, result, fundamentals),
 			'risks': self._build_risks(row, result),
 			'advice': advice,
+			'advice_color': advice_color,
+			'alerts': alerts,
+			'speculative': is_speculative,
+			'altman_z': altman_z,
+			'volume_z': round(volume_z, 2),
+			'win_rate': round(float(win_rate), 2) if result else None,
+			'sharpe': round(float(sharpe), 2) if result else None,
+			'price': round(price_value, 4),
+			'market_cap': market_cap,
+			'dividend_yield': dividend_yield,
 			'type': 'Bluechip' if universe == 'BLUECHIP' else 'Watchlist',
 		}
 
@@ -2756,7 +3648,18 @@ class PortfolioOptimizerView(APIView):
 		result = self._backtest(data, payload, symbol, lookback_days, buy_threshold, sell_threshold)
 		if result and result.win_rate < min_win_rate:
 			return None
+		fundamentals = self._fundamentals_snapshot(symbol)
+		sector = fundamentals.get('sector') or ''
+		revenue_growth = fundamentals.get('revenue_growth')
+		altman_z = fundamentals.get('altman_z')
+		market_cap = fundamentals.get('market_cap')
+		is_healthcare = 'health' in str(sector).lower()
+		if universe == 'PENNY' and is_healthcare and revenue_growth is not None and revenue_growth < 0:
+			return None
+		is_speculative = bool(result and (result.win_rate < 50 or result.sharpe_ratio < 1.0))
 		confidence = self._confidence(signal, result.win_rate if result else None)
+		if is_speculative:
+			return None
 		name = symbol
 		stock = Stock.objects.filter(symbol__iexact=symbol).first()
 		if stock and stock.name:
@@ -2769,10 +3672,19 @@ class PortfolioOptimizerView(APIView):
 			'name': name,
 			'signal': 'ADD',
 			'confidence': confidence,
+			'ai_score': round(signal * 100, 2),
 			'reason': reason,
 			'drivers': self._build_drivers(signal, buy_threshold, sell_threshold, row),
-			'metrics': self._build_metrics(row, signal, result),
+			'metrics': self._build_metrics(data, row, symbol, signal, result, fundamentals),
 			'risks': self._build_risks(row, result),
+			'altman_z': altman_z,
+			'speculative': is_speculative,
+			'volume_z': round(float(row.get('VolumeZ', 0.0) or 0.0), 2),
+			'win_rate': round(float(result.win_rate), 2) if result else None,
+			'sharpe': round(float(result.sharpe_ratio), 2) if result else None,
+			'price': round(float(row.get('Close', 0.0) or 0.0), 4),
+			'market_cap': market_cap,
+			'dividend_yield': fundamentals.get('dividend_yield'),
 			'type': 'Bluechip' if universe == 'BLUECHIP' else 'Penny',
 		}
 
@@ -2850,7 +3762,13 @@ class PortfolioOptimizerView(APIView):
 			if suggestion:
 				suggestions.append(suggestion)
 
-		suggestions.sort(key=lambda item: item.get('confidence', 0), reverse=True)
+		def _priority(item: dict[str, Any]) -> tuple[int, float, float]:
+			altman_z = item.get('altman_z')
+			altman_ok = 1 if altman_z is not None and float(altman_z) > 3.0 else 0
+			altman_score = float(altman_z) if altman_z is not None else 0.0
+			return (altman_ok, altman_score, float(item.get('confidence', 0)))
+
+		suggestions.sort(key=_priority, reverse=True)
 		max_suggestions = int(os.getenv('OPTIMIZER_SUGGESTIONS_LIMIT', '8'))
 		if not actions and not suggestions:
 			fallback = []

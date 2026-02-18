@@ -10,6 +10,10 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
 
 
 MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_v1.pkl"
@@ -22,6 +26,15 @@ FEATURE_COLUMNS = [
     "CPIAUCSL",
     "VolumeZ",
 ]
+
+TRIPLE_BARRIER_UP_PCT = float(os.getenv("TRIPLE_BARRIER_UP_PCT", "0.05"))
+TRIPLE_BARRIER_DOWN_PCT = float(os.getenv("TRIPLE_BARRIER_DOWN_PCT", "0.03"))
+TRIPLE_BARRIER_MAX_DAYS = int(os.getenv("TRIPLE_BARRIER_MAX_DAYS", "20"))
+TIME_SERIES_SPLITS = int(os.getenv("TIME_SERIES_SPLITS", "4"))
+TX_COST_PCT = float(os.getenv("BACKTEST_TX_COST_PCT", "0.002"))
+SLIPPAGE_PCT = float(os.getenv("BACKTEST_SLIPPAGE_PCT", "0.001"))
+MONTE_CARLO_RUNS = int(os.getenv("BACKTEST_MONTE_CARLO_RUNS", "1000"))
+RUIN_THRESHOLD_PCT = float(os.getenv("BACKTEST_RUIN_THRESHOLD_PCT", "0.6"))
 
 
 def get_model_path(universe: str | None = None) -> Path:
@@ -53,6 +66,10 @@ class BacktestResult:
     total_return_pct: float
     win_rate: float
     sharpe_ratio: float
+    sortino_ratio: float
+    profit_factor: float
+    recovery_factor: float
+    monte_carlo_ruin_pct: float
     max_drawdown: float
     equity_curve: list[float]
     buy_hold_curve: list[float]
@@ -149,7 +166,54 @@ def _ensure_features(df: pd.DataFrame) -> pd.DataFrame:
     for col in FEATURE_COLUMNS:
         if col not in data.columns:
             data[col] = 0.0
+    if "sector_code" in data.columns and "VolumeZ" in data.columns:
+        grouped = data.groupby("sector_code")["VolumeZ"]
+        mean = grouped.transform("mean")
+        std = grouped.transform("std").replace(0, np.nan)
+        data["VolumeZ"] = (data["VolumeZ"] - mean) / std
     return data
+
+
+def _triple_barrier_labels(close: pd.Series) -> pd.Series:
+    if close is None or close.empty:
+        return pd.Series(dtype=float)
+    prices = close.values
+    labels = np.full(len(prices), np.nan)
+    for i in range(len(prices) - 1):
+        entry = prices[i]
+        if entry <= 0:
+            continue
+        upper = entry * (1 + TRIPLE_BARRIER_UP_PCT)
+        lower = entry * (1 - TRIPLE_BARRIER_DOWN_PCT)
+        end = min(len(prices), i + TRIPLE_BARRIER_MAX_DAYS + 1)
+        hit = 0
+        for j in range(i + 1, end):
+            if prices[j] >= upper:
+                hit = 1
+                break
+            if prices[j] <= lower:
+                hit = 0
+                break
+        labels[i] = hit
+    return pd.Series(labels, index=close.index)
+
+
+def _select_features(X_df: pd.DataFrame, y: np.ndarray) -> list[str]:
+    try:
+        selector = LogisticRegression(
+            penalty="l1",
+            solver="liblinear",
+            max_iter=200,
+            class_weight="balanced",
+            random_state=42,
+        )
+        pipeline = make_pipeline(StandardScaler(with_mean=False), selector)
+        pipeline.fit(X_df.values, y)
+        coef = selector.coef_[0]
+        selected = [col for col, weight in zip(X_df.columns, coef) if abs(weight) > 1e-6]
+        return selected or list(X_df.columns)
+    except Exception:
+        return list(X_df.columns)
 
 
 def _build_training_set(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[str]]:
@@ -159,22 +223,18 @@ def _build_training_set(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[
         return np.array([]), np.array([]), []
 
     X_df = data[FEATURE_COLUMNS].fillna(0)
-    future_returns = data["Returns"].shift(-1)
-    risk_denom = data["Volatility"].replace(0, pd.NA)
-    risk_adj = future_returns / risk_denom
-    y = (risk_adj > 0).astype(int).values
-    if len(y) > 0:
-        X_df = X_df.iloc[:-1]
-        y = y[:-1]
-    corr = pd.Series(index=X_df.columns, dtype=float)
-    for col in X_df.columns:
-        if X_df[col].nunique() <= 1:
-            corr[col] = 0.0
-        else:
-            corr[col] = float(X_df[col].corr(pd.Series(y))) if len(y) else 0.0
+    if "Close" in data.columns:
+        labels = _triple_barrier_labels(data["Close"])
+    else:
+        labels = (data["Returns"].shift(-1) > 0).astype(int)
+    labels = labels.astype(float)
+    mask = labels.notna()
+    X_df = X_df[mask]
+    y = labels[mask].astype(int).values
+    if len(y) < 10 or len(set(y)) < 2:
+        return np.array([]), np.array([]), []
 
-    filtered = corr[abs(corr) >= 0.05].sort_values(key=lambda s: abs(s), ascending=False)
-    selected = list(filtered.index[:10]) if not filtered.empty else list(X_df.columns[:10])
+    selected = _select_features(X_df, y)
     X = X_df[selected].values
     return X, y, selected
 
@@ -184,6 +244,21 @@ def train_fusion_model(df: pd.DataFrame, model_path: Path = MODEL_PATH) -> dict 
     if X.size == 0 or y.size == 0:
         return None
 
+    cv_scores = []
+    if len(y) >= 20:
+        tscv = TimeSeriesSplit(n_splits=min(TIME_SERIES_SPLITS, max(2, len(y) // 20)))
+        for train_idx, test_idx in tscv.split(X):
+            model_cv = RandomForestClassifier(
+                n_estimators=300,
+                max_depth=5,
+                min_samples_split=8,
+                min_samples_leaf=10,
+                random_state=42,
+            )
+            model_cv.fit(X[train_idx], y[train_idx])
+            score = model_cv.score(X[test_idx], y[test_idx])
+            cv_scores.append(float(score))
+
     model = RandomForestClassifier(
         n_estimators=500,
         max_depth=5,
@@ -192,7 +267,13 @@ def train_fusion_model(df: pd.DataFrame, model_path: Path = MODEL_PATH) -> dict 
         random_state=42,
     )
     model.fit(X, y)
-    payload = {"model": model, "features": selected, "model_version": _new_model_version()}
+    payload = {
+        "model": model,
+        "features": selected,
+        "model_version": _new_model_version(),
+        "cv_scores": cv_scores,
+        "cv_mean": float(np.mean(cv_scores)) if cv_scores else None,
+    }
     joblib.dump(payload, model_path)
     return payload
 
@@ -213,6 +294,9 @@ def train_fusion_model_from_labels(
     if len(y) < 10 or len(set(y)) < 2:
         return None
 
+    selected = _select_features(X_df, y)
+    X_df = X_df[selected]
+
     model = RandomForestClassifier(
         n_estimators=500,
         max_depth=5,
@@ -223,7 +307,7 @@ def train_fusion_model_from_labels(
     model.fit(X_df.values, y)
     payload = {
         "model": model,
-        "features": FEATURE_COLUMNS,
+        "features": selected,
         "trained_from": "paper_trades",
         "sample_count": int(len(X_df)),
         "model_version": _new_model_version(),
@@ -267,6 +351,8 @@ class AIBacktester:
         atr_multiplier: float = 1.5,
         risk_per_trade_pct: float = 0.015,
         position_cap_pct: float = 0.10,
+        tx_cost_pct: float | None = None,
+        slippage_pct: float | None = None,
     ) -> BacktestResult:
         df = self.data.copy().sort_index()
         if lookback_days:
@@ -281,6 +367,10 @@ class AIBacktester:
                 total_return_pct=0.0,
                 win_rate=0.0,
                 sharpe_ratio=0.0,
+                sortino_ratio=0.0,
+                profit_factor=0.0,
+                recovery_factor=0.0,
+                monte_carlo_ruin_pct=0.0,
                 max_drawdown=0.0,
                 equity_curve=[],
                 buy_hold_curve=[],
@@ -330,6 +420,9 @@ class AIBacktester:
         position_weight = 0.0
         capital = self.initial_balance
         equity_curve = [1.0]
+        cost_pct = (tx_cost_pct if tx_cost_pct is not None else TX_COST_PCT) + (
+            slippage_pct if slippage_pct is not None else SLIPPAGE_PCT
+        )
 
         for idx in range(1, len(df)):
             row = df.iloc[idx]
@@ -363,6 +456,8 @@ class AIBacktester:
                 position_cap = capital * position_cap_pct
                 position_value = min(capital, position_cap, risk_budget / (stop_distance / entry_price))
                 position_weight = position_value / capital if capital else 0.0
+                if position_value > 0:
+                    capital -= position_value * cost_pct
             elif prev_pos == 1:
                 if price is not None and highest_price is not None:
                     highest_price = max(highest_price, price)
@@ -374,6 +469,7 @@ class AIBacktester:
                     entry_price = None
                     highest_price = None
                     position_weight = 0.0
+                    capital -= capital * cost_pct
 
             df.iloc[idx, df.columns.get_loc("position")] = pos
 
@@ -396,6 +492,13 @@ class AIBacktester:
         mean_ret = float(np.mean(strat_returns)) if len(strat_returns) else 0.0
         std_ret = float(np.std(strat_returns)) if len(strat_returns) else 0.0
         sharpe = float((mean_ret / std_ret) * np.sqrt(252)) if std_ret else 0.0
+        downside = np.where(strat_returns < 0, strat_returns, 0.0)
+        downside_std = float(np.std(downside)) if len(downside) else 0.0
+        sortino = float((mean_ret / downside_std) * np.sqrt(252)) if downside_std else 0.0
+
+        gains = strat_returns[strat_returns > 0].sum() if len(strat_returns) else 0.0
+        losses = abs(strat_returns[strat_returns < 0].sum()) if len(strat_returns) else 0.0
+        profit_factor = float(gains / losses) if losses else 0.0
 
         active = df[df["position"] != 0]
         wins = active[active["strategy_returns"] > 0]
@@ -403,6 +506,22 @@ class AIBacktester:
 
         final_balance = float(self.initial_balance * cumulative.iloc[-1]) if len(cumulative) else self.initial_balance
         total_return_pct = float((cumulative.iloc[-1] - 1) * 100) if len(cumulative) else 0.0
+        recovery_factor = 0.0
+        if max_drawdown:
+            recovery_factor = float((final_balance - self.initial_balance) / (abs(max_drawdown) * self.initial_balance))
+
+        monte_carlo_ruin_pct = 0.0
+        if MONTE_CARLO_RUNS > 0 and len(strat_returns) > 10:
+            ruin_count = 0
+            for _ in range(MONTE_CARLO_RUNS):
+                sampled = np.random.choice(strat_returns, size=len(strat_returns), replace=True)
+                equity = self.initial_balance
+                for r in sampled:
+                    equity *= (1 + r)
+                    if equity <= self.initial_balance * RUIN_THRESHOLD_PCT:
+                        ruin_count += 1
+                        break
+            monte_carlo_ruin_pct = float((ruin_count / MONTE_CARLO_RUNS) * 100)
 
         raw_position = np.where(df["ai_signal"] > buy_threshold, 1, 0)
         raw_position = np.where(df["ai_signal"] < sell_threshold, 0, raw_position)
@@ -430,6 +549,10 @@ class AIBacktester:
             total_return_pct=round(total_return_pct, 2),
             win_rate=round(win_rate, 2),
             sharpe_ratio=round(sharpe, 3),
+            sortino_ratio=round(sortino, 3),
+            profit_factor=round(profit_factor, 3),
+            recovery_factor=round(recovery_factor, 3),
+            monte_carlo_ruin_pct=round(monte_carlo_ruin_pct, 2),
             max_drawdown=round(max_drawdown, 4),
             equity_curve=[round(v, 4) for v in cumulative.tolist()],
             buy_hold_curve=[round(v, 4) for v in buy_hold_curve],

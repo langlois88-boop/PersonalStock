@@ -18,6 +18,9 @@ from celery.schedules import crontab
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# FX rates
+USD_CAD_RATE = float(os.getenv('USD_CAD_RATE', '1.36'))
+
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
@@ -33,6 +36,7 @@ ALLOWED_HOSTS = [
     '127.0.0.1',
     '192.168.2.92',
     '100.88.73.110',
+    'backend',
 ]
 
 
@@ -322,6 +326,7 @@ ALERT_EMAIL_TO = os.getenv('ALERT_EMAIL_TO', 'langlois88@gmail.com')
 ALERT_PRICE_THRESHOLD = float(os.getenv('ALERT_PRICE_THRESHOLD', '1000'))
 ALERT_DROP_PCT = float(os.getenv('ALERT_DROP_PCT', '5'))
 ALERT_CAPITAL_THRESHOLD = float(os.getenv('ALERT_CAPITAL_THRESHOLD', '10000'))
+ALERT_COOLDOWN_HOURS = int(os.getenv('ALERT_COOLDOWN_HOURS', '12'))
 ALERT_SMS_TO = os.getenv('ALERT_SMS_TO', '')
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID', '')
 TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN', '')

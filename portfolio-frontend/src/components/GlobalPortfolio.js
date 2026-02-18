@@ -10,6 +10,7 @@ const emptyState = {
   change_24h_pct: 0,
   change_7d: 0,
   change_7d_pct: 0,
+  current_drawdown: 0,
   allocation: { stable_pct: 0, risky_pct: 0 },
   holdings: [],
   chart: [],
@@ -41,6 +42,7 @@ function GlobalPortfolio() {
   const [newsLoading, setNewsLoading] = useState(false);
   const [newsSymbol, setNewsSymbol] = useState('ALL');
   const [newsVisible, setNewsVisible] = useState({ holdings: 6, sectors: 6, positive: 6, negative: 6 });
+  const [focusFilter, setFocusFilter] = useState(true);
 
   useEffect(() => {
     setLoading(true);
@@ -180,7 +182,10 @@ function GlobalPortfolio() {
 
   const sortPositions = (positions) => {
     const list = Array.isArray(positions) ? [...positions] : [];
-    list.sort((a, b) => {
+    const filtered = focusFilter
+      ? list.filter((pos) => pos.model_win_rate === null || Number(pos.model_win_rate || 0) >= 45)
+      : list;
+    filtered.sort((a, b) => {
       const aVal = getSortValue(a, sortConfig.key);
       const bVal = getSortValue(b, sortConfig.key);
       if (typeof aVal === 'string' && typeof bVal === 'string') {
@@ -188,7 +193,7 @@ function GlobalPortfolio() {
       }
       return sortConfig.direction === 'asc' ? aVal - bVal : bVal - aVal;
     });
-    return list;
+    return filtered;
   };
 
   const currentValueClass = (pos) => {
@@ -240,6 +245,15 @@ function GlobalPortfolio() {
   const confidenceAiScore = confidence.ai_score ?? null;
   const confidenceVolumeZ = confidence.volume_z ?? null;
   const confidenceVolRegime = confidence.vol_regime ?? null;
+  const confidenceWinRate = confidence.win_rate ?? null;
+  const confidenceSharpe = confidence.sharpe ?? null;
+  const confidenceScoreClass = () => {
+    const score = Number(confidenceAiScore || 0);
+    if (Number(confidenceSharpe) < 0) return 'text-rose-400 animate-pulse';
+    if (score > 85) return 'text-emerald-400';
+    if (score >= 70) return 'text-sky-300';
+    return 'text-amber-400';
+  };
 
   const exportAccountsCsv = () => {
     const rows = [];
@@ -251,6 +265,11 @@ function GlobalPortfolio() {
       'shares',
       'cost_value',
       'current_price',
+      'stop_price',
+      'rsi',
+      'ma20',
+      'model_win_rate',
+      'model_sharpe',
       'current_value',
       'weekly_return_pct',
       'monthly_return_pct',
@@ -268,6 +287,11 @@ function GlobalPortfolio() {
           pos.shares,
           pos.cost_value,
           pos.current_price,
+          pos.stop_price,
+          pos.rsi,
+          pos.ma20,
+          pos.model_win_rate,
+          pos.model_sharpe,
           pos.current_value,
           pos.weekly_return_pct,
           pos.monthly_return_pct,
@@ -315,6 +339,12 @@ function GlobalPortfolio() {
           subtitle={`${data.change_7d_pct}% sur 7 jours"`}
           accent={data.change_7d >= 0 ? 'text-emerald-400' : 'text-rose-400'}
         />
+        <StatCard
+          title="Drawdown actuel"
+          value={`${Number(data.current_drawdown || 0).toFixed(2)}%`}
+          subtitle="Depuis le dernier sommet"
+          accent={Number(data.current_drawdown || 0) < 0 ? 'text-rose-400' : 'text-emerald-400'}
+        />
         <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 backdrop-blur-md flex flex-col gap-2">
           <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Allocation 60/40</p>
           <div className="flex items-center gap-4">
@@ -341,7 +371,11 @@ function GlobalPortfolio() {
             <p className="text-xs opacity-80">Symbole: {confidenceSymbol}</p>
           </div>
           <div className="text-right text-xs space-y-1">
-            <p>IA Score: {confidenceAiScore === null ? '—' : `${confidenceAiScore.toFixed(2)}%`}</p>
+            <p className={confidenceScoreClass()}>
+              IA Score: {confidenceAiScore === null ? '—' : `${confidenceAiScore.toFixed(2)}%`}
+            </p>
+            <p>Win Rate: {confidenceWinRate === null ? '—' : `${Number(confidenceWinRate).toFixed(1)}%`}</p>
+            <p>Sharpe: {confidenceSharpe === null ? '—' : Number(confidenceSharpe).toFixed(2)}</p>
             <p>Volume Z: {confidenceVolumeZ === null ? '—' : confidenceVolumeZ.toFixed(2)}</p>
             <p>Vol Regime: {confidenceVolRegime === null ? '—' : confidenceVolRegime.toFixed(2)}</p>
           </div>
@@ -395,6 +429,15 @@ function GlobalPortfolio() {
                 const costValue = Number(row.cost_value || 0);
                 const unrealized = value - costValue;
                 const unrealizedPct = costValue ? (unrealized / costValue) * 100 : 0;
+                const underperform = unrealizedPct <= -15;
+                const rsiValue = row.rsi;
+                const rsiClass = rsiValue !== null && rsiValue !== undefined
+                  ? rsiValue < 30
+                    ? 'bg-violet-500/20 text-violet-200 border-violet-500/40'
+                    : rsiValue > 70
+                      ? 'bg-rose-500/20 text-rose-200 border-rose-500/40'
+                      : 'bg-slate-700/40 text-slate-200 border-slate-600'
+                  : 'bg-slate-800 text-slate-400 border-slate-700';
                 return (
                   <div key={row.ticker} className="flex items-center justify-between bg-slate-950/40 p-3 rounded-xl">
                     <div>
@@ -409,13 +452,23 @@ function GlobalPortfolio() {
                         </a>{' '}
                         <span
                           className={`text-[10px] px-2 py-0.5 rounded-full ${
-                            row.category === 'Stable'
+                            underperform
+                              ? 'bg-rose-500/10 text-rose-200 border border-rose-500/30'
+                              : row.category === 'Stable'
                               ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30'
                               : 'bg-rose-500/10 text-rose-300 border border-rose-500/30'
                           }`}
                         >
-                          {row.category}
+                          {underperform ? '⚠️ UNDERPERFORM' : row.category}
                         </span>
+                        <span className={`ml-2 text-[10px] px-2 py-0.5 rounded-full border ${rsiClass}`}>
+                          RSI {rsiValue !== null && rsiValue !== undefined ? Number(rsiValue).toFixed(0) : '—'}
+                        </span>
+                        {price < 0.5 ? (
+                          <span className="ml-2 text-[10px] px-2 py-0.5 rounded-full bg-rose-600/20 text-rose-200 border border-rose-500/40">
+                            Penny Stock Risk
+                          </span>
+                        ) : null}
                       </p>
                       <p className="text-xs text-slate-400">{row.name}</p>
                       <p className="text-xs text-slate-500">{shares.toFixed(2)} shares</p>
@@ -424,7 +477,7 @@ function GlobalPortfolio() {
                       </p>
                     </div>
                     <div className="text-right">
-                      <p className="text-white">${price.toFixed(2)}</p>
+                      <p className={`text-white ${price < 0.5 ? 'text-rose-200' : ''}`}>${price.toFixed(2)}</p>
                       <p className="text-xs text-slate-400">Value: ${value.toFixed(2)}</p>
                       <p className={`text-xs ${unrealized >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
                         P/L: {unrealized >= 0 ? '+' : ''}{unrealized.toFixed(2)} ({unrealizedPct.toFixed(2)}%)
@@ -440,12 +493,42 @@ function GlobalPortfolio() {
         </div>
       </div>
 
+      {data.archives && data.archives.length > 0 ? (
+        <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-lg font-semibold text-white">Archives / Spéculatif</h3>
+            <span className="text-xs text-rose-300">Exclus du solde total</span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+            {data.archives.map((item) => (
+              <div key={item.ticker} className="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+                <div className="flex items-center justify-between">
+                  <p className="text-white font-semibold">{item.ticker}</p>
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-rose-500/10 text-rose-200 border border-rose-500/30">
+                    ⚠️ SPÉCULATIF
+                  </span>
+                </div>
+                <p className="text-xs text-slate-400">{item.name}</p>
+                <p className="text-xs text-slate-500">P/L: {Number(item.unrealized_pnl_pct || 0).toFixed(2)}%</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         <div className="xl:col-span-2 bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
           <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
             <h3 className="text-lg font-semibold text-white">Comptes & positions</h3>
             <div className="flex items-center gap-3">
-              <span className="text-xs text-slate-400">Prix d'achat · Rendements</span>
+              <label className="flex items-center gap-2 text-xs text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={focusFilter}
+                  onChange={(event) => setFocusFilter(event.target.checked)}
+                />
+                Focus 1M$ (masquer Win Rate < 45%)
+              </label>
               <select
                 value={selectedAccountId}
                 onChange={(event) => setSelectedAccountId(event.target.value)}
@@ -468,6 +551,14 @@ function GlobalPortfolio() {
               </button>
             </div>
           </div>
+          {accountData.accounts?.[0]?.macro ? (
+            <div className="mb-4 text-xs text-slate-300">
+              DXY: {accountData.accounts[0].macro.dxy?.toFixed?.(2) ?? '—'} |
+              OIL: {accountData.accounts[0].macro.oil?.toFixed?.(2) ?? '—'} |
+              GOLD: {accountData.accounts[0].macro.gold?.toFixed?.(2) ?? '—'}
+              {accountData.accounts[0].macro.tech_risk ? ' - Statut : Prudence Tech' : ''}
+            </div>
+          ) : null}
           {accountLoading ? (
             <p className="text-sm text-slate-400">Chargement…</p>
           ) : accountData.accounts?.length ? (
@@ -512,6 +603,9 @@ function GlobalPortfolio() {
                               Prix actuel {sortIndicator('current_price')}
                             </button>
                           </th>
+                          <th className="text-right py-2">Stop</th>
+                          <th className="text-right py-2">RSI</th>
+                          <th className="text-right py-2">MA20</th>
                           <th className="text-right py-2">
                             <button type="button" onClick={() => toggleSort('current_value')} className="text-right">
                               Valeur actuelle {sortIndicator('current_value')}
@@ -537,6 +631,7 @@ function GlobalPortfolio() {
                               1a {sortIndicator('annual_return_pct')}
                             </button>
                           </th>
+                          <th className="text-right py-2">Pyramidage</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -551,11 +646,52 @@ function GlobalPortfolio() {
                               >
                                 {pos.ticker}
                               </a>
+                              {pos.insider?.insiders_buying ? (
+                                <span className="ml-2 text-[10px] px-2 py-0.5 rounded-full bg-emerald-600/20 text-emerald-200 border border-emerald-500/40">
+                                  Insiders Buying
+                                </span>
+                              ) : null}
+                              {pos.institutional?.whale_signal ? (
+                                <span className="ml-2 text-[10px] px-2 py-0.5 rounded-full bg-sky-500/20 text-sky-200 border border-sky-500/40">
+                                  🐋 Whale Accumulation
+                                </span>
+                              ) : null}
+                              {pos.institutional?.exit_warning ? (
+                                <span className="ml-2 text-[10px] px-2 py-0.5 rounded-full bg-rose-600/20 text-rose-200 border border-rose-500/40">
+                                  Exit Watch
+                                </span>
+                              ) : null}
                             </td>
                             <td className="py-2 text-right">{formatMoney(pos.avg_cost)}</td>
                             <td className="py-2 text-right">{Number(pos.shares || 0).toFixed(2)}</td>
                             <td className="py-2 text-right">{formatMoney(pos.cost_value)}</td>
-                            <td className="py-2 text-right">{formatMoney(pos.current_price)}</td>
+                            <td className="py-2 text-right">
+                              <div className="flex items-center justify-end gap-2">
+                                <span>{formatMoney(pos.current_price)}</span>
+                                {Number(pos.current_price || 0) < 0.5 ? (
+                                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-rose-600/20 text-rose-200 border border-rose-500/40">
+                                    Penny Stock Risk
+                                  </span>
+                                ) : null}
+                              </div>
+                            </td>
+                            <td className="py-2 text-right">{pos.stop_price ? `$${Number(pos.stop_price).toFixed(2)}` : '—'}</td>
+                            <td className="py-2 text-right">
+                              {pos.rsi !== null && pos.rsi !== undefined ? (
+                                <span
+                                  className={`text-[10px] px-2 py-0.5 rounded-full border ${
+                                    pos.rsi < 30
+                                      ? 'bg-violet-500/20 text-violet-200 border-violet-500/40'
+                                      : pos.rsi > 70
+                                        ? 'bg-rose-500/20 text-rose-200 border-rose-500/40'
+                                        : 'bg-slate-700/40 text-slate-200 border-slate-600'
+                                  }`}
+                                >
+                                  {Number(pos.rsi).toFixed(0)}
+                                </span>
+                              ) : '—'}
+                            </td>
+                            <td className="py-2 text-right">{pos.ma20 ? `$${Number(pos.ma20).toFixed(2)}` : '—'}</td>
                             <td className={`py-2 text-right ${currentValueClass(pos)}`}>{formatMoney(pos.current_value)}</td>
                             <td className={`py-2 text-right ${Number(pos.unrealized_pnl_pct || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
                               {formatPct(pos.unrealized_pnl_pct)}
@@ -568,6 +704,21 @@ function GlobalPortfolio() {
                             </td>
                             <td className={`py-2 text-right ${Number(pos.annual_return_pct || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
                               {formatPct(pos.annual_return_pct)}
+                            </td>
+                            <td className="py-2 text-right">
+                              {pos.pyramid ? (
+                                <div className="flex flex-col items-end gap-1">
+                                  <div className="w-24 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                                    <div
+                                      className="h-full bg-emerald-500"
+                                      style={{ width: `${pos.pyramid.progress_pct || 0}%` }}
+                                    ></div>
+                                  </div>
+                                  <span className="text-[10px] text-slate-400">
+                                    Prochaine: {pos.pyramid.next_step?.label || '—'}
+                                  </span>
+                                </div>
+                              ) : '—'}
                             </td>
                           </tr>
                         ))}

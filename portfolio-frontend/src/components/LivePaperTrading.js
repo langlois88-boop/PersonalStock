@@ -102,6 +102,7 @@ function LivePaperTrading() {
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
           <p className="text-xs text-slate-400 uppercase tracking-[0.2em]">Capital disponible</p>
           <p className="text-2xl text-white font-semibold">${summary.available_capital}</p>
+          <p className="mt-1 text-xs text-rose-400">Total Risk: ${summary.total_risk ?? 0}</p>
         </div>
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
           <p className="text-xs text-slate-400 uppercase tracking-[0.2em]">P&L réalisé</p>
