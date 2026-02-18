@@ -1374,6 +1374,9 @@ class PortfolioDashboardView(APIView):
 			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty:
+				if self._fast_mode():
+					stock = Stock.objects.filter(symbol__iexact=symbol).first()
+					return self._rsi_from_history(stock)
 				return None
 			return self._safe_float(frame.tail(1).iloc[0].get('RSI14'))
 		except Exception:
@@ -1384,9 +1387,54 @@ class PortfolioDashboardView(APIView):
 			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty or 'RSI14' not in frame:
+				if self._fast_mode():
+					stock = Stock.objects.filter(symbol__iexact=symbol).first()
+					return self._rsi_history_from_history(stock, window=window)
 				return []
 			values = frame['RSI14'].tail(window).tolist()
 			return [float(v) for v in values if v is not None]
+		except Exception:
+			return []
+
+	def _rsi_from_history(self, stock: Stock | None, window: int = 14) -> float | None:
+		if not stock:
+			return None
+		try:
+			closes = list(
+				PriceHistory.objects.filter(stock=stock).order_by('date').values_list('close_price', flat=True)
+			)
+			if len(closes) < window + 1:
+				return None
+			series = pd.Series([float(val) for val in closes])
+			delta = series.diff()
+			gain = delta.clip(lower=0).rolling(window, min_periods=window).mean()
+			loss = (-delta.clip(upper=0)).rolling(window, min_periods=window).mean()
+			rs = gain / loss.replace(0, pd.NA)
+			rsi = 100 - (100 / (1 + rs))
+			last = rsi.iloc[-1]
+			if pd.isna(last):
+				return None
+			return float(last)
+		except Exception:
+			return None
+
+	def _rsi_history_from_history(self, stock: Stock | None, window: int = 5) -> list[float]:
+		if not stock:
+			return []
+		try:
+			closes = list(
+				PriceHistory.objects.filter(stock=stock).order_by('date').values_list('close_price', flat=True)
+			)
+			if len(closes) < 15:
+				return []
+			series = pd.Series([float(val) for val in closes])
+			delta = series.diff()
+			gain = delta.clip(lower=0).rolling(14, min_periods=14).mean()
+			loss = (-delta.clip(upper=0)).rolling(14, min_periods=14).mean()
+			rs = gain / loss.replace(0, pd.NA)
+			rsi = 100 - (100 / (1 + rs))
+			values = rsi.tail(window).tolist()
+			return [float(v) for v in values if v is not None and not pd.isna(v)]
 		except Exception:
 			return []
 
@@ -2072,6 +2120,28 @@ class AccountDashboardView(APIView):
 	def _fast_mode(self) -> bool:
 		return str(os.getenv('DASHBOARD_FAST_MODE', '1')).strip().lower() in {'1', 'true', 'yes', 'y'}
 
+	def _rsi_from_history(self, stock: Stock | None, window: int = 14) -> float | None:
+		if not stock:
+			return None
+		try:
+			closes = list(
+				PriceHistory.objects.filter(stock=stock).order_by('date').values_list('close_price', flat=True)
+			)
+			if len(closes) < window + 1:
+				return None
+			series = pd.Series([float(val) for val in closes])
+			delta = series.diff()
+			gain = delta.clip(lower=0).rolling(window, min_periods=window).mean()
+			loss = (-delta.clip(upper=0)).rolling(window, min_periods=window).mean()
+			rs = gain / loss.replace(0, pd.NA)
+			rsi = 100 - (100 / (1 + rs))
+			last = rsi.iloc[-1]
+			if pd.isna(last):
+				return None
+			return float(last)
+		except Exception:
+			return None
+
 	def _price_at_or_before(self, stock: Stock, target_date: date) -> float | None:
 		row = PriceHistory.objects.filter(stock=stock, date__lte=target_date).order_by('-date').first()
 		if not row:
@@ -2089,6 +2159,9 @@ class AccountDashboardView(APIView):
 			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty:
+				if self._fast_mode():
+					stock = Stock.objects.filter(symbol__iexact=symbol).first()
+					return self._rsi_from_history(stock)
 				return None
 			return float(frame.tail(1).iloc[0].get('RSI14'))
 		except Exception:

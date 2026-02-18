@@ -10,9 +10,17 @@ const normalizeApiBase = (base) => {
 	return `${trimmed}/api/`;
 };
 
+const defaultApiBase = (() => {
+	const host = window.location.hostname;
+	const isLocal = host === 'localhost' || host === '127.0.0.1';
+	if (isLocal) {
+		return `${window.location.protocol}//${host}:8001`;
+	}
+	return window.location.origin;
+})();
+
 const apiBaseUrl = normalizeApiBase(
-	process.env.REACT_APP_API_BASE_URL ||
-		`${window.location.protocol}//${window.location.hostname}:8001`
+	process.env.REACT_APP_API_BASE_URL || defaultApiBase
 );
 
 const api = axios.create({ baseURL: apiBaseUrl, timeout: 30000 });
