@@ -2446,6 +2446,7 @@ class AccountDashboardView(APIView):
 				latest_two = list(PriceHistory.objects.filter(stock=stock).order_by('-date')[:2])
 				prev_close = float(latest_two[1].close_price) if len(latest_two) > 1 else None
 				day_change_pct = ((current - prev_close) / prev_close * 100) if prev_close else None
+				day_change_value = ((current - prev_close) * shares) if prev_close else None
 
 				position_payload = {
 					'account_id': account.id,
@@ -2472,6 +2473,7 @@ class AccountDashboardView(APIView):
 					'monthly_return_pct': round(monthly_return, 2) if monthly_return is not None else None,
 					'annual_return_pct': round(annual_return, 2) if annual_return is not None else None,
 					'day_change_pct': round(day_change_pct, 2) if day_change_pct is not None else None,
+					'day_change_value': round(day_change_value, 2) if day_change_value is not None else None,
 				}
 				positions.append(position_payload)
 				all_positions.append(position_payload)

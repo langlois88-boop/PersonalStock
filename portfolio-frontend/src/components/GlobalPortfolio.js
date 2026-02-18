@@ -132,9 +132,23 @@ function GlobalPortfolio() {
     return `$${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   };
 
+  const formatMoneySigned = (value) => {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
+    const num = Number(value);
+    const sign = num > 0 ? '+' : num < 0 ? '-' : '';
+    return `${sign}$${Math.abs(num).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  };
+
   const formatPct = (value) => {
     if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
     return `${Number(value).toFixed(2)}%`;
+  };
+
+  const formatPctSigned = (value) => {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
+    const num = Number(value);
+    const sign = num > 0 ? '+' : num < 0 ? '-' : '';
+    return `${sign}${Math.abs(num).toFixed(2)}%`;
   };
 
   const formatDate = (value) => {
@@ -487,13 +501,13 @@ function GlobalPortfolio() {
                         <span className={`ml-2 text-[10px] px-2 py-0.5 rounded-full border ${rsiClass}`}>
                           RSI {rsiValue !== null && rsiValue !== undefined ? Number(rsiValue).toFixed(1) : '—'}
                         </span>
-                        {price < 0.5 ? (
-                          <span className="ml-2 text-[10px] px-2 py-0.5 rounded-full bg-rose-600/20 text-rose-200 border border-rose-500/40">
-                            Penny Stock Risk
-                          </span>
-                        ) : null}
                       </p>
                       <p className="text-xs text-slate-400">{row.name}</p>
+                      {price < 0.5 ? (
+                        <span className="mt-1 inline-flex text-[9px] px-1.5 py-0.5 rounded-full bg-rose-600/10 text-rose-200 border border-rose-500/30">
+                          Penny Stock Risk
+                        </span>
+                      ) : null}
                       {rsiHistory.length ? (
                         <div className="mt-1 flex items-center gap-2 text-[10px] text-slate-400">
                           <div className="flex items-end gap-1">
@@ -655,6 +669,16 @@ function GlobalPortfolio() {
                               Prix actuel {sortIndicator('current_price')}
                             </button>
                           </th>
+                          <th className="text-right py-2">
+                            <button type="button" onClick={() => toggleSort('day_change_value')} className="text-right">
+                              Jour $ {sortIndicator('day_change_value')}
+                            </button>
+                          </th>
+                          <th className="text-right py-2">
+                            <button type="button" onClick={() => toggleSort('day_change_pct')} className="text-right">
+                              Jour % {sortIndicator('day_change_pct')}
+                            </button>
+                          </th>
                           <th className="text-right py-2">Stop</th>
                           <th className="text-right py-2">RSI</th>
                           <th className="text-right py-2">MA20</th>
@@ -713,19 +737,27 @@ function GlobalPortfolio() {
                                   Exit Watch
                                 </span>
                               ) : null}
+                              {Number(pos.current_price || 0) < 0.5 ? (
+                                <span className="ml-2 text-[9px] px-1.5 py-0.5 rounded-full bg-rose-600/10 text-rose-200 border border-rose-500/30">
+                                  Penny Stock Risk
+                                </span>
+                              ) : null}
                             </td>
                             <td className="py-2 text-right">{formatMoney(pos.avg_cost)}</td>
                             <td className="py-2 text-right">{Number(pos.shares || 0).toFixed(2)}</td>
                             <td className="py-2 text-right">{formatMoney(pos.cost_value)}</td>
                             <td className="py-2 text-right">
-                              <div className="flex items-center justify-end gap-2">
-                                <span>{formatMoney(pos.current_price)}</span>
-                                {Number(pos.current_price || 0) < 0.5 ? (
-                                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-rose-600/20 text-rose-200 border border-rose-500/40">
-                                    Penny Stock Risk
-                                  </span>
-                                ) : null}
-                              </div>
+                              <span>{formatMoney(pos.current_price)}</span>
+                            </td>
+                            <td className={`py-2 text-right ${Number(pos.day_change_value || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
+                              {pos.day_change_value !== null && pos.day_change_value !== undefined
+                                ? formatMoneySigned(pos.day_change_value)
+                                : '—'}
+                            </td>
+                            <td className={`py-2 text-right ${Number(pos.day_change_pct || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
+                              {pos.day_change_pct !== null && pos.day_change_pct !== undefined
+                                ? formatPctSigned(pos.day_change_pct)
+                                : '—'}
                             </td>
                             <td className="py-2 text-right">{pos.stop_price ? `$${Number(pos.stop_price).toFixed(2)}` : '—'}</td>
                             <td className="py-2 text-right">
