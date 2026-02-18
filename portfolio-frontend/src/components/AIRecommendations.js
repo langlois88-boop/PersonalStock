@@ -78,6 +78,9 @@ function AIRecommendations({ items = [], title, emptyMessage, onRefresh, isRefre
     const winRate = Number(item.win_rate ?? 0);
     const score = normalizeScore(item.ai_score ?? item.confidence);
     const volumeZ = Number(item.volume_z ?? 0);
+    if ((item.ticker || '').toUpperCase() === 'AVGO' && volumeZ < 0) {
+      return { text: 'ATTENDRE VOLUME', className: 'bg-amber-500 text-white' };
+    }
     if (winRate && winRate < 50) return { text: 'STATISTIQUEMENT FAIBLE', className: 'bg-slate-700 text-slate-200' };
     if (score >= 85 && volumeZ > 0.5) return { text: 'STRONG BUY', className: 'bg-emerald-500 text-white' };
     if (score >= 70) return { text: 'HOLD / KEEP', className: 'bg-sky-500 text-white' };

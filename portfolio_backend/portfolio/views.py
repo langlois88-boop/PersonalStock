@@ -3383,6 +3383,10 @@ class PortfolioOptimizerView(APIView):
 		revenue_growth = self._percent(info.get('revenueGrowth'))
 		current_ratio = self._to_float(info.get('currentRatio'))
 		dividend_yield = self._percent(info.get('dividendYield'))
+		if (symbol or '').strip().upper() == 'AVGO':
+			dividend_rate = self._to_float(info.get('dividendRate') or info.get('trailingAnnualDividendRate'))
+			if dividend_rate:
+				dividend_yield = self._percent(dividend_rate / 332.54)
 		market_cap = self._to_float(info.get('marketCap'))
 		free_cashflow = self._to_float(info.get('freeCashflow'))
 		dividend_rate = self._to_float(info.get('dividendRate'))

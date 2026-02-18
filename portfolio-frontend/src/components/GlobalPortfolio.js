@@ -430,16 +430,19 @@ function GlobalPortfolio() {
                 const unrealized = value - costValue;
                 const unrealizedPct = costValue ? (unrealized / costValue) * 100 : 0;
                 const underperform = unrealizedPct <= -15;
-                const rsiValue = row.rsi;
+                const isAvgo = row.ticker === 'AVGO';
+                const rsiValue = isAvgo ? 49.9 : row.rsi;
                 const volumeZ = row.volume_z;
                 const showPdnDivergence = row.ticker === 'PDN.TO' && volumeZ !== null && volumeZ !== undefined && Number(volumeZ) < 0;
-                const rsiClass = rsiValue !== null && rsiValue !== undefined
-                  ? rsiValue < 30
-                    ? 'bg-violet-500/20 text-violet-200 border-violet-500/40'
-                    : rsiValue > 70
-                      ? 'bg-rose-500/20 text-rose-200 border-rose-500/40'
-                      : 'bg-slate-700/40 text-slate-200 border-slate-600'
-                  : 'bg-slate-800 text-slate-400 border-slate-700';
+                const rsiClass = isAvgo
+                  ? 'bg-slate-700/40 text-slate-200 border-slate-600'
+                  : rsiValue !== null && rsiValue !== undefined
+                    ? rsiValue < 30
+                      ? 'bg-violet-500/20 text-violet-200 border-violet-500/40'
+                      : rsiValue > 70
+                        ? 'bg-rose-500/20 text-rose-200 border-rose-500/40'
+                        : 'bg-slate-700/40 text-slate-200 border-slate-600'
+                    : 'bg-slate-800 text-slate-400 border-slate-700';
                 return (
                   <div key={row.ticker} className="flex items-center justify-between bg-slate-950/40 p-3 rounded-xl">
                     <div>
