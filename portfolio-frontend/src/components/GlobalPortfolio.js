@@ -208,6 +208,18 @@ function GlobalPortfolio() {
     return 'text-slate-300';
   };
 
+  const updateRiskStatus = (rsi, sharpe, tickerType) => {
+    if (tickerType === 'Bluechip') {
+      if (rsi !== null && rsi !== undefined && rsi < 30) {
+        return { label: '🔥 OPPORTUNITÉ (RSI BAS)', className: 'bg-emerald-500/20 text-emerald-200 border-emerald-400/40' };
+      }
+      if (rsi !== null && rsi !== undefined && rsi >= 35 && Number(sharpe || 0) > 0.5) {
+        return null;
+      }
+    }
+    return { label: '⚠️ SPÉCULATIF', className: 'bg-rose-500/10 text-rose-200 border-rose-500/30' };
+  };
+
   const renderNewsItem = (item) => (
     <a
       key={`${item.url}-${item.ticker}`}
@@ -443,6 +455,12 @@ function GlobalPortfolio() {
                         ? 'bg-rose-500/30 text-rose-200 border-rose-400/50'
                         : 'bg-slate-700/40 text-slate-200 border-slate-600'
                     : 'bg-slate-800 text-slate-400 border-slate-700';
+                const rsiHistory = Array.isArray(row.rsi_history) ? row.rsi_history : [];
+                const rsiTrend = rsiHistory.length >= 3 && Number(rsiHistory[rsiHistory.length - 1]) > Number(rsiHistory[rsiHistory.length - 3])
+                  ? 'REBOND'
+                  : rsiHistory.length >= 3
+                    ? 'CHUTE'
+                    : null;
                 return (
                   <div key={row.ticker} className="flex items-center justify-between bg-slate-950/40 p-3 rounded-xl">
                     <div>
@@ -476,6 +494,24 @@ function GlobalPortfolio() {
                         ) : null}
                       </p>
                       <p className="text-xs text-slate-400">{row.name}</p>
+                      {rsiHistory.length ? (
+                        <div className="mt-1 flex items-center gap-2 text-[10px] text-slate-400">
+                          <div className="flex items-end gap-1">
+                            {rsiHistory.slice(-5).map((value, idx) => (
+                              <span
+                                key={`${row.ticker}-rsi-${idx}`}
+                                className="w-2 rounded-sm bg-slate-600"
+                                style={{ height: `${Math.max(6, Math.min(18, Number(value || 0) / 5))}px` }}
+                              ></span>
+                            ))}
+                          </div>
+                          {rsiTrend ? (
+                            <span className={rsiTrend === 'REBOND' ? 'text-emerald-300' : 'text-rose-300'}>
+                              {rsiTrend}
+                            </span>
+                          ) : null}
+                        </div>
+                      ) : null}
                       {showPdnDivergence ? (
                         <p className="text-xs text-amber-300 animate-pulse">
                           Divergence détectée · SÉCURISER PROFITS (50%)
@@ -514,9 +550,15 @@ function GlobalPortfolio() {
               <div key={item.ticker} className="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
                 <div className="flex items-center justify-between">
                   <p className="text-white font-semibold">{item.ticker}</p>
-                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-rose-500/10 text-rose-200 border border-rose-500/30">
-                    ⚠️ SPÉCULATIF
-                  </span>
+                  {(() => {
+                    const badge = updateRiskStatus(item.rsi, item.model_sharpe, item.category === 'Stable' ? 'Bluechip' : 'Other');
+                    if (!badge) return null;
+                    return (
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full border ${badge.className}`}>
+                        {badge.label}
+                      </span>
+                    );
+                  })()}
                 </div>
                 <p className="text-xs text-slate-400">{item.name}</p>
                 <p className="text-xs text-slate-500">P/L: {Number(item.unrealized_pnl_pct || 0).toFixed(2)}%</p>

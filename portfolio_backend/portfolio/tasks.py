@@ -222,6 +222,15 @@ def fetch_prices_hourly() -> dict[str, float]:
                         div_yield = float(dividend_rate) / 332.54
                     except Exception:
                         pass
+            if stock.symbol.upper() == 'TEC.TO':
+                dividend_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate')
+                if dividend_rate is not None and price:
+                    try:
+                        div_yield = float(dividend_rate) / float(price)
+                    except Exception:
+                        pass
+                if div_yield is not None:
+                    div_yield = min(float(div_yield), 0.02)
 
             price = _to_cad_price(stock.symbol, price, info)
             day_low = _to_cad_price(stock.symbol, day_low, info)
@@ -233,7 +242,7 @@ def fetch_prices_hourly() -> dict[str, float]:
             if (not stock.sector) or stock.sector.lower() == 'unknown':
                 if sector:
                     stock.sector = sector
-            if stock.symbol.upper() == 'AVGO' and div_yield is not None:
+            if stock.symbol.upper() in {'AVGO', 'TEC.TO'} and div_yield is not None:
                 stock.dividend_yield = div_yield
             elif not stock.dividend_yield or float(stock.dividend_yield or 0) == 0:
                 if div_yield is not None:

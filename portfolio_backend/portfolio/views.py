@@ -1376,6 +1376,17 @@ class PortfolioDashboardView(APIView):
 		except Exception:
 			return None
 
+	def _get_rsi_history(self, symbol: str, window: int = 5) -> list[float]:
+		try:
+			fusion = DataFusionEngine(symbol)
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty or 'RSI14' not in frame:
+				return []
+			values = frame['RSI14'].tail(window).tolist()
+			return [float(v) for v in values if v is not None]
+		except Exception:
+			return []
+
 	def _get_ma20(self, symbol: str) -> float | None:
 		try:
 			fusion = DataFusionEngine(symbol)
@@ -1682,6 +1693,7 @@ class PortfolioDashboardView(APIView):
 
 			volume_z = None
 			rsi = None
+			rsi_history = []
 			ma20 = None
 			stats = {'win_rate': None, 'sharpe': None}
 			rel_strength = None
@@ -1691,6 +1703,7 @@ class PortfolioDashboardView(APIView):
 			if enrich and symbol in enriched_symbols:
 				volume_z = self._get_volume_z(symbol)
 				rsi = self._get_rsi(symbol)
+				rsi_history = self._get_rsi_history(symbol)
 				ma20 = self._get_ma20(symbol)
 				stats = self._model_stats(symbol)
 				rel_strength = self._sector_relative_strength(stock)
@@ -1720,6 +1733,7 @@ class PortfolioDashboardView(APIView):
 				'volume_z': round(volume_z, 2) if volume_z is not None else None,
 				'ai_score': round(float(ai_score), 2) if ai_score is not None else None,
 				'rsi': round(rsi, 2) if rsi is not None else None,
+				'rsi_history': [round(val, 2) for val in rsi_history] if rsi_history else [],
 				'ma20': round(ma20, 4) if ma20 is not None else None,
 				'stop_price': self._stop_price(effective_price),
 				'exit_strategy': exit_strategy,
@@ -1935,6 +1949,7 @@ class PortfolioDashboardView(APIView):
 
 			volume_z = None
 			rsi = None
+			rsi_history = []
 			ma20 = None
 			stats = {'win_rate': None, 'sharpe': None}
 			rel_strength = None
@@ -1942,6 +1957,7 @@ class PortfolioDashboardView(APIView):
 			if enrich and symbol in enriched_symbols:
 				volume_z = self._get_volume_z(symbol)
 				rsi = self._get_rsi(symbol)
+				rsi_history = self._get_rsi_history(symbol)
 				ma20 = self._get_ma20(symbol)
 				stats = self._model_stats(symbol)
 				rel_strength = self._sector_relative_strength(stock)
@@ -1961,6 +1977,7 @@ class PortfolioDashboardView(APIView):
 				'unrealized_pnl_pct': round(unrealized_pct, 2),
 				'volume_z': round(volume_z, 2) if volume_z is not None else None,
 				'rsi': round(rsi, 2) if rsi is not None else None,
+				'rsi_history': [round(val, 2) for val in rsi_history] if rsi_history else [],
 				'ma20': round(ma20, 4) if ma20 is not None else None,
 				'stop_price': self._stop_price(effective_price),
 				'model_win_rate': round(float(stats.get('win_rate') or 0), 2) if stats.get('win_rate') is not None else None,
@@ -3182,6 +3199,17 @@ class ScoutFundamentalsView(APIView):
 				'dividend_yield': self._percent(info.get('dividendYield')),
 				'revenue_growth': self._percent(info.get('revenueGrowth')),
 			}
+			if symbol == 'AVGO':
+				dividend_rate = self._to_float(info.get('dividendRate') or info.get('trailingAnnualDividendRate'))
+				if dividend_rate:
+					payload['dividend_yield'] = self._percent(dividend_rate / 332.54)
+			if symbol == 'TEC.TO':
+				dividend_rate = self._to_float(info.get('dividendRate') or info.get('trailingAnnualDividendRate'))
+				price = payload.get('price')
+				if dividend_rate and price:
+					payload['dividend_yield'] = self._percent(dividend_rate / price)
+				if payload.get('dividend_yield') is not None:
+					payload['dividend_yield'] = min(float(payload['dividend_yield']), 2.0)
 			cache.set(cache_key, payload, timeout=60 * 60 * 6)
 			results[symbol] = payload
 
@@ -3387,6 +3415,13 @@ class PortfolioOptimizerView(APIView):
 			dividend_rate = self._to_float(info.get('dividendRate') or info.get('trailingAnnualDividendRate'))
 			if dividend_rate:
 				dividend_yield = self._percent(dividend_rate / 332.54)
+		if (symbol or '').strip().upper() == 'TEC.TO':
+			dividend_rate = self._to_float(info.get('dividendRate') or info.get('trailingAnnualDividendRate'))
+			price = self._to_float(info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose'))
+			if dividend_rate and price:
+				dividend_yield = self._percent(dividend_rate / price)
+			if dividend_yield is not None:
+				dividend_yield = min(float(dividend_yield), 2.0)
 		market_cap = self._to_float(info.get('marketCap'))
 		free_cashflow = self._to_float(info.get('freeCashflow'))
 		dividend_rate = self._to_float(info.get('dividendRate'))
