@@ -431,6 +431,8 @@ function GlobalPortfolio() {
                 const unrealizedPct = costValue ? (unrealized / costValue) * 100 : 0;
                 const underperform = unrealizedPct <= -15;
                 const rsiValue = row.rsi;
+                const volumeZ = row.volume_z;
+                const showPdnDivergence = row.ticker === 'PDN.TO' && volumeZ !== null && volumeZ !== undefined && Number(volumeZ) < 0;
                 const rsiClass = rsiValue !== null && rsiValue !== undefined
                   ? rsiValue < 30
                     ? 'bg-violet-500/20 text-violet-200 border-violet-500/40'
@@ -462,7 +464,7 @@ function GlobalPortfolio() {
                           {underperform ? '⚠️ UNDERPERFORM' : row.category}
                         </span>
                         <span className={`ml-2 text-[10px] px-2 py-0.5 rounded-full border ${rsiClass}`}>
-                          RSI {rsiValue !== null && rsiValue !== undefined ? Number(rsiValue).toFixed(0) : '—'}
+                          RSI {rsiValue !== null && rsiValue !== undefined ? Number(rsiValue).toFixed(1) : '—'}
                         </span>
                         {price < 0.5 ? (
                           <span className="ml-2 text-[10px] px-2 py-0.5 rounded-full bg-rose-600/20 text-rose-200 border border-rose-500/40">
@@ -471,6 +473,11 @@ function GlobalPortfolio() {
                         ) : null}
                       </p>
                       <p className="text-xs text-slate-400">{row.name}</p>
+                      {showPdnDivergence ? (
+                        <p className="text-xs text-amber-300 animate-pulse">
+                          Divergence détectée · SÉCURISER PROFITS (50%)
+                        </p>
+                      ) : null}
                       <p className="text-xs text-slate-500">{shares.toFixed(2)} shares</p>
                       <p className="text-xs text-slate-500">
                         Cost: ${Number(row.cost_value || 0).toFixed(2)} @ ${Number(row.avg_cost || 0).toFixed(2)}
