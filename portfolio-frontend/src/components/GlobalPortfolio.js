@@ -437,10 +437,10 @@ function GlobalPortfolio() {
                 const rsiClass = isAvgo
                   ? 'bg-slate-700/40 text-slate-200 border-slate-600'
                   : rsiValue !== null && rsiValue !== undefined
-                    ? rsiValue < 30
-                      ? 'bg-violet-500/20 text-violet-200 border-violet-500/40'
-                      : rsiValue > 70
-                        ? 'bg-rose-500/20 text-rose-200 border-rose-500/40'
+                    ? rsiValue <= 30
+                      ? 'bg-emerald-500/30 text-emerald-200 border-emerald-400/50'
+                      : rsiValue >= 70
+                        ? 'bg-rose-500/30 text-rose-200 border-rose-400/50'
                         : 'bg-slate-700/40 text-slate-200 border-slate-600'
                     : 'bg-slate-800 text-slate-400 border-slate-700';
                 return (
@@ -690,10 +690,10 @@ function GlobalPortfolio() {
                               {pos.rsi !== null && pos.rsi !== undefined ? (
                                 <span
                                   className={`text-[10px] px-2 py-0.5 rounded-full border ${
-                                    pos.rsi < 30
-                                      ? 'bg-violet-500/20 text-violet-200 border-violet-500/40'
-                                      : pos.rsi > 70
-                                        ? 'bg-rose-500/20 text-rose-200 border-rose-500/40'
+                                    pos.rsi <= 30
+                                      ? 'bg-emerald-500/30 text-emerald-200 border-emerald-400/50'
+                                      : pos.rsi >= 70
+                                        ? 'bg-rose-500/30 text-rose-200 border-rose-400/50'
                                         : 'bg-slate-700/40 text-slate-200 border-slate-600'
                                   }`}
                                 >
