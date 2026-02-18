@@ -2042,6 +2042,10 @@ class AccountDashboardView(APIView):
 			return {'win_rate': None, 'sharpe': None}
 
 	def _macro_snapshot(self) -> dict[str, Any]:
+		cache_key = "macro_snapshot"
+		cached = cache.get(cache_key)
+		if cached is not None:
+			return cached
 		try:
 			dxy = yf.Ticker('DX-Y.NYB').history(period='5d', interval='1d')
 			oil = yf.Ticker('CL=F').history(period='5d', interval='1d')
@@ -2057,7 +2061,7 @@ class AccountDashboardView(APIView):
 			oil_price, oil_change = _latest_change(oil)
 			gold_price, gold_change = _latest_change(gold)
 			tech_risk = bool(dxy_change is not None and dxy_change > 0.5) or bool(gold_change is not None and gold_change > 0.5)
-			return {
+			result = {
 				'dxy': dxy_price,
 				'dxy_change_pct': dxy_change,
 				'oil': oil_price,
@@ -2066,6 +2070,8 @@ class AccountDashboardView(APIView):
 				'gold_change_pct': gold_change,
 				'tech_risk': tech_risk,
 			}
+			cache.set(cache_key, result, 60 * 10)
+			return result
 		except Exception:
 			return {}
 
@@ -2112,6 +2118,10 @@ class AccountDashboardView(APIView):
 		}
 
 	def _insider_summary(self, symbol: str) -> dict[str, Any] | None:
+		cache_key = f"insider_summary:{symbol}"
+		cached = cache.get(cache_key)
+		if cached is not None:
+			return cached
 		api_key = os.getenv('FMP_API_KEY')
 		if not api_key:
 			return None
@@ -2124,6 +2134,7 @@ class AccountDashboardView(APIView):
 		except Exception:
 			return None
 		if not isinstance(items, list) or not items:
+			cache.set(cache_key, None, 60 * 60)
 			return None
 		cutoff = timezone.now() - timedelta(days=90)
 		total_buy = 0.0
@@ -2147,18 +2158,25 @@ class AccountDashboardView(APIView):
 				total_buy += float(amount or 0)
 			except Exception:
 				continue
-		return {
+		result = {
 			'total_buy': round(total_buy, 2),
 			'insiders_buying': total_buy >= 50000,
 		}
+		cache.set(cache_key, result, 60 * 60 * 6)
+		return result
 
 	def _institutional_summary(self, symbol: str) -> dict[str, Any] | None:
+		cache_key = f"institutional_summary:{symbol}"
+		cached = cache.get(cache_key)
+		if cached is not None:
+			return cached
 		try:
 			ticker = yf.Ticker(symbol)
 			inst = getattr(ticker, 'institutional_holders', None)
 			if inst is None or inst.empty:
 				inst = getattr(ticker, 'major_holders', None)
 			if inst is None or inst.empty:
+				cache.set(cache_key, None, 60 * 60)
 				return None
 			holders = []
 			accumulation = 0
@@ -2181,12 +2199,14 @@ class AccountDashboardView(APIView):
 						'shares': row.get('Shares') or row.get('TotalShares') or row.get('Shares Outstanding'),
 						'change': change,
 					})
-			return {
+			result = {
 				'holders': holders,
 				'accumulation_count': accumulation,
 				'whale_signal': accumulation >= 2,
 				'exit_warning': exit_warning,
 			}
+			cache.set(cache_key, result, 60 * 60 * 6)
+			return result
 		except Exception:
 			return None
 
@@ -2227,12 +2247,14 @@ class AccountDashboardView(APIView):
 		weekly_date = today - timedelta(days=7)
 		monthly_date = today - timedelta(days=30)
 		annual_date = today - timedelta(days=365)
+		max_enrich = int(os.getenv('ACCOUNT_ENRICH_LIMIT', '8'))
 
 		for account in accounts:
 			positions = []
 			total_value = 0.0
 			total_cost = 0.0
 			macro_snapshot = self._macro_snapshot()
+			pre_entries = []
 			for payload in position_map.get(account.id, {}).values():
 				shares = float(payload['shares'] or 0)
 				if shares <= 0:
@@ -2242,18 +2264,46 @@ class AccountDashboardView(APIView):
 				buy_cost = float(payload.get('buy_cost') or 0)
 				avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
 				current = self._current_price(stock)
-				rsi = self._get_rsi(stock.symbol)
-				ma20 = self._get_ma20(stock.symbol)
-				volume_z = self._get_volume_z(stock.symbol)
-				stats = self._model_stats(stock.symbol)
-				pyramid = self._pyramid_steps(stock.symbol, current, avg_cost, volume_z=volume_z, rsi=rsi, ma20=ma20)
-				insider = self._insider_summary(stock.symbol)
-				institutional = self._institutional_summary(stock.symbol)
 				current_value = current * shares
 				cost_value = avg_cost * shares
-				unrealized_pct = ((current_value - cost_value) / cost_value * 100) if cost_value else None
 				total_value += current_value
 				total_cost += cost_value
+				pre_entries.append({
+					'stock': stock,
+					'shares': shares,
+					'avg_cost': avg_cost,
+					'current': current,
+					'current_value': current_value,
+					'cost_value': cost_value,
+				})
+
+			sorted_entries = sorted(pre_entries, key=lambda item: item['current_value'], reverse=True)
+			enriched_symbols = {
+				(item['stock'].symbol or '').strip().upper()
+				for item in sorted_entries[:max_enrich]
+				if item.get('stock')
+			}
+
+			for entry in sorted_entries:
+				stock = entry['stock']
+				symbol = (stock.symbol or '').strip().upper()
+				shares = entry['shares']
+				avg_cost = entry['avg_cost']
+				current = entry['current']
+				current_value = entry['current_value']
+				cost_value = entry['cost_value']
+				unrealized_pct = ((current_value - cost_value) / cost_value * 100) if cost_value else None
+				rsi = self._get_rsi(symbol)
+				ma20 = self._get_ma20(symbol)
+				volume_z = self._get_volume_z(symbol)
+				stats = {'win_rate': None, 'sharpe': None}
+				insider = None
+				institutional = None
+				if symbol in enriched_symbols:
+					stats = self._model_stats(symbol)
+					insider = self._insider_summary(symbol)
+					institutional = self._institutional_summary(symbol)
+				pyramid = self._pyramid_steps(symbol, current, avg_cost, volume_z=volume_z, rsi=rsi, ma20=ma20)
 
 				weekly_price = self._price_at_or_before(stock, weekly_date)
 				monthly_price = self._price_at_or_before(stock, monthly_date)
@@ -3169,10 +3219,10 @@ class AIBacktesterView(APIView):
 			'total_return_pct': result.total_return_pct,
 			'win_rate': result.win_rate,
 			'sharpe_ratio': result.sharpe_ratio,
-			'sortino_ratio': result.sortino_ratio,
-			'profit_factor': result.profit_factor,
-			'recovery_factor': result.recovery_factor,
-			'monte_carlo_ruin_pct': result.monte_carlo_ruin_pct,
+			'sortino_ratio': getattr(result, 'sortino_ratio', 0.0),
+			'profit_factor': getattr(result, 'profit_factor', 0.0),
+			'recovery_factor': getattr(result, 'recovery_factor', 0.0),
+			'monte_carlo_ruin_pct': getattr(result, 'monte_carlo_ruin_pct', 0.0),
 			'max_drawdown': result.max_drawdown,
 			'expert_advice': generate_expert_advice({
 				'sharpe': result.sharpe_ratio,
@@ -3224,6 +3274,10 @@ class PortfolioOptimizerView(APIView):
 		return None
 
 	def _fundamentals_snapshot(self, symbol: str) -> dict[str, Any]:
+		cache_key = f"fundamentals_snapshot:{symbol}"
+		cached = cache.get(cache_key)
+		if cached is not None:
+			return cached
 		info = {}
 		try:
 			info = yf.Ticker(symbol).info or {}
@@ -3298,7 +3352,7 @@ class PortfolioOptimizerView(APIView):
 		except Exception:
 			altman_z = None
 
-		return {
+		result = {
 			'sector': sector,
 			'revenue_growth': revenue_growth,
 			'current_ratio': current_ratio,
@@ -3310,6 +3364,8 @@ class PortfolioOptimizerView(APIView):
 			'total_return_12y': total_return_12y,
 			'altman_z': altman_z,
 		}
+		cache.set(cache_key, result, 60 * 60 * 6)
+		return result
 
 	def _model_bundle(self, symbol: str, universe: str) -> tuple[pd.DataFrame, dict] | tuple[None, None]:
 		try:
@@ -3366,6 +3422,10 @@ class PortfolioOptimizerView(APIView):
 			return None
 
 	def _correlation_with_nasdaq(self, symbol: str) -> float | None:
+		cache_key = f"corr_nasdaq:{symbol}"
+		cached = cache.get(cache_key)
+		if cached is not None:
+			return cached
 		try:
 			if not symbol:
 				return None
@@ -3380,7 +3440,9 @@ class PortfolioOptimizerView(APIView):
 			aligned = pd.concat([series_symbol, series_nasdaq], axis=1, join='inner').dropna()
 			if aligned.shape[0] < 20:
 				return None
-			return float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
+			corr_value = float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
+			cache.set(cache_key, corr_value, 60 * 60 * 6)
+			return corr_value
 		except Exception:
 			return None
 
