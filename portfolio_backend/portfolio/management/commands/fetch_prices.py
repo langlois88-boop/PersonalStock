@@ -18,7 +18,16 @@ class Command(BaseCommand):
     def _to_cad_price(self, symbol: str, price: float | None, info: dict) -> float | None:
         if price is None:
             return None
-        if not symbol.upper().endswith('.TO'):
+        symbol_upper = (symbol or '').upper()
+        force_list = {'RY'}
+        force_list.update({
+            s.strip().upper()
+            for s in str(getattr(settings, 'FORCE_CAD_TICKERS', '') or '').split(',')
+            if s.strip()
+        })
+        if symbol_upper in force_list:
+            return float(price) * self._usd_cad_rate()
+        if not symbol_upper.endswith('.TO'):
             return price
         currency = (info.get('currency') or info.get('financialCurrency') or '').upper()
         if currency == 'USD':
