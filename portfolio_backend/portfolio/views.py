@@ -1560,7 +1560,7 @@ class PortfolioDashboardView(APIView):
 		flag = request.query_params.get('enrich')
 		if flag is not None:
 			return str(flag).strip().lower() in {'1', 'true', 'yes', 'y'}
-		return False
+		return True
 
 	def _build_holdings_from_account_transactions(
 		self,
@@ -1584,26 +1584,12 @@ class PortfolioDashboardView(APIView):
 				entry['buy_cost'] += qty * float(tx.price or 0)
 
 		items = []
-		total_value = 0.0
-		stable_value = 0.0
-		risky_value = 0.0
-		change_1d = 0.0
-		change_7d = 0.0
-
+		pre_entries = []
 		for payload in position_map.values():
 			shares = float(payload['shares'] or 0)
 			if shares <= 0:
 				continue
 			stock = payload['stock']
-			volume_z = self._get_volume_z(stock.symbol) if enrich else None
-			rsi = self._get_rsi(stock.symbol) if enrich else None
-			ma20 = self._get_ma20(stock.symbol) if enrich else None
-			stats = self._model_stats(stock.symbol) if enrich else {'win_rate': None, 'sharpe': None}
-			rel_strength = self._sector_relative_strength(stock) if enrich else None
-			if enrich:
-				earnings_blacklisted, earnings_date = self._earnings_blacklist(stock.symbol)
-			else:
-				earnings_blacklisted, earnings_date = False, None
 			buy_qty = float(payload.get('buy_qty') or 0)
 			buy_cost = float(payload.get('buy_cost') or 0)
 			avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
@@ -1617,6 +1603,40 @@ class PortfolioDashboardView(APIView):
 			cost_value = avg_cost * shares
 			unrealized = value - cost_value
 			unrealized_pct = (unrealized / cost_value * 100) if cost_value else 0
+			pre_entries.append({
+				'stock': stock,
+				'symbol': (stock.symbol or '').strip().upper(),
+				'shares': shares,
+				'price': price,
+				'effective_price': effective_price,
+				'avg_cost': avg_cost,
+				'value': value,
+				'cost_value': cost_value,
+				'unrealized': unrealized,
+				'unrealized_pct': unrealized_pct,
+			})
+
+		max_enrich = int(os.getenv('DASHBOARD_ENRICH_LIMIT', '6'))
+		sorted_entries = sorted(pre_entries, key=lambda item: item['value'], reverse=True)
+		enriched_symbols = {item['symbol'] for item in sorted_entries[:max_enrich] if item.get('symbol')}
+
+		total_value = 0.0
+		stable_value = 0.0
+		risky_value = 0.0
+		change_1d = 0.0
+		change_7d = 0.0
+
+		for entry in sorted_entries:
+			stock = entry['stock']
+			symbol = entry['symbol']
+			shares = entry['shares']
+			price = entry['price']
+			effective_price = entry['effective_price']
+			avg_cost = entry['avg_cost']
+			value = entry['value']
+			cost_value = entry['cost_value']
+			unrealized = entry['unrealized']
+			unrealized_pct = entry['unrealized_pct']
 			total_value += value
 
 			prev_1d = PriceHistory.objects.filter(stock=stock).order_by('-date')[1:2].first()
@@ -1633,16 +1653,30 @@ class PortfolioDashboardView(APIView):
 			else:
 				risky_value += value
 
-			ai_score, trend = self._ai_score(stock.symbol) if enrich else (None, None)
+			volume_z = None
+			rsi = None
+			ma20 = None
+			stats = {'win_rate': None, 'sharpe': None}
+			rel_strength = None
+			earnings_blacklisted, earnings_date = False, None
+			ai_score, trend = None, None
 			exit_strategy = None
-			if enrich and ai_score is not None and volume_z is not None and trend == 'descending':
-				if volume_z < 0 and ai_score < 65:
-					stop_loss = round(effective_price * 0.97, 2)
-					exit_strategy = {
-						'action': 'VENDRE 50%',
-						'instructions': f"Vendre la moitié maintenant. Placer un Stop-Loss à {stop_loss}$ sur le solde pour 15 jours.",
-						'reason': 'Divergence Volume/Prix + Baisse du score IA.',
-					}
+			if enrich and symbol in enriched_symbols:
+				volume_z = self._get_volume_z(symbol)
+				rsi = self._get_rsi(symbol)
+				ma20 = self._get_ma20(symbol)
+				stats = self._model_stats(symbol)
+				rel_strength = self._sector_relative_strength(stock)
+				earnings_blacklisted, earnings_date = self._earnings_blacklist(symbol)
+				ai_score, trend = self._ai_score(symbol)
+				if ai_score is not None and volume_z is not None and trend == 'descending':
+					if volume_z < 0 and ai_score < 65:
+						stop_loss = round(effective_price * 0.97, 2)
+						exit_strategy = {
+							'action': 'VENDRE 50%',
+							'instructions': f"Vendre la moitié maintenant. Placer un Stop-Loss à {stop_loss}$ sur le solde pour 15 jours.",
+							'reason': 'Divergence Volume/Prix + Baisse du score IA.',
+						}
 
 			items.append({
 				'ticker': stock.symbol,
@@ -1787,17 +1821,9 @@ class PortfolioDashboardView(APIView):
 		change_1d = 0.0
 		change_7d = 0.0
 
+		pre_entries = []
 		for holding in holdings:
 			stock = holding.stock
-			volume_z = self._get_volume_z(stock.symbol) if enrich else None
-			rsi = self._get_rsi(stock.symbol) if enrich else None
-			ma20 = self._get_ma20(stock.symbol) if enrich else None
-			stats = self._model_stats(stock.symbol) if enrich else {'win_rate': None, 'sharpe': None}
-			rel_strength = self._sector_relative_strength(stock) if enrich else None
-			if enrich:
-				earnings_blacklisted, earnings_date = self._earnings_blacklist(stock.symbol)
-			else:
-				earnings_blacklisted, earnings_date = False, None
 			price = stock.latest_price
 			if price is None:
 				last = PriceHistory.objects.filter(stock=stock).order_by('-date').first()
@@ -1833,18 +1859,46 @@ class PortfolioDashboardView(APIView):
 			avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
 			effective_price = price if price > 0 else avg_cost
 			value = float(holding.shares or 0) * effective_price
-			total_value += value
 			cost_value = avg_cost * float(holding.shares or 0)
 			unrealized = value - cost_value
 			unrealized_pct = (unrealized / cost_value * 100) if cost_value else 0
+			pre_entries.append({
+				'stock': stock,
+				'symbol': (stock.symbol or '').strip().upper(),
+				'shares': float(holding.shares or 0),
+				'price': price,
+				'effective_price': effective_price,
+				'avg_cost': avg_cost,
+				'value': value,
+				'cost_value': cost_value,
+				'unrealized': unrealized,
+				'unrealized_pct': unrealized_pct,
+			})
+
+		max_enrich = int(os.getenv('DASHBOARD_ENRICH_LIMIT', '6'))
+		sorted_entries = sorted(pre_entries, key=lambda item: item['value'], reverse=True)
+		enriched_symbols = {item['symbol'] for item in sorted_entries[:max_enrich] if item.get('symbol')}
+
+		for entry in sorted_entries:
+			stock = entry['stock']
+			symbol = entry['symbol']
+			shares = entry['shares']
+			price = entry['price']
+			effective_price = entry['effective_price']
+			avg_cost = entry['avg_cost']
+			value = entry['value']
+			cost_value = entry['cost_value']
+			unrealized = entry['unrealized']
+			unrealized_pct = entry['unrealized_pct']
+			total_value += value
 
 			prev_1d = PriceHistory.objects.filter(stock=stock).order_by('-date')[1:2].first()
 			if prev_1d:
-				change_1d += (price - float(prev_1d.close_price)) * float(holding.shares or 0)
+				change_1d += (price - float(prev_1d.close_price)) * shares
 
 			prev_7d = PriceHistory.objects.filter(stock=stock).order_by('-date')[7:8].first()
 			if prev_7d:
-				change_7d += (price - float(prev_7d.close_price)) * float(holding.shares or 0)
+				change_7d += (price - float(prev_7d.close_price)) * shares
 
 			is_stable = effective_price >= 5 or float(stock.dividend_yield or 0) >= 0.02
 			if is_stable:
@@ -1852,12 +1906,26 @@ class PortfolioDashboardView(APIView):
 			else:
 				risky_value += value
 
+			volume_z = None
+			rsi = None
+			ma20 = None
+			stats = {'win_rate': None, 'sharpe': None}
+			rel_strength = None
+			earnings_blacklisted, earnings_date = False, None
+			if enrich and symbol in enriched_symbols:
+				volume_z = self._get_volume_z(symbol)
+				rsi = self._get_rsi(symbol)
+				ma20 = self._get_ma20(symbol)
+				stats = self._model_stats(symbol)
+				rel_strength = self._sector_relative_strength(stock)
+				earnings_blacklisted, earnings_date = self._earnings_blacklist(symbol)
+
 			items.append({
 				'ticker': stock.symbol,
 				'name': stock.name,
 				'sector': stock.sector,
 				'dividend_yield': float(stock.dividend_yield or 0),
-				'shares': float(holding.shares or 0),
+				'shares': shares,
 				'price': effective_price,
 				'value': value,
 				'avg_cost': round(avg_cost, 4),
