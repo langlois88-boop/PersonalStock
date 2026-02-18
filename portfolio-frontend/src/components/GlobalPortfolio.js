@@ -793,6 +793,7 @@ function GlobalPortfolio() {
                             <td className={`py-2 text-right ${Number(pos.annual_return_pct || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
                               {formatPct(pos.annual_return_pct)}
                             </td>
+                            <td className="py-2 text-right">
                               {pos.pyramid ? (() => {
                                 const pnlPct = Number(pos.unrealized_pnl_pct || 0);
                                 const isLoss = pnlPct < 0;
