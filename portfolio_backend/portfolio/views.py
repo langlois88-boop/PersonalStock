@@ -1443,8 +1443,28 @@ class PortfolioDashboardView(APIView):
 			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty:
+				if self._fast_mode():
+					stock = Stock.objects.filter(symbol__iexact=symbol).first()
+					return self._ma20_from_history(stock)
 				return None
 			return self._safe_float(frame.tail(1).iloc[0].get('MA20'))
+		except Exception:
+			return None
+
+	def _ma20_from_history(self, stock: Stock | None) -> float | None:
+		if not stock:
+			return None
+		try:
+			closes = list(
+				PriceHistory.objects.filter(stock=stock).order_by('date').values_list('close_price', flat=True)
+			)
+			if len(closes) < 10:
+				return None
+			series = pd.Series([float(val) for val in closes])
+			ma20 = series.rolling(20, min_periods=10).mean().iloc[-1]
+			if pd.isna(ma20):
+				return None
+			return float(ma20)
 		except Exception:
 			return None
 
@@ -2182,8 +2202,28 @@ class AccountDashboardView(APIView):
 			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
 			frame = fusion.fuse_all()
 			if frame is None or frame.empty:
+				if self._fast_mode():
+					stock = Stock.objects.filter(symbol__iexact=symbol).first()
+					return self._ma20_from_history(stock)
 				return None
 			return float(frame.tail(1).iloc[0].get('MA20'))
+		except Exception:
+			return None
+
+	def _ma20_from_history(self, stock: Stock | None) -> float | None:
+		if not stock:
+			return None
+		try:
+			closes = list(
+				PriceHistory.objects.filter(stock=stock).order_by('date').values_list('close_price', flat=True)
+			)
+			if len(closes) < 10:
+				return None
+			series = pd.Series([float(val) for val in closes])
+			ma20 = series.rolling(20, min_periods=10).mean().iloc[-1]
+			if pd.isna(ma20):
+				return None
+			return float(ma20)
 		except Exception:
 			return None
 
