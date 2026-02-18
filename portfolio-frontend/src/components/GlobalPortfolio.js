@@ -797,6 +797,17 @@ function GlobalPortfolio() {
                               {pos.pyramid ? (() => {
                                 const pnlPct = Number(pos.unrealized_pnl_pct || 0);
                                 const isLoss = pnlPct < 0;
+                                const volumeZ = Number(pos.volume_z ?? 0);
+                                if (volumeZ < 0) {
+                                  return (
+                                    <div className="flex flex-col items-end gap-1">
+                                      <div className="w-24 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                                        <div className="h-full bg-slate-600" style={{ width: '25%' }}></div>
+                                      </div>
+                                      <span className="text-[10px] text-rose-300">🚫 Volume négatif</span>
+                                    </div>
+                                  );
+                                }
                                 const barClass = isLoss ? 'bg-amber-400' : 'bg-emerald-400 animate-pulse';
                                 const message = isLoss ? '🚫 Ne pas renforcer' : '✅ Prêt pour Vague 2';
                                 return (

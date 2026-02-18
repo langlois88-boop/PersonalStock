@@ -18,10 +18,14 @@ function OptimizerPage() {
     const signalLabel = (item) => {
       const score = normalizeScore(item.ai_score ?? item.confidence);
       const volumeZ = Number(item.volume_z ?? 0);
+      const unrealizedPct = Number(item.unrealized_pnl_pct ?? 0);
       const winRateRaw = Number(item.win_rate ?? 0);
       const winRate = winRateRaw <= 1 ? winRateRaw * 100 : winRateRaw;
       if (winRate && winRate < 50) {
         return { text: 'STATISTIQUEMENT FAIBLE', className: 'bg-slate-700 text-slate-200 border border-slate-500/40' };
+      }
+      if (volumeZ < -1 && unrealizedPct > 20) {
+        return { text: 'VENDRE 50% (SÉCURISER)', className: 'bg-rose-600/30 text-rose-100 border border-rose-500/60 animate-pulse' };
       }
       if (score > 70 && volumeZ > 0) {
         return { text: 'ACHETER', className: 'bg-emerald-500/20 text-emerald-200 border border-emerald-500/40' };
@@ -176,11 +180,23 @@ function OptimizerPage() {
               ) : null;
             })()}
             <div className="mt-3 grid grid-cols-2 gap-2 text-[11px] text-slate-300">
-              <div>Prix: {item.price ?? '—'}</div>
-              <div>Volume Z: {item.volume_z ?? '—'}</div>
+              <div>
+                Prix: {item.price ?? '—'}
+                {item.alerts?.some((note) => String(note).includes('Divergence')) ? (
+                  <span className="ml-1 text-amber-300">⚠️</span>
+                ) : null}
+              </div>
+              <div className={Number(item.volume_z ?? 0) < -1 ? 'rounded bg-rose-600/20 px-2 py-0.5 text-rose-100' : ''}>
+                Volume Z: {item.volume_z ?? '—'}
+              </div>
               <div>Sharpe: {item.sharpe ?? '—'}</div>
               <div>Win rate: {item.win_rate ?? '—'}</div>
             </div>
+            {Number(item.volume_z ?? 0) < -1 ? (
+              <div className="mt-2 rounded-lg border border-rose-500/50 bg-rose-600/20 px-2 py-1 text-xs text-rose-100">
+                ⚠️ SORTIE DE CAPITAL DÉTECTÉE
+              </div>
+            ) : null}
             <div className="absolute z-20 hidden group-hover/action:block left-4 top-full mt-3 w-[22rem] bg-slate-950 border border-slate-800 rounded-xl p-4 text-sm text-slate-200 shadow-xl">
               <p className="text-slate-100 font-semibold text-base">{item.ticker} · Détails IA</p>
               <p className="text-slate-300 mt-1">{item.reason}</p>

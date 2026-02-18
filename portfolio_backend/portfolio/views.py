@@ -3886,6 +3886,30 @@ class PortfolioOptimizerView(APIView):
 		if action == 'SELL' and (dividend_yield is not None and dividend_yield > 5) and signal > sell_threshold:
 			action = 'KEEP'
 
+		avg_cost = None
+		unrealized_pct = None
+		try:
+			tx_qs = Transaction.objects.filter(portfolio=holding.portfolio, stock=holding.stock)
+			buy_qty = 0.0
+			buy_cost = 0.0
+			for tx in tx_qs:
+				qty = float(tx.shares or 0)
+				if tx.transaction_type == 'BUY':
+					buy_qty += qty
+					buy_cost += qty * float(tx.price_per_share or 0)
+				elif tx.transaction_type == 'SELL':
+					avg_tx = (buy_cost / buy_qty) if buy_qty else 0.0
+					buy_qty = max(0.0, buy_qty - qty)
+					buy_cost = max(0.0, buy_cost - avg_tx * qty)
+			if buy_qty:
+				avg_cost = buy_cost / buy_qty
+				cost_value = avg_cost * float(holding.shares or 0)
+				current_value = price_value * float(holding.shares or 0)
+				unrealized_pct = ((current_value - cost_value) / cost_value * 100) if cost_value else None
+		except Exception:
+			avg_cost = None
+			unrealized_pct = None
+
 		alerts: list[str] = []
 		try:
 			if data is not None and 'Close' in data and 'VolumeZ' in data:
@@ -3915,6 +3939,7 @@ class PortfolioOptimizerView(APIView):
 			'speculative': is_speculative,
 			'altman_z': altman_z,
 			'volume_z': round(volume_z, 2),
+			'unrealized_pnl_pct': round(float(unrealized_pct), 2) if unrealized_pct is not None else None,
 			'win_rate': round(float(win_rate), 2) if result else None,
 			'sharpe': round(float(sharpe), 2) if result else None,
 			'price': round(price_value, 4),
