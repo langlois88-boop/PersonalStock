@@ -1617,7 +1617,9 @@ class PortfolioDashboardView(APIView):
 		if not symbol:
 			return None
 		try:
-			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
+			force_full = str(os.getenv('CONFIDENCE_FORCE_FULL', '')).strip().lower() in {'1', 'true', 'yes', 'y'}
+			fast_mode = False if force_full else self._fast_mode()
+			fusion = DataFusionEngine(symbol, fast_mode=fast_mode)
 			fusion_df = fusion.fuse_all()
 			if fusion_df is None or fusion_df.empty:
 				return {'symbol': symbol, 'status': 'unavailable'}

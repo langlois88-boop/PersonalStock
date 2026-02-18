@@ -790,7 +790,17 @@ function GlobalPortfolio() {
                                 </span>
                               ) : '—'}
                             </td>
-                            <td className="py-2 text-right">{pos.ma20 ? `$${Number(pos.ma20).toFixed(2)}` : '—'}</td>
+                            <td
+                              className={`py-2 text-right ${
+                                pos.ma20 && pos.current_price
+                                  ? Number(pos.current_price) > Number(pos.ma20)
+                                    ? 'text-emerald-300'
+                                    : 'text-rose-300'
+                                  : ''
+                              }`}
+                            >
+                              {pos.ma20 ? `$${Number(pos.ma20).toFixed(2)}` : '—'}
+                            </td>
                             <td className={`py-2 text-right ${currentValueClass(pos)}`}>{formatMoney(pos.current_value)}</td>
                             <td className={`py-2 text-right ${Number(pos.unrealized_pnl_pct || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
                               {formatPct(pos.unrealized_pnl_pct)}
@@ -840,7 +850,12 @@ function GlobalPortfolio() {
                                           [pos.ticker]: wave2Amount,
                                         }))
                                       }
-                                      className="text-[10px] text-indigo-300 hover:text-indigo-200"
+                                      className={`text-[10px] ${
+                                        pos.ma20 && pos.current_price && Number(pos.current_price) > Number(pos.ma20)
+                                          ? 'text-indigo-300 hover:text-indigo-200'
+                                          : 'text-slate-600 cursor-not-allowed'
+                                      }`}
+                                      disabled={!pos.ma20 || !pos.current_price || Number(pos.current_price) <= Number(pos.ma20)}
                                     >
                                       Calculer montant Vague 2
                                     </button>
