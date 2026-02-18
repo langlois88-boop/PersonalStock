@@ -42,7 +42,8 @@ function GlobalPortfolio() {
   const [newsLoading, setNewsLoading] = useState(false);
   const [newsSymbol, setNewsSymbol] = useState('ALL');
   const [newsVisible, setNewsVisible] = useState({ holdings: 6, sectors: 6, positive: 6, negative: 6 });
-  const [focusFilter, setFocusFilter] = useState(true);
+  const [focusFilter, setFocusFilter] = useState(false);
+  const [wave2Amounts, setWave2Amounts] = useState({});
 
   useEffect(() => {
     setLoading(true);
@@ -223,6 +224,9 @@ function GlobalPortfolio() {
   };
 
   const updateRiskStatus = (rsi, sharpe, tickerType) => {
+
+      const wave2Budget = 2300;
+      const wave2Amount = Number((wave2Budget * 0.25).toFixed(2));
     if (tickerType === 'Bluechip') {
       if (rsi !== null && rsi !== undefined && rsi < 30) {
         return { label: '🔥 OPPORTUNITÉ (RSI BAS)', className: 'bg-emerald-500/20 text-emerald-200 border-emerald-400/40' };
@@ -789,20 +793,42 @@ function GlobalPortfolio() {
                             <td className={`py-2 text-right ${Number(pos.annual_return_pct || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
                               {formatPct(pos.annual_return_pct)}
                             </td>
-                            <td className="py-2 text-right">
-                              {pos.pyramid ? (
-                                <div className="flex flex-col items-end gap-1">
-                                  <div className="w-24 h-1.5 bg-slate-800 rounded-full overflow-hidden">
-                                    <div
-                                      className="h-full bg-emerald-500"
-                                      style={{ width: `${pos.pyramid.progress_pct || 0}%` }}
-                                    ></div>
+                              {pos.pyramid ? (() => {
+                                const pnlPct = Number(pos.unrealized_pnl_pct || 0);
+                                const isLoss = pnlPct < 0;
+                                const barClass = isLoss ? 'bg-amber-400' : 'bg-emerald-400 animate-pulse';
+                                const message = isLoss ? '🚫 Ne pas renforcer' : '✅ Prêt pour Vague 2';
+                                return (
+                                  <div className="flex flex-col items-end gap-1">
+                                    <div className="w-24 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                                      <div
+                                        className={`h-full ${barClass}`}
+                                        style={{ width: '25%' }}
+                                      ></div>
+                                    </div>
+                                    <span className={`text-[10px] ${isLoss ? 'text-amber-300' : 'text-emerald-300'}`}>
+                                      {message}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setWave2Amounts((prev) => ({
+                                          ...prev,
+                                          [pos.ticker]: wave2Amount,
+                                        }))
+                                      }
+                                      className="text-[10px] text-indigo-300 hover:text-indigo-200"
+                                    >
+                                      Calculer montant Vague 2
+                                    </button>
+                                    {wave2Amounts[pos.ticker] ? (
+                                      <span className="text-[10px] text-slate-300">
+                                        Montant: {formatMoney(wave2Amounts[pos.ticker])}
+                                      </span>
+                                    ) : null}
                                   </div>
-                                  <span className="text-[10px] text-slate-400">
-                                    Prochaine: {pos.pyramid.next_step?.label || '—'}
-                                  </span>
-                                </div>
-                              ) : '—'}
+                                );
+                              })() : '—'}
                             </td>
                           </tr>
                         ))}
