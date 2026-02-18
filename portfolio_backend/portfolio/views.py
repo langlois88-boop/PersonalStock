@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import os
+import math
 from pathlib import Path
 from datetime import datetime, timedelta, date
 from typing import Any
@@ -1337,7 +1338,10 @@ class PortfolioDashboardView(APIView):
 		try:
 			if value is None:
 				return None
-			return float(value)
+			val = float(value)
+			if not math.isfinite(val):
+				return None
+			return val
 		except (TypeError, ValueError):
 			return None
 
