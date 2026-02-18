@@ -301,7 +301,9 @@ function TransactionForm() {
           />
         </label>
 
-        <button type="submit">Save Transaction</button>
+        <button type="submit" disabled={adding}>
+          {adding ? 'Adding stock…' : 'Save Transaction'}
+        </button>
       </form>
       {message && <p className="success">{message}</p>}
       {error && <p className="error">{typeof error === 'string' ? error : JSON.stringify(error)}</p>}
