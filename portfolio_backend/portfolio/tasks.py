@@ -144,7 +144,14 @@ def _usd_cad_rate() -> float:
 def _to_cad_price(symbol: str, price: float | None, info: dict[str, Any]) -> float | None:
     if price is None:
         return None
-    if not symbol.upper().endswith('.TO'):
+    symbol_upper = (symbol or '').upper()
+    force_list = {'RY'}
+    force_list.update({
+        s.strip().upper()
+        for s in str(os.getenv('FORCE_CAD_TICKERS', '')).split(',')
+        if s.strip()
+    })
+    if not symbol_upper.endswith('.TO') and symbol_upper not in force_list:
         return price
     currency = (info.get('currency') or info.get('financialCurrency') or '').upper()
     if currency == 'USD':
