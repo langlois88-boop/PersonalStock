@@ -1386,6 +1386,33 @@ class PortfolioDashboardView(APIView):
 		except Exception:
 			return None
 
+	def _ai_score(self, symbol: str) -> tuple[float | None, str | None]:
+		try:
+			fusion = DataFusionEngine(symbol)
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				return None, None
+			payload = load_or_train_model(frame, model_path=get_model_path('BLUECHIP'))
+			if not payload or not payload.get('model'):
+				return None, None
+			last_row = frame.tail(2).copy()
+			feature_list = payload.get('features') or FEATURE_COLUMNS
+			for col in feature_list:
+				if col not in last_row.columns:
+					last_row[col] = 0.0
+			features = last_row[feature_list].fillna(0).values
+			signal = float(payload['model'].predict_proba(features[-1:])[0][1])
+			ai_score = round(signal * 100, 2)
+			trend = None
+			if len(last_row) >= 2:
+				ma20_now = float(last_row.iloc[-1].get('MA20') or 0)
+				ma20_prev = float(last_row.iloc[-2].get('MA20') or 0)
+				rsi_now = float(last_row.iloc[-1].get('RSI14') or 0)
+				trend = 'descending' if ma20_now < ma20_prev or rsi_now < 50 else 'ascending'
+			return ai_score, trend
+		except Exception:
+			return None, None
+
 	def _stop_price(self, price: float) -> float | None:
 		try:
 			return round(float(price) * 0.95, 4) if price else None
