@@ -43,6 +43,9 @@ function LivePaperTrading() {
   }, []);
 
   useEffect(() => {
+    const wsEnabled = (process.env.REACT_APP_WS_UPDATES || '').toLowerCase() === 'true';
+    if (!wsEnabled) return undefined;
+
     let socket;
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const wsUrl = `${protocol}://${window.location.hostname}:8001/ws/updates/`;
