@@ -4,6 +4,8 @@ import AIRecommendations from './AIRecommendations';
 import api from '../api/api';
 
 function OptimizerPage() {
+    const core12ySymbols = ['ATD', 'ATD.TO', 'RY', 'RY.TO', 'TEC', 'TEC.TO'];
+    const isCore12y = (item) => core12ySymbols.includes(String(item?.ticker || '').toUpperCase());
     const normalizeScore = (value) => {
       const raw = Number(value || 0);
       if (!Number.isFinite(raw)) return 0;
@@ -24,6 +26,9 @@ function OptimizerPage() {
       return rsi < 30;
     };
     const signalLabel = (item) => {
+      if (isCore12y(item)) {
+        return { text: 'HOLD / KEEP', className: 'bg-sky-500/20 text-sky-200 border border-sky-500/40' };
+      }
       if (isEtfOversold(item)) {
         return { text: '✅ BUY (Vague 1)', className: 'bg-emerald-500/20 text-emerald-200 border border-emerald-500/40' };
       }
@@ -208,8 +213,16 @@ function OptimizerPage() {
               <div>Win rate: {item.win_rate ?? '—'}</div>
             </div>
             {Number(item.volume_z ?? 0) < -1 ? (
-              <div className="mt-2 rounded-lg border border-rose-500/50 bg-rose-600/20 px-2 py-1 text-xs text-rose-100">
-                ⚠️ SORTIE DE CAPITAL DÉTECTÉE
+              <div
+                className={`mt-2 rounded-lg border px-2 py-1 text-xs ${
+                  isCore12y(item)
+                    ? 'border-amber-500/40 bg-amber-500/10 text-amber-200'
+                    : 'border-rose-500/50 bg-rose-600/20 text-rose-100'
+                }`}
+              >
+                {isCore12y(item)
+                  ? '🌡️ SURCHAUFFE TEMPORAIRE - ATTENDRE REPLI POUR ACHETER'
+                  : '⚠️ SORTIE DE CAPITAL DÉTECTÉE'}
               </div>
             ) : null}
             <div className="absolute z-20 hidden group-hover/action:block left-4 top-full mt-3 w-[22rem] bg-slate-950 border border-slate-800 rounded-xl p-4 text-sm text-slate-200 shadow-xl">

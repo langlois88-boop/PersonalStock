@@ -83,6 +83,20 @@ from .ml_engine.backtester import (
 
 
 DEFAULT_YIELD = 0.02
+NON_FUNDAMENTAL_SYMBOLS = {
+    'TEC.TO',
+    'BTC-CAD',
+}
+
+
+def _is_crypto_symbol(symbol: str) -> bool:
+    symbol_upper = (symbol or '').upper()
+    return '-' in symbol_upper and symbol_upper.endswith(('CAD', 'USD', 'USDT'))
+
+
+def _skip_fundamentals_info(symbol: str) -> bool:
+    symbol_upper = (symbol or '').upper()
+    return symbol_upper in NON_FUNDAMENTAL_SYMBOLS or _is_crypto_symbol(symbol_upper)
 
 
 def _send_alert(subject: str, message: str) -> None:
@@ -214,10 +228,11 @@ def fetch_prices_hourly() -> dict[str, float]:
             day_high = float(last_row['High']) if 'High' in data else None
 
             info: dict[str, Any] = {}
-            try:
-                info = ticker.info or {}
-            except Exception:
-                info = {}
+            if not _skip_fundamentals_info(stock.symbol):
+                try:
+                    info = ticker.info or {}
+                except Exception:
+                    info = {}
 
             sector = (info.get('sector') or '').strip()
             div_yield = info.get('dividendYield')

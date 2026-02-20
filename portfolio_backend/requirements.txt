@@ -1,3 +1,4 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 django
 djangorestframework
 django-cors-headers
@@ -13,7 +14,7 @@ numpy
 scikit-learn
 joblib
 transformers
-torch
+torch==2.2.2+cpu
 feedparser
 textblob
 vaderSentiment
@@ -25,3 +26,4 @@ prophet
 openai
 psycopg2-binary
 reportlab
+plotly

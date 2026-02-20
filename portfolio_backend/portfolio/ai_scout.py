@@ -17,6 +17,20 @@ from .ml_engine.backtester import AIBacktester, load_or_train_model, get_model_p
 
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+NON_FUNDAMENTAL_SYMBOLS = {
+    "TEC.TO",
+    "BTC-CAD",
+}
+
+
+def _is_crypto_symbol(symbol: str) -> bool:
+    symbol_upper = (symbol or "").upper()
+    return "-" in symbol_upper and symbol_upper.endswith(("CAD", "USD", "USDT"))
+
+
+def _skip_fundamentals_info(symbol: str) -> bool:
+    symbol_upper = (symbol or "").upper()
+    return symbol_upper in NON_FUNDAMENTAL_SYMBOLS or _is_crypto_symbol(symbol_upper)
 
 
 def _get_recent_prices(symbol: str, stock: Stock | None) -> list[float]:
@@ -124,10 +138,11 @@ def build_scout_summary(symbol: str, allow_llm: bool = True) -> dict[str, Any]:
     stock = Stock.objects.filter(symbol__iexact=symbol).first()
 
     info: dict[str, Any] = {}
-    try:
-        info = yf.Ticker(symbol).info or {}
-    except Exception:
-        info = {}
+    if not _skip_fundamentals_info(symbol):
+        try:
+            info = yf.Ticker(symbol).info or {}
+        except Exception:
+            info = {}
 
     cutoff = timezone.now() - timedelta(days=7)
     news_qs = StockNews.objects.filter(stock=stock, fetched_at__gte=cutoff) if stock else None

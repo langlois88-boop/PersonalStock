@@ -1717,6 +1717,7 @@ class PortfolioDashboardView(APIView):
 
 		items = []
 		pre_entries = []
+		total_cost_value = 0.0
 		for payload in position_map.values():
 			shares = float(payload['shares'] or 0)
 			if shares <= 0:
@@ -1735,6 +1736,7 @@ class PortfolioDashboardView(APIView):
 			cost_value = avg_cost * shares
 			unrealized = value - cost_value
 			unrealized_pct = (unrealized / cost_value * 100) if cost_value else 0
+			total_cost_value += cost_value
 			pre_entries.append({
 				'stock': stock,
 				'symbol': (stock.symbol or '').strip().upper(),
@@ -1844,6 +1846,7 @@ class PortfolioDashboardView(APIView):
 			'total_value': total_value,
 			'stable_value': stable_value,
 			'risky_value': risky_value,
+			'total_cost_value': total_cost_value,
 			'change_1d': change_1d,
 			'change_7d': change_7d,
 		}
@@ -1889,6 +1892,9 @@ class PortfolioDashboardView(APIView):
 			risky_value = fallback['risky_value']
 			change_1d = fallback['change_1d']
 			change_7d = fallback['change_7d']
+			total_cost_value = float(fallback.get('total_cost_value') or 0)
+			total_return = total_value - total_cost_value
+			total_return_pct = (total_return / total_cost_value * 100) if total_cost_value else 0.0
 
 			allocation_pct = (stable_value / total_value * 100) if total_value else 0
 			change_1d_pct = (change_1d / (total_value - change_1d) * 100) if total_value else 0
@@ -1897,6 +1903,8 @@ class PortfolioDashboardView(APIView):
 			return Response({
 				'portfolio': None,
 				'total_balance': round(total_value, 2),
+				'total_return': round(total_return, 2),
+				'total_return_pct': round(total_return_pct, 2),
 				'change_24h': round(change_1d, 2),
 				'change_24h_pct': round(change_1d_pct, 2),
 				'change_7d': round(change_7d, 2),
@@ -2090,6 +2098,9 @@ class PortfolioDashboardView(APIView):
 			risky_value = fallback['risky_value']
 			change_1d = fallback['change_1d']
 			change_7d = fallback['change_7d']
+			total_cost_value = float(fallback.get('total_cost_value') or 0)
+		else:
+			total_cost_value = sum(float(item.get('cost_value') or 0) for item in items)
 
 		archived = []
 		if items:
@@ -2111,6 +2122,8 @@ class PortfolioDashboardView(APIView):
 		allocation_pct = (stable_value / total_value * 100) if total_value else 0
 		change_1d_pct = (change_1d / (total_value - change_1d) * 100) if total_value else 0
 		change_7d_pct = (change_7d / (total_value - change_7d) * 100) if total_value else 0
+		total_return = total_value - total_cost_value
+		total_return_pct = (total_return / total_cost_value * 100) if total_cost_value else 0.0
 
 		snapshots = DripSnapshot.objects.filter(portfolio=portfolio).order_by('-as_of')[:365]
 		if snapshots:
@@ -2133,6 +2146,8 @@ class PortfolioDashboardView(APIView):
 		return Response({
 			'portfolio': {'id': portfolio.id, 'name': portfolio.name},
 			'total_balance': round(total_value, 2),
+			'total_return': round(total_return, 2),
+			'total_return_pct': round(total_return_pct, 2),
 			'change_24h': round(change_1d, 2),
 			'change_24h_pct': round(change_1d_pct, 2),
 			'change_7d': round(change_7d, 2),
@@ -2682,10 +2697,7 @@ class PortfolioNewsView(APIView):
 			holdings = PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
 			symbols = [h.stock.symbol for h in holdings if h.stock and h.stock.symbol]
 			if not symbols:
-				transactions = (
-					AccountTransaction.objects.select_related('stock', 'account')
-					.filter(account__portfolio=portfolio)
-				)
+				transactions = AccountTransaction.objects.select_related('stock', 'account').all()
 				symbols = [tx.stock.symbol for tx in transactions if tx.stock and tx.stock.symbol]
 				symbols = list(dict.fromkeys(symbols))
 		else:
@@ -3552,11 +3564,35 @@ class PortfolioOptimizerView(APIView):
 				return self._to_float(df.loc[label].iloc[0])
 		return None
 
+	def _is_crypto_symbol(self, symbol: str) -> bool:
+		symbol_upper = (symbol or '').upper()
+		return '-' in symbol_upper and symbol_upper.endswith(('CAD', 'USD', 'USDT'))
+
+	def _skip_fundamentals_info(self, symbol: str) -> bool:
+		symbol_upper = (symbol or '').upper()
+		return symbol_upper in {'TEC.TO', 'BTC-CAD'} or self._is_crypto_symbol(symbol_upper)
+
 	def _fundamentals_snapshot(self, symbol: str) -> dict[str, Any]:
 		cache_key = f"fundamentals_snapshot:{symbol}"
 		cached = cache.get(cache_key)
 		if cached is not None:
 			return cached
+		if self._skip_fundamentals_info(symbol):
+			sector = 'Crypto' if self._is_crypto_symbol(symbol) else 'ETF'
+			result = {
+				'sector': sector,
+				'revenue_growth': None,
+				'current_ratio': None,
+				'dividend_yield': 0.0,
+				'market_cap': None,
+				'free_cashflow': None,
+				'dividend_rate': None,
+				'yield_safety': None,
+				'total_return_12y': None,
+				'altman_z': None,
+			}
+			cache.set(cache_key, result, 60 * 60 * 6)
+			return result
 		info = {}
 		try:
 			info = yf.Ticker(symbol).info or {}
@@ -4095,10 +4131,7 @@ class PortfolioOptimizerView(APIView):
 					stocks_by_symbol[symbol] = tx.stock
 			if not stocks_by_symbol:
 				if portfolio:
-					account_transactions = (
-						AccountTransaction.objects.select_related('stock', 'account')
-						.filter(account__portfolio=portfolio)
-					)
+						account_transactions = AccountTransaction.objects.select_related('stock', 'account').all()
 				else:
 					account_transactions = AccountTransaction.objects.select_related('stock', 'account').all()
 				for tx in account_transactions:

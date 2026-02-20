@@ -6,6 +6,8 @@ import UnifiedAlerts from './UnifiedAlerts';
 
 const emptyState = {
   total_balance: 0,
+  total_return: 0,
+  total_return_pct: 0,
   change_24h: 0,
   change_24h_pct: 0,
   change_7d: 0,
@@ -364,6 +366,12 @@ function GlobalPortfolio() {
           accent="text-white"
         />
         <StatCard
+          title="Rendement total"
+          value={`${Number(data.total_return_pct || 0).toFixed(2)}%`}
+          subtitle={formatMoneySigned(data.total_return)}
+          accent={Number(data.total_return || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}
+        />
+        <StatCard
           title="Changement 24h"
           value={`${data.change_24h >= 0 ? '+' : ''}${data.change_24h}`}
           subtitle={`${data.change_24h_pct}% aujourd'hui"`}
@@ -422,30 +430,46 @@ function GlobalPortfolio() {
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         <div className="xl:col-span-2 bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
-          <h3 className="text-lg font-semibold text-white mb-4">Performance 1 an</h3>
-          <div className="h-72">
-            {loading ? (
-              <p className="text-sm text-slate-400">Chargement…</p>
-            ) : data.chart && data.chart.length > 0 ? (
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={data.chart}>
-                  <defs>
-                    <linearGradient id="colorValue" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#6366f1" stopOpacity={0.8} />
-                      <stop offset="95%" stopColor="#6366f1" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
-                  <XAxis dataKey="date" stroke="#64748b" />
-                  <YAxis stroke="#64748b" />
-                  <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #1f2937' }} />
-                  <Area type="monotone" dataKey="value" stroke="#6366f1" fillOpacity={1} fill="url(#colorValue)" />
-                </AreaChart>
-              </ResponsiveContainer>
-            ) : (
-              <p className="text-sm text-slate-400">Aucune donnée de performance.</p>
-            )}
-          </div>
+          <h3 className="text-lg font-semibold text-white mb-4">Rendement du portefeuille</h3>
+          {loading ? (
+            <p className="text-sm text-slate-400">Chargement…</p>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+                <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Valeur actuelle</p>
+                <p className="text-2xl font-semibold text-white">{formatMoney(data.total_balance)}</p>
+                <p className="text-xs text-slate-400">Au {new Date().toISOString().slice(0, 10)}</p>
+              </div>
+              <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+                <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Rendement total</p>
+                <p className={`text-2xl font-semibold ${Number(data.total_return || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  {Number(data.total_return_pct || 0).toFixed(2)}%
+                </p>
+                <p className="text-xs text-slate-400">{formatMoneySigned(data.total_return)}</p>
+              </div>
+              <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+                <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Changement 24h</p>
+                <p className={`text-2xl font-semibold ${Number(data.change_24h || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  {formatMoneySigned(data.change_24h)}
+                </p>
+                <p className="text-xs text-slate-400">{Number(data.change_24h_pct || 0).toFixed(2)}% aujourd'hui</p>
+              </div>
+              <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+                <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Changement 7j</p>
+                <p className={`text-2xl font-semibold ${Number(data.change_7d || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  {formatMoneySigned(data.change_7d)}
+                </p>
+                <p className="text-xs text-slate-400">{Number(data.change_7d_pct || 0).toFixed(2)}% sur 7 jours</p>
+              </div>
+              <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4 md:col-span-2">
+                <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Drawdown actuel</p>
+                <p className={`text-2xl font-semibold ${Number(data.current_drawdown || 0) < 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                  {Number(data.current_drawdown || 0).toFixed(2)}%
+                </p>
+                <p className="text-xs text-slate-400">Depuis le dernier sommet</p>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
