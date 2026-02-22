@@ -62,7 +62,10 @@ class Command(BaseCommand):
             self.stderr.write("No data returned")
             return
 
-        close = data["Close"]
+        close = _extract_close(data)
+        if close is None or close.empty:
+            self.stderr.write("No close prices available")
+            return
         if isinstance(close, pd.Series):
             close = close.to_frame()
 
@@ -93,3 +96,24 @@ def _yfinance_fallback(symbols, period):
     except Exception:
         return pd.DataFrame()
     return data if isinstance(data, pd.DataFrame) else pd.DataFrame()
+
+
+def _extract_close(data: pd.DataFrame) -> pd.DataFrame | pd.Series | None:
+    if data is None or data.empty:
+        return None
+    if "Close" in data.columns:
+        return data["Close"]
+    if "Adj Close" in data.columns:
+        return data["Adj Close"]
+    if isinstance(data.columns, pd.MultiIndex):
+        level0 = data.columns.get_level_values(0)
+        level1 = data.columns.get_level_values(1)
+        if "Close" in level0:
+            return data.xs("Close", axis=1, level=0)
+        if "Adj Close" in level0:
+            return data.xs("Adj Close", axis=1, level=0)
+        if "Close" in level1:
+            return data.xs("Close", axis=1, level=1)
+        if "Adj Close" in level1:
+            return data.xs("Adj Close", axis=1, level=1)
+    return None
