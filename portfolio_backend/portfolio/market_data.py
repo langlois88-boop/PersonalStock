@@ -39,9 +39,14 @@ SYMBOL_ALIASES = {
 
 def _yf_timeout() -> float:
     try:
-        return float(os.getenv('YF_TIMEOUT_SEC', '4'))
+        return float(os.getenv('YF_TIMEOUT_SEC', '6'))
     except Exception:
-        return 4.0
+        return 6.0
+
+
+def _is_crypto_symbol(symbol: str) -> bool:
+    symbol_upper = (symbol or '').upper()
+    return '-' in symbol_upper and symbol_upper.endswith(('CAD', 'USD', 'USDT'))
 
 
 def _allow_yf_price_fallback(symbol: str) -> bool:
@@ -49,7 +54,7 @@ def _allow_yf_price_fallback(symbol: str) -> bool:
     if flag in {'1', 'true', 'yes', 'y'}:
         return True
     symbol = (symbol or '').upper()
-    return '.' in symbol
+    return '.' in symbol or _is_crypto_symbol(symbol)
 
 
 def _with_timeout(func, timeout: float, default):
@@ -294,18 +299,18 @@ class Ticker:
             return data
         if _yfinance is None or not _allow_yf_price_fallback(self.symbol):
             return pd.DataFrame()
-        timeout = _yf_timeout()
+        fallback_timeout = float(timeout) if timeout else _yf_timeout()
         fallback = _with_timeout(
             lambda: _yfinance.Ticker(self.symbol).history(
                 period=period,
                 interval=interval,
                 start=start,
                 end=end,
-                timeout=int(timeout),
+                timeout=int(fallback_timeout),
                 auto_adjust=auto_adjust,
                 prepost=prepost,
             ),
-            timeout,
+            fallback_timeout,
             pd.DataFrame(),
         )
         return fallback if isinstance(fallback, pd.DataFrame) else pd.DataFrame()

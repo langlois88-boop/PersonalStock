@@ -25,6 +25,7 @@ except Exception:  # pragma: no cover - optional dependency
     AssetClass = None
 
 from .patterns import enrich_bars_with_patterns
+from . import market_data as market_data
 
 
 def _alpaca_client() -> StockHistoricalDataClient | None:
@@ -125,7 +126,29 @@ def get_intraday_bars(symbol: str, minutes: int = 390) -> pd.DataFrame:
     fallback_start = end - timedelta(days=5)
     fallback_df = get_intraday_bars_range(symbol, start=fallback_start, end=end)
     if fallback_df is None or fallback_df.empty:
-        return pd.DataFrame()
+        try:
+            hist = market_data.Ticker(symbol).history(period='5d', interval='1m', timeout=8)
+            if hist is None or hist.empty:
+                return pd.DataFrame()
+            hist = hist.reset_index()
+            if 'Datetime' in hist.columns and 'timestamp' not in hist.columns:
+                hist = hist.rename(columns={'Datetime': 'timestamp'})
+            if 'Date' in hist.columns and 'timestamp' not in hist.columns:
+                hist = hist.rename(columns={'Date': 'timestamp'})
+            if 'Open' in hist.columns:
+                hist = hist.rename(columns={
+                    'Open': 'open',
+                    'High': 'high',
+                    'Low': 'low',
+                    'Close': 'close',
+                    'Volume': 'volume',
+                })
+            cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            if not all(col in hist.columns for col in cols):
+                return pd.DataFrame()
+            return hist[cols].tail(minutes)
+        except Exception:
+            return pd.DataFrame()
     return fallback_df.tail(minutes)
 
 
