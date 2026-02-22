@@ -153,7 +153,8 @@ class DataFusionEngine:
         else:
             macro = self.get_macro_data()
             fused = market.join(macro, how="left").ffill()
-            sentiment = fetch_news_sentiment(self.ticker)
+            sentiment_days = int(os.getenv("NEWS_SENTIMENT_DAYS", "7"))
+            sentiment = fetch_news_sentiment(self.ticker, days=sentiment_days)
             fused["sentiment_score"] = sentiment.get("news_sentiment", 0.0)
             fused["news_count"] = sentiment.get("news_count", 0)
 
@@ -175,6 +176,22 @@ class DataFusionEngine:
         loss = (-delta.clip(upper=0)).rolling(14, min_periods=7).mean()
         rs = gain / loss.replace(0, pd.NA)
         fused["RSI14"] = 100 - (100 / (1 + rs))
+
+        ema_fast = fused["Close"].ewm(span=12, adjust=False).mean()
+        ema_slow = fused["Close"].ewm(span=26, adjust=False).mean()
+        macd = ema_fast - ema_slow
+        signal = macd.ewm(span=9, adjust=False).mean()
+        fused["MACD"] = macd
+        fused["MACD_SIGNAL"] = signal
+        fused["MACD_HIST"] = macd - signal
+
+        if "Open" in fused.columns and "High" in fused.columns and "Low" in fused.columns:
+            body = fused["Close"] - fused["Open"]
+            range_ = fused["High"] - fused["Low"]
+            fused["CandleBody"] = body
+            fused["CandleRange"] = range_
+            fused["CandleBodyPct"] = body.abs() / range_.replace(0, pd.NA)
+            fused["CandleRangePct"] = range_ / fused["Close"].replace(0, pd.NA)
 
         if self.fast_mode:
             return fused.dropna(subset=["Close"])

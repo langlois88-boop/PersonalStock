@@ -170,6 +170,37 @@ def _time_hhmm(dt_value: datetime | None = None) -> str:
     return dt_value.strftime('%H:%M')
 
 
+def _market_closed_now() -> bool:
+    now = _ny_time_now()
+    if now.weekday() >= 5:
+        return True
+    return not (dt_time(9, 30) <= now.time() <= dt_time(16, 0))
+
+
+def _collect_training_symbols() -> dict[str, list[str]]:
+    penny_symbols: set[str] = set()
+    bluechip_symbols: set[str] = set()
+
+    watch_penny = SandboxWatchlist.objects.filter(sandbox='AI_PENNY').first()
+    if watch_penny and watch_penny.symbols:
+        penny_symbols.update({str(s).strip().upper() for s in watch_penny.symbols if str(s).strip()})
+
+    watch_blue = SandboxWatchlist.objects.filter(sandbox='AI_BLUECHIP').first()
+    if watch_blue and watch_blue.symbols:
+        bluechip_symbols.update({str(s).strip().upper() for s in watch_blue.symbols if str(s).strip()})
+
+    holdings = PortfolioHolding.objects.select_related('stock').all()
+    for holding in holdings:
+        symbol = (holding.stock.symbol or '').strip().upper()
+        if symbol:
+            bluechip_symbols.add(symbol)
+
+    return {
+        'PENNY': sorted(penny_symbols),
+        'BLUECHIP': sorted(bluechip_symbols),
+    }
+
+
 def _profit_wallet_path() -> Path:
     return Path(settings.BASE_DIR) / 'profit_wallet.json'
 
@@ -2025,6 +2056,157 @@ def backtest_retrain_guard() -> dict[str, Any]:
         'min_win_rate': min_win_rate,
         'retrained': retrained,
     }
+
+
+def _build_training_frame(symbol: str, lookback_days: int, news_days: int) -> pd.DataFrame:
+    prev_news_days = os.environ.get('NEWS_SENTIMENT_DAYS')
+    os.environ['NEWS_SENTIMENT_DAYS'] = str(news_days)
+    try:
+        engine = DataFusionEngine(symbol, use_alpaca=True)
+        data = engine.fuse_all()
+        if data is None or data.empty:
+            engine = DataFusionEngine(symbol, use_alpaca=False)
+            data = engine.fuse_all()
+    finally:
+        if prev_news_days is None:
+            os.environ.pop('NEWS_SENTIMENT_DAYS', None)
+        else:
+            os.environ['NEWS_SENTIMENT_DAYS'] = prev_news_days
+    if data is None or data.empty:
+        return pd.DataFrame()
+    if len(data) > lookback_days:
+        data = data.tail(lookback_days)
+    return data
+
+
+def _symbol_training_report(symbol: str, df: pd.DataFrame) -> dict[str, Any]:
+    if df is None or df.empty:
+        return {}
+    first = df.iloc[0]
+    last = df.iloc[-1]
+    close_first = float(first.get('Close') or 0)
+    close_last = float(last.get('Close') or 0)
+    change_pct = ((close_last - close_first) / close_first) * 100 if close_first else 0.0
+    volume_change_pct = None
+    if 'Volume' in df.columns and len(df) >= 40:
+        vol_recent = float(df['Volume'].tail(20).mean() or 0)
+        vol_past = float(df['Volume'].head(20).mean() or 0)
+        if vol_past:
+            volume_change_pct = ((vol_recent - vol_past) / vol_past) * 100
+
+    reasons: list[str] = []
+    rsi = float(last.get('RSI14') or 0)
+    macd_hist = float(last.get('MACD_HIST') or 0)
+    volume_z = float(last.get('VolumeZ') or 0)
+    if change_pct >= 5:
+        reasons.append('trend_haussier_6m')
+    if change_pct <= -5:
+        reasons.append('trend_baissier_6m')
+    if rsi >= 70:
+        reasons.append('rsi_surachat')
+    elif rsi <= 30:
+        reasons.append('rsi_survente')
+    if macd_hist > 0:
+        reasons.append('macd_positif')
+    if volume_z >= 1.5:
+        reasons.append('volume_en_hausse')
+    candle_body_pct = float(last.get('CandleBodyPct') or 0)
+    if candle_body_pct >= 0.6:
+        reasons.append('candle_impulsion')
+
+    return {
+        'symbol': symbol,
+        'close': close_last,
+        'change_6m_pct': round(change_pct, 2),
+        'volume_change_pct': round(volume_change_pct, 2) if volume_change_pct is not None else None,
+        'rsi14': round(rsi, 2),
+        'macd_hist': round(macd_hist, 4),
+        'sentiment_score': float(last.get('sentiment_score') or 0),
+        'news_count': int(last.get('news_count') or 0),
+        'candle_body_pct': round(candle_body_pct, 4),
+        'candle_range_pct': round(float(last.get('CandleRangePct') or 0), 4),
+        'reasons': reasons,
+    }
+
+
+@shared_task
+def nightly_closed_market_retrain() -> dict[str, Any]:
+    log = _task_log_start('nightly_closed_market_retrain')
+    if not _market_closed_now():
+        result = {'skipped': 'market_open'}
+        _task_log_finish(log, 'SUCCESS', result)
+        return result
+
+    lookback_days = int(os.getenv('NIGHTLY_TRAIN_LOOKBACK_DAYS', '180'))
+    news_days = int(os.getenv('NIGHTLY_TRAIN_NEWS_DAYS', '180'))
+    max_symbols = int(os.getenv('NIGHTLY_TRAIN_MAX_SYMBOLS', '1000'))
+
+    symbols_by_universe = _collect_training_symbols()
+    penny_symbols = symbols_by_universe.get('PENNY') or []
+    blue_symbols = symbols_by_universe.get('BLUECHIP') or []
+
+    if max_symbols > 0:
+        penny_symbols = penny_symbols[:max_symbols]
+        blue_symbols = blue_symbols[:max_symbols]
+
+    datasets: dict[str, list[pd.DataFrame]] = {'PENNY': [], 'BLUECHIP': []}
+    reports: dict[str, Any] = {}
+    skipped: list[str] = []
+
+    for symbol in penny_symbols:
+        df = _build_training_frame(symbol, lookback_days, news_days)
+        if df is None or df.empty:
+            skipped.append(symbol)
+            continue
+        datasets['PENNY'].append(df)
+        reports[symbol] = _symbol_training_report(symbol, df)
+
+    for symbol in blue_symbols:
+        df = _build_training_frame(symbol, lookback_days, news_days)
+        if df is None or df.empty:
+            skipped.append(symbol)
+            continue
+        datasets['BLUECHIP'].append(df)
+        reports[symbol] = _symbol_training_report(symbol, df)
+
+    model_updates: dict[str, Any] = {}
+    for universe, frames in datasets.items():
+        if not frames:
+            continue
+        merged = pd.concat(frames, ignore_index=True)
+        payload = train_fusion_model(merged, model_path=get_model_path(universe))
+        if payload:
+            model_updates[universe] = {
+                'model_version': payload.get('model_version'),
+                'samples': int(len(merged)),
+                'cv_mean': payload.get('cv_mean'),
+                'features': payload.get('features') or [],
+            }
+
+    report_payload = {
+        'as_of': timezone.now().isoformat(),
+        'lookback_days': lookback_days,
+        'news_days': news_days,
+        'symbol_counts': {
+            'penny': len(penny_symbols),
+            'bluechip': len(blue_symbols),
+            'skipped': len(skipped),
+        },
+        'model_updates': model_updates,
+        'reports': reports,
+    }
+
+    try:
+        report_dir = Path(_journal_output_dir())
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / f"nightly_retrain_{timezone.now().date().isoformat()}.json"
+        report_path.write_text(json.dumps(report_payload, indent=2, default=str))
+        report_payload['report_path'] = str(report_path)
+    except Exception:
+        pass
+
+    _task_log_finish(log, 'SUCCESS', report_payload)
+    return report_payload
 
 
 def _env_float(prefix: str, name: str, default: str) -> float:

@@ -308,6 +308,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.auto_retrain_on_drift_daily',
         'schedule': crontab(minute=45, hour=7),
     },
+    'nightly-closed-market-retrain': {
+        'task': 'portfolio.tasks.nightly_closed_market_retrain',
+        'schedule': crontab(minute=0, hour=2),
+    },
     'model-rollback-daily': {
         'task': 'portfolio.tasks.auto_rollback_models_daily',
         'schedule': crontab(minute=55, hour=7),

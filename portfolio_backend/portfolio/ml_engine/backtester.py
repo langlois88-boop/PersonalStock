@@ -21,10 +21,20 @@ BLUECHIP_MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_bluec
 PENNY_MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_penny_v1.pkl"
 FEATURE_COLUMNS = [
     "MA20",
+    "MA50",
+    "MA200",
     "vol_regime",
+    "Volatility",
+    "Momentum20",
+    "VolumeZ",
+    "RSI14",
+    "MACD_HIST",
+    "CandleBodyPct",
+    "CandleRangePct",
+    "sentiment_score",
+    "news_count",
     "DCOILWTICO",
     "CPIAUCSL",
-    "VolumeZ",
 ]
 
 TRIPLE_BARRIER_UP_PCT = float(os.getenv("TRIPLE_BARRIER_UP_PCT", "0.05"))
