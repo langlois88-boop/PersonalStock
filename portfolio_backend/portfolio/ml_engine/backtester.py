@@ -209,6 +209,7 @@ def _triple_barrier_labels(close: pd.Series) -> pd.Series:
 
 
 def _select_features(X_df: pd.DataFrame, y: np.ndarray) -> list[str]:
+    min_features = int(os.getenv("MIN_FEATURE_SELECTION", "6"))
     try:
         selector = LogisticRegression(
             penalty="l1",
@@ -221,7 +222,9 @@ def _select_features(X_df: pd.DataFrame, y: np.ndarray) -> list[str]:
         pipeline.fit(X_df.values, y)
         coef = selector.coef_[0]
         selected = [col for col, weight in zip(X_df.columns, coef) if abs(weight) > 1e-6]
-        return selected or list(X_df.columns)
+        if len(selected) < min_features:
+            return list(X_df.columns)
+        return selected
     except Exception:
         return list(X_df.columns)
 
