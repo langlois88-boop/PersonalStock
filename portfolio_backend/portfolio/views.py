@@ -3000,11 +3000,26 @@ class StablePredictionView(APIView):
 		if spy is None or spy.empty or 'Close' not in spy or len(spy) < 200:
 			return Response({'error': 'Insufficient SPY history.'}, status=400)
 
-		close = data['Close']
+		def _normalize_index(series: pd.Series) -> pd.Series:
+			try:
+				idx = pd.to_datetime(series.index)
+			except Exception:
+				return series
+			try:
+				if getattr(idx, 'tz', None) is not None:
+					idx = idx.tz_localize(None)
+			except Exception:
+				pass
+			series = series.copy()
+			series.index = pd.to_datetime(idx).normalize()
+			return series
+
+		close = _normalize_index(data['Close'])
 		volume = data['Volume'] if 'Volume' in data else pd.Series([0] * len(close), index=close.index)
+		volume = _normalize_index(volume)
 		ret = close.pct_change().dropna()
 
-		spy_close = spy['Close']
+		spy_close = _normalize_index(spy['Close'])
 		spy_ret = spy_close.pct_change().dropna()
 		aligned = pd.concat([ret, spy_ret], axis=1, join='inner').dropna()
 		aligned.columns = ['stock', 'spy']
