@@ -7,7 +7,7 @@ from typing import Optional
 
 import pandas as pd
 import requests
-import yfinance as yf
+from ... import market_data as yf
 
 from ...alpaca_data import get_daily_bars
 

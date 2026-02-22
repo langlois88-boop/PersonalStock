@@ -3,7 +3,7 @@ from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+from .. import market_data as yf
 
 from .collectors.fmp_api import fetch_fmp_fundamentals, fetch_fmp_sentiment
 from .collectors.fred_api import fetch_fred_latest

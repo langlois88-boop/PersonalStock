@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import numpy as np
-import yfinance as yf
+from . import market_data as yf
 from django.db import models
 from django.utils import timezone
 from openai import OpenAI

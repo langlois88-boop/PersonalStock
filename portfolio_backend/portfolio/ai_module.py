@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
-import yfinance as yf
+from . import market_data as yf
 from prophet import Prophet
 
 

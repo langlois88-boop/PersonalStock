@@ -15,7 +15,7 @@ from django.db.utils import OperationalError
 from django.db.models import Prefetch
 from django.utils import timezone
 import finnhub
-import yfinance as yf
+from . import market_data as yf
 import numpy as np
 import pandas as pd
 import joblib
@@ -503,8 +503,6 @@ class PortfolioViewSet(viewsets.ModelViewSet):
 
 				# Beta vs SPY (if available)
 				try:
-					import yfinance as yf
-
 					spy = yf.download('SPY', period=f'{days}d', interval='1d', progress=False)
 					if not spy.empty and 'Close' in spy:
 						spy_returns = spy['Close'].pct_change().dropna().values
@@ -3731,7 +3729,7 @@ class PortfolioOptimizerView(APIView):
 		symbol_upper = (symbol or '').upper()
 		return symbol_upper in {'TEC.TO', 'BTC-CAD'} or self._is_crypto_symbol(symbol_upper)
 
-	def _fundamentals_snapshot(self, symbol: str) -> dict[str, Any]:
+	def _fundamentals_snapshot(self, symbol: str, fast_mode: bool = False) -> dict[str, Any]:
 		cache_key = f"fundamentals_snapshot:{symbol}"
 		cached = cache.get(cache_key)
 		if cached is not None:
@@ -3784,58 +3782,60 @@ class PortfolioOptimizerView(APIView):
 				yield_safety = free_cashflow / annual_dividends
 
 		total_return_12y = None
-		try:
-			ticker = yf.Ticker(symbol)
-			hist = ticker.history(period='13y', interval='1d')
-			if hist is not None and not hist.empty and 'Close' in hist:
-				price_now = float(hist['Close'].iloc[-1])
-				start_idx = max(0, len(hist) - 252 * 12)
-				price_then = float(hist['Close'].iloc[start_idx]) if len(hist) > start_idx else None
-				dividends = ticker.dividends
-				div_sum = 0.0
-				if dividends is not None and not dividends.empty:
-					cutoff = hist.index[start_idx]
-					div_sum = float(dividends[dividends.index >= cutoff].sum())
-				if price_then and price_then > 0:
-					total_return_12y = (price_now - price_then + div_sum) / price_then
-		except Exception:
-			total_return_12y = None
 		altman_z = None
-		try:
-			ticker = yf.Ticker(symbol)
-			balance = ticker.balance_sheet
-			financials = ticker.financials
-			total_assets = self._df_value(balance, ['Total Assets', 'Total assets'])
-			total_liab = self._df_value(balance, ['Total Liab', 'Total Liabilities', 'Total Liabilities Net Minority Interest'])
-			retained = self._df_value(balance, ['Retained Earnings'])
-			current_assets = self._df_value(balance, ['Total Current Assets', 'Current Assets'])
-			current_liab = self._df_value(balance, ['Total Current Liabilities', 'Current Liabilities'])
-			ebit = self._df_value(financials, ['EBIT', 'Ebit'])
-			sales = self._df_value(financials, ['Total Revenue', 'Total revenue'])
-			if sales is None:
-				sales = self._to_float(info.get('totalRevenue'))
-			market_cap = self._to_float(info.get('marketCap'))
-			working_cap = None
-			if current_assets is not None and current_liab is not None:
-				working_cap = current_assets - current_liab
-			if (
-				total_assets
-				and total_liab
-				and retained is not None
-				and ebit is not None
-				and sales is not None
-				and market_cap
-				and working_cap is not None
-			):
-				altman_z = (
-					1.2 * (working_cap / total_assets)
-					+ 1.4 * (retained / total_assets)
-					+ 3.3 * (ebit / total_assets)
-					+ 0.6 * (market_cap / total_liab)
-					+ 1.0 * (sales / total_assets)
-				)
-		except Exception:
+		if not fast_mode:
+			try:
+				ticker = yf.Ticker(symbol)
+				hist = ticker.history(period='13y', interval='1d')
+				if hist is not None and not hist.empty and 'Close' in hist:
+					price_now = float(hist['Close'].iloc[-1])
+					start_idx = max(0, len(hist) - 252 * 12)
+					price_then = float(hist['Close'].iloc[start_idx]) if len(hist) > start_idx else None
+					dividends = ticker.dividends
+					div_sum = 0.0
+					if dividends is not None and not dividends.empty:
+						cutoff = hist.index[start_idx]
+						div_sum = float(dividends[dividends.index >= cutoff].sum())
+					if price_then and price_then > 0:
+						total_return_12y = (price_now - price_then + div_sum) / price_then
+			except Exception:
+				total_return_12y = None
 			altman_z = None
+			try:
+				ticker = yf.Ticker(symbol)
+				balance = ticker.balance_sheet
+				financials = ticker.financials
+				total_assets = self._df_value(balance, ['Total Assets', 'Total assets'])
+				total_liab = self._df_value(balance, ['Total Liab', 'Total Liabilities', 'Total Liabilities Net Minority Interest'])
+				retained = self._df_value(balance, ['Retained Earnings'])
+				current_assets = self._df_value(balance, ['Total Current Assets', 'Current Assets'])
+				current_liab = self._df_value(balance, ['Total Current Liabilities', 'Current Liabilities'])
+				ebit = self._df_value(financials, ['EBIT', 'Ebit'])
+				sales = self._df_value(financials, ['Total Revenue', 'Total revenue'])
+				if sales is None:
+					sales = self._to_float(info.get('totalRevenue'))
+				market_cap = self._to_float(info.get('marketCap'))
+				working_cap = None
+				if current_assets is not None and current_liab is not None:
+					working_cap = current_assets - current_liab
+				if (
+					total_assets
+					and total_liab
+					and retained is not None
+					and ebit is not None
+					and sales is not None
+					and market_cap
+					and working_cap is not None
+				):
+					altman_z = (
+						1.2 * (working_cap / total_assets)
+						+ 1.4 * (retained / total_assets)
+						+ 3.3 * (ebit / total_assets)
+						+ 0.6 * (market_cap / total_liab)
+						+ 1.0 * (sales / total_assets)
+					)
+			except Exception:
+				altman_z = None
 
 		result = {
 			'sector': sector,
@@ -3892,6 +3892,8 @@ class PortfolioOptimizerView(APIView):
 
 	def _confidence(self, signal: float, win_rate: float | None) -> int:
 		signal_pct = signal * 100
+		if win_rate is None:
+			return int(round(self._clamp(signal_pct, 45, 95)))
 		win_pct = (win_rate or 0)
 		confidence = (signal_pct * 0.7) + (win_pct * 0.3)
 		return int(round(self._clamp(confidence, 45, 95)))
@@ -4009,7 +4011,16 @@ class PortfolioOptimizerView(APIView):
 				drivers.append('RSI en zone de survente.')
 		return drivers
 
-	def _build_metrics(self, df: pd.DataFrame, row: pd.Series, symbol: str, signal: float, result: BacktestResult | None, fundamentals: dict[str, Any] | None = None) -> list[dict[str, str]]:
+	def _build_metrics(
+		self,
+		df: pd.DataFrame,
+		row: pd.Series,
+		symbol: str,
+		signal: float,
+		result: BacktestResult | None,
+		fundamentals: dict[str, Any] | None = None,
+		fast_mode: bool = False,
+	) -> list[dict[str, str]]:
 		metrics = [
 			{'label': 'Signal', 'value': f"{signal * 100:.1f}%"},
 		]
@@ -4050,11 +4061,12 @@ class PortfolioOptimizerView(APIView):
 			if total_return_12y is not None:
 				metrics.append({'label': 'Total Return 12y', 'value': f"{float(total_return_12y) * 100:.1f}%"})
 
-		etf_symbols = [s.strip().upper() for s in os.getenv('ETF_SYMBOLS', 'TEC.TO').split(',') if s.strip()]
-		if symbol.upper() in etf_symbols:
-			corr = self._correlation_with_nasdaq(symbol)
-			if corr is not None:
-				metrics.append({'label': 'Corr NASDAQ', 'value': f"{corr:.2f}"})
+		if not fast_mode:
+			etf_symbols = [s.strip().upper() for s in os.getenv('ETF_SYMBOLS', 'TEC.TO').split(',') if s.strip()]
+			if symbol.upper() in etf_symbols:
+				corr = self._correlation_with_nasdaq(symbol)
+				if corr is not None:
+					metrics.append({'label': 'Corr NASDAQ', 'value': f"{corr:.2f}"})
 		return metrics
 
 	def _build_risks(self, row: pd.Series, result: BacktestResult | None) -> list[str]:
@@ -4070,7 +4082,15 @@ class PortfolioOptimizerView(APIView):
 				risks.append('Drawdown historique élevé')
 		return risks or ['Risque macro global']
 
-	def _build_action(self, holding: PortfolioHolding, universe: str, lookback_days: int, buy_threshold: float, sell_threshold: float) -> dict[str, Any] | None:
+	def _build_action(
+		self,
+		holding: PortfolioHolding,
+		universe: str,
+		lookback_days: int,
+		buy_threshold: float,
+		sell_threshold: float,
+		fast_mode: bool = False,
+	) -> dict[str, Any] | None:
 		symbol = (holding.stock.symbol or '').strip().upper()
 		if not symbol:
 			return None
@@ -4090,10 +4110,10 @@ class PortfolioOptimizerView(APIView):
 			}
 
 		signal, row = self._latest_signal(data, payload, symbol)
-		result = self._backtest(data, payload, symbol, lookback_days, buy_threshold, sell_threshold)
+		result = None if fast_mode else self._backtest(data, payload, symbol, lookback_days, buy_threshold, sell_threshold)
 		confidence = self._confidence(signal, result.win_rate if result else None)
-		win_rate = result.win_rate if result else 0
-		sharpe = result.sharpe_ratio if result else 0
+		win_rate = result.win_rate if result else None
+		sharpe = result.sharpe_ratio if result else None
 		volume_z = float(row.get('VolumeZ', 0.0) or 0.0)
 		min_volume_z = float(os.getenv('VOLUME_ZSCORE_MIN', '0.5'))
 		rsi_value = float(row.get('RSI14', 0.0) or 0.0)
@@ -4102,8 +4122,8 @@ class PortfolioOptimizerView(APIView):
 		sma200 = self._sma(data.get('Close') if data is not None else None, 200)
 		etf_symbols = [s.strip().upper() for s in os.getenv('ETF_SYMBOLS', 'TEC.TO').split(',') if s.strip()]
 		is_etf = symbol.upper() in etf_symbols
-		is_speculative = bool(result and (result.win_rate < 50 or result.sharpe_ratio < 1.0))
-		fundamentals = self._fundamentals_snapshot(symbol)
+		is_speculative = False if fast_mode else bool(result and (result.win_rate < 50 or result.sharpe_ratio < 1.0))
+		fundamentals = self._fundamentals_snapshot(symbol, fast_mode=fast_mode)
 		sector = (fundamentals.get('sector') or holding.stock.sector or '')
 		revenue_growth = fundamentals.get('revenue_growth')
 		altman_z = fundamentals.get('altman_z')
@@ -4120,7 +4140,7 @@ class PortfolioOptimizerView(APIView):
 		else:
 			action = 'KEEP'
 
-		if confidence < 70 or win_rate == 0:
+		if confidence < 70 or win_rate in (0, None):
 			action = 'KEEP'
 		if is_speculative:
 			action = 'KEEP'
@@ -4165,7 +4185,7 @@ class PortfolioOptimizerView(APIView):
 			advice = ['✋ HOLD (Attendre confirmation volume)']
 			advice_color = 'Cyan'
 
-		if confidence < 70 or win_rate == 0:
+		if confidence < 70 or win_rate in (0, None):
 			advice = ['NE PAS TOUCHER (Données insuffisantes).']
 			advice_color = 'Red'
 		elif action != 'BUY MORE' and confidence < 80:
@@ -4256,7 +4276,7 @@ class PortfolioOptimizerView(APIView):
 			'ai_score': round(signal * 100, 2),
 			'reason': reason,
 			'drivers': self._build_drivers(signal, buy_threshold, sell_threshold, row),
-			'metrics': self._build_metrics(data, row, symbol, signal, result, fundamentals),
+			'metrics': self._build_metrics(data, row, symbol, signal, result, fundamentals, fast_mode=fast_mode),
 			'risks': self._build_risks(row, result),
 			'advice': advice,
 			'advice_color': advice_color,
@@ -4266,8 +4286,8 @@ class PortfolioOptimizerView(APIView):
 			'volume_z': round(volume_z, 2),
 			'rsi': round(rsi_value, 2) if rsi_value is not None else None,
 			'unrealized_pnl_pct': round(float(unrealized_pct), 2) if unrealized_pct is not None else None,
-			'win_rate': round(float(win_rate), 2) if result else None,
-			'sharpe': round(float(sharpe), 2) if result else None,
+			'win_rate': round(float(win_rate), 2) if win_rate is not None else None,
+			'sharpe': round(float(sharpe), 2) if sharpe is not None else None,
 			'price': round(price_value, 4),
 			'market_cap': market_cap,
 			'dividend_yield': dividend_yield,
@@ -4278,17 +4298,26 @@ class PortfolioOptimizerView(APIView):
 		raw = os.getenv(env_key, fallback)
 		return [s.strip().upper() for s in str(raw).split(',') if s.strip()]
 
-	def _build_suggestion(self, symbol: str, universe: str, lookback_days: int, buy_threshold: float, sell_threshold: float, min_win_rate: float) -> dict[str, Any] | None:
+	def _build_suggestion(
+		self,
+		symbol: str,
+		universe: str,
+		lookback_days: int,
+		buy_threshold: float,
+		sell_threshold: float,
+		min_win_rate: float,
+		fast_mode: bool = False,
+	) -> dict[str, Any] | None:
 		data, payload = self._model_bundle(symbol, universe)
 		if data is None or payload is None:
 			return None
 		signal, row = self._latest_signal(data, payload, symbol)
 		if signal < buy_threshold:
 			return None
-		result = self._backtest(data, payload, symbol, lookback_days, buy_threshold, sell_threshold)
+		result = None if fast_mode else self._backtest(data, payload, symbol, lookback_days, buy_threshold, sell_threshold)
 		if result and result.win_rate < min_win_rate:
 			return None
-		fundamentals = self._fundamentals_snapshot(symbol)
+		fundamentals = self._fundamentals_snapshot(symbol, fast_mode=fast_mode)
 		sector = fundamentals.get('sector') or ''
 		revenue_growth = fundamentals.get('revenue_growth')
 		altman_z = fundamentals.get('altman_z')
@@ -4296,7 +4325,7 @@ class PortfolioOptimizerView(APIView):
 		is_healthcare = 'health' in str(sector).lower()
 		if universe == 'PENNY' and is_healthcare and revenue_growth is not None and revenue_growth < 0:
 			return None
-		is_speculative = bool(result and (result.win_rate < 50 or result.sharpe_ratio < 1.0))
+		is_speculative = False if fast_mode else bool(result and (result.win_rate < 50 or result.sharpe_ratio < 1.0))
 		confidence = self._confidence(signal, result.win_rate if result else None)
 		if is_speculative:
 			return None
@@ -4315,7 +4344,7 @@ class PortfolioOptimizerView(APIView):
 			'ai_score': round(signal * 100, 2),
 			'reason': reason,
 			'drivers': self._build_drivers(signal, buy_threshold, sell_threshold, row),
-			'metrics': self._build_metrics(data, row, symbol, signal, result, fundamentals),
+			'metrics': self._build_metrics(data, row, symbol, signal, result, fundamentals, fast_mode=fast_mode),
 			'risks': self._build_risks(row, result),
 			'altman_z': altman_z,
 			'speculative': is_speculative,
@@ -4335,6 +4364,7 @@ class PortfolioOptimizerView(APIView):
 		buy_threshold = float(os.getenv('OPTIMIZER_BUY_THRESHOLD', '0.64'))
 		sell_threshold = float(os.getenv('OPTIMIZER_SELL_THRESHOLD', '0.35'))
 		min_win_rate = float(os.getenv('OPTIMIZER_MIN_WIN_RATE', '0.52'))
+		fast_mode = str(request.query_params.get('fast', '')).lower() in {'1', 'true', 'yes'}
 		portfolio = None
 		if portfolio_id:
 			portfolio = Portfolio.objects.filter(id=portfolio_id).first()
@@ -4368,6 +4398,11 @@ class PortfolioOptimizerView(APIView):
 						stocks_by_symbol[symbol] = tx.stock
 			holdings = [SimpleNamespace(stock=stock) for stock in stocks_by_symbol.values()]
 
+		if fast_mode:
+			max_holdings = int(os.getenv('OPTIMIZER_MAX_HOLDINGS', '20'))
+			if len(holdings) > max_holdings:
+				holdings = holdings[:max_holdings]
+
 		actions: list[dict[str, Any]] = []
 		existing = set()
 		for holding in holdings:
@@ -4377,7 +4412,7 @@ class PortfolioOptimizerView(APIView):
 			existing.add(symbol)
 			is_stable = float(holding.stock.latest_price or 0) >= 5 or float(holding.stock.dividend_yield or 0) >= 0.02
 			universe = 'BLUECHIP' if is_stable else 'PENNY'
-			action = self._build_action(holding, universe, lookback_days, buy_threshold, sell_threshold)
+			action = self._build_action(holding, universe, lookback_days, buy_threshold, sell_threshold, fast_mode=fast_mode)
 			if action:
 				actions.append(action)
 
@@ -4386,17 +4421,37 @@ class PortfolioOptimizerView(APIView):
 			'SPY,AAPL,MSFT,NVDA,AMZN,GOOGL,TSLA,AVGO,LLY',
 		)
 		penny_candidates = self._candidate_symbols('OPTIMIZER_UNIVERSE_PENNY', '')
+		if fast_mode:
+			max_candidates = int(os.getenv('OPTIMIZER_MAX_CANDIDATES', '20'))
+			bluechip_candidates = bluechip_candidates[:max_candidates]
+			penny_candidates = penny_candidates[:max_candidates]
 		suggestions: list[dict[str, Any]] = []
 		for symbol in bluechip_candidates:
 			if symbol in existing:
 				continue
-			suggestion = self._build_suggestion(symbol, 'BLUECHIP', lookback_days, buy_threshold, sell_threshold, min_win_rate)
+			suggestion = self._build_suggestion(
+				symbol,
+				'BLUECHIP',
+				lookback_days,
+				buy_threshold,
+				sell_threshold,
+				min_win_rate,
+				fast_mode=fast_mode,
+			)
 			if suggestion:
 				suggestions.append(suggestion)
 		for symbol in penny_candidates:
 			if symbol in existing:
 				continue
-			suggestion = self._build_suggestion(symbol, 'PENNY', lookback_days, buy_threshold, sell_threshold, min_win_rate)
+			suggestion = self._build_suggestion(
+				symbol,
+				'PENNY',
+				lookback_days,
+				buy_threshold,
+				sell_threshold,
+				min_win_rate,
+				fast_mode=fast_mode,
+			)
 			if suggestion:
 				suggestions.append(suggestion)
 
@@ -4437,6 +4492,7 @@ class PortfolioOptimizerView(APIView):
 				'sell_threshold': sell_threshold,
 				'min_win_rate': min_win_rate,
 			},
+			'fast_mode': fast_mode,
 		})
 
 

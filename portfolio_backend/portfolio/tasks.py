@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, time as dt_time
 from math import isfinite
 from typing import Any
 
-import yfinance as yf
+from . import market_data as yf
 import requests
 import random
 import json
@@ -663,74 +663,42 @@ def fetch_prices_hourly() -> dict[str, float]:
         for stock in Stock.objects.all().order_by('symbol'):
             if not _is_valid_symbol(stock.symbol):
                 continue
-            ticker = yf.Ticker(stock.symbol)
+            data = None
             try:
-                data = ticker.history(period='1mo', interval='1d', timeout=10)
+                data = get_daily_bars(stock.symbol, days=30)
             except Exception:
                 data = None
-            if data is None or data.empty or 'Close' not in data:
+            latest_price = get_latest_trade_price(stock.symbol)
+            if data is None or data.empty:
                 if _backfill_latest_price(stock):
                     prices[stock.symbol] = float(stock.latest_price or 0)
                 continue
+            data = data.sort_values('timestamp') if 'timestamp' in data.columns else data
             last_row = data.iloc[-1]
-            price = float(last_row['Close'])
+            price = latest_price if latest_price is not None else float(last_row.get('close') or 0)
             if not _is_valid_price(price):
                 if _backfill_latest_price(stock):
                     prices[stock.symbol] = float(stock.latest_price or 0)
                 continue
-            day_low = float(last_row['Low']) if 'Low' in data else None
-            day_high = float(last_row['High']) if 'High' in data else None
+            day_low = float(last_row.get('low') or 0) if 'low' in data.columns else None
+            day_high = float(last_row.get('high') or 0) if 'high' in data.columns else None
 
-            info: dict[str, Any] = {}
-            if not _skip_fundamentals_info(stock.symbol):
-                try:
-                    info = ticker.info or {}
-                except Exception:
-                    info = {}
-
-            sector = (info.get('sector') or '').strip()
-            div_yield = info.get('dividendYield')
-            if div_yield is None:
-                div_yield = info.get('trailingAnnualDividendYield')
-            div_yield = float(div_yield) if div_yield is not None else None
-            if stock.symbol.upper() == 'AVGO':
-                dividend_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate')
-                if dividend_rate is not None:
-                    try:
-                        div_yield = float(dividend_rate) / 332.54
-                    except Exception:
-                        pass
-            if stock.symbol.upper() == 'TEC.TO':
-                dividend_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate')
-                if dividend_rate is not None and price:
-                    try:
-                        div_yield = float(dividend_rate) / float(price)
-                    except Exception:
-                        pass
-                if div_yield is not None:
-                    div_yield = min(float(div_yield), 0.02)
-
-            price = _to_cad_price(stock.symbol, price, info)
-            day_low = _to_cad_price(stock.symbol, day_low, info)
-            day_high = _to_cad_price(stock.symbol, day_high, info)
+            price = _to_cad_price(stock.symbol, price, {})
+            day_low = _to_cad_price(stock.symbol, day_low, {})
+            day_high = _to_cad_price(stock.symbol, day_high, {})
 
             stock.latest_price = price
             stock.day_low = day_low
             stock.day_high = day_high
-            if (not stock.sector) or stock.sector.lower() == 'unknown':
-                if sector:
-                    stock.sector = sector
-            if stock.symbol.upper() in {'AVGO', 'TEC.TO'} and div_yield is not None:
-                stock.dividend_yield = div_yield
-            elif not stock.dividend_yield or float(stock.dividend_yield or 0) == 0:
-                if div_yield is not None:
-                    stock.dividend_yield = div_yield
             stock.latest_price_updated_at = timezone.now()
-            stock.save(update_fields=['latest_price', 'day_low', 'day_high', 'sector', 'dividend_yield', 'latest_price_updated_at'])
+            stock.save(update_fields=['latest_price', 'day_low', 'day_high', 'latest_price_updated_at'])
 
-            for dt, row in data.iterrows():
-                close_price = float(row['Close'])
-                close_price = _to_cad_price(stock.symbol, close_price, info)
+            for _, row in data.iterrows():
+                dt = row.get('timestamp')
+                if dt is None:
+                    continue
+                close_price = float(row.get('close') or 0)
+                close_price = _to_cad_price(stock.symbol, close_price, {})
                 PriceHistory.objects.update_or_create(
                     stock=stock,
                     date=dt.date(),
@@ -743,6 +711,67 @@ def fetch_prices_hourly() -> dict[str, float]:
     except Exception as exc:
         _task_log_finish(log, 'FAILED', error=str(exc))
         _send_alert('Task failed: fetch_prices_hourly', str(exc))
+        raise
+
+
+@shared_task
+def fetch_fundamentals_daily() -> dict[str, int]:
+    log = _task_log_start('fetch_fundamentals_daily')
+    updated = 0
+    skipped = 0
+    try:
+        for stock in Stock.objects.all().order_by('symbol'):
+            if not _is_valid_symbol(stock.symbol) or _skip_fundamentals_info(stock.symbol):
+                skipped += 1
+                continue
+            ticker = yf.Ticker(stock.symbol)
+            try:
+                info = ticker.info or {}
+            except Exception:
+                info = {}
+            sector = (info.get('sector') or '').strip()
+            div_yield = info.get('dividendYield')
+            if div_yield is None:
+                div_yield = info.get('trailingAnnualDividendYield')
+            div_yield = float(div_yield) if div_yield is not None else None
+            price_hint = info.get('regularMarketPrice') or info.get('currentPrice') or stock.latest_price
+            if stock.symbol.upper() == 'AVGO':
+                dividend_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate')
+                if dividend_rate is not None:
+                    try:
+                        div_yield = float(dividend_rate) / 332.54
+                    except Exception:
+                        pass
+            if stock.symbol.upper() == 'TEC.TO':
+                dividend_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate')
+                if dividend_rate is not None and price_hint:
+                    try:
+                        div_yield = float(dividend_rate) / float(price_hint)
+                    except Exception:
+                        pass
+                if div_yield is not None:
+                    div_yield = min(float(div_yield), 0.02)
+
+            changed = False
+            if sector and ((not stock.sector) or stock.sector.lower() == 'unknown'):
+                stock.sector = sector
+                changed = True
+            if div_yield is not None:
+                if stock.symbol.upper() in {'AVGO', 'TEC.TO'}:
+                    stock.dividend_yield = div_yield
+                    changed = True
+                elif not stock.dividend_yield or float(stock.dividend_yield or 0) == 0:
+                    stock.dividend_yield = div_yield
+                    changed = True
+
+            if changed:
+                stock.save(update_fields=['sector', 'dividend_yield'])
+                updated += 1
+        _task_log_finish(log, 'SUCCESS', {'updated': updated, 'skipped': skipped})
+        return {'updated': updated, 'skipped': skipped}
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        _send_alert('Task failed: fetch_fundamentals_daily', str(exc))
         raise
 
 

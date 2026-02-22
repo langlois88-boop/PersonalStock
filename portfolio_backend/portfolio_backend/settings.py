@@ -184,9 +184,13 @@ CHANNEL_LAYERS = {
 }
 
 CELERY_BEAT_SCHEDULE = {
-    'fetch-prices-hourly': {
+    'fetch-prices-2min': {
         'task': 'portfolio.tasks.fetch_prices_hourly',
-        'schedule': crontab(minute=0, hour='*'),
+        'schedule': crontab(minute='*/2', hour='*'),
+    },
+    'fetch-fundamentals-12h': {
+        'task': 'portfolio.tasks.fetch_fundamentals_daily',
+        'schedule': crontab(minute=10, hour='6,18'),
     },
     'fetch-news-daily': {
         'task': 'portfolio.tasks.fetch_news_daily',

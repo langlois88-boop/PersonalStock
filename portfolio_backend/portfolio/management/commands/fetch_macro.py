@@ -7,7 +7,7 @@ import io
 import pandas as pd
 import numpy as np
 import requests
-import yfinance as yf
+from ... import market_data as yf
 from django.core.management.base import BaseCommand
 
 from portfolio.models import MacroIndicator
