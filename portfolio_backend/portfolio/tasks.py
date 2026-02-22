@@ -195,6 +195,32 @@ def _collect_training_symbols() -> dict[str, list[str]]:
         if symbol:
             bluechip_symbols.add(symbol)
 
+    tfsa_accounts = Account.objects.filter(account_type='TFSA')
+    if tfsa_accounts.exists():
+        txs = (
+            AccountTransaction.objects.filter(account__in=tfsa_accounts)
+            .select_related('stock')
+            .order_by('date')
+        )
+        positions: dict[int, float] = {}
+        for tx in txs:
+            if tx.type == 'DIVIDEND':
+                continue
+            qty = float(tx.quantity or 0)
+            if qty <= 0:
+                continue
+            sign = 1 if tx.type == 'BUY' else -1
+            positions[tx.stock_id] = positions.get(tx.stock_id, 0.0) + (sign * qty)
+        for stock_id, shares in positions.items():
+            if shares <= 0:
+                continue
+            stock = Stock.objects.filter(id=stock_id).first()
+            if not stock:
+                continue
+            symbol = (stock.symbol or '').strip().upper()
+            if symbol:
+                bluechip_symbols.add(symbol)
+
     return {
         'PENNY': sorted(penny_symbols),
         'BLUECHIP': sorted(bluechip_symbols),
