@@ -1385,7 +1385,7 @@ class AlpacaIntradayView(APIView):
 			bars = get_intraday_bars(alt_symbol, minutes=minutes)
 		if bars.empty:
 			return Response({
-				'error': f"Aucune donnée intraday pour {resolved_symbol}. Vérifie le ticker.",
+				'error': f"Aucune donnée intraday pour {resolved_symbol}. Alpaca ne couvre pas certains tickers (.TO, crypto, etc.).",
 				'symbol': resolved_symbol,
 				'bars': [],
 				'annotations': [],

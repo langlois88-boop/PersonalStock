@@ -44,6 +44,14 @@ def _yf_timeout() -> float:
         return 4.0
 
 
+def _allow_yf_price_fallback(symbol: str) -> bool:
+    flag = str(os.getenv('ALLOW_YF_PRICE_FALLBACK', '')).strip().lower()
+    if flag in {'1', 'true', 'yes', 'y'}:
+        return True
+    symbol = (symbol or '').upper()
+    return '.' in symbol
+
+
 def _with_timeout(func, timeout: float, default):
     if func is None:
         return default
@@ -282,6 +290,22 @@ class Ticker:
             start=start,
             end=end,
         )
-        if isinstance(data, pd.DataFrame):
+        if isinstance(data, pd.DataFrame) and not data.empty:
             return data
-        return pd.DataFrame()
+        if _yfinance is None or not _allow_yf_price_fallback(self.symbol):
+            return pd.DataFrame()
+        timeout = _yf_timeout()
+        fallback = _with_timeout(
+            lambda: _yfinance.Ticker(self.symbol).history(
+                period=period,
+                interval=interval,
+                start=start,
+                end=end,
+                timeout=int(timeout),
+                auto_adjust=auto_adjust,
+                prepost=prepost,
+            ),
+            timeout,
+            pd.DataFrame(),
+        )
+        return fallback if isinstance(fallback, pd.DataFrame) else pd.DataFrame()
