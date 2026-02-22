@@ -917,7 +917,7 @@ def fetch_google_news_daily(days: int = 1) -> dict[str, int]:
             query = quote_plus(f"{stock.symbol} stock")
             url = (
                 "https://news.google.com/rss/search"
-                f"?q={query}&hl=en-US&gl=US&ceid=US:en"
+                f"?q={query}&hl=en-CA&gl=CA&ceid=CA:en"
             )
             feed = feedparser.parse(url)
 
@@ -1050,7 +1050,7 @@ def fetch_press_releases_hourly(hours: int = 24) -> dict[str, int]:
             query = quote_plus(f"{stock.symbol} press release")
             url = (
                 "https://news.google.com/rss/search"
-                f"?q={query}&hl=en-US&gl=US&ceid=US:en"
+                f"?q={query}&hl=en-CA&gl=CA&ceid=CA:en"
             )
             feed = feedparser.parse(url)
 

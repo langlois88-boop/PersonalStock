@@ -118,16 +118,19 @@ def get_intraday_bars_range(symbol: str, start: datetime, end: datetime) -> pd.D
 
 def get_intraday_bars(symbol: str, minutes: int = 390) -> pd.DataFrame:
     end = datetime.now(timezone.utc)
-    start = end - timedelta(minutes=minutes)
+    if end.weekday() >= 5:
+        end = end - timedelta(days=end.weekday() - 4)
+    max_days = 3
+    start = max(end - timedelta(minutes=minutes), end - timedelta(days=max_days))
     df = get_intraday_bars_range(symbol, start=start, end=end)
     if df is not None and not df.empty:
         return df
-    # fallback: last 5 trading days, then take last N minutes
-    fallback_start = end - timedelta(days=5)
+    # fallback: last 3 trading days, then take last N minutes
+    fallback_start = end - timedelta(days=max_days)
     fallback_df = get_intraday_bars_range(symbol, start=fallback_start, end=end)
     if fallback_df is None or fallback_df.empty:
         try:
-            hist = market_data.Ticker(symbol).history(period='5d', interval='1m', timeout=8)
+            hist = market_data.Ticker(symbol).history(period=f'{max_days}d', interval='1m', timeout=8)
             if hist is None or hist.empty:
                 return pd.DataFrame()
             hist = hist.reset_index()
