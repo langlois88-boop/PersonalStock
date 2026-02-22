@@ -3,6 +3,8 @@ from django.core.management.base import BaseCommand
 from django.conf import settings
 from django.utils import timezone
 
+import pandas as pd
+
 from portfolio.models import PriceHistory, Stock
 
 
@@ -34,6 +36,23 @@ class Command(BaseCommand):
             return float(price) * self._usd_cad_rate()
         return price
 
+    def _normalize_history(self, data: pd.DataFrame | None) -> pd.DataFrame:
+        if data is None or data.empty:
+            return pd.DataFrame()
+        frame = data.copy()
+        if isinstance(frame.columns, pd.MultiIndex):
+            level0 = frame.columns.get_level_values(0)
+            level1 = frame.columns.get_level_values(1)
+            if 'Close' in level0 or 'Adj Close' in level0:
+                frame.columns = level0
+            elif 'Close' in level1 or 'Adj Close' in level1:
+                frame.columns = level1
+            else:
+                frame.columns = [col[0] for col in frame.columns]
+        if 'Close' not in frame.columns and 'Adj Close' in frame.columns:
+            frame = frame.rename(columns={'Adj Close': 'Close'})
+        return frame
+
     def handle(self, *args, **options):
         for stock in Stock.objects.all():
             ticker = yf.Ticker(stock.symbol)
@@ -42,6 +61,7 @@ class Command(BaseCommand):
             except Exception as exc:
                 self.stdout.write(f"{stock.symbol}: error {exc}")
                 continue
+            data = self._normalize_history(data)
             if data is None or data.empty or 'Close' not in data:
                 self.stdout.write(f"{stock.symbol}: no data")
                 continue
