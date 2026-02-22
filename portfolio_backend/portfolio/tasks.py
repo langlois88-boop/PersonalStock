@@ -712,6 +712,37 @@ def _calc_yield(stocks: list[Stock]) -> float:
     return sum((weights[i] / total) * float(stocks[i].dividend_yield or 0) for i in range(len(stocks)))
 
 
+def _normalize_price_frame(data: pd.DataFrame | None) -> pd.DataFrame:
+    if data is None or data.empty:
+        return pd.DataFrame()
+    frame = data.copy()
+    if isinstance(frame.columns, pd.MultiIndex):
+        level0 = frame.columns.get_level_values(0)
+        level1 = frame.columns.get_level_values(1)
+        if 'Close' in level0 or 'Adj Close' in level0:
+            frame.columns = level0
+        elif 'Close' in level1 or 'Adj Close' in level1:
+            frame.columns = level1
+        else:
+            frame.columns = [col[0] for col in frame.columns]
+    rename_map = {
+        'Open': 'open',
+        'High': 'high',
+        'Low': 'low',
+        'Close': 'close',
+        'Adj Close': 'close',
+        'Volume': 'volume',
+    }
+    frame = frame.rename(columns=rename_map)
+    if 'timestamp' not in frame.columns and isinstance(frame.index, pd.DatetimeIndex):
+        frame = frame.reset_index()
+        for col in ('Date', 'Datetime', 'index'):
+            if col in frame.columns:
+                frame = frame.rename(columns={col: 'timestamp'})
+                break
+    return frame
+
+
 @shared_task
 def fetch_prices_hourly() -> dict[str, float]:
     log = _task_log_start('fetch_prices_hourly')
@@ -727,6 +758,12 @@ def fetch_prices_hourly() -> dict[str, float]:
                 data = None
             latest_price = get_latest_trade_price(stock.symbol)
             if data is None or data.empty:
+                try:
+                    data = yf.download(stock.symbol, period='1mo', interval='1d', progress=False)
+                except Exception:
+                    data = None
+            data = _normalize_price_frame(data)
+            if data.empty:
                 if _backfill_latest_price(stock):
                     prices[stock.symbol] = float(stock.latest_price or 0)
                 continue
