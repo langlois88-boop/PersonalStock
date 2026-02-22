@@ -54,6 +54,9 @@ def _allow_yf_price_fallback(symbol: str) -> bool:
     if flag in {'1', 'true', 'yes', 'y'}:
         return True
     symbol = (symbol or '').upper()
+    allowed = [s.strip().upper() for s in os.getenv('ALLOW_YF_PRICE_FALLBACK_SYMBOLS', 'SPY').split(',') if s.strip()]
+    if symbol in allowed:
+        return True
     return '.' in symbol or _is_crypto_symbol(symbol)
 
 
