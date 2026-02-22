@@ -2060,14 +2060,21 @@ def backtest_retrain_guard() -> dict[str, Any]:
 
 def _build_training_frame(symbol: str, lookback_days: int, news_days: int) -> pd.DataFrame:
     prev_news_days = os.environ.get('NEWS_SENTIMENT_DAYS')
+    prev_use_alpaca = os.environ.get('DATAFUSION_USE_ALPACA')
     os.environ['NEWS_SENTIMENT_DAYS'] = str(news_days)
+    os.environ['DATAFUSION_USE_ALPACA'] = 'true'
     try:
-        engine = DataFusionEngine(symbol, use_alpaca=True)
+        engine = DataFusionEngine(symbol)
         data = engine.fuse_all()
         if data is None or data.empty:
-            engine = DataFusionEngine(symbol, use_alpaca=False)
+            os.environ['DATAFUSION_USE_ALPACA'] = 'false'
+            engine = DataFusionEngine(symbol)
             data = engine.fuse_all()
     finally:
+        if prev_use_alpaca is None:
+            os.environ.pop('DATAFUSION_USE_ALPACA', None)
+        else:
+            os.environ['DATAFUSION_USE_ALPACA'] = prev_use_alpaca
         if prev_news_days is None:
             os.environ.pop('NEWS_SENTIMENT_DAYS', None)
         else:
