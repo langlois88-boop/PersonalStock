@@ -384,6 +384,40 @@ class AlertEvent(models.Model):
 		return f"{self.category}: {self.created_at}"
 
 
+
+class ActiveSignal(models.Model):
+	STATUS_CHOICES = (
+		('OPEN', 'OPEN'),
+		('TARGET', 'TARGET'),
+		('STOP', 'STOP'),
+		('TIMEOUT', 'TIMEOUT'),
+		('CLOSED', 'CLOSED'),
+	)
+
+	ticker = models.CharField(max_length=12, db_index=True)
+	pattern = models.CharField(max_length=80, blank=True, default='')
+	rvol = models.FloatField(null=True, blank=True)
+	entry_price = models.FloatField()
+	target_price = models.FloatField()
+	stop_loss = models.FloatField()
+	confidence = models.FloatField(null=True, blank=True)
+	status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='OPEN', db_index=True)
+	opened_at = models.DateTimeField(auto_now_add=True)
+	closed_at = models.DateTimeField(null=True, blank=True)
+	closed_price = models.FloatField(null=True, blank=True)
+	outcome = models.CharField(max_length=10, blank=True, default='')
+	liquidity_note = models.CharField(max_length=120, blank=True, default='')
+	meta = models.JSONField(default=dict, blank=True)
+
+	class Meta:
+		ordering = ['-opened_at']
+		indexes = [
+			models.Index(fields=['status', 'opened_at'], name='activesignal_status_dt'),
+		]
+
+	def __str__(self) -> str:
+		return f"{self.ticker} {self.status}"
+
 class DripSnapshot(models.Model):
 	portfolio = models.ForeignKey(Portfolio, on_delete=models.CASCADE)
 	as_of = models.DateField()

@@ -272,6 +272,14 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.execute_paper_trades_ai_penny',
         'schedule': crontab(minute='*/15', hour='9-16', day_of_week='mon-fri'),
     },
+    'market-scanner-5min': {
+        'task': 'portfolio.tasks.market_scanner_task',
+        'schedule': crontab(minute='*/5', hour='9-16', day_of_week='mon-fri'),
+    },
+    'active-signal-monitor-1min': {
+        'task': 'portfolio.tasks.monitor_active_signals',
+        'schedule': crontab(minute='*/1', hour='9-16', day_of_week='mon-fri'),
+    },
     'paper-trade-retrain-daily': {
         'task': 'portfolio.tasks.retrain_from_paper_trades_daily',
         'schedule': crontab(minute=40, hour=7),
@@ -307,6 +315,34 @@ CELERY_BEAT_SCHEDULE = {
     'trading-journal-daily': {
         'task': 'portfolio.tasks.generate_trading_journal_daily',
         'schedule': crontab(minute=30, hour=20),
+    },
+    'weekend-deep-research-sat': {
+        'task': 'portfolio.tasks.weekend_deep_research',
+        'schedule': crontab(minute=0, hour=6, day_of_week='sat'),
+    },
+    'economic-calendar-weekly': {
+        'task': 'portfolio.tasks.economic_calendar_module',
+        'schedule': crontab(minute=0, hour=6, day_of_week='sun'),
+    },
+    'sunday-evening-briefing': {
+        'task': 'portfolio.tasks.sunday_evening_briefing',
+        'schedule': crontab(minute=0, hour=20, day_of_week='sun'),
+    },
+    'morning-status-check': {
+        'task': 'portfolio.tasks.morning_status_check',
+        'schedule': crontab(minute=20, hour=9, day_of_week='mon-fri'),
+    },
+    'daily-profit-tracker': {
+        'task': 'portfolio.tasks.daily_profit_tracker',
+        'schedule': crontab(minute=30, hour=16, day_of_week='mon-fri'),
+    },
+    'monitor-my-portfolio-hourly': {
+        'task': 'portfolio.tasks.monitor_my_portfolio',
+        'schedule': crontab(minute=0, hour='9-16', day_of_week='mon-fri'),
+    },
+    'portfolio-news-brief-morning': {
+        'task': 'portfolio.tasks.portfolio_news_brief',
+        'schedule': crontab(minute=0, hour=9, day_of_week='mon-fri'),
     },
 }
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from functools import lru_cache
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time as dt_time
 from math import isfinite
 from typing import Any
 
@@ -12,11 +12,13 @@ import requests
 import random
 import json
 import pandas as pd
+from zoneinfo import ZoneInfo
 from celery import shared_task
 from django.conf import settings
 from django.core.mail import send_mail
 from django.core.management import call_command
 from django.db import models
+from django.core.cache import cache
 from django.utils import timezone
 import finnhub
 import feedparser
@@ -26,7 +28,6 @@ import re
 import praw
 from newsapi import NewsApiClient
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from transformers import pipeline
 from sklearn.ensemble import RandomForestClassifier
 try:
     from reportlab.lib.pagesizes import letter
@@ -43,6 +44,7 @@ from .models import (
     Account,
     AccountTransaction,
     AlertEvent,
+    ActiveSignal,
     DividendHistory,
     DripSnapshot,
     MacroIndicator,
@@ -68,6 +70,15 @@ from .models import (
     UserPreference,
 )
 from .ai_module import run_predictions
+from .alpaca_data import (
+    get_daily_bars,
+    get_intraday_context,
+    get_intraday_bars,
+    get_latest_trade_price,
+    get_stock_snapshots,
+    get_tradable_symbols,
+)
+from .patterns import enrich_bars_with_patterns
 from .ml_engine.engine.data_fusion import DataFusionEngine
 from .ml_engine.backtester import (
     AIBacktester,
@@ -114,6 +125,449 @@ def _send_alert(subject: str, message: str) -> None:
             requests.post(webhook, json={'text': f"{subject}\n{message}"}, timeout=10)
         except Exception:
             pass
+
+
+def _send_telegram_alert(message: str, allow_during_blackout: bool = False, category: str = 'signal') -> None:
+    if not allow_during_blackout:
+        blocked, event = _is_high_impact_window()
+        if blocked:
+            cache.set(
+                'telegram_signal_blocked',
+                {
+                    'category': category,
+                    'message': message,
+                    'event': event,
+                    'blocked_at': timezone.now().isoformat(),
+                },
+                timeout=60 * 60,
+            )
+            return
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    chat_id = os.getenv('TELEGRAM_CHAT_ID')
+    if not token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        'chat_id': chat_id,
+        'text': message,
+        'parse_mode': 'Markdown',
+    }
+    try:
+        requests.post(url, json=payload, timeout=8)
+    except Exception:
+        pass
+
+
+def _ny_time_now() -> datetime:
+    try:
+        return timezone.now().astimezone(ZoneInfo('America/New_York'))
+    except Exception:
+        return timezone.now()
+
+
+def _time_hhmm(dt_value: datetime | None = None) -> str:
+    dt_value = dt_value or _ny_time_now()
+    return dt_value.strftime('%H:%M')
+
+
+def _profit_wallet_path() -> Path:
+    return Path(settings.BASE_DIR) / 'profit_wallet.json'
+
+
+def _week_start_date(now: datetime) -> date:
+    ny_now = now.astimezone(ZoneInfo('America/New_York'))
+    start = ny_now.date() - timedelta(days=ny_now.weekday())
+    return start
+
+
+def _load_profit_wallet() -> dict[str, Any]:
+    path = _profit_wallet_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _save_profit_wallet(payload: dict[str, Any]) -> None:
+    path = _profit_wallet_path()
+    try:
+        path.write_text(json.dumps(payload, indent=2))
+    except Exception:
+        pass
+
+
+def _spy_premarket_snapshot() -> tuple[float | None, float | None]:
+    try:
+        hist = yf.Ticker('SPY').history(period='2d', interval='1m', prepost=True)
+        if hist is None or hist.empty or 'Close' not in hist:
+            return None, None
+        last_price = float(hist['Close'].iloc[-1])
+        daily = yf.Ticker('SPY').history(period='3d', interval='1d')
+        if daily is None or daily.empty or 'Close' not in daily:
+            return last_price, None
+        prev_close = float(daily['Close'].iloc[-2]) if len(daily) >= 2 else float(daily['Close'].iloc[-1])
+        if prev_close <= 0:
+            return last_price, None
+        change_pct = ((last_price - prev_close) / prev_close) * 100
+        return last_price, change_pct
+    except Exception:
+        return None, None
+
+
+def _top_watchlist_symbols(limit: int = 3) -> list[str]:
+    research = cache.get('weekend_deep_research') or {}
+    penny = (research.get('penny') or {}).get('watchlist') or []
+    if penny:
+        return [str(item.get('symbol') or '').strip().upper() for item in penny[:limit] if item.get('symbol')]
+    watch = SandboxWatchlist.objects.filter(sandbox='AI_PENNY').first()
+    if watch and watch.symbols:
+        return [s for s in watch.symbols[:limit] if s]
+    return []
+
+
+ECONOMIC_CALENDAR_CACHE_KEY = 'economic_calendar_week'
+
+
+def _parse_economic_event_datetime(event: dict[str, Any]) -> datetime | None:
+    raw_date = str(event.get('date') or '').strip()
+    raw_time = str(event.get('time') or '').strip()
+    if raw_time.lower().startswith('all'):
+        return None
+    if raw_date and ':' in raw_date:
+        dt_str = raw_date
+    elif raw_date and raw_time:
+        dt_str = f"{raw_date} {raw_time}"
+    else:
+        dt_str = raw_date
+    if not dt_str:
+        return None
+    try:
+        parsed = pd.to_datetime(dt_str, utc=True, errors='coerce')
+        if pd.isna(parsed):
+            return None
+        return parsed.to_pydatetime()
+    except Exception:
+        return None
+
+
+def _economic_calendar_events() -> list[dict[str, Any]]:
+    return cache.get(ECONOMIC_CALENDAR_CACHE_KEY, []) or []
+
+
+def _is_high_impact_event(event: dict[str, Any]) -> bool:
+    impact = str(event.get('impact') or '').strip().lower()
+    return impact in {'high', 'high impact', 'critique', 'critical', 'red'}
+
+
+def _is_high_impact_window(window_minutes: int = 30) -> tuple[bool, dict[str, Any] | None]:
+    now = _ny_time_now()
+    events = _economic_calendar_events()
+    if not events:
+        return False, None
+    window = timedelta(minutes=window_minutes)
+    for event in events:
+        if not _is_high_impact_event(event):
+            continue
+        event_time_str = event.get('datetime_ny') or event.get('datetime_utc')
+        try:
+            event_time = pd.to_datetime(event_time_str, utc=True, errors='coerce')
+            if pd.isna(event_time):
+                continue
+            event_time = event_time.to_pydatetime().astimezone(ZoneInfo('America/New_York'))
+        except Exception:
+            continue
+        if event_time - window <= now <= event_time + window:
+            return True, event
+    return False, None
+
+
+def _economic_calendar_note_for_today() -> str | None:
+    today = _ny_time_now().date()
+    events = _economic_calendar_events()
+    if not events:
+        return None
+    upcoming = []
+    for event in events:
+        if not _is_high_impact_event(event):
+            continue
+        try:
+            event_time = pd.to_datetime(event.get('datetime_ny'), utc=True, errors='coerce')
+            if pd.isna(event_time):
+                continue
+            event_time = event_time.to_pydatetime().astimezone(ZoneInfo('America/New_York'))
+        except Exception:
+            continue
+        if event_time.date() == today:
+            upcoming.append(f"{event_time.strftime('%H:%M')} {event.get('title')}")
+    if not upcoming:
+        return None
+    return "⚠️ Attention : " + ", ".join(upcoming) + ". L'IA sera en mode observation autour de ces annonces."
+
+
+def _bluechip_aggressive_multiplier() -> float:
+    try:
+        return float(cache.get('bluechip_aggressive_multiplier', 1.0) or 1.0)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _calc_stop_target_from_prev_candle(bars: pd.DataFrame, current_price: float) -> tuple[float, float, float]:
+    if bars is None or bars.empty or len(bars) < 2:
+        stop_loss = max(current_price * 0.98, current_price - 0.05)
+        risk = max(current_price - stop_loss, 0.01)
+        target_price = current_price + (2 * risk)
+        return stop_loss, target_price, risk
+    prev = bars.iloc[-2]
+    prev_low = float(prev.get('low') or prev.get('l') or 0.0)
+    buffer = max(0.01, prev_low * 0.001)
+    stop_loss = max(prev_low - buffer, current_price * 0.5)
+    risk = max(current_price - stop_loss, 0.01)
+    target_price = current_price + (2 * risk)
+    return stop_loss, target_price, risk
+
+
+def _calc_spread_and_liquidity(symbol: str, bars: pd.DataFrame | None) -> tuple[float | None, float | None]:
+    snapshots = get_stock_snapshots([symbol])
+    snap = (snapshots or {}).get(symbol)
+    bid = None
+    ask = None
+    if snap is not None:
+        latest_quote = getattr(snap, 'latest_quote', None) or getattr(snap, 'latestQuote', None)
+        if latest_quote is not None:
+            bid = float(getattr(latest_quote, 'bid_price', 0) or 0)
+            ask = float(getattr(latest_quote, 'ask_price', 0) or 0)
+    spread_pct = None
+    if bid and ask and bid > 0:
+        spread_pct = ((ask - bid) / bid) * 100
+
+    avg_vol = None
+    if bars is not None and not bars.empty and 'volume' in bars:
+        recent = bars.tail(3)
+        avg_vol = float(recent['volume'].mean()) if not recent.empty else None
+    return spread_pct, avg_vol
+
+
+def _sector_etf_for_stock(symbol: str) -> str | None:
+    stock = Stock.objects.filter(symbol__iexact=symbol).first()
+    if not stock or not stock.sector:
+        return None
+    sector = stock.sector.lower()
+    mapping = {
+        'biotech': 'XBI',
+        'health': 'XLV',
+        'tech': 'XLK',
+        'financial': 'XLF',
+        'energy': 'XLE',
+        'industrial': 'XLI',
+        'consumer defensive': 'XLP',
+        'consumer cyclical': 'XLY',
+        'materials': 'XLB',
+        'utilities': 'XLU',
+        'real estate': 'XLRE',
+        'communication': 'XLC',
+    }
+    for key, etf in mapping.items():
+        if key in sector:
+            return etf
+    return None
+
+
+def _sector_confirmation_ok(symbol: str) -> bool:
+    etf = _sector_etf_for_stock(symbol)
+    if not etf:
+        return True
+    bars = get_intraday_bars(etf, minutes=90)
+    if bars is None or bars.empty:
+        return True
+    closes = bars['close'] if 'close' in bars else bars.get('c')
+    if closes is None or closes.empty:
+        return True
+    ema9 = closes.ewm(span=9, adjust=False).mean().iloc[-1]
+    latest = float(closes.iloc[-1])
+    return latest >= float(ema9)
+
+
+def _poc_from_bars(bars: pd.DataFrame) -> float | None:
+    if bars is None or bars.empty:
+        return None
+    closes = bars['close'] if 'close' in bars else None
+    volumes = bars['volume'] if 'volume' in bars else None
+    if closes is None or volumes is None:
+        return None
+    last_price = float(closes.iloc[-1]) if not closes.empty else 0.0
+    if last_price <= 0:
+        return None
+    if last_price < 1:
+        step = 0.001
+    elif last_price < 10:
+        step = 0.01
+    elif last_price < 100:
+        step = 0.05
+    else:
+        step = 0.1
+    bins = (closes / step).round() * step
+    volume_by_price = volumes.groupby(bins).sum()
+    if volume_by_price.empty:
+        return None
+    return float(volume_by_price.idxmax())
+
+
+def _resample_ohlcv(bars: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    if bars is None or bars.empty:
+        return pd.DataFrame()
+    df = bars.copy()
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, errors='coerce')
+        df = df.dropna(subset=['timestamp']).set_index('timestamp')
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return pd.DataFrame()
+    agg = {
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum',
+    }
+    for col in agg.keys():
+        if col not in df.columns:
+            return pd.DataFrame()
+    resampled = df.resample(f'{minutes}min').agg(agg).dropna()
+    resampled = resampled.reset_index().rename(columns={'index': 'timestamp'})
+    return resampled
+
+
+def _intraday_context_for_timeframe(symbol: str, minutes: int, timeframe: int, rvol_window: int = 20) -> dict[str, Any] | None:
+    bars = get_intraday_bars(symbol, minutes=minutes)
+    if bars is None or bars.empty:
+        return None
+    resampled = _resample_ohlcv(bars, timeframe)
+    if resampled.empty:
+        return None
+    enriched = enrich_bars_with_patterns(resampled, rvol_window=rvol_window)
+    if enriched.empty:
+        return None
+    last = enriched.iloc[-1]
+    return {
+        'bars': enriched,
+        'rvol': float(last.get('rvol') or 0.0),
+        'pattern_signal': float(last.get('pattern_signal') or 0.0),
+        'patterns': last.get('patterns') or [],
+        'volatility': float(last.get('volatility') or 0.0),
+        'last_close': float(last.get('close') or 0.0),
+    }
+
+
+def _build_swing_signal_message(
+    ticker: str,
+    confidence_pct: float,
+    entry_price: float,
+    buy_limit: float,
+    target_price: float,
+    stop_price: float,
+    investment: float,
+    news_title: str | None,
+    news_source: str | None,
+    news_note: str | None,
+) -> str:
+    quantity = investment / buy_limit if buy_limit else 0.0
+    target_gain = investment * ((target_price - buy_limit) / buy_limit) if buy_limit else 0.0
+    lines = [
+        f"🚀 OPPORTUNITÉ SWING : ${ticker}",
+        f"🔥 Confiance : {confidence_pct:.1f}%",
+        f"📥 Prix Entrée : {entry_price:.2f}$ (WealthSimple Limit Order)",
+        "🎯 ACTION À PRENDRE (Wealthsimple)",
+        f"🔹 Prix Limite : {buy_limit:.2f}$",
+        f"🔹 Quantité : {quantity:.2f} actions",
+        f"💰 Objectif : {target_price:.2f}$ (+{target_gain:.2f}$ pour {investment:.0f}$ investi)",
+        f"🛡️ Protection : {stop_price:.2f}$ (Stop-Loss)",
+    ]
+    if news_title:
+        source_txt = f"Source : {news_source}" if news_source else "Source : Google News"
+        lines.append(f"📰 NEWS RÉCENTE : {news_title}")
+        lines.append(source_txt)
+    if news_note:
+        lines.append(f"{news_note}")
+    return "\n".join(lines)
+
+
+def _compute_rsi(series: pd.Series, period: int = 14) -> float | None:
+    if series is None or series.empty or len(series) < period:
+        return None
+    delta = series.diff().fillna(0)
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, pd.NA)
+    rsi = 100 - (100 / (1 + rs))
+    value = rsi.iloc[-1]
+    return float(value) if pd.notna(value) else None
+
+
+def _compute_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[float | None, float | None, float | None]:
+    if series is None or series.empty or len(series) < slow:
+        return None, None, None
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    hist = macd_line - signal_line
+    return float(macd_line.iloc[-1]), float(signal_line.iloc[-1]), float(hist.iloc[-1])
+
+
+def _compute_bollinger(series: pd.Series, window: int = 20, width: float = 2.0) -> tuple[float | None, float | None, float | None]:
+    if series is None or series.empty or len(series) < window:
+        return None, None, None
+    ma = series.rolling(window).mean().iloc[-1]
+    std = series.rolling(window).std().iloc[-1]
+    if pd.isna(ma) or pd.isna(std):
+        return None, None, None
+    upper = float(ma + width * std)
+    lower = float(ma - width * std)
+    return float(ma), upper, lower
+
+
+def _macd_weakening(hist_series: pd.Series) -> bool:
+    if hist_series is None or hist_series.empty or len(hist_series) < 3:
+        return False
+    tail = hist_series.tail(3)
+    return float(tail.iloc[-1]) < float(tail.iloc[-2]) < float(tail.iloc[-3])
+
+
+def _build_signal_message(
+    ticker: str,
+    confidence: float,
+    entry_price: float,
+    target_price: float,
+    stop_loss: float,
+    pattern: str,
+    rvol: float,
+    liquidity_note: str,
+) -> str:
+    target_pct = ((target_price - entry_price) / entry_price) * 100 if entry_price else 0
+    return (
+        f"🚀 SIGNAL IA : ${ticker}\n"
+        f"🔥 Confiance : {confidence:.1f}%\n"
+        f"📥 ENTRÉE : {entry_price:.2f}$\n"
+        f"💰 VENDRE À : {target_price:.2f}$ (Objectif +{target_pct:.2f}%)\n"
+        f"🛡️ STOP-LOSS : {stop_loss:.2f}$\n"
+        f"📉 RAISON : {pattern} + Volume Relatif {rvol:.2f}\n"
+        f"{liquidity_note}\n"
+        f"🕒 HEURE : {_time_hhmm()}"
+    )
+
+
+def _is_lunch_time_strict(confidence: float) -> bool:
+    strict_bonus = float(os.getenv('LUNCH_CONFIDENCE_BONUS', '7'))
+    now_ny = _ny_time_now()
+    if dt_time(12, 0) <= now_ny.time() <= dt_time(13, 0):
+        return confidence >= (float(os.getenv('MIN_CONFIDENCE', '70')) + strict_bonus)
+    return confidence >= float(os.getenv('MIN_CONFIDENCE', '70'))
+
+
+def _active_signal_exists(ticker: str, minutes: int = 30) -> bool:
+    cutoff = timezone.now() - timedelta(minutes=minutes)
+    return ActiveSignal.objects.filter(ticker__iexact=ticker, status='OPEN', opened_at__gte=cutoff).exists()
 
 
 def _task_log_start(task_name: str) -> TaskRunLog:
@@ -1008,6 +1462,7 @@ def _sanitize_json(value: Any) -> Any:
 
 @lru_cache(maxsize=1)
 def _finbert_pipeline():
+    from transformers import pipeline
     return pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
 
@@ -1647,9 +2102,14 @@ def _get_vix_level() -> float | None:
     return None
 
 
-def _model_signal(symbol: str, universe: str, model_path: str | Path) -> dict[str, Any] | None:
+def _model_signal(
+    symbol: str,
+    universe: str,
+    model_path: str | Path,
+    use_alpaca: bool = False,
+) -> dict[str, Any] | None:
     try:
-        fusion = DataFusionEngine(symbol)
+        fusion = DataFusionEngine(symbol, use_alpaca=use_alpaca)
         fusion_df = fusion.fuse_all()
         if fusion_df is None or fusion_df.empty:
             return None
@@ -1699,6 +2159,7 @@ def _model_signal(symbol: str, universe: str, model_path: str | Path) -> dict[st
 
 def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, Any]:
     """Execute live paper trades for a specific sandbox using model signals and risk rules."""
+    use_alpaca = sandbox in {'AI_BLUECHIP', 'AI_PENNY'}
     watchlist = _get_watchlist(sandbox, prefix, 'SPY,AAPL,MSFT,NVDA,AMZN')
     universe = 'PENNY' if sandbox == 'AI_PENNY' else 'BLUECHIP'
     model_path = get_model_path(universe)
@@ -1767,6 +2228,9 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         return win_rate < min_win_rate
 
     def _latest_price(symbol: str) -> float | None:
+        if use_alpaca:
+            price = get_latest_trade_price(symbol)
+            return float(price) if price else None
         try:
             hist = yf.Ticker(symbol).history(period='5d', interval='1d', timeout=10)
             if hist is not None and not hist.empty and 'Close' in hist:
@@ -1777,13 +2241,24 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
 
     def _atr(symbol: str) -> float:
         try:
-            hist = yf.Ticker(symbol).history(period='20d', interval='1d', timeout=10)
-            if hist is None or hist.empty or not {'High', 'Low', 'Close'}.issubset(hist.columns):
-                return 0.0
+            if use_alpaca:
+                hist = get_daily_bars(symbol, days=30)
+                if hist is None or hist.empty:
+                    return 0.0
+                high = hist['high']
+                low = hist['low']
+                close = hist['close']
+            else:
+                hist = yf.Ticker(symbol).history(period='20d', interval='1d', timeout=10)
+                if hist is None or hist.empty or not {'High', 'Low', 'Close'}.issubset(hist.columns):
+                    return 0.0
+                high = hist['High']
+                low = hist['Low']
+                close = hist['Close']
             tr = pd.concat([
-                (hist['High'] - hist['Low']).abs(),
-                (hist['High'] - hist['Close'].shift(1)).abs(),
-                (hist['Low'] - hist['Close'].shift(1)).abs(),
+                (high - low).abs(),
+                (high - close.shift(1)).abs(),
+                (low - close.shift(1)).abs(),
             ], axis=1).max(axis=1)
             atr = tr.rolling(14).mean().iloc[-1]
             return float(atr) if atr is not None else 0.0
@@ -1794,7 +2269,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         if days <= 0:
             return False, None
         try:
-            fusion = DataFusionEngine(symbol)
+            fusion = DataFusionEngine(symbol, use_alpaca=use_alpaca)
             frame = fusion.fuse_all()
             if frame is None or frame.empty or 'VolumeZ' not in frame:
                 return False, None
@@ -1810,7 +2285,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             return False, None
 
     def _signal(symbol: str) -> dict[str, Any] | None:
-        return _model_signal(symbol, universe, model_path)
+        return _model_signal(symbol, universe, model_path, use_alpaca=use_alpaca)
 
     created = 0
     closed = 0
@@ -1819,6 +2294,13 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         price = _latest_price(symbol)
         if price is None:
             continue
+        intraday_ctx = None
+        if use_alpaca:
+            intraday_ctx = get_intraday_context(
+                symbol,
+                minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
+                rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
+            )
         signal_payload = _signal(symbol)
         signal = signal_payload['signal'] if signal_payload else None
         for trade in trades:
@@ -1853,6 +2335,12 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 break_even_stop,
                 dynamic_atr_stop,
             )
+            if intraday_ctx:
+                pattern_signal = float(intraday_ctx.get('pattern_signal') or 0)
+                rvol = float(intraday_ctx.get('rvol') or 0)
+                if pattern_signal < 0 and rvol >= 2:
+                    new_stop = max(new_stop, price * (1 - (trail_pct * 0.5)))
+                    trade.notes = (trade.notes or '') + ' | Pattern baissier + RVOL élevé: stop resserré.'
             trade.stop_loss = new_stop
             stop_hit = price <= new_stop
             signal_exit = signal is not None and signal < sell_threshold
@@ -1876,6 +2364,24 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         existing_trades = open_trades_by_symbol.get(symbol, [])
         signal_payload = _signal(symbol)
         signal = signal_payload['signal'] if signal_payload else None
+        intraday_ctx = None
+        if use_alpaca:
+            intraday_ctx = get_intraday_context(
+                symbol,
+                minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
+                rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
+            )
+            if intraday_ctx:
+                pattern_signal = float(intraday_ctx.get('pattern_signal') or 0)
+                rvol = float(intraday_ctx.get('rvol') or 0)
+                if pattern_signal < 0 and rvol >= 2:
+                    continue
+                if signal is not None and pattern_signal > 0 and rvol >= 2:
+                    signal = min(1.0, float(signal) * 1.02)
+        if signal is not None and sandbox == 'AI_BLUECHIP':
+            multiplier = _bluechip_aggressive_multiplier()
+            if multiplier > 1.0:
+                signal = min(1.0, float(signal) * multiplier)
         if signal is None or signal < buy_threshold:
             continue
         if existing_trades and signal < reinforce_min_score:
@@ -1904,20 +2410,42 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             continue
         atr = _atr(symbol)
         stop_distance = max(price * trail_pct, atr_mult * atr, price * 0.01)
+        if intraday_ctx:
+            vol = float(intraday_ctx.get('volatility') or 0)
+            if vol > 0:
+                vol_stop = price * min(max(vol * 3, 0.01), 0.06)
+                stop_distance = max(stop_distance, vol_stop)
         risk_budget = capital * risk_pct
         position_cap = capital * position_cap_pct
+        exposure_pct = (open_value / capital) if capital else 1.0
+        if exposure_pct >= 0.8:
+            continue
+        confidence_factor = max(0.0, min(1.0, (float(signal) - 0.65) / 0.35)) if signal is not None else 0.0
+        if confidence_factor <= 0:
+            continue
         position_value = min(available, position_cap, risk_budget / (stop_distance / price)) if price else 0.0
+        position_value *= confidence_factor
         quantity = int(position_value / price) if price else 0
         if quantity <= 0:
             continue
         stop_loss = price - stop_distance
+        entry_features = dict((signal_payload or {}).get('features') or {})
+        if intraday_ctx:
+            entry_features.update({
+                'intraday_pattern_signal': float(intraday_ctx.get('pattern_signal') or 0),
+                'intraday_rvol': float(intraday_ctx.get('rvol') or 0),
+                'intraday_volatility': float(intraday_ctx.get('volatility') or 0),
+                'intraday_rsi14': float(intraday_ctx.get('rsi14') or 0),
+                'intraday_ema20': float(intraday_ctx.get('ema20') or 0),
+                'intraday_ema50': float(intraday_ctx.get('ema50') or 0),
+            })
         PaperTrade.objects.create(
             ticker=symbol,
             sandbox=sandbox,
             entry_price=round(price, 2),
             quantity=quantity,
             entry_signal=signal,
-            entry_features=(signal_payload or {}).get('features'),
+            entry_features=entry_features,
             entry_explanations=(signal_payload or {}).get('explanations'),
             model_name=(signal_payload or {}).get('model_name', universe),
             model_version=(signal_payload or {}).get('model_version', ''),
@@ -1945,6 +2473,307 @@ def execute_paper_trades_ai_bluechip() -> dict[str, Any]:
 @shared_task
 def execute_paper_trades_ai_penny() -> dict[str, Any]:
     return _execute_paper_trades_for_sandbox('AI_PENNY', 'AI_PENNY')
+
+
+@shared_task
+def market_scanner_task() -> dict[str, Any]:
+    """Scan market for high-momentum candidates and cache results."""
+    min_price = float(os.getenv('SCANNER_MIN_PRICE', '0.5'))
+    max_price = float(os.getenv('SCANNER_MAX_PRICE', '10'))
+    min_volume = float(os.getenv('SCANNER_MIN_VOLUME', '500000'))
+    min_change = float(os.getenv('SCANNER_MIN_CHANGE_PCT', '2'))
+    min_rvol = float(os.getenv('SCANNER_MIN_RVOL', '2.5'))
+    limit = int(os.getenv('SCANNER_LIMIT', '50'))
+    minutes = int(os.getenv('SCANNER_INTRADAY_MINUTES', '180'))
+    timeframe_5m = int(os.getenv('SCANNER_TIMEFRAME_5M', '5'))
+    timeframe_15m = int(os.getenv('SCANNER_TIMEFRAME_15M', '15'))
+    min_confidence = float(os.getenv('SCANNER_MIN_CONFIDENCE', '65'))
+    swing_target_pct = float(os.getenv('SWING_TARGET_PCT', '0.08'))
+    swing_min_rvol_target_pct = float(os.getenv('SWING_MIN_RVOL_TARGET_PCT', '0.05'))
+    swing_stop_pct = float(os.getenv('SWING_STOP_PCT', '0.03'))
+    investment = float(os.getenv('SWING_INVESTMENT', '200'))
+    buy_limit_buffer = float(os.getenv('SWING_BUY_LIMIT_BUFFER', '0.005'))
+    update_watchlist = os.getenv('AI_SCANNER_UPDATE_WATCHLIST', 'true').lower() in {'1', 'true', 'yes', 'y'}
+    notify = os.getenv('AI_SCANNER_TELEGRAM', 'false').lower() in {'1', 'true', 'yes', 'y'}
+
+    symbols_env = os.getenv('SCANNER_SYMBOLS', '').strip()
+    if symbols_env:
+        symbols = [s.strip().upper() for s in symbols_env.split(',') if s.strip()]
+    else:
+        symbols = get_tradable_symbols(limit=800)
+
+    if not symbols:
+        cache.set('market_scanner_results', [], timeout=300)
+        return {'status': 'empty', 'count': 0}
+
+    candidates: list[dict[str, Any]] = []
+    chunk_size = 200
+    for i in range(0, len(symbols), chunk_size):
+        chunk = symbols[i:i + chunk_size]
+        snapshots = get_stock_snapshots(chunk)
+        for symbol, snap in (snapshots or {}).items():
+            try:
+                latest_trade = getattr(snap, 'latest_trade', None) or getattr(snap, 'latestTrade', None)
+                daily_bar = getattr(snap, 'daily_bar', None) or getattr(snap, 'dailyBar', None)
+                if latest_trade is None or daily_bar is None:
+                    continue
+                price = float(getattr(latest_trade, 'price', 0) or 0)
+                prev_close = float(getattr(daily_bar, 'close', 0) or 0)
+                volume = float(getattr(daily_bar, 'volume', 0) or 0)
+                if price <= 0 or prev_close <= 0:
+                    continue
+                change_pct = ((price - prev_close) / prev_close) * 100
+                if not (min_price <= price <= max_price):
+                    continue
+                if volume < min_volume or change_pct < min_change:
+                    continue
+                candidates.append({
+                    'symbol': symbol,
+                    'price': price,
+                    'change_pct': round(change_pct, 2),
+                    'volume': int(volume),
+                })
+            except Exception:
+                continue
+
+    candidates = sorted(candidates, key=lambda x: x['change_pct'], reverse=True)[:limit]
+    results: list[dict[str, Any]] = []
+    market_ctx = get_intraday_context('QQQ', minutes=minutes) or {}
+    market_ok = float(market_ctx.get('ema20') or 0) >= float(market_ctx.get('ema50') or 0)
+
+    for candidate in candidates:
+        symbol = candidate['symbol']
+        ctx_5m = _intraday_context_for_timeframe(symbol, minutes=minutes, timeframe=timeframe_5m, rvol_window=20)
+        ctx_15m = _intraday_context_for_timeframe(symbol, minutes=minutes, timeframe=timeframe_15m, rvol_window=20)
+        if not ctx_5m or not ctx_15m:
+            continue
+        rvol = float(ctx_5m.get('rvol') or 0)
+        patterns = ctx_5m.get('patterns') or []
+        pattern_signal_15 = float(ctx_15m.get('pattern_signal') or 0)
+        if rvol < min_rvol:
+            continue
+        if pattern_signal_15 <= 0:
+            if rvol > 3:
+                _send_telegram_alert(
+                    f"⚠️ ALERTE DE CHUTE : ${symbol} RVOL {rvol:.2f} mais pattern négatif.",
+                    category='alert',
+                )
+            continue
+        if pattern_signal_15 <= 0.5:
+            continue
+        if not {'Hammer', 'Bullish Engulfing'}.intersection(set(patterns)):
+            continue
+
+        base_score = 0.5 + (pattern_signal_15 * 0.1) + (0.05 if rvol >= 4 else 0.0)
+        confidence_pct = base_score * 100
+        news_sentiment, news_titles = _news_sentiment_score(symbol, days=1)
+        news_note = None
+        if news_titles:
+            if news_sentiment > 0.3:
+                confidence_pct *= 1.1
+        else:
+            confidence_pct *= 0.85
+            news_note = '⚠️ Mouvement purement technique (Attention aux faux rebonds)'
+        if not market_ok:
+            confidence_pct *= 0.95
+        confidence_pct = max(0.0, min(95.0, confidence_pct))
+        if confidence_pct < min_confidence:
+            continue
+
+        score = round(confidence_pct / 100, 4)
+        results.append({
+            **candidate,
+            'rvol': round(rvol, 2),
+            'patterns': patterns,
+            'pattern_signal': round(pattern_signal_15, 2),
+            'market_ok': market_ok,
+            'score': score,
+            'confidence_pct': round(confidence_pct, 2),
+            'news_titles': news_titles[:3],
+            'news_sentiment': round(news_sentiment, 3),
+            'news_note': news_note,
+        })
+
+    cache.set('market_scanner_results', results, timeout=300)
+
+    if update_watchlist and results:
+        SandboxWatchlist.objects.update_or_create(
+            sandbox='AI_PENNY',
+            defaults={'symbols': [entry['symbol'] for entry in results[:25]]},
+        )
+
+    if notify and results:
+        top = results[0]
+        entry_price = float(top['price'])
+        buy_limit = entry_price * (1 + buy_limit_buffer)
+        target_pct = swing_target_pct
+        if rvol > 3:
+            target_pct = max(target_pct, swing_min_rvol_target_pct)
+        target_price = buy_limit * (1 + target_pct)
+        stop_price = buy_limit * (1 - swing_stop_pct)
+        title = (top.get('news_titles') or [''])[0] or None
+        message = _build_swing_signal_message(
+            ticker=top['symbol'],
+            confidence_pct=float(top.get('confidence_pct') or 0),
+            entry_price=entry_price,
+            buy_limit=buy_limit,
+            target_price=target_price,
+            stop_price=stop_price,
+            investment=investment,
+            news_title=title,
+            news_source='Google News' if title else None,
+            news_note=top.get('news_note'),
+        )
+        _send_telegram_alert(message, category='signal')
+        if not _active_signal_exists(top['symbol']):
+            ActiveSignal.objects.create(
+                ticker=top['symbol'],
+                pattern=', '.join(top.get('patterns') or []),
+                rvol=float(top.get('rvol') or 0),
+                entry_price=entry_price,
+                target_price=target_price,
+                stop_loss=stop_price,
+                confidence=float(top.get('confidence_pct') or 0),
+                liquidity_note=top.get('news_note') or '',
+                meta={
+                    'buy_limit': round(buy_limit, 4),
+                    'investment': investment,
+                    'news_titles': top.get('news_titles') or [],
+                    'news_sentiment': float(top.get('news_sentiment') or 0),
+                    'timeframe': f"{timeframe_5m}m/{timeframe_15m}m",
+                    'mode': 'swing',
+                },
+            )
+
+    return {'status': 'ok', 'count': len(results)}
+
+
+@shared_task
+def monitor_active_signals() -> dict[str, Any]:
+    open_signals = ActiveSignal.objects.filter(status='OPEN')
+    if not open_signals.exists():
+        return {'status': 'empty', 'checked': 0}
+
+    trailing_enabled = os.getenv('TRAILING_STOP_ENABLED', 'true').lower() in {'1', 'true', 'yes', 'y'}
+    swing_sell_on_target = os.getenv('SWING_SELL_ON_TARGET', 'true').lower() in {'1', 'true', 'yes', 'y'}
+    break_even_pct = float(os.getenv('TRAIL_BREAK_EVEN_PCT', '0.01'))
+    trail_trigger_pct = float(os.getenv('TRAIL_TRIGGER_PCT', '0.02'))
+    trail_distance_pct = float(os.getenv('TRAIL_DISTANCE_PCT', '0.01'))
+
+    symbols = [s.ticker for s in open_signals]
+    snapshots = get_stock_snapshots(symbols)
+    now_ny = _ny_time_now()
+    market_close = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
+
+    closed = 0
+    for signal in open_signals:
+        snap = (snapshots or {}).get(signal.ticker)
+        price = None
+        if snap is not None:
+            latest_trade = getattr(snap, 'latest_trade', None) or getattr(snap, 'latestTrade', None)
+            if latest_trade is not None:
+                price = float(getattr(latest_trade, 'price', 0) or 0)
+        if not price:
+            continue
+
+        status = None
+        message = None
+        meta = signal.meta or {}
+        entry_price = float(signal.entry_price or 0)
+        profit_pct = ((price - entry_price) / entry_price) if entry_price else 0.0
+        peak_price = float(meta.get('peak_price') or entry_price or price)
+
+        if trailing_enabled and profit_pct >= break_even_pct and not meta.get('break_even_notified'):
+            _send_telegram_alert(
+                f"🛡️ SÉCURITÉ : ${signal.ticker} atteint +{break_even_pct * 100:.1f}%. "
+                "Suggéré: remonter le stop-loss au prix d'entrée.",
+                allow_during_blackout=True,
+                category='trail',
+            )
+            meta['break_even_notified'] = True
+
+        if trailing_enabled and profit_pct >= trail_trigger_pct:
+            meta['trail_active'] = True
+
+        if meta.get('trail_active') and not meta.get('reversal_notified'):
+            reversal_ctx = _intraday_context_for_timeframe(
+                signal.ticker,
+                minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
+                timeframe=int(os.getenv('REVERSAL_TIMEFRAME', '15')),
+                rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
+            )
+            if reversal_ctx and float(reversal_ctx.get('pattern_signal') or 0) <= -0.5:
+                _send_telegram_alert(
+                    f"🚪 ALERTE SORTIE : Le momentum faiblit sur ${signal.ticker}. "
+                    f"Gain actuel: {profit_pct * 100:.2f}%.",
+                    allow_during_blackout=True,
+                    category='trail',
+                )
+                meta['reversal_notified'] = True
+
+        if meta.get('trail_active'):
+            if price > peak_price:
+                peak_price = price
+            trail_stop = peak_price * (1 - trail_distance_pct)
+            if trail_stop > float(signal.stop_loss or 0):
+                signal.stop_loss = trail_stop
+            meta['peak_price'] = peak_price
+            meta['trail_stop'] = trail_stop
+            if price <= trail_stop:
+                status = 'CLOSED'
+                message = (
+                    f"🚪 SORTIE : ${signal.ticker} a touché le stop suiveur {trail_stop:.2f}$. "
+                    f"Profit final: {profit_pct * 100:.2f}%."
+                )
+
+        if price >= float(signal.target_price) and not meta.get('target_notified'):
+            if meta.get('mode') == 'swing' and swing_sell_on_target:
+                status = 'TARGET'
+                message = (
+                    f"🔔 VENDRE MAINTENANT : ${signal.ticker} a touché la target. "
+                    f"Profit actuel: {profit_pct * 100:.2f}%."
+                )
+            else:
+                _send_telegram_alert(
+                    f"💰 TARGET ATTEINTE : ${signal.ticker} est à +{profit_pct * 100:.2f}%. "
+                    "On laisse courir ! Stop suiveur actif.",
+                    allow_during_blackout=True,
+                    category='trail',
+                )
+            meta['target_notified'] = True
+
+        if status is None:
+            if price <= float(signal.stop_loss):
+                status = 'STOP'
+                message = (
+                    f"❌ STOP-LOSS TOUCHÉ sur ${signal.ticker}. Le prix est descendu à {price:.2f}$."
+                )
+            elif now_ny >= market_close:
+                status = 'TIMEOUT'
+                message = (
+                    f"⏰ SIGNAL FERMÉ À 16H sur ${signal.ticker}. Prix de clôture: {price:.2f}$."
+                )
+            elif price >= float(signal.target_price) and not trailing_enabled:
+                status = 'TARGET'
+                message = (
+                    f"✅ OBJECTIF ATTEINT sur ${signal.ticker} ! Le prix a touché {price:.2f}$."
+                )
+
+        if status:
+            signal.status = status
+            signal.closed_at = timezone.now()
+            signal.closed_price = price
+            signal.outcome = status
+            signal.meta = meta
+            signal.save(update_fields=['status', 'closed_at', 'closed_price', 'outcome', 'stop_loss', 'meta'])
+            if message:
+                _send_telegram_alert(message, allow_during_blackout=True, category='outcome')
+            closed += 1
+        else:
+            signal.meta = meta
+            signal.save(update_fields=['stop_loss', 'meta'])
+
+    return {'status': 'ok', 'checked': len(symbols), 'closed': closed}
 
 
 @shared_task
@@ -2060,6 +2889,9 @@ def send_morning_scout_report() -> dict[str, Any]:
             lines.append(
                 f"⚠️ Market Stress High - Trading Restricted (VIX {float(vix_level or 0):.2f} >= {vix_threshold:.2f})"
             )
+        calendar_note = _economic_calendar_note_for_today()
+        if calendar_note:
+            lines.append(calendar_note)
         lines.append('')
 
         payload_summary: dict[str, Any] = {}
@@ -2069,6 +2901,7 @@ def send_morning_scout_report() -> dict[str, Any]:
             model_path = get_model_path(universe)
             buy_threshold = _env_float(prefix, 'BUY_THRESHOLD', '0.82')
             min_volume_z = _env_float(prefix, 'VOLUME_ZSCORE_MIN', '0.5')
+            use_alpaca = sandbox in {'AI_BLUECHIP', 'AI_PENNY'}
 
             validated: list[dict[str, Any]] = []
             excluded: list[tuple[str, str]] = []
@@ -2076,7 +2909,7 @@ def send_morning_scout_report() -> dict[str, Any]:
             for symbol in watchlist:
                 if not _is_valid_symbol(symbol):
                     continue
-                signal_payload = _model_signal(symbol, universe, model_path)
+                signal_payload = _model_signal(symbol, universe, model_path, use_alpaca=use_alpaca)
                 if not signal_payload:
                     continue
                 signal = float(signal_payload.get('signal') or 0.0)
@@ -3193,6 +4026,553 @@ def refresh_ai_penny_watchlist() -> dict[str, Any]:
         return {'status': 'ok', 'sandbox': 'AI_PENNY', 'count': len(symbols)}
     except Exception as exc:
         return {'status': 'error', 'sandbox': 'AI_PENNY', 'error': str(exc)}
+
+
+def _google_news_titles(ticker: str, days: int = 7, limit: int = 8) -> list[str]:
+    if not ticker:
+        return []
+    now = datetime.utcnow()
+    start = now - timedelta(days=days)
+    rss_url = (
+        f"https://news.google.com/rss/search?q={ticker}+stock+when:{days}d"
+        "&hl=en-CA&gl=CA&ceid=CA:en"
+    )
+    feed = feedparser.parse(rss_url)
+    titles: list[str] = []
+    for entry in feed.entries or []:
+        published = getattr(entry, 'published_parsed', None)
+        if not published:
+            continue
+        published_dt = datetime(*published[:6])
+        if published_dt < start or published_dt > now:
+            continue
+        title = getattr(entry, 'title', '')
+        if title:
+            titles.append(title)
+        if len(titles) >= limit:
+            break
+    return titles
+
+
+def _news_sentiment_score(ticker: str, days: int = 7) -> tuple[float, list[str]]:
+    titles = _google_news_titles(ticker, days=days)
+    if not titles:
+        return 0.0, []
+    analyzer = SentimentIntensityAnalyzer()
+    scores = [analyzer.polarity_scores(title).get('compound', 0.0) for title in titles]
+    if not scores:
+        return 0.0, titles
+    return float(sum(scores) / len(scores)), titles
+
+
+def _fetch_sp500_symbols(limit: int = 50) -> list[str]:
+    try:
+        tables = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
+        frame = tables[0]
+        symbols = [str(s).strip().upper().replace('.', '-') for s in frame['Symbol'].tolist()]
+        return symbols[:limit]
+    except Exception:
+        fallback = [s.strip().upper() for s in os.getenv('BLUECHIP_SYMBOLS', '').split(',') if s.strip()]
+        return fallback[:limit]
+
+
+def _analyze_penny_breakouts() -> dict[str, Any]:
+    quotes = _fetch_yahoo_screener('most_actives', count=400)
+    candidates: list[dict[str, Any]] = []
+    for quote in quotes:
+        symbol = (quote.get('symbol') or '').strip().upper()
+        price = _safe_float(quote.get('regularMarketPrice'))
+        volume = _safe_float(quote.get('regularMarketVolume') or quote.get('averageDailyVolume3Month'))
+        if not symbol or price is None or volume is None:
+            continue
+        if price <= 0 or price > 5:
+            continue
+        if volume < 500000:
+            continue
+        candidates.append({'symbol': symbol, 'price': price, 'volume': volume})
+    candidates = sorted(candidates, key=lambda x: x['volume'], reverse=True)[:200]
+    symbols = [c['symbol'] for c in candidates]
+    if not symbols:
+        return {'watchlist': [], 'count': 0}
+
+    data = yf.download(
+        tickers=" ".join(symbols),
+        period='1y',
+        interval='1d',
+        group_by='ticker',
+        threads=True,
+        auto_adjust=False,
+    )
+
+    watchlist: list[dict[str, Any]] = []
+    for item in candidates:
+        symbol = item['symbol']
+        if isinstance(data.columns, pd.MultiIndex):
+            if symbol not in data:
+                continue
+            frame = data[symbol].dropna()
+        else:
+            frame = data.copy().dropna()
+        if frame is None or frame.empty or 'Close' not in frame or 'Volume' not in frame:
+            continue
+        close = frame['Close'].tail(30)
+        volume = frame['Volume'].tail(30)
+        if len(close) < 30 or len(volume) < 30:
+            continue
+        mean_price = float(close.mean()) if close.mean() else 0.0
+        if mean_price <= 0:
+            continue
+        price_range_pct = (float(close.max()) - float(close.min())) / mean_price
+        last5 = float(volume.tail(5).mean()) if len(volume) >= 5 else float(volume.mean())
+        prev20 = float(volume.head(25).tail(20).mean()) if len(volume) >= 25 else float(volume.mean())
+        vol_ratio = (last5 / prev20) if prev20 else 0.0
+        if price_range_pct > 0.08 or vol_ratio < 1.2:
+            continue
+        sentiment, titles = _news_sentiment_score(symbol, days=7)
+        catalyst_keywords = ['contract', 'fda', 'patent', 'approval', 'merger', 'acquisition']
+        catalyst_hits = [t for t in titles if any(k in t.lower() for k in catalyst_keywords)]
+        score = (max(0.0, 1 - price_range_pct) * 0.6) + (min(vol_ratio / 3, 1) * 0.4)
+        score = score * (1 + (sentiment * 0.3))
+        watchlist.append({
+            'symbol': symbol,
+            'last_close': float(close.iloc[-1]),
+            'price_range_pct': round(price_range_pct * 100, 2),
+            'volume_ratio': round(vol_ratio, 2),
+            'sentiment': round(sentiment, 3),
+            'score': round(score, 3),
+            'catalysts': catalyst_hits[:3],
+        })
+
+    watchlist = sorted(watchlist, key=lambda x: x['score'], reverse=True)[:30]
+    return {'watchlist': watchlist, 'count': len(watchlist)}
+
+
+def _analyze_bluechip_rebounds() -> dict[str, Any]:
+    symbols = _fetch_sp500_symbols(limit=50)
+    if not symbols:
+        return {'selection': [], 'count': 0}
+    tickers = symbols + ['SPY']
+    data = yf.download(
+        tickers=" ".join(tickers),
+        period='1y',
+        interval='1d',
+        group_by='ticker',
+        threads=True,
+        auto_adjust=False,
+    )
+    spy = data['SPY'] if isinstance(data.columns, pd.MultiIndex) and 'SPY' in data else None
+    if spy is None or spy.empty:
+        return {'selection': [], 'count': 0}
+    spy_close = spy['Close'] if 'Close' in spy else None
+    if spy_close is None or spy_close.empty:
+        return {'selection': [], 'count': 0}
+
+    candidates: list[dict[str, Any]] = []
+    for symbol in symbols:
+        if symbol not in data:
+            continue
+        frame = data[symbol].dropna()
+        if frame is None or frame.empty or 'Close' not in frame:
+            continue
+        close = frame['Close']
+        if len(close) < 220:
+            continue
+        sma50 = close.rolling(50).mean().iloc[-1]
+        sma200 = close.rolling(200).mean().iloc[-1]
+        last_close = float(close.iloc[-1])
+        if not sma50 or not sma200:
+            continue
+        rs = close / spy_close.reindex(close.index).fillna(method='ffill')
+        rs_mean = rs.rolling(50).mean().iloc[-1]
+        rs_score = 1 if rs.iloc[-1] >= rs_mean else 0
+        rebound = last_close >= sma50 * 0.99 or last_close >= sma200 * 0.99
+        if not rebound:
+            continue
+        sentiment, titles = _news_sentiment_score(symbol, days=14)
+        score = (0.4 if last_close >= sma50 else 0) + (0.3 if last_close >= sma200 else 0) + (0.3 * rs_score)
+        score = score * (1 + sentiment * 0.2)
+        candidates.append({
+            'symbol': symbol,
+            'last_close': round(last_close, 2),
+            'sma50': round(float(sma50), 2),
+            'sma200': round(float(sma200), 2),
+            'sentiment': round(sentiment, 3),
+            'score': round(score, 3),
+            'news': titles[:3],
+        })
+
+    candidates = sorted(candidates, key=lambda x: x['score'], reverse=True)[:3]
+    return {'selection': candidates, 'count': len(candidates)}
+
+
+@shared_task
+def economic_calendar_module() -> dict[str, Any]:
+    log = _task_log_start('economic_calendar_module')
+    url = os.getenv('ECONOMIC_CALENDAR_URL', 'https://nfs.faireconomy.media/ff_calendar_thisweek.json')
+    try:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        payload = resp.json() or []
+        events: list[dict[str, Any]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            event_dt = _parse_economic_event_datetime(item)
+            if not event_dt:
+                continue
+            ny_dt = event_dt.astimezone(ZoneInfo('America/New_York'))
+            events.append({
+                'title': item.get('title') or item.get('event') or '',
+                'country': item.get('country') or '',
+                'currency': item.get('currency') or '',
+                'impact': item.get('impact') or '',
+                'datetime_utc': event_dt.isoformat(),
+                'datetime_ny': ny_dt.isoformat(),
+                'forecast': item.get('forecast'),
+                'actual': item.get('actual'),
+                'previous': item.get('previous'),
+            })
+        cache.set(ECONOMIC_CALENDAR_CACHE_KEY, events, timeout=60 * 60 * 24 * 7)
+
+        for event in events:
+            title = str(event.get('title') or '').lower()
+            if 'cpi' not in title:
+                continue
+            actual = _safe_float(event.get('actual'))
+            forecast = _safe_float(event.get('forecast'))
+            if actual is None or forecast is None:
+                continue
+            if actual < forecast:
+                cache.set('bluechip_aggressive_multiplier', 1.05, timeout=60 * 60 * 6)
+                break
+
+        result = {'status': 'ok', 'events': len(events)}
+        _task_log_finish(log, 'SUCCESS', result)
+        return result
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+@shared_task
+def weekend_deep_research() -> dict[str, Any]:
+    log = _task_log_start('weekend_deep_research')
+    try:
+        penny = _analyze_penny_breakouts()
+        bluechip = _analyze_bluechip_rebounds()
+        payload = {
+            'as_of': timezone.now().isoformat(),
+            'penny': penny,
+            'bluechip': bluechip,
+        }
+        cache.set('weekend_deep_research', payload, timeout=60 * 60 * 24 * 7)
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+@shared_task
+def sunday_evening_briefing() -> dict[str, Any]:
+    log = _task_log_start('sunday_evening_briefing')
+    try:
+        research = cache.get('weekend_deep_research') or {}
+        calendar_events = _economic_calendar_events()
+        high_events = [e for e in calendar_events if _is_high_impact_event(e)]
+
+        lines = [
+            "🏛️ *RÉSUMÉ STRATÉGIQUE DE LA SEMAINE*",
+        ]
+        if high_events:
+            lines.append("\n📅 *CALENDRIER ÉCONOMIQUE (⚠️ Risque)*")
+            for event in high_events[:6]:
+                dt_ny = event.get('datetime_ny')
+                try:
+                    when = pd.to_datetime(dt_ny, utc=True, errors='coerce')
+                    if pd.isna(when):
+                        when = None
+                    else:
+                        when = when.to_pydatetime().astimezone(ZoneInfo('America/New_York'))
+                except Exception:
+                    when = None
+                when_txt = when.strftime('%a %H:%M') if when else 'n/a'
+                lines.append(f"• {when_txt} : {event.get('title')} (Impact: {event.get('impact')})")
+            lines.append("Note : l'IA passera en mode observation autour des annonces high impact.")
+
+        penny = (research.get('penny') or {}).get('watchlist') or []
+        if penny:
+            lines.append("\n🚀 *WATCHLIST PENNY STOCKS*")
+            for item in penny[:5]:
+                catalyst = f" | News: {item['catalysts'][0]}" if item.get('catalysts') else ''
+                lines.append(
+                    f"${item['symbol']} : Accumulation | Vol {item['volume_ratio']}x | Score {item['score']}{catalyst}"
+                )
+
+        bluechip = (research.get('bluechip') or {}).get('selection') or []
+        if bluechip:
+            lines.append("\n💎 *SÉLECTION BLUE CHIPS*")
+            for item in bluechip:
+                lines.append(
+                    f"${item['symbol']} : Rebond SMA | Score {item['score']} | Sentiment {item['sentiment']}"
+                )
+
+        message = "\n".join(lines).strip()
+        if message:
+            _send_telegram_alert(message, allow_during_blackout=True, category='briefing')
+
+        payload = {'status': 'sent', 'penny': len(penny), 'bluechip': len(bluechip), 'events': len(high_events)}
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+@shared_task
+def morning_status_check() -> dict[str, Any]:
+    log = _task_log_start('morning_status_check')
+    try:
+        price, change_pct = _spy_premarket_snapshot()
+        eco_note = _economic_calendar_note_for_today()
+        watchlist = _top_watchlist_symbols(limit=3)
+
+        lines = ["☕ *Morning Brief*", ""]
+        if price is not None:
+            change_txt = f" ({change_pct:+.2f}%)" if change_pct is not None else ''
+            lines.append(f"SPY pré-marché: {price:.2f}$" + change_txt)
+        else:
+            lines.append("SPY pré-marché: n/a")
+        if eco_note:
+            lines.append(eco_note)
+        if watchlist:
+            lines.append("Top 3 watchlist: " + ", ".join(watchlist))
+
+        message = "\n".join(lines).strip()
+        if message:
+            _send_telegram_alert(message, allow_during_blackout=True, category='briefing')
+
+        payload = {'status': 'sent', 'watchlist': watchlist}
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+@shared_task
+def daily_profit_tracker() -> dict[str, Any]:
+    log = _task_log_start('daily_profit_tracker')
+    try:
+        investment = float(os.getenv('PROFIT_TRACKER_INVESTMENT', '200'))
+        today = timezone.localdate()
+        signals = ActiveSignal.objects.filter(closed_at__date=today)
+
+        wins = 0
+        losses = 0
+        profit_total = 0.0
+        for signal in signals:
+            entry = float(signal.entry_price or 0)
+            exit_price = float(signal.closed_price or 0)
+            if entry <= 0 or exit_price <= 0:
+                continue
+            ret_pct = (exit_price - entry) / entry
+            pnl = investment * ret_pct
+            profit_total += pnl
+            if pnl >= 0:
+                wins += 1
+            else:
+                losses += 1
+
+        wallet = _load_profit_wallet()
+        week_start = _week_start_date(timezone.now()).isoformat()
+        if wallet.get('week_start') != week_start:
+            wallet = {'week_start': week_start, 'weekly_total': 0.0}
+        wallet['weekly_total'] = float(wallet.get('weekly_total') or 0) + profit_total
+        wallet['updated_at'] = timezone.now().isoformat()
+        _save_profit_wallet(wallet)
+
+        day_pct = (profit_total / investment * 100) if investment else 0.0
+        lines = [
+            "🏦 *BILAN DE TA JOURNÉE (Swing Mode)*",
+            f"✅ Trades Gagnants : {wins}",
+            f"❌ Trades Perdants : {losses}",
+            "",
+            f"💰 Profit du jour : {profit_total:+.2f}$",
+            f"📈 Rendement : {day_pct:+.2f}%",
+            "",
+            f"📅 CAGNOTTE DE LA SEMAINE : {wallet['weekly_total']:+.2f}$",
+            "Objectif Vendredi : 100$",
+            "",
+            "🧠 Note de l'IA : Sentiment news stable aujourd'hui.",
+            "Le modèle sera réentraîné ce soir. Prêt pour demain !",
+        ]
+        _send_telegram_alert("\n".join(lines).strip(), allow_during_blackout=True, category='report')
+
+        payload = {
+            'status': 'sent',
+            'wins': wins,
+            'losses': losses,
+            'profit_total': round(profit_total, 2),
+            'weekly_total': round(float(wallet['weekly_total']), 2),
+        }
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+def _portfolio_news_sentiment(symbol: str, hours: int = 24) -> float:
+    cutoff = timezone.now() - timedelta(hours=hours)
+    avg = (
+        StockNews.objects.filter(stock__symbol__iexact=symbol, published_at__gte=cutoff)
+        .aggregate(avg=models.Avg('sentiment'))
+        .get('avg')
+    )
+    if avg is None:
+        sentiment, _ = _news_sentiment_score(symbol, days=1)
+        return float(sentiment)
+    return float(avg)
+
+
+def _portfolio_symbols_from_env() -> tuple[list[str], list[str]]:
+    core = [s.strip().upper() for s in os.getenv('MY_PORTFOLIO_CORE', 'RY.TO,ATD.TO,TEC.TO').split(',') if s.strip()]
+    moon = [s.strip().upper() for s in os.getenv('MY_PORTFOLIO_MOONSHOTS', 'PDN.TO,MN.V,ONCY').split(',') if s.strip()]
+    return core, moon
+
+
+@shared_task
+def monitor_my_portfolio() -> dict[str, Any]:
+    log = _task_log_start('monitor_my_portfolio')
+    try:
+        core_symbols, moon_symbols = _portfolio_symbols_from_env()
+        symbols = list(dict.fromkeys(core_symbols + moon_symbols))
+        if not symbols:
+            _task_log_finish(log, 'SUCCESS', {'status': 'empty'})
+            return {'status': 'empty'}
+
+        alerts_sent = 0
+
+        for symbol in symbols:
+            is_core = symbol in core_symbols
+            interval = '60m' if is_core else '15m'
+            period = '60d' if is_core else '10d'
+            hist = yf.Ticker(symbol).history(period=period, interval=interval)
+            if hist is None or hist.empty or 'Close' not in hist:
+                continue
+            close = hist['Close']
+            price = float(close.iloc[-1])
+            rsi = _compute_rsi(close, 14)
+            macd_line, macd_signal, macd_hist = _compute_macd(close)
+            macd_series = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+            macd_hist_series = macd_series - macd_series.ewm(span=9, adjust=False).mean()
+            macd_weak = _macd_weakening(macd_hist_series) if len(macd_hist_series) >= 3 else False
+
+            daily = yf.Ticker(symbol).history(period='1y', interval='1d')
+            sma200 = None
+            prev_close = None
+            if daily is not None and not daily.empty and 'Close' in daily:
+                series = daily['Close']
+                sma200 = float(series.rolling(200).mean().iloc[-1]) if len(series) >= 200 else None
+                prev_close = float(series.iloc[-2]) if len(series) >= 2 else None
+
+            _, _, bb_lower = _compute_bollinger(daily['Close'] if daily is not None and 'Close' in daily else close, 20)
+            news_sent = _portfolio_news_sentiment(symbol, hours=24)
+            negative_news = news_sent < -0.2
+
+            if rsi is not None and rsi >= 75:
+                _send_telegram_alert(
+                    f"⚠️ SÉCURISATION : ${symbol} en surchauffe (RSI {rsi:.1f}). "
+                    "Je suggère de vendre 50% pour sécuriser les gains.",
+                    allow_during_blackout=True,
+                    category='portfolio_guard',
+                )
+                alerts_sent += 1
+                continue
+
+            if macd_hist is not None and macd_hist < 0 and macd_weak:
+                _send_telegram_alert(
+                    f"⚠️ SÉCURISATION : ${symbol} montre un essoufflement MACD. "
+                    "Je suggère de vendre 50%.",
+                    allow_during_blackout=True,
+                    category='portfolio_guard',
+                )
+                alerts_sent += 1
+                continue
+
+            if prev_close and prev_close > 0:
+                drop_pct = ((price - prev_close) / prev_close) * 100
+                near_support = False
+                if sma200:
+                    near_support = abs(price - sma200) / sma200 <= 0.015
+                if bb_lower:
+                    near_support = near_support or price <= bb_lower * 1.01
+                if drop_pct <= -3 and near_support and not negative_news:
+                    _send_telegram_alert(
+                        f"📉 BUY THE DIP : ${symbol} est sur un support majeur. "
+                        "Bon moment pour accumuler.",
+                        allow_during_blackout=True,
+                        category='portfolio_guard',
+                    )
+                    alerts_sent += 1
+
+            if not is_core:
+                vol = hist['Volume'] if 'Volume' in hist else None
+                if vol is not None and len(vol) >= 20:
+                    rvol = float(vol.iloc[-1]) / float(vol.tail(20).mean()) if float(vol.tail(20).mean()) else 0.0
+                    if rvol >= 2 and not negative_news:
+                        _send_telegram_alert(
+                            f"🚀 Volume anormal sur ${symbol} (RVOL {rvol:.2f}). "
+                            "News positives détectées.",
+                            allow_during_blackout=True,
+                            category='portfolio_guard',
+                        )
+                        alerts_sent += 1
+
+            if symbol.upper() == 'TEC.TO':
+                spy_price, spy_change = _spy_premarket_snapshot()
+                if spy_change is not None and spy_change <= -1.0:
+                    _send_telegram_alert(
+                        "⚠️ Nasdaq en baisse >1%. TEC.TO pourrait subir une pression à la baisse.",
+                        allow_during_blackout=True,
+                        category='portfolio_guard',
+                    )
+                    alerts_sent += 1
+
+        result = {'status': 'ok', 'alerts': alerts_sent}
+        _task_log_finish(log, 'SUCCESS', result)
+        return result
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+@shared_task
+def portfolio_news_brief() -> dict[str, Any]:
+    log = _task_log_start('portfolio_news_brief')
+    try:
+        core_symbols, moon_symbols = _portfolio_symbols_from_env()
+        symbols = list(dict.fromkeys(core_symbols + moon_symbols))
+        if not symbols:
+            _task_log_finish(log, 'SUCCESS', {'status': 'empty'})
+            return {'status': 'empty'}
+        lines = ["📰 *News Portfolio*", ""]
+        for symbol in symbols:
+            titles = _google_news_titles(symbol, days=1, limit=2)
+            if not titles:
+                continue
+            lines.append(f"${symbol}:")
+            for title in titles:
+                lines.append(f"• {title}")
+        message = "\n".join(lines).strip()
+        if message:
+            _send_telegram_alert(message, allow_during_blackout=True, category='portfolio_guard')
+        _task_log_finish(log, 'SUCCESS', {'status': 'sent'})
+        return {'status': 'sent'}
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
 
 
 @shared_task

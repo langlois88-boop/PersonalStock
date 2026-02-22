@@ -7,6 +7,7 @@ import ScoutEyePage from './components/ScoutEyePage';
 import AnalyticsLabPage from './components/AnalyticsLabPage';
 import LivePaperTrading from './components/LivePaperTrading';
 import ManagePortfolioPage from './components/ManagePortfolioPage';
+import IntradayAI from './components/IntradayAI';
 
 function App() {
   const [page, setPage] = useState('home');
@@ -21,6 +22,7 @@ function App() {
         {page === 'scout' && <ScoutEyePage />}
         {page === 'lab' && <AnalyticsLabPage />}
         {page === 'paper' && <LivePaperTrading />}
+        {page === 'intraday' && <IntradayAI />}
       </main>
     </div>
   );

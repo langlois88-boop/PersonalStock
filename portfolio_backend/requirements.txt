@@ -9,10 +9,12 @@ celery
 redis
 requests
 yfinance
+alpaca-py
 pandas
 numpy
 scikit-learn
 joblib
+xgboost
 transformers
 torch==2.2.2+cpu
 feedparser

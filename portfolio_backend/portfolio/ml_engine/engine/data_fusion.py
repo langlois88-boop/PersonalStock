@@ -9,14 +9,20 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from ...alpaca_data import get_daily_bars
+
 from ..collectors.news_rss import fetch_news_sentiment
 
 
 class DataFusionEngine:
-    def __init__(self, ticker: str, fast_mode: bool = False):
+    def __init__(self, ticker: str, fast_mode: bool = False, use_alpaca: bool = False):
         self.ticker = (ticker or "").upper().strip()
         self.end_date = datetime.utcnow()
         self.start_date = self.end_date - timedelta(days=365)
+        self.use_alpaca = bool(
+            use_alpaca
+            or str(os.getenv("DATAFUSION_USE_ALPACA", "")).strip().lower() in {"1", "true", "yes", "y"}
+        )
         self.fast_mode = bool(
             fast_mode
             or str(os.getenv("DATAFUSION_FAST_MODE", "")).strip().lower() in {"1", "true", "yes", "y"}
@@ -48,6 +54,26 @@ class DataFusionEngine:
     def get_market_data(self) -> pd.DataFrame:
         if self.fast_mode:
             return self._get_market_data_from_db()
+        if self.use_alpaca:
+            alpaca_df = get_daily_bars(self.ticker, days=730)
+            if alpaca_df is not None and not alpaca_df.empty:
+                if isinstance(alpaca_df.index, pd.MultiIndex):
+                    alpaca_df = alpaca_df.reset_index()
+                if 'timestamp' in alpaca_df.columns:
+                    alpaca_df = alpaca_df.set_index('timestamp')
+                alpaca_df.index = pd.to_datetime(alpaca_df.index, errors="coerce")
+                alpaca_df = alpaca_df[~alpaca_df.index.isna()]
+                alpaca_df = alpaca_df.rename(
+                    columns={
+                        'open': 'Open',
+                        'high': 'High',
+                        'low': 'Low',
+                        'close': 'Close',
+                        'volume': 'Volume',
+                    }
+                )
+                alpaca_df['Returns'] = alpaca_df['Close'].pct_change()
+                return alpaca_df
         try:
             df = yf.download(
                 self.ticker,

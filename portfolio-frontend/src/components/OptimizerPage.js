@@ -139,7 +139,7 @@ function OptimizerPage() {
                 : 'bg-slate-800 text-slate-300 border-slate-700'
             }`}
           >
-            Core Portfolio ({coreActions.length})
+            Core Portfolio ({coreActions.length}) · AI
           </button>
           <button
             type="button"
@@ -150,7 +150,7 @@ function OptimizerPage() {
                 : 'bg-slate-800 text-slate-300 border-slate-700'
             }`}
           >
-            Moonshots ({moonshotActions.length})
+            Moonshots ({moonshotActions.length}) · AI
           </button>
         </div>
         {visibleActions.map((item, idx) => (

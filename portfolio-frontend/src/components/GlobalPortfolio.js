@@ -31,6 +31,19 @@ const StatCard = ({ title, value, subtitle, accent }) => (
   </motion.div>
 );
 
+const CHART_RANGES = [
+  { key: '1M', label: '1M', days: 30 },
+  { key: '3M', label: '3M', days: 90 },
+  { key: '6M', label: '6M', days: 180 },
+  { key: '1Y', label: '1Y', days: 365 },
+  { key: 'ALL', label: 'MAX', days: null },
+];
+
+const CHART_MODES = [
+  { key: 'value', label: 'Valeur' },
+  { key: 'pct', label: '% période' },
+];
+
 function GlobalPortfolio() {
   const [data, setData] = useState(emptyState);
   const [error, setError] = useState('');
@@ -46,6 +59,8 @@ function GlobalPortfolio() {
   const [newsVisible, setNewsVisible] = useState({ holdings: 6, sectors: 6, positive: 6, negative: 6 });
   const [focusFilter, setFocusFilter] = useState(false);
   const [wave2Amounts, setWave2Amounts] = useState({});
+  const [chartRange, setChartRange] = useState('3M');
+  const [chartMode, setChartMode] = useState('value');
 
   useEffect(() => {
     setLoading(true);
@@ -122,13 +137,6 @@ function GlobalPortfolio() {
     setNewsVisible({ holdings: 6, sectors: 6, positive: 6, negative: 6 });
   }, [newsSymbol]);
 
-  const gaugeData = useMemo(
-    () => [
-      { name: 'Stable', value: data.allocation?.stable_pct || 0, fill: '#6366f1' },
-      { name: 'Risky', value: data.allocation?.risky_pct || 0, fill: '#f43f5e' },
-    ],
-    [data.allocation]
-  );
 
   const formatMoney = (value) => {
     if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
@@ -166,6 +174,91 @@ function GlobalPortfolio() {
     if (value >= 0.35) return 'text-emerald-300';
     if (value <= -0.35) return 'text-rose-300';
     return 'text-slate-400';
+  };
+
+  const gaugeData = useMemo(
+    () => [
+      { name: 'Stable', value: data.allocation?.stable_pct || 0, fill: '#6366f1' },
+      { name: 'Risky', value: data.allocation?.risky_pct || 0, fill: '#f43f5e' },
+    ],
+    [data.allocation]
+  );
+
+  const filteredChart = useMemo(() => {
+    const chart = Array.isArray(data.chart) ? data.chart : [];
+    if (!chart.length || chartRange === 'ALL') return chart;
+    const range = CHART_RANGES.find((item) => item.key === chartRange);
+    if (!range?.days) return chart;
+    const lastDate = new Date(chart[chart.length - 1]?.date);
+    if (Number.isNaN(lastDate.getTime())) return chart;
+    const startDate = new Date(lastDate);
+    startDate.setDate(startDate.getDate() - range.days);
+    return chart.filter((point) => {
+      const date = new Date(point.date);
+      if (Number.isNaN(date.getTime())) return true;
+      return date >= startDate;
+    });
+  }, [data.chart, chartRange]);
+
+  const performanceSeries = useMemo(() => {
+    const chart = Array.isArray(filteredChart) ? filteredChart : [];
+    if (!chart.length) return [];
+    const baseValue = Number(chart[0]?.value || 0) || 0;
+    return chart.map((point) => {
+      const value = Number(point.value || 0);
+      const pct = baseValue ? ((value - baseValue) / baseValue) * 100 : 0;
+      return {
+        date: point.date,
+        value,
+        pct,
+      };
+    });
+  }, [filteredChart]);
+
+  const periodReturn = useMemo(() => {
+    if (!performanceSeries.length) return { value: null, pct: null };
+    const first = Number(performanceSeries[0]?.value || 0);
+    const last = Number(performanceSeries[performanceSeries.length - 1]?.value || 0);
+    if (!first && !last) return { value: null, pct: null };
+    const diff = last - first;
+    const pct = first ? (diff / first) * 100 : 0;
+    return { value: diff, pct };
+  }, [performanceSeries]);
+
+  const portfolioDividendYield = useMemo(() => {
+    const list = Array.isArray(data.holdings) ? data.holdings : [];
+    let total = 0;
+    let weighted = 0;
+    list.forEach((row) => {
+      const value = Number(row.value ?? (Number(row.price || 0) * Number(row.shares || 0)));
+      if (!Number.isFinite(value) || value <= 0) return;
+      const yieldValue = Number(row.dividend_yield || 0);
+      total += value;
+      weighted += value * (Number.isFinite(yieldValue) ? yieldValue : 0);
+    });
+    if (!total) return null;
+    return weighted / total;
+  }, [data.holdings]);
+
+  const PerformanceTooltip = ({ active, payload, label, chartMode: mode }) => {
+    if (!active || !payload || !payload.length) return null;
+    const point = payload[0]?.payload;
+    return (
+      <div className="rounded-xl border border-slate-800 bg-slate-950/95 p-3 text-xs text-slate-200">
+        <p className="text-slate-400">{formatDate(label)}</p>
+        {mode === 'pct' ? (
+          <>
+            <p className="text-sm font-semibold">{formatPctSigned(point?.pct)}</p>
+            <p className="text-slate-400">{formatMoney(point?.value)}</p>
+          </>
+        ) : (
+          <>
+            <p className="text-sm font-semibold">{formatMoney(point?.value)}</p>
+            <p className="text-slate-400">{formatPctSigned(point?.pct)}</p>
+          </>
+        )}
+      </div>
+    );
   };
 
   const topHoldings = useMemo(() => {
@@ -358,70 +451,20 @@ function GlobalPortfolio() {
   return (
     <div className="space-y-6">
       <UnifiedAlerts />
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
-        <StatCard
-          title="Solde Total"
-          value={`$${data.total_balance?.toLocaleString('fr-CA')}`}
-          subtitle="Valeur actuelle en CAD"
-          accent="text-white"
-        />
-        <StatCard
-          title="Rendement total"
-          value={`${Number(data.total_return_pct || 0).toFixed(2)}%`}
-          subtitle={formatMoneySigned(data.total_return)}
-          accent={Number(data.total_return || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}
-        />
-        <StatCard
-          title="Changement 24h"
-          value={`${data.change_24h >= 0 ? '+' : ''}${data.change_24h}`}
-          subtitle={`${data.change_24h_pct}% aujourd'hui"`}
-          accent={data.change_24h >= 0 ? 'text-emerald-400' : 'text-rose-400'}
-        />
-        <StatCard
-          title="Performance Hebdo"
-          value={`${data.change_7d >= 0 ? '+' : ''}${data.change_7d}`}
-          subtitle={`${data.change_7d_pct}% sur 7 jours"`}
-          accent={data.change_7d >= 0 ? 'text-emerald-400' : 'text-rose-400'}
-        />
-        <StatCard
-          title="Drawdown actuel"
-          value={`${Number(data.current_drawdown || 0).toFixed(2)}%`}
-          subtitle="Depuis le dernier sommet"
-          accent={Number(data.current_drawdown || 0) < 0 ? 'text-rose-400' : 'text-emerald-400'}
-        />
-        <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 backdrop-blur-md flex flex-col gap-2">
-          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Allocation 60/40</p>
-          <div className="flex items-center gap-4">
-            <div className="h-20 w-20">
-              <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                  <Pie data={gaugeData} dataKey="value" innerRadius={28} outerRadius={36} stroke="none" />
-                </PieChart>
-              </ResponsiveContainer>
-            </div>
-            <div>
-              <p className="text-white text-lg font-semibold">{data.allocation?.stable_pct || 0}% Stable</p>
-              <p className="text-xs text-slate-400">{data.allocation?.risky_pct || 0}% Risky</p>
-            </div>
-          </div>
-        </div>
-      </div>
 
-      <div className={`border rounded-2xl p-4 backdrop-blur-md ${confidenceStyles[confidenceStatus] || confidenceStyles.unavailable}`}>
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div>
-            <p className="text-xs uppercase tracking-[0.2em]">Confidence Meter</p>
-            <p className="text-lg font-semibold">{confidenceLabel}</p>
-            <p className="text-xs opacity-80">Symbole: {confidenceSymbol}</p>
+      <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
+        <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Allocation 60/40</p>
+        <div className="flex items-center gap-4">
+          <div className="h-20 w-20">
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie data={gaugeData} dataKey="value" innerRadius={28} outerRadius={36} stroke="none" />
+              </PieChart>
+            </ResponsiveContainer>
           </div>
-          <div className="text-right text-xs space-y-1">
-            <p className={confidenceScoreClass()}>
-              IA Score: {confidenceAiScore === null ? '—' : `${confidenceAiScore.toFixed(2)}%`}
-            </p>
-            <p>Win Rate: {confidenceWinRate === null ? '—' : `${Number(confidenceWinRate).toFixed(1)}%`}</p>
-            <p>Sharpe: {confidenceSharpe === null ? '—' : Number(confidenceSharpe).toFixed(2)}</p>
-            <p>Volume Z: {confidenceVolumeZ === null ? '—' : confidenceVolumeZ.toFixed(2)}</p>
-            <p>Vol Regime: {confidenceVolRegime === null ? '—' : confidenceVolRegime.toFixed(2)}</p>
+          <div>
+            <p className="text-white text-lg font-semibold">{data.allocation?.stable_pct || 0}% Stable</p>
+            <p className="text-xs text-slate-400">{data.allocation?.risky_pct || 0}% Risky</p>
           </div>
         </div>
       </div>
@@ -430,43 +473,114 @@ function GlobalPortfolio() {
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         <div className="xl:col-span-2 bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
-          <h3 className="text-lg font-semibold text-white mb-4">Rendement du portefeuille</h3>
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+            <h3 className="text-lg font-semibold text-white">Rendement du portefeuille</h3>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <div className="flex items-center gap-1 rounded-full border border-slate-800 bg-slate-950/60 p-1">
+                {CHART_RANGES.map((item) => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => setChartRange(item.key)}
+                    className={`px-3 py-1 rounded-full transition ${chartRange === item.key
+                      ? 'bg-indigo-500 text-white'
+                      : 'text-slate-300 hover:text-white hover:bg-slate-800/60'}`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-1 rounded-full border border-slate-800 bg-slate-950/60 p-1">
+                {CHART_MODES.map((item) => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => setChartMode(item.key)}
+                    className={`px-3 py-1 rounded-full transition ${chartMode === item.key
+                      ? 'bg-slate-100 text-slate-900'
+                      : 'text-slate-300 hover:text-white hover:bg-slate-800/60'}`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
           {loading ? (
             <p className="text-sm text-slate-400">Chargement…</p>
           ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
-                <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Valeur actuelle</p>
-                <p className="text-2xl font-semibold text-white">{formatMoney(data.total_balance)}</p>
-                <p className="text-xs text-slate-400">Au {new Date().toISOString().slice(0, 10)}</p>
+            <div className="space-y-4">
+              <div className="h-72">
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={performanceSeries} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="portfolioPerf" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#6366f1" stopOpacity={0.4} />
+                        <stop offset="95%" stopColor="#6366f1" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
+                    <XAxis dataKey="date" tickFormatter={formatDate} stroke="#64748b" fontSize={11} />
+                    <YAxis
+                      tickFormatter={(val) => (chartMode === 'pct' ? formatPctSigned(val) : formatMoney(val))}
+                      stroke="#64748b"
+                      fontSize={11}
+                      width={80}
+                    />
+                    <Tooltip content={<PerformanceTooltip chartMode={chartMode} />} />
+                    <Area
+                      type="monotone"
+                      dataKey={chartMode === 'pct' ? 'pct' : 'value'}
+                      stroke="#6366f1"
+                      fill="url(#portfolioPerf)"
+                      strokeWidth={2}
+                    />
+                  </AreaChart>
+                </ResponsiveContainer>
               </div>
-              <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
-                <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Rendement total</p>
-                <p className={`text-2xl font-semibold ${Number(data.total_return || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {Number(data.total_return_pct || 0).toFixed(2)}%
-                </p>
-                <p className="text-xs text-slate-400">{formatMoneySigned(data.total_return)}</p>
-              </div>
-              <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
-                <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Changement 24h</p>
-                <p className={`text-2xl font-semibold ${Number(data.change_24h || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {formatMoneySigned(data.change_24h)}
-                </p>
-                <p className="text-xs text-slate-400">{Number(data.change_24h_pct || 0).toFixed(2)}% aujourd'hui</p>
-              </div>
-              <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
-                <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Changement 7j</p>
-                <p className={`text-2xl font-semibold ${Number(data.change_7d || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {formatMoneySigned(data.change_7d)}
-                </p>
-                <p className="text-xs text-slate-400">{Number(data.change_7d_pct || 0).toFixed(2)}% sur 7 jours</p>
-              </div>
-              <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4 md:col-span-2">
-                <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Drawdown actuel</p>
-                <p className={`text-2xl font-semibold ${Number(data.current_drawdown || 0) < 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
-                  {Number(data.current_drawdown || 0).toFixed(2)}%
-                </p>
-                <p className="text-xs text-slate-400">Depuis le dernier sommet</p>
+              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+                <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Rendement total</p>
+                  <p className={`text-lg font-semibold ${Number(data.total_return || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {formatPctSigned(data.total_return_pct)}
+                  </p>
+                  <p className="text-xs text-slate-400">{formatMoneySigned(data.total_return)}</p>
+                </div>
+                <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Période {chartRange}</p>
+                  <p className={`text-lg font-semibold ${Number(periodReturn.pct || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {periodReturn.pct === null ? '—' : formatPctSigned(periodReturn.pct)}
+                  </p>
+                  <p className="text-xs text-slate-400">{periodReturn.value === null ? '—' : formatMoneySigned(periodReturn.value)}</p>
+                </div>
+                <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">24h</p>
+                  <p className={`text-lg font-semibold ${Number(data.change_24h || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {formatMoneySigned(data.change_24h)}
+                  </p>
+                  <p className="text-xs text-slate-400">{formatPctSigned(data.change_24h_pct)}</p>
+                </div>
+                <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">7 jours</p>
+                  <p className={`text-lg font-semibold ${Number(data.change_7d || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {formatMoneySigned(data.change_7d)}
+                  </p>
+                  <p className="text-xs text-slate-400">{formatPctSigned(data.change_7d_pct)}</p>
+                </div>
+                <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Drawdown</p>
+                  <p className={`text-lg font-semibold ${Number(data.current_drawdown || 0) < 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                    {formatPctSigned(data.current_drawdown)}
+                  </p>
+                  <p className="text-xs text-slate-400">Depuis le sommet</p>
+                </div>
+                <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Dividend yield</p>
+                  <p className="text-lg font-semibold text-slate-100">
+                    {portfolioDividendYield === null ? '—' : formatPct(portfolioDividendYield * 100)}
+                  </p>
+                  <p className="text-xs text-slate-400">Moyenne pondérée</p>
+                </div>
               </div>
             </div>
           )}

@@ -83,6 +83,8 @@ from .serializers import (
 from .ai_module import run_predictions
 from .tasks import _fetch_yahoo_screener, _fetch_yfinance_screeners
 from .ai_scout import build_scout_summary
+from .alpaca_data import get_intraday_bars, get_intraday_context
+from .patterns import build_pattern_annotations, enrich_bars_with_patterns
 from .ml_engine.engine.data_fusion import DataFusionEngine
 from .ml_engine.collectors.news_rss import fetch_news_sentiment
 
@@ -1331,6 +1333,163 @@ class MacroIndicatorView(APIView):
 		limit = max(1, min(limit, 365))
 		queryset = MacroIndicator.objects.order_by('-date')[:limit]
 		return Response(MacroIndicatorSerializer(queryset, many=True).data)
+
+
+class AlpacaIntradayView(APIView):
+	def get(self, request):
+		def _safe_number(value: Any, default: float = 0.0) -> float:
+			try:
+				val = float(value)
+				if not math.isfinite(val):
+					return default
+				return val
+			except (TypeError, ValueError):
+				return default
+
+		def _clean_json(value: Any) -> Any:
+			if value is None:
+				return None
+			if isinstance(value, dict):
+				return {key: _clean_json(val) for key, val in value.items()}
+			if isinstance(value, list):
+				return [_clean_json(item) for item in value]
+			if isinstance(value, tuple):
+				return [_clean_json(item) for item in value]
+			if isinstance(value, pd.Timestamp):
+				try:
+					return int(value.timestamp())
+				except Exception:
+					return None
+			if isinstance(value, (np.generic,)):
+				try:
+					value = value.item()
+				except Exception:
+					return None
+			if isinstance(value, float):
+				return value if math.isfinite(value) else 0.0
+			return value
+
+		symbol = (request.query_params.get('symbol') or '').strip().upper()
+		if not symbol:
+			return Response({'error': 'symbol is required'}, status=400)
+		alias_map = {
+			'APPL': 'AAPL',
+			'GOOG': 'GOOGL',
+		}
+		resolved_symbol = alias_map.get(symbol, symbol)
+		minutes = int(request.query_params.get('minutes', 390))
+		minutes = max(30, min(minutes, 2000))
+		rvol_window = int(request.query_params.get('rvol_window', 20))
+		bars = get_intraday_bars(resolved_symbol, minutes=minutes)
+		alt_symbol = None
+		if bars.empty and '.' not in resolved_symbol:
+			alt_symbol = f"{resolved_symbol}.TO"
+			bars = get_intraday_bars(alt_symbol, minutes=minutes)
+		if bars.empty:
+			return Response({
+				'error': f"Aucune donnée intraday pour {resolved_symbol}. Vérifie le ticker.",
+				'symbol': resolved_symbol,
+				'bars': [],
+				'annotations': [],
+				'guidance': [],
+				'stats': {},
+			}, status=200)
+
+		bars = enrich_bars_with_patterns(bars, rvol_window=rvol_window)
+		annotations = build_pattern_annotations(bars)
+		clean_annotations = []
+		for item in annotations:
+			clean_annotations.append({
+				'time': int(item.get('time') or 0),
+				'text': item.get('text') or '',
+				'signal': _safe_number(item.get('signal')),
+				'rvol': _safe_number(item.get('rvol')),
+			})
+
+		bars_payload = []
+		for _, row in bars.iterrows():
+			try:
+				time_val = int(pd.Timestamp(row['timestamp']).timestamp())
+			except Exception:
+				continue
+			bars_payload.append({
+				'time': time_val,
+				'open': _safe_number(row.get('open')),
+				'high': _safe_number(row.get('high')),
+				'low': _safe_number(row.get('low')),
+				'close': _safe_number(row.get('close')),
+				'volume': _safe_number(row.get('volume')),
+				'rvol': _safe_number(row.get('rvol')),
+				'pattern_signal': _safe_number(row.get('pattern_signal')),
+				'ema20': _safe_number(row.get('ema20')),
+				'ema50': _safe_number(row.get('ema50')),
+				'rsi14': _safe_number(row.get('rsi14')),
+				'patterns': row.get('patterns') or [],
+			})
+
+		latest = bars.iloc[-1]
+		last_close = _safe_number(latest.get('close'))
+		pattern_signal = _safe_number(latest.get('pattern_signal'))
+		rvol = _safe_number(latest.get('rvol'))
+		volatility = _safe_number(latest.get('volatility'))
+		support = _safe_number(bars.tail(30)['low'].min() if 'low' in bars else last_close, default=last_close)
+		resistance = _safe_number(bars.tail(30)['high'].max() if 'high' in bars else last_close, default=last_close)
+		stop_loss = last_close * (1 - max(volatility * 3, 0.01)) if last_close else 0.0
+		base_prob = 0.5 + (pattern_signal * 0.08)
+		if rvol >= 2:
+			base_prob += 0.05
+		probability = min(0.95, max(0.05, base_prob))
+		base_target_pct = float(os.getenv('INTRADAY_TARGET_BASE_PCT', '0.02'))
+		aggressive_pct = float(os.getenv('INTRADAY_TARGET_AGGRESSIVE_PCT', '0.05'))
+		aggressive_high_pct = float(os.getenv('INTRADAY_TARGET_AGGRESSIVE_HIGH_PCT', '0.07'))
+		target_pct = base_target_pct
+		if probability >= 0.8 and rvol > 5:
+			target_pct = aggressive_pct
+		if probability >= 0.9 and rvol > 6:
+			target_pct = aggressive_high_pct
+		profit_target = last_close * (1 + target_pct) if last_close else 0.0
+
+		guidance = []
+		if pattern_signal > 0 and rvol >= 2:
+			guidance.append(
+				f"Pattern haussier + RVOL élevé. Support {support:.2f}$, stop-loss suggéré {stop_loss:.2f}$, target {profit_target:.2f}$."
+			)
+		elif pattern_signal < 0 and rvol >= 2:
+			guidance.append(
+				f"Pattern baissier + RVOL élevé. Résistance {resistance:.2f}$, prudence et stop-loss {stop_loss:.2f}$."
+			)
+		else:
+			guidance.append(
+				f"RVOL {rvol:.2f} et volatilité {volatility:.4f}. Support {support:.2f}$, résistance {resistance:.2f}$."
+			)
+
+		payload = {
+			'symbol': alt_symbol or resolved_symbol,
+			'bars': bars_payload,
+			'annotations': clean_annotations,
+			'guidance': [str(item) for item in guidance if item is not None],
+			'stats': {
+				'last_close': _safe_number(last_close),
+				'pattern_signal': _safe_number(pattern_signal),
+				'rvol': _safe_number(rvol),
+				'volatility': _safe_number(volatility),
+				'rsi14': _safe_number(latest.get('rsi14')),
+				'ema20': _safe_number(latest.get('ema20')),
+				'ema50': _safe_number(latest.get('ema50')),
+				'probability': _safe_number(round(float(probability), 4)),
+				'support': _safe_number(support, default=0.0),
+				'resistance': _safe_number(resistance, default=0.0),
+				'suggested_stop': _safe_number(stop_loss),
+				'suggested_target': _safe_number(profit_target),
+			},
+		}
+		return Response(_clean_json(payload), status=200)
+
+
+class MarketScannerView(APIView):
+	def get(self, request):
+		results = cache.get('market_scanner_results') or []
+		return Response({'results': results}, status=200)
 
 
 class PortfolioDashboardView(APIView):
@@ -3747,6 +3906,46 @@ class PortfolioOptimizerView(APIView):
 		except Exception:
 			return None
 
+	def _compute_rsi(self, series: pd.Series | None, period: int = 14) -> float | None:
+		if series is None or series.empty or len(series) < period:
+			return None
+		delta = series.diff().fillna(0)
+		gain = delta.clip(lower=0).rolling(period).mean()
+		loss = (-delta.clip(upper=0)).rolling(period).mean()
+		rs = gain / loss.replace(0, pd.NA)
+		rsi = 100 - (100 / (1 + rs))
+		value = rsi.iloc[-1]
+		return float(value) if pd.notna(value) else None
+
+	def _compute_macd_hist(self, series: pd.Series | None) -> pd.Series | None:
+		if series is None or series.empty or len(series) < 26:
+			return None
+		ema_fast = series.ewm(span=12, adjust=False).mean()
+		ema_slow = series.ewm(span=26, adjust=False).mean()
+		macd = ema_fast - ema_slow
+		signal = macd.ewm(span=9, adjust=False).mean()
+		return macd - signal
+
+	def _compute_bollinger(self, series: pd.Series | None, window: int = 20) -> tuple[float | None, float | None, float | None]:
+		if series is None or series.empty or len(series) < window:
+			return None, None, None
+		ma = series.rolling(window).mean().iloc[-1]
+		std = series.rolling(window).std().iloc[-1]
+		if pd.isna(ma) or pd.isna(std):
+			return None, None, None
+		upper = float(ma + 2 * std)
+		lower = float(ma - 2 * std)
+		return float(ma), upper, lower
+
+	def _news_sentiment_recent(self, symbol: str, hours: int = 24) -> float | None:
+		cutoff = timezone.now() - timedelta(hours=hours)
+		avg = (
+			StockNews.objects.filter(stock__symbol__iexact=symbol, published_at__gte=cutoff)
+			.aggregate(avg=models.Avg('sentiment'))
+			.get('avg')
+		)
+		return float(avg) if avg is not None else None
+
 	def _correlation_with_nasdaq(self, symbol: str) -> float | None:
 		cache_key = f"corr_nasdaq:{symbol}"
 		cached = cache.get(cache_key)
@@ -4019,6 +4218,33 @@ class PortfolioOptimizerView(APIView):
 					vol_weak = (vol_series < -0.5).all()
 					if price_up and vol_weak:
 						alerts.append('⚠️ Divergence détectée : Hausse non supportée par le volume. Remontez vos Stops.')
+		except Exception:
+			pass
+
+		try:
+			close_series = data['Close'] if data is not None and 'Close' in data else None
+			if close_series is not None and not close_series.empty:
+				macd_hist = self._compute_macd_hist(close_series)
+				macd_weak = False
+				if macd_hist is not None and len(macd_hist) >= 3:
+					macd_weak = macd_hist.iloc[-1] < macd_hist.iloc[-2] < macd_hist.iloc[-3]
+				bb_ma, bb_upper, bb_lower = self._compute_bollinger(close_series)
+				recent_rsi = self._compute_rsi(close_series)
+				news_sent = self._news_sentiment_recent(symbol) or 0.0
+				prev_close = float(close_series.iloc[-2]) if len(close_series) >= 2 else None
+				if recent_rsi is not None and recent_rsi >= 75:
+					alerts.append('⚠️ Surchauffe RSI : suggéré de sécuriser 50%.')
+				if macd_hist is not None and float(macd_hist.iloc[-1]) < 0 and macd_weak:
+					alerts.append('⚠️ MACD en essoufflement : prudence, sécuriser 50%.')
+				if prev_close and prev_close > 0:
+					drop_pct = ((price_value - prev_close) / prev_close) * 100
+					near_support = False
+					if sma200 is not None:
+						near_support = abs(price_value - sma200) / sma200 <= 0.015
+					if bb_lower is not None:
+						near_support = near_support or price_value <= bb_lower * 1.01
+					if drop_pct <= -3 and near_support and news_sent >= -0.2:
+						alerts.append('📉 BUY THE DIP : Support majeur détecté, news stables.')
 		except Exception:
 			pass
 
