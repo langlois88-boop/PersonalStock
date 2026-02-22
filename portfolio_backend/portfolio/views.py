@@ -1279,9 +1279,12 @@ class PennyStockPredictionView(APIView):
 			return Response({'error': 'Model not trained yet.'}, status=503)
 
 		try:
-			model = joblib.load(model_path)
+			payload = joblib.load(model_path)
 		except Exception:
 			return Response({'error': 'Failed to load model.'}, status=503)
+
+		model = payload.get('model') if isinstance(payload, dict) else payload
+		feature_list = payload.get('features') if isinstance(payload, dict) else None
 
 		try:
 			data = yf.Ticker(symbol).history(period='1y', interval='1d', timeout=10)
@@ -1302,18 +1305,27 @@ class PennyStockPredictionView(APIView):
 		close = data['Close']
 		volume = data['Volume'] if 'Volume' in data else pd.Series([0] * len(close), index=close.index)
 		ret = close.pct_change()
+		feature_map = {
+			'close': float(close.iloc[-1]),
+			'sma_10': float(close.rolling(10).mean().iloc[-1]),
+			'sma_20': float(close.rolling(20).mean().iloc[-1]),
+			'sma_50': float(close.rolling(50).mean().iloc[-1]),
+			'volatility_20': float(ret.rolling(20).std().iloc[-1]),
+			'volume_change_10': float(volume.pct_change().rolling(10).mean().iloc[-1]),
+			'rsi_14': float(rsi(close, 14)),
+		}
+		if not feature_list:
+			feature_list = list(feature_map.keys())
 		features = np.array([
-			float(close.iloc[-1]),
-			float(close.rolling(10).mean().iloc[-1]),
-			float(close.rolling(20).mean().iloc[-1]),
-			float(close.rolling(50).mean().iloc[-1]),
-			float(ret.rolling(20).std().iloc[-1]),
-			float(volume.pct_change().rolling(10).mean().iloc[-1]),
-			float(rsi(close, 14)),
+			float(feature_map.get(name, 0.0) or 0.0) for name in feature_list
 		])
 
 		try:
-			prob = float(model.predict_proba([features])[0][1])
+			if hasattr(model, 'predict_proba'):
+				prob = float(model.predict_proba([features])[0][1])
+			else:
+				pred = float(model.predict([features])[0])
+				prob = max(0.0, min(1.0, 0.5 + pred))
 		except Exception:
 			return Response({'error': 'Prediction failed.'}, status=500)
 

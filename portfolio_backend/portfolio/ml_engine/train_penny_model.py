@@ -99,7 +99,12 @@ def train_model(output_path: Path) -> None:
     print(classification_report(y_test, y_pred, zero_division=0))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(model, output_path)
+    payload = {
+        'model': model,
+        'features': list(X.columns),
+        'model_type': 'classifier',
+    }
+    joblib.dump(payload, output_path)
     print(f"Saved model to {output_path}")
 
 

@@ -47,5 +47,20 @@ def save_model(model: Pipeline, path: str) -> None:
     joblib.dump(model, path)
 
 
+def load_model_payload(path: str) -> dict:
+    payload = joblib.load(path)
+    if isinstance(payload, dict):
+        model = payload.get("model")
+        features = payload.get("features")
+        model_type = payload.get("model_type")
+        return {
+            "model": model,
+            "features": features,
+            "model_type": model_type,
+        }
+    return {"model": payload, "features": FEATURE_COLUMNS, "model_type": None}
+
+
 def load_model(path: str) -> Pipeline:
-    return joblib.load(path)
+    payload = load_model_payload(path)
+    return payload.get("model")

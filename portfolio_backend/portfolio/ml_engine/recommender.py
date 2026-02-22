@@ -2,32 +2,45 @@ from typing import Dict, List
 
 import numpy as np
 
-from .model import FEATURE_COLUMNS, load_model
+from .model import FEATURE_COLUMNS, load_model_payload
 from .processor import DataMerger
 
 
-def build_feature_vector(features: Dict[str, float]) -> np.ndarray:
-    row = [features.get(col) if features.get(col) is not None else 0.0 for col in FEATURE_COLUMNS]
+def build_feature_vector(features: Dict[str, float], feature_list: List[str]) -> np.ndarray:
+    row = [features.get(col) if features.get(col) is not None else 0.0 for col in feature_list]
     return np.array(row, dtype=float)
 
 
 def generate_recommendations(symbols: List[str], model_path: str) -> List[Dict[str, float]]:
     merger = DataMerger()
-    model = load_model(model_path)
+    payload = load_model_payload(model_path)
+    model = payload.get("model")
+    feature_list = payload.get("features") or FEATURE_COLUMNS
 
     results = []
     for symbol in symbols:
         features = merger.merge(symbol)
         if not features:
             continue
-        vector = build_feature_vector(features)
-        proba = float(model.predict_proba([vector])[0][1])
-        results.append({
-            "symbol": symbol,
-            "prob_up_15d": round(proba, 4),
-            "recommendation": "BUY" if proba >= 0.7 else "HOLD",
-            "features": features,
-        })
+        vector = build_feature_vector(features, feature_list)
+        if hasattr(model, "predict_proba"):
+            score = float(model.predict_proba([vector])[0][1])
+            recommendation = "BUY" if score >= 0.7 else "HOLD"
+            results.append({
+                "symbol": symbol,
+                "prob_up_15d": round(score, 4),
+                "recommendation": recommendation,
+                "features": features,
+            })
+        else:
+            pred = float(model.predict([vector])[0])
+            recommendation = "BUY" if pred >= 0.02 else "HOLD"
+            results.append({
+                "symbol": symbol,
+                "predicted_20d_return": round(pred, 4),
+                "recommendation": recommendation,
+                "features": features,
+            })
 
-    results.sort(key=lambda x: x["prob_up_15d"], reverse=True)
+    results.sort(key=lambda x: x.get("prob_up_15d", x.get("predicted_20d_return", 0)), reverse=True)
     return results
