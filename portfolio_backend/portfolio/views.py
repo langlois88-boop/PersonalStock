@@ -2990,15 +2990,15 @@ class StablePredictionView(APIView):
 			return Response({'error': 'Failed to load model.'}, status=503)
 
 		try:
-			data = yf.Ticker(symbol).history(period='1y', interval='1d', timeout=10)
-			spy = yf.Ticker('SPY').history(period='1y', interval='1d', timeout=10)
+			data = yf.Ticker(symbol).history(period='2y', interval='1d', timeout=10)
+			spy = yf.Ticker('SPY').history(period='2y', interval='1d', timeout=10)
 		except Exception:
-			return Response({'error': 'Failed to load price data.'}, status=503)
+			return Response({'error': 'Failed to load price data.', 'symbol': symbol, 'recommendation': 'HOLD'}, status=200)
 
 		if data is None or data.empty or 'Close' not in data or len(data) < 200:
-			return Response({'error': 'Insufficient price history.'}, status=400)
+			return Response({'error': 'Insufficient price history.', 'symbol': symbol, 'recommendation': 'HOLD'}, status=200)
 		if spy is None or spy.empty or 'Close' not in spy or len(spy) < 200:
-			return Response({'error': 'Insufficient SPY history.'}, status=400)
+			return Response({'error': 'Insufficient SPY history.', 'symbol': symbol, 'recommendation': 'HOLD'}, status=200)
 
 		def _normalize_index(series: pd.Series) -> pd.Series:
 			try:
@@ -3024,7 +3024,7 @@ class StablePredictionView(APIView):
 		aligned = pd.concat([ret, spy_ret], axis=1, join='inner').dropna()
 		aligned.columns = ['stock', 'spy']
 		if len(aligned) < 60:
-			return Response({'error': 'Insufficient aligned history.'}, status=400)
+			return Response({'error': 'Insufficient aligned history.', 'symbol': symbol, 'recommendation': 'HOLD'}, status=200)
 
 		beta = float(aligned['stock'].cov(aligned['spy']) / (aligned['spy'].var() or 1))
 		log_ret_20 = float(np.log(close.iloc[-1] / close.iloc[-21]))
@@ -3053,7 +3053,7 @@ class StablePredictionView(APIView):
 		try:
 			pred = float(model.predict([features])[0])
 		except Exception:
-			return Response({'error': 'Prediction failed.'}, status=500)
+			return Response({'error': 'Prediction failed.', 'symbol': symbol, 'recommendation': 'HOLD'}, status=200)
 
 		return Response({
 			'symbol': symbol,
