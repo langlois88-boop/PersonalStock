@@ -57,6 +57,8 @@ class Command(BaseCommand):
 
         data = yf.download(symbols, period=period, interval="1d", progress=False)
         if data.empty:
+            data = _yfinance_fallback(symbols, period)
+        if data.empty:
             self.stderr.write("No data returned")
             return
 
@@ -78,3 +80,16 @@ class Command(BaseCommand):
             )
         else:
             self.stdout.write("No values produced")
+
+
+def _yfinance_fallback(symbols, period):
+    try:
+        import yfinance as yfinance
+    except Exception:
+        return pd.DataFrame()
+    try:
+        tickers = ' '.join(symbols)
+        data = yfinance.download(tickers, period=period, interval="1d", progress=False)
+    except Exception:
+        return pd.DataFrame()
+    return data if isinstance(data, pd.DataFrame) else pd.DataFrame()

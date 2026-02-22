@@ -214,15 +214,56 @@ def download(
     if not symbols:
         return pd.DataFrame()
     if len(symbols) == 1:
-        return _frame_from_bars(symbol_pairs[0][1], bars)
+        frame = _frame_from_bars(symbol_pairs[0][1], bars)
+        if frame is not None and not frame.empty:
+            return frame
+        return _yf_download_fallback(symbols, period, interval, start, end, group_by, threads, auto_adjust, progress)
     frames = {}
     for original, mapped in symbol_pairs:
         frame = _frame_from_bars(mapped, bars)
         if frame is not None and not frame.empty:
             frames[original] = frame
     if not frames:
-        return pd.DataFrame()
+        return _yf_download_fallback(symbols, period, interval, start, end, group_by, threads, auto_adjust, progress)
     return pd.concat(frames, axis=1)
+
+
+def _yf_download_fallback(
+    symbols: list[str],
+    period: str | None,
+    interval: str | None,
+    start: Any | None,
+    end: Any | None,
+    group_by: str | None,
+    threads: bool | None,
+    auto_adjust: bool | None,
+    progress: bool | None,
+) -> pd.DataFrame:
+    if _yfinance is None:
+        return pd.DataFrame()
+    if not symbols:
+        return pd.DataFrame()
+    allow = any(_allow_yf_price_fallback(symbol) for symbol in symbols)
+    if not allow:
+        return pd.DataFrame()
+    timeout = _yf_timeout()
+    tickers = ' '.join(symbols)
+    fallback = _with_timeout(
+        lambda: _yfinance.download(
+            tickers=tickers,
+            period=period,
+            interval=interval,
+            start=start,
+            end=end,
+            group_by=group_by,
+            threads=threads,
+            auto_adjust=auto_adjust,
+            progress=progress,
+        ),
+        timeout,
+        pd.DataFrame(),
+    )
+    return fallback if isinstance(fallback, pd.DataFrame) else pd.DataFrame()
 
 
 def screen(scr_id: str, count: int = 200) -> dict[str, Any]:
