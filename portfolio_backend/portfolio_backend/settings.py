@@ -315,6 +315,10 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': crontab(hour=16, minute=0, day_of_week='mon-fri'),
         'kwargs': {'is_close': True},
     },
+    'deep-learning-retro-nightly': {
+        'task': 'portfolio.tasks.deep_learning_retro_train',
+        'schedule': crontab(hour=2, minute=10),
+    },
     'drift-retrain-daily': {
         'task': 'portfolio.tasks.auto_retrain_on_drift_daily',
         'schedule': crontab(minute=45, hour=7),

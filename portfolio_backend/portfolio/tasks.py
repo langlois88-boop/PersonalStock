@@ -28,7 +28,7 @@ import re
 import praw
 from newsapi import NewsApiClient
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 import google.generativeai as genai
 try:
     from reportlab.lib.pagesizes import letter
@@ -4517,6 +4517,80 @@ def _news_sentiment_score(ticker: str, days: int = 7) -> tuple[float, list[str]]
     return float(sum(scores) / len(scores)), titles
 
 
+@lru_cache(maxsize=1)
+def _finbert_pipeline():
+    try:
+        from transformers import pipeline
+        return pipeline(
+            'sentiment-analysis',
+            model='ProsusAI/finbert',
+            tokenizer='ProsusAI/finbert',
+            truncation=True,
+        )
+    except Exception:
+        return None
+
+
+def _finbert_score_from_titles(titles: list[str]) -> float:
+    if not titles:
+        return 0.0
+    pipe = _finbert_pipeline()
+    if pipe is None:
+        return 0.0
+    try:
+        results = pipe(titles)
+        scores = []
+        for item in results:
+            label = str(item.get('label') or '').upper()
+            score = float(item.get('score') or 0)
+            if label == 'POSITIVE':
+                scores.append(score)
+            elif label == 'NEGATIVE':
+                scores.append(-score)
+            else:
+                scores.append(0.0)
+        return float(sum(scores) / len(scores)) if scores else 0.0
+    except Exception:
+        return 0.0
+
+
+def _news_sentiment_at_date(symbol: str, as_of: datetime) -> float:
+    symbol = (symbol or '').strip().upper()
+    if not symbol:
+        return 0.0
+    stock = Stock.objects.filter(symbol__iexact=symbol).first()
+    if not stock:
+        return 0.0
+    start = as_of - timedelta(days=1)
+    end = as_of + timedelta(days=1)
+    headlines = list(
+        StockNews.objects.filter(stock=stock, published_at__gte=start, published_at__lte=end)
+        .order_by('-published_at')
+        .values_list('headline', flat=True)[:5]
+    )
+    return _finbert_score_from_titles([h for h in headlines if h])
+
+
+def _yahoo_fundamentals(symbol: str) -> dict[str, float]:
+    symbol = (symbol or '').strip().upper()
+    if not symbol:
+        return {}
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.info or {}
+        return {
+            'quick_ratio': float(info.get('quickRatio') or 0),
+            'current_ratio': float(info.get('currentRatio') or 0),
+            'revenue_growth': float(info.get('revenueGrowth') or 0),
+            'profit_margins': float(info.get('profitMargins') or 0),
+            'debt_to_equity': float(info.get('debtToEquity') or 0),
+            'price_to_book': float(info.get('priceToBook') or 0),
+            'trailing_pe': float(info.get('trailingPE') or 0),
+        }
+    except Exception:
+        return {}
+
+
 def _fetch_sp500_symbols(limit: int = 50) -> list[str]:
     try:
         tables = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
@@ -4597,6 +4671,144 @@ def _analyze_penny_breakouts() -> dict[str, Any]:
 
     watchlist = sorted(watchlist, key=lambda x: x['score'], reverse=True)[:30]
     return {'watchlist': watchlist, 'count': len(watchlist)}
+
+
+@shared_task
+def deep_learning_retro_train() -> dict[str, Any]:
+    log = _task_log_start('deep_learning_retro_train')
+    try:
+        import numpy as np
+        import pandas_ta as ta
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import mean_squared_error
+        import joblib
+
+        watch = SandboxWatchlist.objects.filter(sandbox='WATCHLIST').first()
+        symbols = [str(s).strip().upper() for s in (watch.symbols if watch else []) if str(s).strip()]
+        if not symbols:
+            fallback = os.getenv('WATCHLIST_SYMBOLS', os.getenv('WATCHLIST', '')).strip()
+            if fallback:
+                symbols = [s.strip().upper() for s in fallback.split(',') if s.strip()]
+
+        limit = int(os.getenv('RETRO_TRAIN_SYMBOL_LIMIT', '50'))
+        symbols = symbols[:limit]
+        if not symbols:
+            payload = {'status': 'empty'}
+            _task_log_finish(log, 'SUCCESS', payload)
+            return payload
+
+        lookahead_days = int(os.getenv('RETRO_TRAIN_LOOKAHEAD_DAYS', '5'))
+        target_pct = float(os.getenv('RETRO_TRAIN_TARGET_PCT', '0.05'))
+
+        feature_rows: list[dict[str, Any]] = []
+        target_rows: list[float] = []
+
+        for symbol in symbols:
+            daily = get_daily_bars(symbol, days=365 * 5)
+            if daily is None or daily.empty:
+                daily = yf.download(symbol, period='5y', interval='1d')
+                if daily is None or daily.empty:
+                    continue
+                daily = daily.rename(columns={
+                    'Open': 'open',
+                    'High': 'high',
+                    'Low': 'low',
+                    'Close': 'close',
+                    'Volume': 'volume',
+                })
+                if isinstance(daily.index, pd.DatetimeIndex):
+                    daily['timestamp'] = daily.index
+
+            frame = daily.copy()
+            if 'timestamp' in frame.columns:
+                frame['timestamp'] = pd.to_datetime(frame['timestamp'], errors='coerce', utc=True)
+                frame = frame.dropna(subset=['timestamp']).set_index('timestamp')
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                if col not in frame.columns:
+                    frame[col] = pd.NA
+            frame = frame.dropna(subset=['open', 'high', 'low', 'close'])
+            if frame.empty:
+                continue
+
+            frame = enrich_bars_with_patterns(frame)
+            if frame.empty:
+                continue
+
+            frame['rsi14'] = ta.rsi(frame['close'], length=14)
+            frame['ema20'] = ta.ema(frame['close'], length=20)
+            frame['ema50'] = ta.ema(frame['close'], length=50)
+            frame['atr14'] = ta.atr(frame['high'], frame['low'], frame['close'], length=14)
+            frame['momentum10'] = ta.mom(frame['close'], length=10)
+            frame = frame.fillna(0.0)
+
+            fundamentals = _yahoo_fundamentals(symbol)
+            parent = CORRELATION_MAP.get(symbol) or os.getenv('PENNY_SNIPER_DEFAULT_PARENT', 'SPY')
+            parent_change = _intraday_pct_change(parent, minutes=60) if parent else None
+            parent_change = float(parent_change or 0.0)
+
+            closes = frame['close'].values
+            for idx in range(len(frame) - lookahead_days):
+                row = frame.iloc[idx]
+                if float(row.get('pattern_signal') or 0) <= 0:
+                    continue
+                if float(row.get('rvol') or 0) < 1.5:
+                    continue
+                base = float(closes[idx])
+                future_max = float(np.max(closes[idx + 1: idx + 1 + lookahead_days]))
+                target = 1.0 if future_max >= base * (1 + target_pct) else 0.0
+                sentiment = _news_sentiment_at_date(symbol, row.name.to_pydatetime())
+
+                feature_rows.append({
+                    'pattern_signal': float(row.get('pattern_signal') or 0),
+                    'rvol': float(row.get('rvol') or 0),
+                    'rsi14': float(row.get('rsi14') or 0),
+                    'ema20': float(row.get('ema20') or 0),
+                    'ema50': float(row.get('ema50') or 0),
+                    'volatility': float(row.get('volatility') or 0),
+                    'atr14': float(row.get('atr14') or 0),
+                    'momentum10': float(row.get('momentum10') or 0),
+                    'news_sentiment': float(sentiment or 0),
+                    'parent_change': parent_change,
+                    **fundamentals,
+                })
+                target_rows.append(float(target))
+
+        if not feature_rows:
+            payload = {'status': 'no_samples'}
+            _task_log_finish(log, 'SUCCESS', payload)
+            return payload
+
+        dataset = pd.DataFrame(feature_rows).fillna(0.0)
+        target = np.array(target_rows)
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            dataset, target, test_size=0.2, shuffle=False
+        )
+
+        model = RandomForestRegressor(
+            n_estimators=300,
+            max_depth=8,
+            random_state=42,
+        )
+        model.fit(X_train, y_train)
+        preds = model.predict(X_test) if len(X_test) else []
+        rmse = float(mean_squared_error(y_test, preds, squared=False)) if len(preds) else 0.0
+
+        model_path = Path(__file__).resolve().parent / 'ml_engine' / 'retro_pattern_success.pkl'
+        joblib.dump({'model': model, 'features': list(dataset.columns)}, model_path)
+
+        payload = {
+            'status': 'ok',
+            'symbols': len(symbols),
+            'samples': len(dataset),
+            'rmse': round(rmse, 4),
+            'model_path': str(model_path),
+        }
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
 
 
 def _analyze_bluechip_rebounds() -> dict[str, Any]:
