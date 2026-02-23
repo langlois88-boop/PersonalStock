@@ -3690,7 +3690,7 @@ class AIBacktesterView(APIView):
 		if data is None or data.empty:
 			try:
 				fallback = yf.download(symbol, period=f"{days}d", interval='1d')
-				except Exception:
+			except Exception:
 				fallback = None
 			if fallback is None or fallback.empty or 'Close' not in fallback.columns:
 				return Response({'error': 'No data available for backtest.'}, status=400)
