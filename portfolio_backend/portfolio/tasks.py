@@ -77,6 +77,7 @@ from .alpaca_data import (
     get_intraday_bars,
     get_latest_trade_price,
     get_stock_snapshots,
+    get_trading_client,
     get_tradable_symbols,
 )
 from .patterns import enrich_bars_with_patterns
@@ -5590,6 +5591,103 @@ def penny_sniper_alert() -> dict[str, Any]:
             alerts.append(symbol)
 
         payload = {'status': 'ok', 'alerts': alerts}
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+def _latest_news_headline(symbol: str) -> str | None:
+    symbol = (symbol or '').strip().upper()
+    if not symbol:
+        return None
+    stock = Stock.objects.filter(symbol__iexact=symbol).first()
+    if not stock:
+        return None
+    news = StockNews.objects.filter(stock=stock).order_by('-published_at', '-fetched_at').first()
+    if news and news.headline:
+        return str(news.headline)
+    return None
+
+
+@shared_task
+def task_audit_portfolio_complet(is_close: bool = False) -> dict[str, Any]:
+    log = _task_log_start('task_audit_portfolio_complet')
+    try:
+        client = get_trading_client()
+        if client is None:
+            payload = {'status': 'no_client'}
+            _task_log_finish(log, 'SUCCESS', payload)
+            return payload
+
+        positions = []
+        try:
+            positions = client.get_all_positions() or []
+        except Exception:
+            try:
+                positions = client.list_positions() or []
+            except Exception:
+                positions = []
+
+        if not positions:
+            payload = {'status': 'empty'}
+            _task_log_finish(log, 'SUCCESS', payload)
+            return payload
+
+        rows = []
+        for pos in positions:
+            symbol = str(getattr(pos, 'symbol', '') or getattr(pos, 'ticker', '')).strip().upper()
+            entry_price = float(getattr(pos, 'avg_entry_price', 0) or getattr(pos, 'entry_price', 0) or 0)
+            current_price = float(getattr(pos, 'current_price', 0) or getattr(pos, 'market_value', 0) or 0)
+            pnl_pct = None
+            unrealized_plpc = getattr(pos, 'unrealized_plpc', None)
+            if unrealized_plpc is not None:
+                try:
+                    pnl_pct = float(unrealized_plpc) * 100
+                except Exception:
+                    pnl_pct = None
+            if pnl_pct is None and entry_price:
+                pnl_pct = ((current_price - entry_price) / entry_price) * 100 if entry_price else 0.0
+            news_title = _latest_news_headline(symbol) or ''
+            rows.append({
+                'ticker': symbol,
+                'entry_price': round(entry_price, 4),
+                'current_price': round(current_price, 4),
+                'pnl_pct': round(float(pnl_pct or 0), 2),
+                'news': news_title,
+            })
+
+        api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
+        if not api_key:
+            payload = {'status': 'no_api_key', 'count': len(rows)}
+            _task_log_finish(log, 'SUCCESS', payload)
+            return payload
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        prompt = (
+            f"Voici mon portfolio actuel : {rows}. En tant qu'expert en gestion de risque, analyse chaque ligne. "
+            "Pour chacune, réponds brièvement : 1. Statut (HOLD/SELL/TAKE PROFIT), 2. Raison rapide (ex: News négative, "
+            "Bitcoin chute, ou Momentum haussier), et 3. Urgence (Bas/Moyen/Haut). Termine par un conseil sur mon exposition totale."
+        )
+        try:
+            response = model.generate_content(prompt)
+            analysis = (getattr(response, 'text', None) or '').strip()
+        except Exception as exc:
+            message = str(exc).lower()
+            if 'quota' in message or 'resource_exhausted' in message or '429' in message:
+                analysis = "Analyse Gemini indisponible (quota gratuit dépassé)."
+            else:
+                analysis = f"Analyse Gemini indisponible ({str(exc)})"
+
+        if analysis:
+            prefix = "⚠️ DÉCISION DE CLÔTURE REQUISE\n" if is_close else ""
+            timestamp = timezone.localtime().strftime('%Y-%m-%d %H:%M')
+            message = f"{prefix}{analysis}\n\n⏱️ {timestamp}"
+            _send_telegram_alert(message, category='portfolio_audit')
+
+        payload = {'status': 'ok', 'count': len(rows)}
         _task_log_finish(log, 'SUCCESS', payload)
         return payload
     except Exception as exc:

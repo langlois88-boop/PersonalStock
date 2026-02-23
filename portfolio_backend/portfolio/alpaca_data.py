@@ -51,6 +51,10 @@ def _alpaca_trading_client() -> TradingClient | None:
     return TradingClient(api_key, api_secret, paper=paper)
 
 
+def get_trading_client() -> TradingClient | None:
+    return _alpaca_trading_client()
+
+
 def get_tradable_symbols(limit: int = 500) -> list[str]:
     client = _alpaca_trading_client()
     if client is None or GetAssetsRequest is None or AssetClass is None:

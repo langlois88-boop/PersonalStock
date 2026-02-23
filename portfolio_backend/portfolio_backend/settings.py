@@ -305,6 +305,16 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.compute_continuous_evaluation_daily',
         'schedule': crontab(minute=35, hour=7),
     },
+    'audit-portfolio-matin': {
+        'task': 'portfolio.tasks.task_audit_portfolio_complet',
+        'schedule': crontab(hour=9, minute=31, day_of_week='mon-fri'),
+        'kwargs': {'is_close': False},
+    },
+    'audit-portfolio-cloture': {
+        'task': 'portfolio.tasks.task_audit_portfolio_complet',
+        'schedule': crontab(hour=16, minute=0, day_of_week='mon-fri'),
+        'kwargs': {'is_close': True},
+    },
     'drift-retrain-daily': {
         'task': 'portfolio.tasks.auto_retrain_on_drift_daily',
         'schedule': crontab(minute=45, hour=7),
