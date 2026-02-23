@@ -90,6 +90,8 @@ from .tasks import (
 	_finbert_score_from_titles,
 	_intraday_pct_change,
 	CORRELATION_MAP,
+	_add_candlestick_features,
+	_yahoo_fundamentals,
 )
 from .ai_scout import build_scout_summary
 from .alpaca_data import get_intraday_bars, get_intraday_context
@@ -1704,6 +1706,115 @@ class PortfolioDashboardView(APIView):
 			return self._safe_float(frame.tail(1).iloc[0].get('VolumeZ'))
 		except Exception:
 			return None
+
+
+def _retro_model_payload() -> dict[str, Any] | None:
+	model_path = Path(__file__).resolve().parent / 'ml_engine' / 'retro_pattern_success.pkl'
+	if not model_path.exists():
+		return None
+	try:
+		payload = joblib.load(model_path)
+		if isinstance(payload, dict) and payload.get('model') and payload.get('features'):
+			return payload
+	except Exception:
+		return None
+	return None
+
+
+def _retro_feature_row(symbol: str) -> tuple[dict[str, Any], pd.Series] | None:
+	try:
+		import pandas_ta as ta
+		from .alpaca_data import get_daily_bars
+
+		daily = get_daily_bars(symbol, days=365 * 2)
+		if daily is None or daily.empty:
+			daily = yf.download(symbol, period='2y', interval='1d')
+			if daily is None or daily.empty:
+				return None
+			daily = daily.rename(columns={
+				'Open': 'open',
+				'High': 'high',
+				'Low': 'low',
+				'Close': 'close',
+				'Volume': 'volume',
+			})
+			if isinstance(daily.index, pd.DatetimeIndex):
+				daily['timestamp'] = daily.index
+
+		frame = daily.copy()
+		if 'timestamp' in frame.columns:
+			frame['timestamp'] = pd.to_datetime(frame['timestamp'], errors='coerce', utc=True)
+			frame = frame.dropna(subset=['timestamp']).set_index('timestamp')
+		for col in ['open', 'high', 'low', 'close', 'volume']:
+			if col not in frame.columns:
+				frame[col] = pd.NA
+		frame = frame.dropna(subset=['open', 'high', 'low', 'close'])
+		if frame.empty:
+			return None
+
+		frame = enrich_bars_with_patterns(frame)
+		frame = _add_candlestick_features(frame)
+		if frame.empty:
+			return None
+		frame['rsi14'] = ta.rsi(frame['close'], length=14)
+		frame['ema20'] = ta.ema(frame['close'], length=20)
+		frame['ema50'] = ta.ema(frame['close'], length=50)
+		frame['atr14'] = ta.atr(frame['high'], frame['low'], frame['close'], length=14)
+		frame['momentum10'] = ta.mom(frame['close'], length=10)
+		frame['day_of_week'] = pd.to_datetime(frame.index).dayofweek
+		frame['hour_of_day'] = pd.to_datetime(frame.index).hour
+		frame = frame.fillna(0.0)
+
+		row = frame.iloc[-1]
+		fundamentals = _yahoo_fundamentals(symbol)
+		parent = CORRELATION_MAP.get(symbol) or os.getenv('PENNY_SNIPER_DEFAULT_PARENT', 'SPY')
+		parent_change = _intraday_pct_change(parent, minutes=60) if parent else 0.0
+		news_titles = _google_news_titles(symbol, days=2)
+		news_sentiment = _finbert_score_from_titles(news_titles)
+
+		return {
+			'pattern_signal': float(row.get('pattern_signal') or 0),
+			'rvol': float(row.get('rvol') or 0),
+			'pattern_doji': bool(row.get('pattern_doji')),
+			'pattern_hammer': bool(row.get('pattern_hammer')),
+			'pattern_engulfing': bool(row.get('pattern_engulfing')),
+			'pattern_morning_star': bool(row.get('pattern_morning_star')),
+			'pattern_success_3d': False,
+			'rsi14': float(row.get('rsi14') or 0),
+			'ema20': float(row.get('ema20') or 0),
+			'ema50': float(row.get('ema50') or 0),
+			'volatility': float(row.get('volatility') or 0),
+			'atr14': float(row.get('atr14') or 0),
+			'momentum10': float(row.get('momentum10') or 0),
+			'day_of_week': int(row.get('day_of_week') or 0),
+			'hour_of_day': int(row.get('hour_of_day') or 0),
+			'news_sentiment': float(news_sentiment or 0),
+			'parent_change': float(parent_change or 0),
+			**fundamentals,
+		}, row
+	except Exception:
+		return None
+
+
+def _gemini_macro_ok(symbol: str, sector: str, news_titles: list[str]) -> bool:
+	api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
+	if not api_key:
+		return False
+	try:
+		import google.generativeai as genai
+		genai.configure(api_key=api_key)
+		model = genai.GenerativeModel('gemini-1.5-flash')
+		news_text = " | ".join(news_titles[:5]) if news_titles else 'n/a'
+		prompt = (
+			"Tu es un analyste macro. Réponds uniquement par OK ou NO. "
+			f"Ticker: {symbol}. Secteur: {sector}. News: {news_text}. "
+			"Le contexte macro/secteur est-il sain pour un achat court terme?"
+		)
+		response = model.generate_content(prompt)
+		text = (getattr(response, 'text', None) or '').strip().upper()
+		return text.startswith('OK') or text.startswith('YES')
+	except Exception:
+		return False
 
 	def _get_rsi(self, symbol: str) -> float | None:
 		try:
@@ -3759,6 +3870,126 @@ class ValueNavigatorAPI(APIView):
 		payload_out = {'results': results, 'count': len(results)}
 		cache.set(cache_key, payload_out, timeout=60 * 10)
 		return Response(payload_out)
+
+
+class ValueNavigatorRecommendation(APIView):
+	def get(self, request):
+		retro_payload = _retro_model_payload()
+		if retro_payload is None:
+			return Response({'error': 'retro model not available'}, status=500)
+
+		cache_key = 'value-navigator:recommendation'
+		cached = cache.get(cache_key)
+		if cached:
+			return Response(cached)
+
+		watchlist: list[str] = []
+		try:
+			quotes = _fetch_yfinance_screeners(
+				['most_actives', 'day_gainers', 'undervalued_large_caps', 'growth_technology_stocks'],
+				count=200,
+			)
+			watchlist.extend([
+				str(q.get('symbol') or '').strip().upper()
+				for q in quotes
+				if isinstance(q, dict)
+			])
+			watchlist.extend([
+				str(q.get('symbol') or '').strip().upper()
+				for q in _fetch_yahoo_screener('most_actives', count=200)
+				if isinstance(q, dict)
+			])
+			watchlist.extend([
+				str(q.get('symbol') or '').strip().upper()
+				for q in _fetch_yahoo_screener('day_gainers', count=200)
+				if isinstance(q, dict)
+			])
+		except Exception:
+			watchlist = []
+
+		seen: set[str] = set()
+		symbols: list[str] = []
+		for sym in watchlist:
+			if not sym or sym in seen:
+				continue
+			seen.add(sym)
+			symbols.append(sym)
+			if len(symbols) >= 500:
+				break
+
+		results: list[dict[str, Any]] = []
+		feature_list = retro_payload.get('features') or []
+		model = retro_payload.get('model')
+
+		for symbol in symbols:
+			row_data = _retro_feature_row(symbol)
+			if row_data is None:
+				continue
+			features, last_row = row_data
+			if not feature_list or model is None:
+				continue
+			vector = [float(features.get(col, 0.0) or 0.0) for col in feature_list]
+			try:
+				pred = float(model.predict([vector])[0])
+			except Exception:
+				continue
+
+			predicted_move_pct = max(0.0, min(0.5, pred * 0.15))
+			if predicted_move_pct < 0.10:
+				continue
+
+			price = float(last_row.get('close') or last_row.get('Close') or 0.0)
+			atr = float(last_row.get('atr14') or 0.0)
+			if price <= 0 or atr <= 0:
+				continue
+			stop = price - atr
+			target = price + (3 * atr)
+			risk = max(price - stop, 0.0001)
+			reward = max(target - price, 0.0001)
+			risk_reward = reward / risk
+			if risk_reward < 3.0:
+				continue
+
+			stock = Stock.objects.filter(symbol__iexact=symbol).first()
+			sector = (stock.sector if stock else None) or (yf.Ticker(symbol).info or {}).get('sector') or 'n/a'
+			news_titles = _google_news_titles(symbol, days=2)
+			if not _gemini_macro_ok(symbol, sector, news_titles):
+				continue
+
+			pattern = None
+			if features.get('pattern_hammer'):
+				pattern = 'Marteau'
+			elif features.get('pattern_engulfing'):
+				pattern = 'Engulfing'
+			elif features.get('pattern_morning_star'):
+				pattern = 'Morning Star'
+			elif features.get('pattern_doji'):
+				pattern = 'Doji'
+			pattern_txt = pattern or 'Pattern'
+
+			parent = CORRELATION_MAP.get(symbol) or os.getenv('PENNY_SNIPER_DEFAULT_PARENT', 'SPY')
+			parent_change = _intraday_pct_change(parent, minutes=60) or 0.0
+			news_sentiment = _finbert_score_from_titles(news_titles)
+			news_score = max(0.0, min(1.0, (news_sentiment + 1.0) / 2.0))
+
+			results.append({
+				'ticker': symbol,
+				'predicted_move_pct': round(predicted_move_pct * 100, 2),
+				'risk_reward': round(risk_reward, 2),
+				'entry': round(price, 4),
+				'target': round(target, 4),
+				'stop': round(stop, 4),
+				'proof': (
+					f"Recommandé car {pattern_txt} confirmé par hausse du {parent} "
+					f"({parent_change * 100:+.2f}%) et news positive à {news_score:.2f}"
+				),
+			})
+			if len(results) >= 3:
+				break
+
+		payload = {'results': results, 'count': len(results)}
+		cache.set(cache_key, payload, timeout=60 * 15)
+		return Response(payload)
 
 
 class AIScoutBatchView(APIView):

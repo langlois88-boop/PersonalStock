@@ -203,6 +203,27 @@ def _ny_time_now() -> datetime:
         return timezone.now()
 
 
+def _entry_time_features(symbol: str, now: datetime | None = None) -> dict[str, Any]:
+    now = now or _ny_time_now()
+    hour = now.hour
+    weekday = now.weekday()
+    minutes_to_close = max(0, (16 * 60) - (now.hour * 60 + now.minute))
+    earnings_in_days = None
+    try:
+        ticker = yf.Ticker(symbol)
+        earnings_date = _get_earnings_date(ticker)
+        if earnings_date:
+            earnings_in_days = (earnings_date - now.date()).days
+    except Exception:
+        earnings_in_days = None
+    return {
+        'entry_hour': hour,
+        'entry_weekday': weekday,
+        'minutes_to_close': minutes_to_close,
+        'earnings_in_days': earnings_in_days if earnings_in_days is not None else 0,
+    }
+
+
 def _time_hhmm(dt_value: datetime | None = None) -> str:
     dt_value = dt_value or _ny_time_now()
     return dt_value.strftime('%H:%M')
@@ -2576,6 +2597,93 @@ def _stop_loss_multiplier(explanations: list[dict[str, Any]] | None) -> float:
         return 1.0
 
 
+def _add_candlestick_features(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    df = frame.copy()
+    for col in ['open', 'high', 'low', 'close']:
+        if col not in df.columns:
+            return pd.DataFrame()
+    df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].apply(pd.to_numeric, errors='coerce')
+    df = df.dropna(subset=['open', 'high', 'low', 'close'])
+    if df.empty:
+        return pd.DataFrame()
+
+    df['pattern_doji'] = False
+    df['pattern_hammer'] = False
+    df['pattern_engulfing'] = False
+    df['pattern_morning_star'] = False
+
+    try:
+        import pandas_ta as ta
+        patterns = ta.cdl_pattern(
+            open_=df['open'],
+            high=df['high'],
+            low=df['low'],
+            close=df['close'],
+            name=["doji", "hammer", "engulfing", "morningstar"],
+        )
+        if patterns is not None and not patterns.empty:
+            if 'CDL_DOJI' in patterns:
+                df['pattern_doji'] = patterns['CDL_DOJI'] != 0
+            if 'CDL_HAMMER' in patterns:
+                df['pattern_hammer'] = patterns['CDL_HAMMER'] != 0
+            if 'CDL_ENGULFING' in patterns:
+                df['pattern_engulfing'] = patterns['CDL_ENGULFING'] > 0
+            if 'CDL_MORNINGSTAR' in patterns:
+                df['pattern_morning_star'] = patterns['CDL_MORNINGSTAR'] != 0
+            return df
+    except Exception:
+        pass
+
+    for idx in range(len(df)):
+        row = df.iloc[idx]
+        prev = df.iloc[idx - 1] if idx > 0 else None
+        prev2 = df.iloc[idx - 2] if idx > 1 else None
+
+        body = abs(float(row['close']) - float(row['open']))
+        candle_range = max(float(row['high']) - float(row['low']), 0)
+        lower_shadow = min(float(row['open']), float(row['close'])) - float(row['low'])
+        upper_shadow = float(row['high']) - max(float(row['open']), float(row['close']))
+        if candle_range > 0 and body <= candle_range * 0.1:
+            df.at[df.index[idx], 'pattern_doji'] = True
+        if body > 0 and lower_shadow >= 2 * body and upper_shadow <= body * 0.5:
+            df.at[df.index[idx], 'pattern_hammer'] = True
+        if prev is not None:
+            prev_red = float(prev['close']) < float(prev['open'])
+            curr_green = float(row['close']) > float(row['open'])
+            engulfs = float(row['close']) >= float(prev['open']) and float(row['open']) <= float(prev['close'])
+            if prev_red and curr_green and engulfs:
+                df.at[df.index[idx], 'pattern_engulfing'] = True
+        if prev is not None and prev2 is not None:
+            prev2_red = float(prev2['close']) < float(prev2['open'])
+            prev_small = abs(float(prev['close']) - float(prev['open'])) <= (
+                max(float(prev['high']) - float(prev['low']), 0.0) * 0.3
+            )
+            curr_green = float(row['close']) > float(row['open'])
+            gap_down = float(prev['close']) < float(prev2['close'])
+            recover = float(row['close']) >= (float(prev2['open']) + float(prev2['close'])) / 2
+            if prev2_red and prev_small and curr_green and gap_down and recover:
+                df.at[df.index[idx], 'pattern_morning_star'] = True
+
+    return df
+
+
+def _pattern_success_3d(frame: pd.DataFrame, target_pct: float = 0.05) -> pd.Series:
+    if frame is None or frame.empty or 'close' not in frame.columns:
+        return pd.Series(dtype=bool)
+    closes = frame['close'].values
+    success = []
+    for idx in range(len(frame)):
+        base = float(closes[idx]) if closes[idx] else 0.0
+        if base <= 0 or idx + 3 >= len(frame):
+            success.append(False)
+            continue
+        future_max = float(max(closes[idx + 1: idx + 4]))
+        success.append(future_max >= base * (1 + target_pct))
+    return pd.Series(success, index=frame.index)
+
+
 def _normalize_score(value: float | None, low: float, high: float) -> float:
     if value is None:
         return 0.0
@@ -2900,6 +3008,10 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             )
         signal_payload = _signal(symbol, intraday_ctx=intraday_ctx)
         signal = signal_payload['signal'] if signal_payload else None
+        if signal is not None and intraday_ctx:
+            now_ny = _ny_time_now()
+            if now_ny.time() >= dt_time(14, 30) and float(intraday_ctx.get('rvol') or 0) < 1.0:
+                signal = float(signal) * 0.9
         for trade in trades:
             entry_price = float(trade.entry_price or 0)
             profit_pct = (price - entry_price) / entry_price if entry_price else 0.0
@@ -2963,6 +3075,10 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         existing_trades = open_trades_by_symbol.get(symbol, [])
         signal_payload = _signal(symbol, intraday_ctx=intraday_ctx)
         signal = signal_payload['signal'] if signal_payload else None
+        if signal is not None and intraday_ctx:
+            now_ny = _ny_time_now()
+            if now_ny.time() >= dt_time(14, 30) and float(intraday_ctx.get('rvol') or 0) < 1.0:
+                signal = float(signal) * 0.9
         intraday_ctx = None
         if use_alpaca:
             intraday_ctx = get_intraday_context(
@@ -3040,6 +3156,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 'intraday_ema20': float(intraday_ctx.get('ema20') or 0),
                 'intraday_ema50': float(intraday_ctx.get('ema50') or 0),
             })
+        entry_features.update(_entry_time_features(symbol))
         PaperTrade.objects.create(
             ticker=symbol,
             sandbox=sandbox,
@@ -4935,11 +5052,19 @@ def deep_learning_retro_train() -> dict[str, Any]:
             if frame.empty:
                 continue
 
+            frame = _add_candlestick_features(frame)
+            if frame.empty:
+                continue
+
+            frame['pattern_success_3d'] = _pattern_success_3d(frame, target_pct=0.05)
+
             frame['rsi14'] = ta.rsi(frame['close'], length=14)
             frame['ema20'] = ta.ema(frame['close'], length=20)
             frame['ema50'] = ta.ema(frame['close'], length=50)
             frame['atr14'] = ta.atr(frame['high'], frame['low'], frame['close'], length=14)
             frame['momentum10'] = ta.mom(frame['close'], length=10)
+            frame['day_of_week'] = pd.to_datetime(frame.index).dayofweek
+            frame['hour_of_day'] = pd.to_datetime(frame.index).hour
             frame = frame.fillna(0.0)
 
             fundamentals = _yahoo_fundamentals(symbol)
@@ -4962,12 +5087,19 @@ def deep_learning_retro_train() -> dict[str, Any]:
                 feature_rows.append({
                     'pattern_signal': float(row.get('pattern_signal') or 0),
                     'rvol': float(row.get('rvol') or 0),
+                    'pattern_doji': bool(row.get('pattern_doji')),
+                    'pattern_hammer': bool(row.get('pattern_hammer')),
+                    'pattern_engulfing': bool(row.get('pattern_engulfing')),
+                    'pattern_morning_star': bool(row.get('pattern_morning_star')),
+                    'pattern_success_3d': bool(row.get('pattern_success_3d')),
                     'rsi14': float(row.get('rsi14') or 0),
                     'ema20': float(row.get('ema20') or 0),
                     'ema50': float(row.get('ema50') or 0),
                     'volatility': float(row.get('volatility') or 0),
                     'atr14': float(row.get('atr14') or 0),
                     'momentum10': float(row.get('momentum10') or 0),
+                    'day_of_week': int(row.get('day_of_week') or 0),
+                    'hour_of_day': int(row.get('hour_of_day') or 0),
                     'news_sentiment': float(sentiment or 0),
                     'parent_change': parent_change,
                     **fundamentals,
@@ -5005,6 +5137,152 @@ def deep_learning_retro_train() -> dict[str, Any]:
             'rmse': round(rmse, 4),
             'model_path': str(model_path),
         }
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+def _error_category(label: str | None) -> str:
+    text = (label or '').lower()
+    if 'btc' in text or 'bitcoin' in text:
+        return 'btc_drop'
+    if 'dilution' in text:
+        return 'dilution'
+    if 'fausse' in text or 'breakout' in text:
+        return 'false_breakout'
+    return 'news_negative'
+
+
+def _gemini_error_label(symbol: str, headlines: list[str], parent: str | None, parent_change: float | None) -> str | None:
+    api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
+    if not api_key:
+        return None
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        headline_text = " | ".join(headlines[:5]) if headlines else 'n/a'
+        prompt = (
+            "Tu analyses un trade perdant de paper trading. Donne une étiquette courte d'erreur "
+            "parmi: 'Fausse cassure', 'Baisse du Bitcoin', 'Dilution', 'News négatives', 'Macro défavorable'. "
+            f"Ticker: {symbol}. Headlines: {headline_text}. Parent: {parent}, change: {parent_change}."
+        )
+        response = model.generate_content(prompt)
+        label = (getattr(response, 'text', None) or '').strip()
+        return label or None
+    except Exception:
+        return None
+
+
+@shared_task
+def backtesting_critique_task(sandbox_override: str | None = None) -> dict[str, Any]:
+    log = _task_log_start('backtesting_critique_task')
+    try:
+        from sklearn.ensemble import RandomForestClassifier
+        import numpy as np
+
+        lookback_days = int(os.getenv('ERROR_TRAIN_LOOKBACK_DAYS', '120'))
+        cutoff = timezone.now() - timedelta(days=lookback_days)
+        sandbox = (sandbox_override or os.getenv('ERROR_TRAIN_SANDBOX', 'ALL')).strip().upper()
+        sandboxes = ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'] if sandbox == 'ALL' else [sandbox]
+
+        results: list[dict[str, Any]] = []
+
+        for sb in sandboxes:
+            trades = (
+                PaperTrade.objects.filter(status='CLOSED', sandbox=sb, entry_date__gte=cutoff)
+                .exclude(entry_features__isnull=True)
+                .order_by('entry_date')
+            )
+            if not trades.exists():
+                results.append({'sandbox': sb, 'status': 'no_trades'})
+                continue
+
+            error_labels: dict[int, str] = {}
+            for trade in trades.filter(outcome='LOSS')[:50]:
+                symbol = (trade.ticker or '').strip().upper()
+                if not symbol:
+                    continue
+                start = (trade.entry_date or timezone.now()) - timedelta(hours=12)
+                end = (trade.entry_date or timezone.now()) + timedelta(hours=12)
+                headlines = list(
+                    StockNews.objects.filter(stock__symbol__iexact=symbol, published_at__gte=start, published_at__lte=end)
+                    .order_by('-published_at')
+                    .values_list('headline', flat=True)[:5]
+                )
+                if not headlines:
+                    headlines = _google_news_titles(symbol, days=2, limit=5)
+                parent = CORRELATION_MAP.get(symbol) or os.getenv('PENNY_SNIPER_DEFAULT_PARENT', 'SPY')
+                parent_change = _intraday_pct_change(parent, minutes=60) if parent else None
+                label = _gemini_error_label(symbol, headlines, parent, parent_change)
+                if label is None:
+                    if parent_change is not None and parent_change < -0.01:
+                        label = f"Baisse du {parent}"
+                    else:
+                        label = 'Fausse cassure'
+                error_labels[trade.id] = label
+                if label and label not in (trade.notes or ''):
+                    trade.notes = (trade.notes or '') + f" | Error label: {label}"
+                    trade.save(update_fields=['notes'])
+
+            feature_rows: list[dict[str, Any]] = []
+            target_rows: list[int] = []
+            sample_weights: list[float] = []
+
+            for trade in trades:
+                features = dict(trade.entry_features or {})
+                symbol = (trade.ticker or '').strip().upper()
+                features.update(_entry_time_features(symbol, now=trade.entry_date or timezone.now()))
+                label = error_labels.get(trade.id)
+                category = _error_category(label)
+                features.update({
+                    'error_flag': 1 if (trade.outcome == 'LOSS' and label) else 0,
+                    'error_cat_btc': 1 if category == 'btc_drop' else 0,
+                    'error_cat_dilution': 1 if category == 'dilution' else 0,
+                    'error_cat_false_breakout': 1 if category == 'false_breakout' else 0,
+                    'error_cat_news_negative': 1 if category == 'news_negative' else 0,
+                })
+                feature_rows.append(features)
+                target_rows.append(1 if trade.outcome == 'WIN' else 0)
+                weight = 2.5 if (trade.outcome == 'LOSS' and label) else 1.0
+                sample_weights.append(weight)
+
+            df = pd.DataFrame(feature_rows).fillna(0.0)
+            if df.empty:
+                results.append({'sandbox': sb, 'status': 'no_samples'})
+                continue
+            X = df.values
+            y = np.array(target_rows)
+
+            if len(set(y)) < 2:
+                results.append({'sandbox': sb, 'status': 'insufficient_labels'})
+                continue
+
+            model = RandomForestClassifier(
+                n_estimators=400,
+                max_depth=6,
+                min_samples_split=6,
+                min_samples_leaf=6,
+                random_state=42,
+            )
+            model.fit(X, y, sample_weight=np.array(sample_weights))
+
+            universe = 'PENNY' if sb == 'AI_PENNY' else 'BLUECHIP'
+            model_path = get_model_path(universe)
+            joblib.dump({'model': model, 'features': list(df.columns)}, model_path)
+
+            results.append({
+                'sandbox': sb,
+                'status': 'ok',
+                'samples': int(len(df)),
+                'loss_labels': len(error_labels),
+                'model_path': str(model_path),
+            })
+
+        payload = {'status': 'ok', 'results': results}
         _task_log_finish(log, 'SUCCESS', payload)
         return payload
     except Exception as exc:
