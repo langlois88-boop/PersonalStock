@@ -159,9 +159,23 @@ function AnalyticsLabPage() {
     return selected.sharpe_ratio ?? null;
   }, [sandboxStats, sandboxFilter]);
 
+  const paperSummary = useMemo(() => {
+    if (!sandboxStats?.length) return null;
+    const selected = sandboxFilter === 'ALL'
+      ? sandboxStats.find((stat) => stat.sandbox === 'WATCHLIST')
+      : sandboxStats.find((stat) => stat.sandbox === sandboxFilter);
+    if (!selected || !selected.trades) return null;
+    return selected;
+  }, [sandboxStats, sandboxFilter]);
+
+  const winRateValue = paperSummary ? paperSummary.win_rate : backtest?.win_rate;
+  const winRateLabel = paperSummary ? 'Win Rate (paper)' : 'Win Rate';
+  const totalReturnValue = paperSummary ? paperSummary.total_return_pct : backtest?.total_return_pct;
+  const totalReturnLabel = paperSummary ? 'Total Return (paper)' : 'Total Return';
+
   const reportMetrics = [
-    { label: 'Win Rate', value: formatPct(backtest?.win_rate, 2) },
-    { label: 'Total Return', value: formatPct(backtest?.total_return_pct, 2) },
+    { label: winRateLabel, value: formatPct(winRateValue, 2) },
+    { label: totalReturnLabel, value: formatPct(totalReturnValue, 2) },
     { label: 'Sharpe Ratio', value: formatNumber(backtest?.sharpe_ratio, 3) },
     { label: 'Sharpe réel (paper)', value: paperSharpe === null ? '—' : formatNumber(paperSharpe, 3) },
     { label: 'Max Drawdown', value: formatPct((backtest?.max_drawdown ?? 0) * 100, 2) },
