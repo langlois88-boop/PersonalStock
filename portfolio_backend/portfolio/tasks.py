@@ -2557,6 +2557,123 @@ def _model_signal(
         return None
 
 
+def _normalize_score(value: float | None, low: float, high: float) -> float:
+    if value is None:
+        return 0.0
+    if high <= low:
+        return 0.0
+    return max(0.0, min(1.0, (float(value) - low) / (high - low)))
+
+
+def _bluechip_fundamental_score(symbol: str) -> float:
+    fundamentals = _yahoo_fundamentals(symbol)
+    if not fundamentals:
+        return 0.0
+    current_ratio = fundamentals.get('current_ratio')
+    revenue_growth = fundamentals.get('revenue_growth')
+    profit_margins = fundamentals.get('profit_margins')
+    debt_to_equity = fundamentals.get('debt_to_equity')
+    trailing_pe = fundamentals.get('trailing_pe')
+
+    current_score = _normalize_score(current_ratio, 0.5, 3.0)
+    growth_score = _normalize_score(revenue_growth, -0.05, 0.30)
+    margin_score = _normalize_score(profit_margins, 0.0, 0.30)
+    debt_score = 1.0 - _normalize_score(debt_to_equity, 0.0, 2.5)
+    pe_score = 1.0 - _normalize_score(trailing_pe, 8.0, 35.0)
+    scores = [current_score, growth_score, margin_score, debt_score, pe_score]
+    valid = [s for s in scores if s is not None]
+    return float(sum(valid) / len(valid)) if valid else 0.0
+
+
+def _index_correlation_score(symbol: str, days: int = 90) -> float:
+    try:
+        symbols = [symbol, 'SPY', 'QQQ']
+        data = yf.download(
+            tickers=" ".join(symbols),
+            period=f"{days}d",
+            interval='1d',
+            group_by='ticker',
+            threads=True,
+            auto_adjust=False,
+        )
+        if data is None or data.empty:
+            return 0.0
+        returns: dict[str, pd.Series] = {}
+        for sym in symbols:
+            frame = data[sym] if isinstance(data.columns, pd.MultiIndex) and sym in data else data.copy()
+            close = _extract_close_series(frame)
+            if close is None or close.empty:
+                continue
+            returns[sym] = close.pct_change().dropna()
+        base = returns.get(symbol)
+        if base is None or base.empty:
+            return 0.0
+        corr_scores = []
+        for idx_sym in ['SPY', 'QQQ']:
+            idx_series = returns.get(idx_sym)
+            if idx_series is None or idx_series.empty:
+                continue
+            aligned = pd.concat([base, idx_series], axis=1).dropna()
+            if aligned.shape[0] < 10:
+                continue
+            corr = float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]) or 0.0)
+            corr_scores.append(max(0.0, corr))
+        return max(corr_scores) if corr_scores else 0.0
+    except Exception:
+        return 0.0
+
+
+def _mean_reversion_score(symbol: str) -> tuple[float, float | None, float | None]:
+    try:
+        hist = yf.Ticker(symbol).history(period='120d', interval='1d', timeout=10)
+    except Exception:
+        hist = None
+    close = _extract_close_series(hist) if hist is not None else None
+    if close is None or close.empty:
+        return 0.0, None, None
+    rsi = _compute_rsi(close, 14)
+    if rsi is None:
+        return 0.0, None, None
+    rsi_score = max(0.0, min(1.0, (30.0 - rsi) / 30.0))
+    _, _, lower = _compute_bollinger(close, window=20, width=2.0)
+    last_close = float(close.iloc[-1]) if not close.empty else None
+    bollinger_bonus = 0.15 if lower is not None and last_close is not None and last_close <= lower else 0.0
+    score = max(0.0, min(1.0, rsi_score + bollinger_bonus))
+    return score, rsi, lower
+
+
+def _finbert_recent_sentiment(symbol: str, days: int = 2) -> tuple[float, list[str]]:
+    titles = _google_news_titles(symbol, days=days)
+    score = _finbert_score_from_titles(titles)
+    return score, titles
+
+
+def _penny_breakout_score(bars: pd.DataFrame | None) -> tuple[bool, float]:
+    if bars is None or bars.empty:
+        return False, 0.0
+    frame = bars.copy()
+    for col in ['high', 'close', 'volume']:
+        if col not in frame.columns:
+            return False, 0.0
+    frame = frame.dropna(subset=['high', 'close', 'volume'])
+    if len(frame) < 25:
+        return False, 0.0
+    recent = frame.tail(21)
+    prev = recent.iloc[:-1]
+    last = recent.iloc[-1]
+    prev_high = float(prev['high'].max()) if not prev.empty else None
+    if prev_high is None or prev_high <= 0:
+        return False, 0.0
+    last_close = float(last.get('close') or 0)
+    last_volume = float(last.get('volume') or 0)
+    avg_volume = float(prev['volume'].mean()) if not prev.empty else 0.0
+    breakout = last_close > (prev_high * 1.002) and avg_volume > 0 and last_volume >= avg_volume * 1.5
+    breakout_strength = max(0.0, (last_close / prev_high) - 1.0)
+    volume_strength = (last_volume / avg_volume) if avg_volume else 0.0
+    score = min(1.0, breakout_strength * 40) + min(1.0, volume_strength / 3)
+    return breakout, max(0.0, min(1.0, score))
+
+
 def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, Any]:
     """Execute live paper trades for a specific sandbox using model signals and risk rules."""
     use_alpaca = sandbox in {'AI_BLUECHIP', 'AI_PENNY'}
@@ -2613,6 +2730,9 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         sell_threshold = 0.65
         trail_pct = 0.05
         min_volume_z = max(min_volume_z, 0.5)
+    if sandbox == 'WATCHLIST':
+        buy_threshold = 0.60
+        sell_threshold = 0.25
 
     capital = initial_capital + closed_pnl
     available = max(0.0, capital - open_value)
@@ -2684,8 +2804,66 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         except Exception:
             return False, None
 
-    def _signal(symbol: str) -> dict[str, Any] | None:
-        return _model_signal(symbol, universe, model_path, use_alpaca=use_alpaca)
+    def _signal(symbol: str, intraday_ctx: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        base_payload = _model_signal(symbol, universe, model_path, use_alpaca=use_alpaca)
+        base_signal = float(base_payload.get('signal') or 0) if base_payload else 0.0
+        payload = base_payload or {
+            'signal': None,
+            'features': {},
+            'explanations': [],
+            'model_version': '',
+            'model_name': universe,
+        }
+
+        if sandbox == 'WATCHLIST':
+            score, rsi, lower_band = _mean_reversion_score(symbol)
+            if rsi is None:
+                return payload if base_payload else None
+            payload['signal'] = score
+            payload['model_name'] = 'MEAN_REVERSION'
+            payload['features'] = dict(payload.get('features') or {})
+            payload['features'].update({
+                'rsi14': float(rsi),
+                'mean_reversion_score': float(score),
+                'bollinger_lower': float(lower_band) if lower_band is not None else 0.0,
+            })
+            return payload
+
+        if sandbox == 'AI_BLUECHIP':
+            fundamentals_score = _bluechip_fundamental_score(symbol)
+            corr_score = _index_correlation_score(symbol)
+            composite = (0.2 * base_signal) + (0.4 * fundamentals_score) + (0.4 * corr_score)
+            payload['signal'] = float(composite)
+            payload['model_name'] = 'BLUECHIP_FUNDAMENTAL'
+            payload['features'] = dict(payload.get('features') or {})
+            payload['features'].update({
+                'fundamental_score': float(fundamentals_score),
+                'index_correlation_score': float(corr_score),
+            })
+            return payload
+
+        if sandbox == 'AI_PENNY':
+            ctx = intraday_ctx or {}
+            rvol = float(ctx.get('rvol') or 0.0)
+            breakout, breakout_score = _penny_breakout_score(ctx.get('bars'))
+            sentiment, _ = _finbert_recent_sentiment(symbol, days=2)
+            sentiment_score = max(0.0, min(1.0, (sentiment + 1.0) / 2.0))
+            rvol_score = max(0.0, min(1.0, rvol / 3.0))
+            composite = (0.1 * base_signal) + (0.9 * (
+                (0.45 * rvol_score) + (0.35 * sentiment_score) + (0.20 * breakout_score)
+            ))
+            payload['signal'] = float(composite)
+            payload['model_name'] = 'PENNY_RVOL_SENTIMENT'
+            payload['features'] = dict(payload.get('features') or {})
+            payload['features'].update({
+                'intraday_rvol': rvol,
+                'finbert_sentiment': float(sentiment),
+                'breakout_1m': 1.0 if breakout else 0.0,
+                'breakout_score': float(breakout_score),
+            })
+            return payload
+
+        return payload
 
     created = 0
     closed = 0
@@ -2701,7 +2879,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
                 rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
             )
-        signal_payload = _signal(symbol)
+        signal_payload = _signal(symbol, intraday_ctx=intraday_ctx)
         signal = signal_payload['signal'] if signal_payload else None
         for trade in trades:
             entry_price = float(trade.entry_price or 0)
@@ -2762,7 +2940,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
 
     for symbol in watchlist:
         existing_trades = open_trades_by_symbol.get(symbol, [])
-        signal_payload = _signal(symbol)
+        signal_payload = _signal(symbol, intraday_ctx=intraday_ctx)
         signal = signal_payload['signal'] if signal_payload else None
         intraday_ctx = None
         if use_alpaca:
@@ -2788,22 +2966,22 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             continue
         if sandbox == 'AI_PENNY' and _penny_blocked():
             continue
-        volume_z = _safe_float((signal_payload or {}).get('features', {}).get('VolumeZ'))
-        if volume_z is not None and volume_z < min_volume_z:
-            ai_score = float(signal or 0) * 100
-            message = (
-                f"Non-Trade [{sandbox}]: {symbol} signal {ai_score:.2f}% "
-                f"volume_z {float(volume_z):.2f} < {min_volume_z:.2f}"
-            )
-            stock = Stock.objects.filter(symbol__iexact=symbol).first()
-            AlertEvent.objects.create(category='PAPER_NON_TRADE', message=message, stock=stock)
-            continue
+        if sandbox != 'AI_PENNY':
+            volume_z = _safe_float((signal_payload or {}).get('features', {}).get('VolumeZ'))
+            if volume_z is not None and volume_z < min_volume_z:
+                ai_score = float(signal or 0) * 100
+                message = (
+                    f"Non-Trade [{sandbox}]: {symbol} signal {ai_score:.2f}% "
+                    f"volume_z {float(volume_z):.2f} < {min_volume_z:.2f}"
+                )
+                stock = Stock.objects.filter(symbol__iexact=symbol).first()
+                AlertEvent.objects.create(category='PAPER_NON_TRADE', message=message, stock=stock)
+                continue
         if sandbox == 'AI_PENNY':
-            altman_z = _safe_float(
-                (signal_payload or {}).get('features', {}).get('AltmanZ')
-                or (signal_payload or {}).get('features', {}).get('AltmanZScore')
-            )
-            if altman_z is None or altman_z <= min_altman_z:
+            min_rvol = float(os.getenv('AI_PENNY_MIN_RVOL', '1.8'))
+            intraday_rvol = float((intraday_ctx or {}).get('rvol') or 0.0)
+            breakout_flag = float((signal_payload or {}).get('features', {}).get('breakout_1m') or 0.0)
+            if intraday_rvol < min_rvol or breakout_flag <= 0:
                 continue
         price = _latest_price(symbol)
         if price is None:
