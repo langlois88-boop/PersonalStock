@@ -296,6 +296,7 @@ def train_fusion_model_from_labels(
     label_col: str = "label",
     model_path: Path = MODEL_PATH,
     save: bool = True,
+    sample_weight: list[float] | None = None,
 ) -> dict | None:
     if samples is None or samples.empty or label_col not in samples.columns:
         return None
@@ -317,7 +318,10 @@ def train_fusion_model_from_labels(
         min_samples_leaf=10,
         random_state=42,
     )
-    model.fit(X_df.values, y)
+    if sample_weight and len(sample_weight) == len(y):
+        model.fit(X_df.values, y, sample_weight=sample_weight)
+    else:
+        model.fit(X_df.values, y)
     payload = {
         "model": model,
         "features": selected,

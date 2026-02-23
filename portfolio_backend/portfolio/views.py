@@ -92,6 +92,7 @@ from .tasks import (
 	CORRELATION_MAP,
 	_add_candlestick_features,
 	_yahoo_fundamentals,
+	analyze_ticker_for_ui,
 )
 from .ai_scout import build_scout_summary
 from .alpaca_data import get_intraday_bars, get_intraday_context
@@ -4013,6 +4014,21 @@ class AIScoutBatchView(APIView):
 				results.append({'symbol': symbol, 'error': str(exc)})
 
 		return Response({'results': results})
+
+
+class GetAIAnalysisView(APIView):
+	def get(self, request):
+		ticker = (request.query_params.get('ticker') or '').strip().upper()
+		if not ticker:
+			return Response({'error': 'Ticker requis'}, status=400)
+		try:
+			task = analyze_ticker_for_ui.delay(ticker)
+			result = task.get(timeout=25)
+			if isinstance(result, dict) and result.get('error'):
+				return Response(result, status=400)
+			return Response(result)
+		except Exception as exc:
+			return Response({'error': f"Analyse échouée: {str(exc)}"}, status=504)
 
 
 class ScoutFundamentalsView(APIView):

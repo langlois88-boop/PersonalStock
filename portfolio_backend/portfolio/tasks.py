@@ -75,6 +75,7 @@ from .alpaca_data import (
     get_daily_bars,
     get_intraday_context,
     get_intraday_bars,
+    get_intraday_bars_range,
     get_latest_trade_price,
     get_stock_snapshots,
     get_trading_client,
@@ -222,6 +223,57 @@ def _entry_time_features(symbol: str, now: datetime | None = None) -> dict[str, 
         'minutes_to_close': minutes_to_close,
         'earnings_in_days': earnings_in_days if earnings_in_days is not None else 0,
     }
+
+
+def _price_move_after_entry(symbol: str, entry_time: datetime, hours: int) -> tuple[float | None, float | None]:
+    start = entry_time.astimezone(timezone.utc)
+    end = start + timedelta(hours=hours)
+    df = get_intraday_bars_range(symbol, start=start, end=end)
+    if df is None or df.empty or 'close' not in df.columns:
+        try:
+            hist = yf.download(symbol, period='5d', interval='1m')
+            df = hist.rename(columns={'Close': 'close'}) if hist is not None else None
+        except Exception:
+            df = None
+    if df is None or df.empty or 'close' not in df.columns:
+        return None, None
+    series = df['close'].dropna()
+    if series.empty:
+        return None, None
+    entry_price = float(series.iloc[0]) if float(series.iloc[0]) else None
+    if not entry_price:
+        return None, None
+    max_move = (float(series.max()) - entry_price) / entry_price
+    min_move = (float(series.min()) - entry_price) / entry_price
+    return max_move, min_move
+
+
+def _risk_manager_allocation(
+    confidence_score: float,
+    sentiment_score: float | None,
+    price: float | None,
+    atr: float | None,
+) -> float:
+    if confidence_score < 60:
+        return {
+    if confidence_score < 75:
+        allocation = float(os.getenv('RISK_ALLOC_MIN', '50'))
+    elif confidence_score < 90:
+            'penalized_trades': penalized,
+        allocation = float(os.getenv('RISK_ALLOC_STD', '150'))
+    else:
+        allocation = float(os.getenv('RISK_ALLOC_MAX', '250'))
+
+    if sentiment_score is not None:
+        sentiment_score = max(0.0, min(1.0, sentiment_score))
+        allocation *= max(0.6, min(1.2, 1 + ((sentiment_score - 0.5) * 0.4)))
+
+    if price and atr:
+        atr_pct = atr / price if price else 0.0
+        if atr_pct >= float(os.getenv('RISK_ALLOC_VOL_ATR_PCT', '0.06')):
+            allocation *= 0.75
+
+    return round(float(allocation), 2)
 
 
 def _time_hhmm(dt_value: datetime | None = None) -> str:
@@ -3141,6 +3193,12 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         if confidence_factor <= 0:
             continue
         position_value = min(available, position_cap, risk_budget / (stop_distance / price)) if price else 0.0
+        sentiment_raw, _ = _news_sentiment_score(symbol, days=1)
+        sentiment_score = max(0.0, min(1.0, (float(sentiment_raw) + 1.0) / 2.0))
+        allocation = _risk_manager_allocation(float(signal or 0.0) * 100, sentiment_score, price, atr)
+        if allocation <= 0:
+            continue
+        position_value = min(position_value, allocation)
         position_value *= confidence_factor
         quantity = int(position_value / price) if price else 0
         if quantity <= 0:
@@ -3170,7 +3228,10 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             stop_loss=round(stop_loss, 2),
             status='OPEN',
             pnl=0,
-            notes=f"Signal {signal:.2f} / ATR {atr:.2f}",
+            notes=(
+                f"Signal {signal:.2f} / ATR {atr:.2f} | Mise suggérée {allocation:.0f}$ "
+                f"(Confiance {float(signal or 0) * 100:.1f}%)"
+            ),
         )
         created += 1
         available = max(0.0, available - (quantity * price))
@@ -3976,6 +4037,8 @@ def retrain_from_paper_trades_daily(sandbox_override: str | None = None) -> dict
             return {'sandbox': selected_sandbox, 'status': 'no_trades', 'samples': 0}
 
         samples: list[dict[str, Any]] = []
+        sample_weights: list[float] = []
+        penalized = 0
         for trade in trades:
             symbol = (trade.ticker or '').strip().upper()
             if not symbol:
@@ -3983,6 +4046,7 @@ def retrain_from_paper_trades_daily(sandbox_override: str | None = None) -> dict
             entry_date = trade.entry_date or trade.exit_date
             if not entry_date:
                 continue
+            entry_signal = float(trade.entry_signal or 0.0)
             if trade.entry_features:
                 sample = {col: float((trade.entry_features or {}).get(col, 0.0)) for col in FEATURE_COLUMNS}
                 vol = float((trade.entry_features or {}).get('Volatility') or 0) or None
@@ -4003,6 +4067,23 @@ def retrain_from_paper_trades_daily(sandbox_override: str | None = None) -> dict
             sample['label'] = _label_from_trade(trade, vol)
             sample['entry_date'] = pd.to_datetime(entry_date)
             samples.append(sample)
+
+            max_4h, min_4h = _price_move_after_entry(symbol, entry_date, 4)
+            max_24h, min_24h = _price_move_after_entry(symbol, entry_date, 24)
+            max_move = max([v for v in [max_4h, max_24h] if v is not None], default=None)
+            min_move = min([v for v in [min_4h, min_24h] if v is not None], default=None)
+
+            weight = 1.0
+            if entry_signal >= 0.6:
+                if max_move is not None and max_move >= 0.05:
+                    weight = 2.0
+                if min_move is not None and min_move <= -0.04:
+                    weight = 5.0
+                    penalized += 1
+            if max_move is not None and min_move is not None:
+                if abs(max_move) <= 0.01 and abs(min_move) <= 0.01:
+                    weight = 0.5
+            sample_weights.append(weight)
 
         samples_df = pd.DataFrame(samples)
         if samples_df.empty:
@@ -4041,7 +4122,12 @@ def retrain_from_paper_trades_daily(sandbox_override: str | None = None) -> dict
                 holdout_accuracy = float((preds == y_holdout).mean())
                 holdout_ok = holdout_accuracy >= min_holdout_accuracy
 
-        payload = train_fusion_model_from_labels(samples_df.drop(columns=['entry_date']), model_path=model_path, save=False)
+        payload = train_fusion_model_from_labels(
+            samples_df.drop(columns=['entry_date']),
+            model_path=model_path,
+            save=False,
+            sample_weight=sample_weights,
+        )
         if not payload:
             return {'sandbox': selected_sandbox, 'status': 'failed', 'samples': int(len(train_df)), 'trained': False}
 
@@ -4091,6 +4177,7 @@ def retrain_from_paper_trades_daily(sandbox_override: str | None = None) -> dict
                         'holdout_accuracy': holdout_accuracy,
                         'holdout_ok': holdout_ok,
                         'holdout_days': holdout_days,
+                        'penalized_trades': penalized,
                     },
                 },
             )
@@ -5288,6 +5375,128 @@ def backtesting_critique_task(sandbox_override: str | None = None) -> dict[str, 
     except Exception as exc:
         _task_log_finish(log, 'FAILED', error=str(exc))
         return {'status': 'failed', 'error': str(exc)}
+
+
+@shared_task
+def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
+    """Analyse complète pour UI: technique, sentiment, fondamentaux, Gemini et mise suggérée."""
+    try:
+        symbol = (symbol or '').strip().upper()
+        if not symbol:
+            return {'error': 'Ticker requis'}
+
+        daily = get_daily_bars(symbol, days=45)
+        if daily is None or daily.empty:
+            daily = yf.download(symbol, period='2mo', interval='1d')
+            if daily is None or daily.empty:
+                return {'error': f"Données introuvables pour {symbol}"}
+            daily = daily.rename(columns={
+                'Open': 'open',
+                'High': 'high',
+                'Low': 'low',
+                'Close': 'close',
+                'Volume': 'volume',
+            })
+
+        last_price = float(daily['close'].iloc[-1]) if 'close' in daily else float(daily['Close'].iloc[-1])
+
+        is_bluechip = last_price >= 5
+        universe = 'BLUECHIP' if is_bluechip else 'PENNY'
+        model_path = get_model_path(universe)
+        fusion = DataFusionEngine(symbol)
+        fusion_df = fusion.fuse_all()
+        payload = load_or_train_model(fusion_df, model_path=model_path) if fusion_df is not None else None
+
+        confidence_score = 0.5
+        if payload and payload.get('model') and fusion_df is not None and not fusion_df.empty:
+            last_row = fusion_df.tail(1).copy()
+            feature_list = payload.get('features') or FEATURE_COLUMNS
+            for col in feature_list:
+                if col not in last_row.columns:
+                    last_row[col] = 0.0
+            features = last_row[feature_list].fillna(0).values
+            try:
+                confidence_score = float(payload['model'].predict_proba(features)[0][1])
+            except Exception:
+                confidence_score = 0.5
+
+        news_sentiment, titles = _news_sentiment_score(symbol, days=2)
+        sentiment_score = max(0.0, min(1.0, (float(news_sentiment) + 1.0) / 2.0))
+
+        atr = None
+        if {'high', 'low', 'close'}.issubset(set(daily.columns)):
+            high = daily['high']
+            low = daily['low']
+            close = daily['close']
+        elif {'High', 'Low', 'Close'}.issubset(set(daily.columns)):
+            high = daily['High']
+            low = daily['Low']
+            close = daily['Close']
+        else:
+            high = low = close = None
+        if high is not None and low is not None and close is not None:
+            tr = pd.concat([
+                (high - low).abs(),
+                (high - close.shift(1)).abs(),
+                (low - close.shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            atr = float(tr.rolling(14).mean().iloc[-1]) if len(tr) >= 14 else None
+
+        allocation = _risk_manager_allocation(confidence_score * 100, sentiment_score, last_price, atr)
+
+        earnings_date = None
+        days_to_earnings = None
+        pe_ratio = None
+        eps = None
+        debt_to_equity = None
+        try:
+            ticker = yf.Ticker(symbol)
+            earnings_date = _get_earnings_date(ticker)
+            if earnings_date:
+                days_to_earnings = (earnings_date - timezone.now().date()).days
+            info = ticker.info or {}
+            pe_ratio = float(info.get('trailingPE') or 0) if info.get('trailingPE') else None
+            eps = float(info.get('trailingEps') or 0) if info.get('trailingEps') else None
+            debt_to_equity = float(info.get('debtToEquity') or 0) if info.get('debtToEquity') else None
+        except Exception:
+            earnings_date = None
+
+        gemini_summary = None
+        if getattr(settings, 'GEMINI_AI_API_KEY', None):
+            try:
+                genai.configure(api_key=settings.GEMINI_AI_API_KEY)
+                model = genai.GenerativeModel('gemini-1.5-flash')
+                prompt = (
+                    f"Analyse {symbol} au prix {last_price:.2f}. "
+                    f"Confidence ML: {confidence_score:.2f}, Sentiment News: {sentiment_score:.2f}. "
+                    f"P/E: {pe_ratio}, EPS: {eps}, Debt/Equity: {debt_to_equity}. "
+                    f"Jours avant earnings: {days_to_earnings}. "
+                    "Explique en 3 lignes max la synthèse de l'analyste. "
+                    "Si earnings dans <7 jours, ajoute ⚠️ PRUDENCE : Résultats imminents. "
+                    "Termine par un verdict ACHETER, VENDRE ou ATTENDRE."
+                )
+                response = model.generate_content(prompt)
+                gemini_summary = (getattr(response, 'text', None) or '').strip() or None
+            except Exception:
+                gemini_summary = None
+
+        target_price = round(last_price * (1 + (confidence_score / 5)), 2)
+        stop_loss = round(last_price * 0.95, 2)
+
+        return {
+            'symbol': symbol,
+            'price': round(last_price, 4),
+            'confidence': round(confidence_score * 100, 2),
+            'sentiment': 'Positif' if news_sentiment > 0.2 else 'Négatif' if news_sentiment < -0.2 else 'Neutre',
+            'suggested_investment': allocation,
+            'earnings_risk': 'HAUT' if days_to_earnings is not None and days_to_earnings < 7 else 'BAS',
+            'summary': gemini_summary,
+            'target_price': target_price,
+            'stop_loss': stop_loss,
+            'news_titles': titles[:5],
+        }
+    except Exception as exc:
+        return {'error': str(exc)}
 
 
 def _analyze_bluechip_rebounds() -> dict[str, Any]:
