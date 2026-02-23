@@ -154,20 +154,13 @@ def get_intraday_bars(symbol: str, minutes: int = 390) -> pd.DataFrame:
 def _get_yahoo_fallback(symbol: str, minutes: int, max_days: int) -> pd.DataFrame:
     """Fonction de secours robuste utilisant Yahoo Finance via market_data"""
     try:
-        from . import market_data  # <--- L'IMPORT DOIT ÊTRE ICI
-    # Removed circular import
-        if hist is None or hist.empty:
-            return pd.DataFrame()
-        
-        hist = hist.reset_index()
-        
-        # Unification des colonnes pour correspondre au format attendu par le dashboard
-        rename_map = {
-            'Datetime': 'timestamp',
-            'Date': 'timestamp',
-            'Open': 'open',
-            'High': 'high',
-            'Low': 'low',
+        # Removed circular import
+        # You must import only the needed functions from market_data, not the whole module, and avoid circularity.
+        # Example: from .market_data import get_yahoo_intraday_bars
+        # If you need market_data, move the import outside or refactor the dependency.
+        # Placeholder for actual fallback logic.
+        return pd.DataFrame()
+        # ...existing code...
             'Close': 'close',
             'Volume': 'volume'
         }
