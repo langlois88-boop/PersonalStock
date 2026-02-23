@@ -1709,7 +1709,13 @@ class PortfolioDashboardView(APIView):
 		if value is None:
 			return None
 		try:
-			if isinstance(value, (list, tuple, pd.Series)) and value:
+			if isinstance(value, pd.Series):
+				if value.empty:
+					return None
+				value = value.iloc[0]
+			elif isinstance(value, (list, tuple)):
+				if not value:
+					return None
 				value = value[0]
 			parsed = pd.to_datetime(value, errors='coerce')
 			if parsed is None or pd.isna(parsed):
@@ -3632,7 +3638,13 @@ class AIBacktesterView(APIView):
 
 		payload = load_or_train_model(data, model_path=get_model_path(universe))
 		backtester = AIBacktester(data, payload, symbol=symbol)
-		result = backtester.run_simulation(lookback_days=days)
+		buy_threshold = float(os.getenv('BACKTEST_BUY_THRESHOLD', '0.64'))
+		sell_threshold = float(os.getenv('BACKTEST_SELL_THRESHOLD', '0.35'))
+		result = backtester.run_simulation(
+			lookback_days=days,
+			buy_threshold=buy_threshold,
+			sell_threshold=sell_threshold,
+		)
 		portfolio_snapshot = _portfolio_return_snapshot()
 		paper_stats = None
 		try:
@@ -3687,6 +3699,8 @@ class AIBacktesterView(APIView):
 			'symbol': symbol,
 			'days': days,
 			'universe': universe,
+			'buy_threshold': buy_threshold,
+			'sell_threshold': sell_threshold,
 			'model_version': model_version,
 			'feature_importance': feature_importance,
 			'logs': logs,

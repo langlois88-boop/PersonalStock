@@ -3,6 +3,8 @@ from django.core.management.base import BaseCommand
 from django.conf import settings
 from django.utils import timezone
 
+import os
+import requests
 import pandas as pd
 
 from portfolio.models import PriceHistory, Stock
@@ -12,10 +14,43 @@ class Command(BaseCommand):
     help = 'Fetch latest close price for each Stock and print it'
 
     def _usd_cad_rate(self) -> float:
+        if hasattr(self, '_usd_cad_cached') and self._usd_cad_cached:
+            return float(self._usd_cad_cached)
+
+        fallback = 1.36
         try:
-            return float(getattr(settings, 'USD_CAD_RATE', 1.36))
+            fallback = float(getattr(settings, 'USD_CAD_RATE', os.getenv('USD_CAD_RATE', '1.36')))
         except (TypeError, ValueError):
-            return 1.36
+            fallback = 1.36
+
+        auto_rate = os.getenv('AUTO_USD_CAD_RATE', 'true').lower() in {'1', 'true', 'yes', 'on'}
+        if not auto_rate:
+            self._usd_cad_cached = fallback
+            return fallback
+
+        symbol = os.getenv('USD_CAD_YF_SYMBOL', 'USDCAD=X')
+        try:
+            data = yf.download(
+                tickers=symbol,
+                period='5d',
+                interval='1d',
+                group_by='ticker',
+                threads=False,
+                auto_adjust=False,
+            )
+            data = self._normalize_history(data)
+            if data is not None and not data.empty:
+                close_col = 'Close' if 'Close' in data.columns else 'Adj Close' if 'Adj Close' in data.columns else None
+                if close_col:
+                    last = data[close_col].dropna()
+                    if not last.empty:
+                        self._usd_cad_cached = float(last.iloc[-1])
+                        return float(self._usd_cad_cached)
+        except Exception:
+            pass
+
+        self._usd_cad_cached = fallback
+        return fallback
 
     def _to_cad_price(self, symbol: str, price: float | None, info: dict) -> float | None:
         if price is None:

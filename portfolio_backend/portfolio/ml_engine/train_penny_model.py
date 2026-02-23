@@ -58,11 +58,11 @@ def build_dataset(symbols: Iterable[str]) -> tuple[pd.DataFrame, pd.Series]:
 
     for symbol in symbols:
         try:
-            data = yf.Ticker(symbol).history(period='1y', interval='1d', timeout=10)
+            data = yf.Ticker(symbol).history(period='60d', interval='1d', timeout=10)
         except Exception:
             continue
 
-        if data is None or data.empty or len(data) < 80:
+        if data is None or data.empty or len(data) < 40:
             continue
 
         feats = _build_features(data).dropna()

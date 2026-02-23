@@ -24,6 +24,10 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        news_enabled = os.getenv('FINNHUB_NEWS_ENABLED', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
+        if not news_enabled:
+            self.stdout.write(self.style.WARNING("Skipping Finnhub news: FINNHUB_NEWS_ENABLED is false."))
+            return
         api_key = os.getenv("FINNHUB_API_KEY")
         if not api_key:
             self.stdout.write(

@@ -105,6 +105,42 @@ def _is_crypto_symbol(symbol: str) -> bool:
     return '-' in symbol_upper and symbol_upper.endswith(('CAD', 'USD', 'USDT'))
 
 
+def _symbol_currency(symbol: str) -> str:
+    symbol_upper = (symbol or '').upper()
+    if symbol_upper.endswith(('.TO', '.V')):
+        return 'CAD'
+    if _is_crypto_symbol(symbol_upper):
+        return 'CAD' if symbol_upper.endswith('CAD') else 'USD'
+    return 'USD'
+
+
+def _cache_key(symbol: str, suffix: str) -> str:
+    date_key = _ny_time_now().strftime('%Y%m%d')
+    return f"trade_monitor:{symbol}:{suffix}:{date_key}"
+
+
+def _latest_bid_ask(symbol: str) -> tuple[float | None, float | None]:
+    try:
+        info = yf.Ticker(symbol).info or {}
+        bid = info.get('bid')
+        ask = info.get('ask')
+        bid = float(bid) if bid is not None else None
+        ask = float(ask) if ask is not None else None
+        return bid, ask
+    except Exception:
+        return None, None
+
+
+def _projection_price(symbol: str, entry_price: float) -> float | None:
+    hist = yf.Ticker(symbol).history(period='60d', interval='1d')
+    close = _extract_close_series(hist)
+    if close is None or close.empty:
+        return None
+    recent_high = float(close.tail(20).max())
+    base = float(entry_price) * 1.1 if entry_price else recent_high
+    return max(recent_high, base)
+
+
 def _skip_fundamentals_info(symbol: str) -> bool:
     symbol_upper = (symbol or '').upper()
     return symbol_upper in NON_FUNDAMENTAL_SYMBOLS or _is_crypto_symbol(symbol_upper)
@@ -530,15 +566,16 @@ def _build_swing_signal_message(
 ) -> str:
     quantity = investment / buy_limit if buy_limit else 0.0
     target_gain = investment * ((target_price - buy_limit) / buy_limit) if buy_limit else 0.0
+    currency = _symbol_currency(ticker)
     lines = [
         f"🚀 OPPORTUNITÉ SWING : ${ticker}",
         f"🔥 Confiance : {confidence_pct:.1f}%",
-        f"📥 Prix Entrée : {entry_price:.2f}$ (WealthSimple Limit Order)",
+        f"📥 Prix Entrée : {entry_price:.2f} {currency} (WealthSimple Limit Order)",
         "🎯 ACTION À PRENDRE (Wealthsimple)",
-        f"🔹 Prix Limite : {buy_limit:.2f}$",
+        f"🔹 Prix Limite : {buy_limit:.2f} {currency}",
         f"🔹 Quantité : {quantity:.2f} actions",
-        f"💰 Objectif : {target_price:.2f}$ (+{target_gain:.2f}$ pour {investment:.0f}$ investi)",
-        f"🛡️ Protection : {stop_price:.2f}$ (Stop-Loss)",
+        f"💰 Objectif : {target_price:.2f} {currency} (+{target_gain:.2f}$ pour {investment:.0f}$ investi)",
+        f"🛡️ Protection : {stop_price:.2f} {currency} (Stop-Loss)",
     ]
     if news_title:
         source_txt = f"Source : {news_source}" if news_source else "Source : Google News"
@@ -555,10 +592,31 @@ def _compute_rsi(series: pd.Series, period: int = 14) -> float | None:
     delta = series.diff().fillna(0)
     gain = delta.clip(lower=0).rolling(period).mean()
     loss = (-delta.clip(upper=0)).rolling(period).mean()
-    rs = gain / loss.replace(0, pd.NA)
+    last_gain = float(gain.iloc[-1]) if pd.notna(gain.iloc[-1]) else None
+    last_loss = float(loss.iloc[-1]) if pd.notna(loss.iloc[-1]) else None
+    if last_gain is None or last_loss is None:
+        return None
+    if last_loss == 0:
+        return 100.0 if last_gain > 0 else 0.0
+    rs = last_gain / last_loss
     rsi = 100 - (100 / (1 + rs))
-    value = rsi.iloc[-1]
-    return float(value) if pd.notna(value) else None
+    return float(rsi)
+
+
+def _extract_close_series(hist: pd.DataFrame) -> pd.Series | None:
+    if hist is None or hist.empty:
+        return None
+    if 'Close' in hist.columns:
+        return hist['Close']
+    if isinstance(hist.columns, pd.MultiIndex):
+        try:
+            close = hist.xs('Close', axis=1, level=-1)
+        except Exception:
+            return None
+        if isinstance(close, pd.DataFrame):
+            return close.iloc[:, 0] if not close.empty else None
+        return close
+    return None
 
 
 def _compute_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[float | None, float | None, float | None]:
@@ -602,12 +660,13 @@ def _build_signal_message(
     liquidity_note: str,
 ) -> str:
     target_pct = ((target_price - entry_price) / entry_price) * 100 if entry_price else 0
+    currency = _symbol_currency(ticker)
     return (
         f"🚀 SIGNAL IA : ${ticker}\n"
         f"🔥 Confiance : {confidence:.1f}%\n"
-        f"📥 ENTRÉE : {entry_price:.2f}$\n"
-        f"💰 VENDRE À : {target_price:.2f}$ (Objectif +{target_pct:.2f}%)\n"
-        f"🛡️ STOP-LOSS : {stop_loss:.2f}$\n"
+        f"📥 ENTRÉE : {entry_price:.2f} {currency}\n"
+        f"💰 VENDRE À : {target_price:.2f} {currency} (Objectif +{target_pct:.2f}%)\n"
+        f"🛡️ STOP-LOSS : {stop_loss:.2f} {currency}\n"
         f"📉 RAISON : {pattern} + Volume Relatif {rvol:.2f}\n"
         f"{liquidity_note}\n"
         f"🕒 HEURE : {_time_hhmm()}"
@@ -660,10 +719,47 @@ def _is_valid_price(value: float | None) -> bool:
 
 
 def _usd_cad_rate() -> float:
+    fallback = 1.36
     try:
-        return float(getattr(settings, 'USD_CAD_RATE', os.getenv('USD_CAD_RATE', '1.36')))
+        fallback = float(getattr(settings, 'USD_CAD_RATE', os.getenv('USD_CAD_RATE', '1.36')))
     except (TypeError, ValueError):
-        return 1.36
+        fallback = 1.36
+
+    auto_rate = os.getenv('AUTO_USD_CAD_RATE', 'true').lower() in {'1', 'true', 'yes', 'on'}
+    if not auto_rate:
+        return fallback
+
+    cached = cache.get('usd_cad_rate')
+    if cached:
+        try:
+            return float(cached)
+        except (TypeError, ValueError):
+            pass
+
+    symbol = os.getenv('USD_CAD_YF_SYMBOL', 'USDCAD=X')
+    try:
+        data = yf.download(
+            tickers=symbol,
+            period='5d',
+            interval='1d',
+            group_by='ticker',
+            threads=False,
+            auto_adjust=False,
+        )
+        data = _normalize_price_frame(data)
+        if data is None or data.empty:
+            return fallback
+        close_col = 'Close' if 'Close' in data.columns else 'Adj Close' if 'Adj Close' in data.columns else None
+        if not close_col:
+            return fallback
+        last = data[close_col].dropna()
+        if last.empty:
+            return fallback
+        rate = float(last.iloc[-1])
+        cache.set('usd_cad_rate', rate, timeout=60 * 60 * 6)
+        return rate
+    except Exception:
+        return fallback
 
 
 def _to_cad_price(symbol: str, price: float | None, info: dict[str, Any]) -> float | None:
@@ -769,13 +865,14 @@ def fetch_prices_hourly() -> dict[str, float]:
                 continue
             data = data.sort_values('timestamp') if 'timestamp' in data.columns else data
             last_row = data.iloc[-1]
-            price = latest_price if latest_price is not None else float(last_row.get('close') or 0)
+            close_value = _safe_float(last_row.get('close'))
+            price = latest_price if latest_price is not None else float(close_value or 0)
             if not _is_valid_price(price):
                 if _backfill_latest_price(stock):
                     prices[stock.symbol] = float(stock.latest_price or 0)
                 continue
-            day_low = float(last_row.get('low') or 0) if 'low' in data.columns else None
-            day_high = float(last_row.get('high') or 0) if 'high' in data.columns else None
+            day_low = _safe_float(last_row.get('low')) if 'low' in data.columns else None
+            day_high = _safe_float(last_row.get('high')) if 'high' in data.columns else None
 
             price = _to_cad_price(stock.symbol, price, {})
             day_low = _to_cad_price(stock.symbol, day_low, {})
@@ -791,7 +888,7 @@ def fetch_prices_hourly() -> dict[str, float]:
                 dt = row.get('timestamp')
                 if dt is None:
                     continue
-                close_price = float(row.get('close') or 0)
+                close_price = float(_safe_float(row.get('close')) or 0)
                 close_price = _to_cad_price(stock.symbol, close_price, {})
                 PriceHistory.objects.update_or_create(
                     stock=stock,
@@ -943,6 +1040,11 @@ def fetch_news_daily(days: int = 1, page_size: int = 10, language: str = 'en') -
 @shared_task
 def fetch_finnhub_news_daily(days: int = 1) -> dict[str, int]:
     log = _task_log_start('fetch_finnhub_news_daily')
+    news_enabled = os.getenv('FINNHUB_NEWS_ENABLED', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
+    if not news_enabled:
+        result = {'created': 0, 'seen': 0, 'skipped': 'disabled'}
+        _task_log_finish(log, 'SUCCESS', result)
+        return result
     api_key = os.getenv('FINNHUB_API_KEY')
     if not api_key:
         _task_log_finish(log, 'SUCCESS', {'created': 0, 'seen': 0, 'skipped': 'missing_api_key'})
@@ -992,8 +1094,13 @@ def fetch_finnhub_news_daily(days: int = 1) -> dict[str, int]:
         _task_log_finish(log, 'SUCCESS', {'created': created, 'seen': seen})
         return {'created': created, 'seen': seen}
     except Exception as exc:
-        _task_log_finish(log, 'FAILED', error=str(exc))
-        _send_alert('Task failed: fetch_finnhub_news_daily', str(exc))
+        error_text = str(exc)
+        if 'status_code: 403' in error_text or '403' in error_text:
+            result = {'created': created, 'seen': seen, 'skipped': 'finnhub_403'}
+            _task_log_finish(log, 'SUCCESS', result)
+            return result
+        _task_log_finish(log, 'FAILED', error=error_text)
+        _send_alert('Task failed: fetch_finnhub_news_daily', error_text)
         raise
 
 
@@ -1548,6 +1655,10 @@ def _safe_float(value: Any) -> float | None:
     try:
         if value is None:
             return None
+        if isinstance(value, pd.Series):
+            if value.empty:
+                return None
+            value = value.iloc[0]
         return float(value)
     except (TypeError, ValueError):
         return None
@@ -2093,7 +2204,7 @@ def run_penny_ai_scout() -> dict[str, int]:
 def backtest_retrain_guard() -> dict[str, Any]:
     """Run AI backtest guardrail and retrain if win rate drops."""
     symbol = os.getenv('BACKTEST_SYMBOL', 'SPY').strip().upper()
-    lookback_days = int(os.getenv('BACKTEST_LOOKBACK_DAYS', '90'))
+    lookback_days = int(os.getenv('BACKTEST_LOOKBACK_DAYS', '60'))
     min_win_rate = float(os.getenv('BACKTEST_MIN_WIN_RATE', '52'))
 
     engine = DataFusionEngine(symbol)
@@ -2207,8 +2318,8 @@ def nightly_closed_market_retrain() -> dict[str, Any]:
         _task_log_finish(log, 'SUCCESS', result)
         return result
 
-    lookback_days = int(os.getenv('NIGHTLY_TRAIN_LOOKBACK_DAYS', '180'))
-    news_days = int(os.getenv('NIGHTLY_TRAIN_NEWS_DAYS', '180'))
+    lookback_days = int(os.getenv('NIGHTLY_TRAIN_LOOKBACK_DAYS', '60'))
+    news_days = int(os.getenv('NIGHTLY_TRAIN_NEWS_DAYS', '60'))
     max_symbols = int(os.getenv('NIGHTLY_TRAIN_MAX_SYMBOLS', '1000'))
 
     symbols_by_universe = _collect_training_symbols()
@@ -2310,7 +2421,13 @@ def _coerce_date(value: Any) -> date | None:
     if value is None:
         return None
     try:
-        if isinstance(value, (list, tuple, pd.Series)) and value:
+        if isinstance(value, pd.Series):
+            if value.empty:
+                return None
+            value = value.iloc[0]
+        elif isinstance(value, (list, tuple)):
+            if not value:
+                return None
             value = value[0]
         parsed = pd.to_datetime(value, errors='coerce')
         if parsed is None or pd.isna(parsed):
@@ -3061,9 +3178,19 @@ def monitor_active_signals() -> dict[str, Any]:
 def send_morning_scout_report() -> dict[str, Any]:
     log = _task_log_start('send_morning_scout_report')
     try:
+        channel = os.getenv('MORNING_REPORT_CHANNEL', 'telegram').lower().strip()
+        use_telegram = channel in {'telegram', 'both'}
+        use_email = channel in {'email', 'both'}
+
+        has_telegram = bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID'))
         email_to = settings.ALERT_EMAIL_TO
-        if not email_to:
-            result = {'status': 'skipped', 'reason': 'no alert email configured'}
+
+        if use_telegram and not has_telegram:
+            use_telegram = False
+        if use_email and not email_to:
+            use_email = False
+        if not use_telegram and not use_email:
+            result = {'status': 'skipped', 'reason': 'no alert channel configured'}
             _task_log_finish(log, 'SUCCESS', result)
             return result
 
@@ -3163,16 +3290,51 @@ def send_morning_scout_report() -> dict[str, Any]:
             results.sort(key=lambda x: (x['stock'].symbol or ''))
             return results
 
+        def _tg_safe(text: str) -> str:
+            return str(text).replace('_', '\\_')
+
+        def _format_table_block(headers: list[str], rows: list[list[str]]) -> list[str]:
+            if not rows:
+                return ['— Aucun titre']
+            table_lines = _format_table(headers, rows)
+            return ['```', *table_lines, '```']
+
+        def _send_telegram_chunks(message: str) -> None:
+            max_len = 3800
+            chunk: list[str] = []
+            current_len = 0
+            for line in message.splitlines():
+                if current_len + len(line) + 1 > max_len and chunk:
+                    _send_telegram_alert("\n".join(chunk).strip(), allow_during_blackout=True, category='report')
+                    chunk = [line]
+                    current_len = len(line) + 1
+                else:
+                    chunk.append(line)
+                    current_len += len(line) + 1
+            if chunk:
+                _send_telegram_alert("\n".join(chunk).strip(), allow_during_blackout=True, category='report')
+
         lines: list[str] = []
         today = timezone.now().date()
-        lines.append(f"Rapport du matin - {today}")
+        lines.append(f"☀️ *Rapport du matin* — {today}")
         if market_stress:
             lines.append(
-                f"⚠️ Market Stress High - Trading Restricted (VIX {float(vix_level or 0):.2f} >= {vix_threshold:.2f})"
+                f"⚠️ *Market Stress* — VIX {float(vix_level or 0):.2f} ≥ {vix_threshold:.2f}"
             )
         calendar_note = _economic_calendar_note_for_today()
         if calendar_note:
-            lines.append(calendar_note)
+            lines.append(f"📅 {_tg_safe(calendar_note)}")
+        lines.append('')
+
+        lines.append("📈 *Performance Modèles* ")
+        for model_name in ['BLUECHIP', 'PENNY']:
+            active = ModelRegistry.objects.filter(model_name=model_name, status='ACTIVE').order_by('-trained_at').first()
+            if active:
+                win_rate = float(active.backtest_win_rate or 0)
+                sharpe = float(active.backtest_sharpe or 0)
+                lines.append(f"• {model_name}: WinRate {win_rate:.2f}% | Sharpe {sharpe:.2f}")
+            else:
+                lines.append(f"• {model_name}: n/a")
         lines.append('')
 
         payload_summary: dict[str, Any] = {}
@@ -3217,26 +3379,26 @@ def send_morning_scout_report() -> dict[str, Any]:
                     }
                 )
 
-            lines.append(f"=== {sandbox} ===")
-            lines.append('Validées:')
+            lines.append(f"🔎 *{sandbox}*")
+            lines.append(f"✅ Validées: {len(validated)}")
             if validated:
-                for entry in validated:
+                for entry in validated[:5]:
                     extra = f" | {entry['reason']}" if entry['reason'] else ''
                     vol_txt = (
-                        f" | VolumeZ {entry['volume_z']:.2f}" if entry['volume_z'] is not None else ''
+                        f" | VolZ {entry['volume_z']:.2f}" if entry['volume_z'] is not None else ''
                     )
                     lines.append(
-                        f"- {entry['symbol']} | signal {entry['signal']:.2f}{vol_txt}{extra}"
+                        f"• {_tg_safe(entry['symbol'])} | signal {entry['signal']:.2f}{vol_txt}{extra}"
                     )
             else:
-                lines.append('- Aucune')
+                lines.append('• Aucune')
 
-            lines.append('Exclues aujourd’hui:')
+            lines.append(f"🚫 Exclues aujourd’hui: {len(excluded)}")
             if excluded:
-                for symbol, reason in excluded:
-                    lines.append(f"- {symbol}: {reason}")
+                for symbol, reason in excluded[:5]:
+                    lines.append(f"• {_tg_safe(symbol)}: {_tg_safe(reason)}")
             else:
-                lines.append('- Aucune')
+                lines.append('• Aucune')
 
             lines.append('')
 
@@ -3249,16 +3411,16 @@ def send_morning_scout_report() -> dict[str, Any]:
         # Portfolio details
         portfolios = Portfolio.objects.all()
         if portfolios.exists():
-            lines.append('=== Portefeuilles ===')
+            lines.append('💼 *Portefeuilles*')
             for portfolio in portfolios:
-                lines.append(f"{portfolio.name}:")
+                lines.append(f"*{_tg_safe(portfolio.name)}*:")
                 holdings = (
                     PortfolioHolding.objects.select_related('stock')
                     .filter(portfolio=portfolio)
                     .order_by('stock__symbol')
                 )
                 if not holdings:
-                    lines.append('- Aucun titre')
+                    lines.append('— Aucun titre')
                     lines.append('')
                     continue
 
@@ -3311,7 +3473,7 @@ def send_morning_scout_report() -> dict[str, Any]:
 
                     news_items = (
                         StockNews.objects.filter(stock=stock)
-                        .order_by('-published_at')[:2]
+                        .order_by('-published_at')[:1]
                     )
                     if news_items:
                         news_map[stock.symbol] = [
@@ -3319,22 +3481,22 @@ def send_morning_scout_report() -> dict[str, Any]:
                         ]
 
                 headers = ['Symbole', 'Qté', 'Prix', 'Achat', 'Valeur', 'PnL', 'Jour', 'Projection', 'Reco']
-                lines.extend(_format_table(headers, table_rows))
+                lines.extend(_format_table_block(headers, table_rows))
                 if news_map:
                     for symbol, headlines in news_map.items():
                         for headline in headlines:
-                            lines.append(f"  • {symbol}: {headline}")
+                            lines.append(f"📰 {_tg_safe(symbol)}: {_tg_safe(headline)}")
                 lines.append('')
 
         # Account details
         accounts = Account.objects.all().order_by('name')
         if accounts.exists():
-            lines.append('=== Comptes ===')
+            lines.append('🏦 *Comptes*')
             for account in accounts:
-                lines.append(f"{account.name} ({account.account_type}):")
+                lines.append(f"*{_tg_safe(account.name)}* ({_tg_safe(account.account_type)}):")
                 positions = _positions_from_account(account)
                 if not positions:
-                    lines.append('- Aucun titre')
+                    lines.append('— Aucun titre')
                     lines.append('')
                     continue
 
@@ -3384,7 +3546,7 @@ def send_morning_scout_report() -> dict[str, Any]:
 
                     news_items = (
                         StockNews.objects.filter(stock=stock)
-                        .order_by('-published_at')[:2]
+                        .order_by('-published_at')[:1]
                     )
                     if news_items:
                         news_map[stock.symbol] = [
@@ -3392,23 +3554,27 @@ def send_morning_scout_report() -> dict[str, Any]:
                         ]
 
                 headers = ['Symbole', 'Qté', 'Prix', 'Achat', 'Valeur', 'PnL', 'Jour', 'Projection', 'Reco']
-                lines.extend(_format_table(headers, table_rows))
+                lines.extend(_format_table_block(headers, table_rows))
                 if news_map:
                     for symbol, headlines in news_map.items():
                         for headline in headlines:
-                            lines.append(f"  • {symbol}: {headline}")
+                            lines.append(f"📰 {_tg_safe(symbol)}: {_tg_safe(headline)}")
                 lines.append('')
 
-        lines.append('Notes: simulation uniquement. Les recommandations sont indicatives.')
+        lines.append('ℹ️ Notes: simulation uniquement. Les recommandations sont indicatives.')
 
-        subject = f"Daily AI Scout Report - {today}"
-        send_mail(
-            subject=subject,
-            message='\n'.join(lines).strip(),
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[email_to],
-            fail_silently=True,
-        )
+        message = '\n'.join(lines).strip()
+        if use_telegram:
+            _send_telegram_chunks(message)
+        if use_email:
+            subject = f"Daily AI Scout Report - {today}"
+            send_mail(
+                subject=subject,
+                message=message,
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[email_to],
+                fail_silently=True,
+            )
 
         payload = {
             'status': 'sent',
@@ -3559,7 +3725,7 @@ def retrain_from_paper_trades_daily(sandbox_override: str | None = None) -> dict
         model_version = get_model_version(payload, model_path)
 
         symbol = os.getenv('BACKTEST_SYMBOL', 'SPY').strip().upper()
-        lookback_days = int(os.getenv('BACKTEST_LOOKBACK_DAYS', '90'))
+        lookback_days = int(os.getenv('BACKTEST_LOOKBACK_DAYS', '60'))
         engine = DataFusionEngine(symbol)
         data = engine.fuse_all()
         if data is None or data.empty:
@@ -4634,6 +4800,245 @@ def morning_status_check() -> dict[str, Any]:
             _send_telegram_alert(message, allow_during_blackout=True, category='briefing')
 
         payload = {'status': 'sent', 'watchlist': watchlist}
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+def _opening_price_today(symbol: str) -> float | None:
+    symbol = (symbol or '').strip().upper()
+    if not symbol:
+        return None
+    df = get_intraday_bars(symbol, minutes=120)
+    if df is None or df.empty:
+        return None
+    ts = None
+    if 'timestamp' in df.columns:
+        ts = pd.to_datetime(df['timestamp'], utc=True, errors='coerce')
+    elif df.index is not None:
+        ts = pd.to_datetime(df.index, utc=True, errors='coerce')
+    if ts is None:
+        return None
+    try:
+        ts_ny = ts.tz_convert('America/New_York')
+    except Exception:
+        return None
+    df = df.copy()
+    df['ts_ny'] = ts_ny
+    today = _ny_time_now().date()
+    df_today = df[df['ts_ny'].dt.date == today].sort_values('ts_ny')
+    if df_today.empty:
+        return None
+    first = df_today.iloc[0]
+    for key in ['open', 'Open', 'close', 'Close']:
+        if key in first:
+            try:
+                value = float(first.get(key) or 0)
+            except Exception:
+                value = 0.0
+            if value > 0:
+                return value
+    return None
+
+
+@shared_task
+def rebound_rsi_alert(symbols: list[str] | None = None, rsi_threshold: float = 30.0) -> dict[str, Any]:
+    log = _task_log_start('rebound_rsi_alert')
+    try:
+        default_hive = os.getenv('HIVE_REBOUND_SYMBOL', 'HIVE.V')
+        symbols = [s.strip().upper() for s in (symbols or [default_hive, 'ARRY']) if s and str(s).strip()]
+        results: dict[str, Any] = {}
+        for symbol in symbols:
+            hist = yf.Ticker(symbol).history(period='90d', interval='1d')
+            close = _extract_close_series(hist)
+            if close is None or close.empty:
+                results[symbol] = {'status': 'no_data'}
+                continue
+            rsi = _compute_rsi(close, 14)
+            results[symbol] = {'rsi': rsi}
+            if rsi is not None and rsi < rsi_threshold:
+                currency = _symbol_currency(symbol)
+                _send_telegram_alert(
+                    f"🚀 ACHAT DE REBOND : ${symbol} ({currency}) | RSI {rsi:.2f} (< {rsi_threshold:.0f})",
+                    allow_during_blackout=True,
+                    category='signal',
+                )
+                results[symbol]['alerted'] = True
+            else:
+                results[symbol]['alerted'] = False
+        payload = {'status': 'ok', 'results': results}
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+@shared_task
+def hive_opening_rebound_alert() -> dict[str, Any]:
+    log = _task_log_start('hive_opening_rebound_alert')
+    try:
+        symbol = os.getenv('HIVE_REBOUND_SYMBOL', 'HIVE.V').strip().upper() or 'HIVE.V'
+        hist = yf.Ticker(symbol).history(period='90d', interval='1d')
+        close = _extract_close_series(hist)
+        rsi = _compute_rsi(close, 14) if close is not None and not close.empty else None
+        open_price = _opening_price_today(symbol)
+        if open_price is None:
+            open_price = get_latest_trade_price(symbol)
+        status = 'no_open'
+        currency = _symbol_currency(symbol)
+        message = f"🚀 HIVE Rebound Alert: prix d'ouverture indisponible."
+
+        if open_price is not None:
+            status = 'evaluated'
+            if rsi is not None and rsi < 30 and 2.05 <= open_price <= 2.15:
+                message = (
+                    f"🚀 SIGNAL BUY CONFIRMÉ : HIVE ouvre à {open_price:.2f} {currency} | RSI {rsi:.2f}"
+                )
+            elif open_price < 2.00:
+                message = (
+                    f"⛔ SIGNAL ANNULÉ - TROP RISQUÉ : HIVE ouvre à {open_price:.2f} {currency}"
+                )
+            elif rsi is not None and rsi < 30:
+                message = (
+                    f"⚠️ SIGNAL REBOND : HIVE ouvre à {open_price:.2f} {currency} | RSI {rsi:.2f} (hors plage 2.05–2.15)"
+                )
+            else:
+                rsi_txt = f"{rsi:.2f}" if rsi is not None else 'n/a'
+                message = (
+                    f"ℹ️ HIVE : pas de signal rebond | Open {open_price:.2f} {currency} | RSI {rsi_txt}"
+                )
+
+        _send_telegram_alert(message, allow_during_blackout=True, category='signal')
+
+        payload = {
+            'status': status,
+            'open_price': open_price,
+            'rsi': rsi,
+        }
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+@shared_task
+def monitor_hive_trade() -> dict[str, Any]:
+    log = _task_log_start('monitor_hive_trade')
+    try:
+        symbol = os.getenv('HIVE_MONITOR_SYMBOL', 'HIVE.V').strip().upper() or 'HIVE.V'
+        limit_price = float(os.getenv('HIVE_ENTRY_LIMIT', '2.95'))
+        target1_pct = float(os.getenv('HIVE_TARGET1_PCT', '0.10'))
+        target2_pct = float(os.getenv('HIVE_TARGET2_PCT', '0.15'))
+        stop_pct = float(os.getenv('HIVE_STOP_PCT', '0.05'))
+        rsi_sell = float(os.getenv('HIVE_RSI_SELL', '60'))
+        currency = _symbol_currency(symbol)
+        now_ny = _ny_time_now()
+        if now_ny.weekday() >= 5:
+            _task_log_finish(log, 'SUCCESS', {'status': 'market_closed'})
+            return {'status': 'market_closed'}
+        if not (dt_time(9, 30) <= now_ny.time() <= dt_time(16, 0)):
+            _task_log_finish(log, 'SUCCESS', {'status': 'outside_session'})
+            return {'status': 'outside_session'}
+
+        latest_price = get_latest_trade_price(symbol)
+        if latest_price is None:
+            latest_price = yf.Ticker(symbol).history(period='1d', interval='1m')
+            if latest_price is not None and not latest_price.empty:
+                latest_price = float(_extract_close_series(latest_price).iloc[-1])
+
+        if latest_price is None:
+            _task_log_finish(log, 'SUCCESS', {'status': 'no_price'})
+            return {'status': 'no_price'}
+
+        filled_key = _cache_key(symbol, 'filled')
+        filled = cache.get(filled_key, False)
+        if not filled and latest_price >= limit_price:
+            cache.set(filled_key, True, timeout=60 * 60 * 8)
+            _send_telegram_alert(
+                f"✅ ORDRE PROBABLEMENT FILLED : {symbol} à {latest_price:.2f} {currency} (limite {limit_price:.2f}).",
+                allow_during_blackout=True,
+                category='signal',
+            )
+            filled = True
+
+        stop_price = limit_price * (1 - stop_pct)
+        stop_key = _cache_key(symbol, 'stop')
+        if filled and latest_price <= stop_price and not cache.get(stop_key, False):
+            cache.set(stop_key, True, timeout=60 * 60 * 8)
+            _send_telegram_alert(
+                f"⛔ STOP-LOSS ATTEINT : {symbol} à {latest_price:.2f} {currency} (stop {stop_price:.2f}).",
+                allow_during_blackout=True,
+                category='signal',
+            )
+
+        target1 = limit_price * (1 + target1_pct)
+        target2 = limit_price * (1 + target2_pct)
+        target1_key = _cache_key(symbol, 'target10')
+        target2_key = _cache_key(symbol, 'target15')
+        if filled and latest_price >= target1 and not cache.get(target1_key, False):
+            cache.set(target1_key, True, timeout=60 * 60 * 8)
+            _send_telegram_alert(
+                f"✅ PALIER 10% ATTEINT : {symbol} à {latest_price:.2f} {currency} (cible {target1:.2f}).",
+                allow_during_blackout=True,
+                category='signal',
+            )
+        if filled and latest_price >= target2 and not cache.get(target2_key, False):
+            cache.set(target2_key, True, timeout=60 * 60 * 8)
+            _send_telegram_alert(
+                f"🔥 CIBLE 15% ATTEINTE : {symbol} à {latest_price:.2f} {currency} (cible {target2:.2f}).",
+                allow_during_blackout=True,
+                category='signal',
+            )
+
+        intraday = yf.Ticker(symbol).history(period='5d', interval='15m')
+        close_15m = _extract_close_series(intraday)
+        rsi_15m = _compute_rsi(close_15m, 14) if close_15m is not None and not close_15m.empty else None
+        rsi_key = _cache_key(symbol, 'rsi')
+        if filled and rsi_15m is not None and rsi_15m >= rsi_sell and not cache.get(rsi_key, False):
+            cache.set(rsi_key, True, timeout=60 * 60 * 8)
+            _send_telegram_alert(
+                f"⚠️ RSI CHAUD : {symbol} RSI15m {rsi_15m:.1f} ≥ {rsi_sell:.0f}. Recommandation : vendre.",
+                allow_during_blackout=True,
+                category='signal',
+            )
+
+        if now_ny.time() >= dt_time(10, 0) and not filled:
+            advice_key = _cache_key(symbol, '10am')
+            if not cache.get(advice_key, False):
+                cache.set(advice_key, True, timeout=60 * 60 * 6)
+                bid, ask = _latest_bid_ask(symbol)
+                if bid is not None and ask is not None and ask > 0:
+                    spread = (ask - bid) / ask
+                    if bid < limit_price and spread > 0.01:
+                        message = (
+                            f"⏰ 10:00 — ORDRE NON REMPLI. Bid {bid:.2f} / Ask {ask:.2f} {currency}. "
+                            "Recommandation : monter légèrement la limite ou attendre confirmation."
+                        )
+                    else:
+                        message = (
+                            f"⏰ 10:00 — ORDRE NON REMPLI. Bid {bid:.2f} / Ask {ask:.2f} {currency}. "
+                            "Signal en attente, pas d'ajustement nécessaire."
+                        )
+                else:
+                    message = (
+                        "⏰ 10:00 — ORDRE NON REMPLI. Carnet indisponible. "
+                        "Recommandation : ajuster la limite si le prix reste sous 2.95."
+                    )
+                _send_telegram_alert(message, allow_during_blackout=True, category='signal')
+
+        payload = {
+            'status': 'ok',
+            'symbol': symbol,
+            'price': latest_price,
+            'filled': bool(filled),
+            'rsi_15m': rsi_15m,
+            'target1': target1,
+            'target2': target2,
+        }
         _task_log_finish(log, 'SUCCESS', payload)
         return payload
     except Exception as exc:

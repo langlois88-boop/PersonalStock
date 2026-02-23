@@ -140,6 +140,13 @@ def _map_symbol(symbol: str) -> str:
     symbol = (symbol or '').strip().upper()
     if not symbol:
         return symbol
+    if '.' not in symbol:
+        force_v = [s.strip().upper() for s in os.getenv('FORCE_V_SUFFIX_SYMBOLS', '').split(',') if s.strip()]
+        force_to = [s.strip().upper() for s in os.getenv('FORCE_TO_SUFFIX_SYMBOLS', '').split(',') if s.strip()]
+        if symbol in force_v:
+            symbol = f"{symbol}.V"
+        elif symbol in force_to:
+            symbol = f"{symbol}.TO"
     return SYMBOL_ALIASES.get(symbol, symbol)
 
 

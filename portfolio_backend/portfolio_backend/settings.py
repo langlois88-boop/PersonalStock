@@ -352,6 +352,14 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.portfolio_news_brief',
         'schedule': crontab(minute=0, hour=9, day_of_week='mon-fri'),
     },
+    'hive-opening-rebound-alert': {
+        'task': 'portfolio.tasks.hive_opening_rebound_alert',
+        'schedule': crontab(minute=31, hour=9, day_of_week='mon-fri'),
+    },
+    'monitor-hive-trade-1min': {
+        'task': 'portfolio.tasks.monitor_hive_trade',
+        'schedule': crontab(minute='*/1', hour='9-16', day_of_week='mon-fri'),
+    },
 }
 
 # Alerting / Email (dev defaults)

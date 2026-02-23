@@ -6,20 +6,22 @@ from typing import Any
 
 import pandas as pd
 
+# On regroupe tous les imports Alpaca dans le bloc sécurisé
 try:
     from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
+    from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest, StockSnapshotRequest
     from alpaca.data.timeframe import TimeFrame
-    from alpaca.data.requests import StockSnapshotRequest
+    from alpaca.data.enums import DataFeed  # <--- Crucial pour le plan gratuit
     from alpaca.trading.client import TradingClient
     from alpaca.trading.requests import GetAssetsRequest
     from alpaca.trading.enums import AssetClass
-except Exception:  # pragma: no cover - optional dependency
+except Exception:  # pragma: no cover
     StockHistoricalDataClient = None
     StockBarsRequest = None
     StockLatestTradeRequest = None
     TimeFrame = None
     StockSnapshotRequest = None
+    DataFeed = None
     TradingClient = None
     GetAssetsRequest = None
     AssetClass = None
@@ -94,88 +96,125 @@ def _bars_to_frame(bars: Any) -> pd.DataFrame:
 
 def get_intraday_bars_range(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
     client = _alpaca_client()
-    if client is None or TimeFrame is None:
+    # On vérifie que DataFeed est disponible pour le plan gratuit
+    if client is None or TimeFrame is None or DataFeed is None:
         return pd.DataFrame()
+    
     symbol = (symbol or '').strip().upper()
     if not symbol:
         return pd.DataFrame()
+    
     try:
         request = StockBarsRequest(
             symbol_or_symbols=[symbol],
             timeframe=TimeFrame.Minute,
             start=start,
             end=end,
+            feed=DataFeed.IEX  # <--- Utilisation du flux gratuit IEX
         )
         bars = client.get_stock_bars(request)
         df = _bars_to_frame(bars)
         if df.empty:
             return df
-        df = df[df.get('symbol', symbol) == symbol] if 'symbol' in df.columns else df
+        
+        # Filtrage par symbole pour éviter les résidus de MultiIndex
+        if 'symbol' in df.columns:
+            df = df[df['symbol'] == symbol]
+            
         return df.sort_values('timestamp')
     except Exception:
         return pd.DataFrame()
 
 
 def get_intraday_bars(symbol: str, minutes: int = 390) -> pd.DataFrame:
+    """
+    Récupère les bougies intraday avec fallback automatique sur Yahoo Finance
+    si Alpaca ne renvoie rien (week-end ou actions hors IEX).
+    """
+    symbol = (symbol or '').strip().upper()
+    
+    # 1. Gestion de la fenêtre de temps
     end = datetime.now(timezone.utc)
-    if end.weekday() >= 5:
+    if end.weekday() >= 5: # Si samedi ou dimanche, on recule au vendredi
         end = end - timedelta(days=end.weekday() - 4)
+    
     max_days = 3
     start = max(end - timedelta(minutes=minutes), end - timedelta(days=max_days))
+    
+    # 2. Tentative via Alpaca
     df = get_intraday_bars_range(symbol, start=start, end=end)
-    if df is not None and not df.empty:
-        return df
-    # fallback: last 3 trading days, then take last N minutes
-    fallback_start = end - timedelta(days=max_days)
-    fallback_df = get_intraday_bars_range(symbol, start=fallback_start, end=end)
-    if fallback_df is None or fallback_df.empty:
-        try:
-            hist = market_data.Ticker(symbol).history(period=f'{max_days}d', interval='1m', timeout=8)
-            if hist is None or hist.empty:
-                return pd.DataFrame()
-            hist = hist.reset_index()
-            if 'Datetime' in hist.columns and 'timestamp' not in hist.columns:
-                hist = hist.rename(columns={'Datetime': 'timestamp'})
-            if 'Date' in hist.columns and 'timestamp' not in hist.columns:
-                hist = hist.rename(columns={'Date': 'timestamp'})
-            if 'Open' in hist.columns:
-                hist = hist.rename(columns={
-                    'Open': 'open',
-                    'High': 'high',
-                    'Low': 'low',
-                    'Close': 'close',
-                    'Volume': 'volume',
-                })
-            cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-            if not all(col in hist.columns for col in cols):
-                return pd.DataFrame()
-            return hist[cols].tail(minutes)
-        except Exception:
+    
+    # 3. Si Alpaca échoue ou est vide, on utilise le Fallback Yahoo
+    if df is None or df.empty:
+        return _get_yahoo_fallback(symbol, minutes, max_days)
+    
+    return df.tail(minutes)
+
+
+def _get_yahoo_fallback(symbol: str, minutes: int, max_days: int) -> pd.DataFrame:
+    """Fonction de secours robuste utilisant Yahoo Finance via market_data"""
+    try:
+        # On demande un peu plus de jours pour être sûr de couvrir les gaps du week-end
+        hist = market_data.Ticker(symbol).history(period=f'{max_days+2}d', interval='1m', timeout=8)
+        if hist is None or hist.empty:
             return pd.DataFrame()
-    return fallback_df.tail(minutes)
+        
+        hist = hist.reset_index()
+        
+        # Unification des colonnes pour correspondre au format attendu par le dashboard
+        rename_map = {
+            'Datetime': 'timestamp',
+            'Date': 'timestamp',
+            'Open': 'open',
+            'High': 'high',
+            'Low': 'low',
+            'Close': 'close',
+            'Volume': 'volume'
+        }
+        hist = hist.rename(columns={k: v for k, v in rename_map.items() if k in hist.columns})
+        
+        # On s'assure d'avoir les colonnes minimales en minuscules
+        cols_needed = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        # On vérifie lesquelles sont disponibles
+        existing_cols = [c for c in cols_needed if c in hist.columns]
+        
+        if 'timestamp' not in existing_cols:
+            return pd.DataFrame()
+            
+        return hist[existing_cols].tail(minutes)
+    except Exception:
+        return pd.DataFrame()
 
 
 def get_daily_bars(symbol: str, days: int = 30) -> pd.DataFrame:
     client = _alpaca_client()
     if client is None or TimeFrame is None:
         return pd.DataFrame()
+    
     symbol = (symbol or '').strip().upper()
     if not symbol:
         return pd.DataFrame()
+    
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
+    
     try:
+        # Note: Pour les daily bars, feed=IEX est moins critique mais recommandé pour la cohérence
         request = StockBarsRequest(
             symbol_or_symbols=[symbol],
             timeframe=TimeFrame.Day,
             start=start,
             end=end,
+            feed=DataFeed.IEX if DataFeed else None
         )
         bars = client.get_stock_bars(request)
         df = _bars_to_frame(bars)
         if df.empty:
             return df
-        df = df[df.get('symbol', symbol) == symbol] if 'symbol' in df.columns else df
+        
+        if 'symbol' in df.columns:
+            df = df[df['symbol'] == symbol]
+            
         return df.sort_values('timestamp')
     except Exception:
         return pd.DataFrame()
@@ -189,7 +228,8 @@ def get_latest_trade_price(symbol: str) -> float | None:
     if not symbol:
         return None
     try:
-        request = StockLatestTradeRequest(symbol_or_symbols=[symbol])
+        # Pour le prix "latest", Alpaca gratuit a souvent 15min de délai sur IEX
+        request = StockLatestTradeRequest(symbol_or_symbols=[symbol], feed=DataFeed.IEX if DataFeed else None)
         trade = client.get_stock_latest_trade(request)
         if isinstance(trade, dict):
             trade = trade.get(symbol) or next(iter(trade.values()), None)
@@ -207,9 +247,12 @@ def get_intraday_context(symbol: str, minutes: int = 390, rvol_window: int = 20)
     df = get_intraday_bars(symbol, minutes=minutes)
     if df.empty:
         return None
+    
+    # Enrichissement avec les indicateurs techniques (RSI, EMA, Patterns)
     enriched = enrich_bars_with_patterns(df, rvol_window=rvol_window)
     if enriched.empty:
         return None
+    
     last = enriched.iloc[-1]
     return {
         'bars': enriched,
