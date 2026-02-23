@@ -1553,6 +1553,21 @@ class AlpacaIntradayView(APIView):
 class MarketScannerView(APIView):
 	def get(self, request):
 		results = cache.get('market_scanner_results') or []
+		if not results:
+			watch = SandboxWatchlist.objects.filter(sandbox='AI_PENNY').first()
+			if watch and watch.symbols:
+				results = [
+					{
+						'symbol': str(symbol).strip().upper(),
+						'change_pct': 0,
+						'rvol': 0,
+						'patterns': [],
+						'score': 0,
+						'source': 'watchlist',
+					}
+					for symbol in watch.symbols
+					if str(symbol).strip()
+				]
 		return Response({'results': results}, status=200)
 
 
