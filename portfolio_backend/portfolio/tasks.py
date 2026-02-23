@@ -2557,6 +2557,25 @@ def _model_signal(
         return None
 
 
+def _stop_loss_multiplier(explanations: list[dict[str, Any]] | None) -> float:
+    if not explanations:
+        return 1.0
+    try:
+        contributions = [float(item.get('contribution') or 0.0) for item in explanations if isinstance(item, dict)]
+        total = sum(contributions) if contributions else 0.0
+        if total >= 80:
+            return 1.15
+        if total >= 60:
+            return 1.05
+        if total <= 30:
+            return 0.85
+        if total <= 45:
+            return 0.95
+        return 1.0
+    except Exception:
+        return 1.0
+
+
 def _normalize_score(value: float | None, low: float, high: float) -> float:
     if value is None:
         return 0.0
@@ -2907,9 +2926,11 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             dynamic_atr_stop = 0.0
             if profit_pct >= trail_profit_trigger and atr > 0:
                 dynamic_atr_stop = price - (trail_atr_mult * atr)
+            stop_mult = _stop_loss_multiplier(trade.entry_explanations)
+            adjusted_trail = max(0.005, min(0.25, trail_pct * stop_mult))
             new_stop = max(
                 float(trade.stop_loss),
-                price * (1 - trail_pct),
+                price * (1 - adjusted_trail),
                 break_even_stop,
                 dynamic_atr_stop,
             )
@@ -2987,7 +3008,9 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         if price is None:
             continue
         atr = _atr(symbol)
-        stop_distance = max(price * trail_pct, atr_mult * atr, price * 0.01)
+        stop_mult = _stop_loss_multiplier((signal_payload or {}).get('explanations'))
+        adjusted_trail = max(0.005, min(0.25, trail_pct * stop_mult))
+        stop_distance = max(price * adjusted_trail, atr_mult * atr, price * 0.01)
         if intraday_ctx:
             vol = float(intraday_ctx.get('volatility') or 0)
             if vol > 0:

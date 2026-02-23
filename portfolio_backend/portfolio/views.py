@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 from django.db import models
+from django.conf import settings
 from django.db.utils import OperationalError
 from django.db.models import Prefetch
 from django.utils import timezone
@@ -4051,6 +4052,60 @@ class AIBacktesterView(APIView):
 
 
 class PortfolioOptimizerView(APIView):
+	def _gemini_optimizer_report(
+		self,
+		portfolio: dict[str, Any] | None,
+		actions: list[dict[str, Any]],
+		suggestions: list[dict[str, Any]],
+	) -> str | None:
+		api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
+		if not api_key:
+			return None
+		try:
+			import google.generativeai as genai
+			genai.configure(api_key=api_key)
+			model = genai.GenerativeModel('gemini-1.5-flash')
+			portfolio_name = portfolio.get('name') if portfolio else 'Portfolio'
+			positions = []
+			penny_count = 0
+			blue_count = 0
+			for item in actions:
+				if item.get('type') == 'Penny':
+					penny_count += 1
+				else:
+					blue_count += 1
+				positions.append(
+					{
+						'ticker': item.get('ticker'),
+						'avg_cost': item.get('avg_cost'),
+						'price': item.get('price'),
+						'unrealized_pnl_pct': item.get('unrealized_pnl_pct'),
+						'ai_score': item.get('ai_score'),
+					}
+				)
+			suggestions_brief = [
+				{
+					'ticker': s.get('ticker'),
+					'ai_score': s.get('ai_score'),
+					'reason': s.get('reason'),
+				}
+				for s in suggestions[:8]
+			]
+			prompt = (
+				"Tu es un conseiller stratégique en portefeuille. Analyse ce portefeuille et propose un audit clair. "
+				"Tu reçois le P/L actuel, les prix d'entrée, et les prédictions du modèle. "
+				"Réponds en français, concis, avec des actions recommandées.\n\n"
+				f"Portfolio: {portfolio_name}\n"
+				f"Exposition: Penny {penny_count} vs Stable {blue_count}\n"
+				f"Positions: {json.dumps(positions, ensure_ascii=False)}\n"
+				f"Suggestions modèle: {json.dumps(suggestions_brief, ensure_ascii=False)}\n"
+				"Donne un diagnostic: sur-exposition, titres à alléger, titres à renforcer. "
+				"Utilise des phrases du type: 'Attention, tu es trop exposé aux Penny Stocks...'"
+			)
+			response = model.generate_content(prompt)
+			return (getattr(response, 'text', None) or '').strip() or None
+		except Exception:
+			return None
 	def _clamp(self, value: float, low: float, high: float) -> float:
 		return max(low, min(high, value))
 
@@ -4641,6 +4696,8 @@ class PortfolioOptimizerView(APIView):
 			'volume_z': round(volume_z, 2),
 			'rsi': round(rsi_value, 2) if rsi_value is not None else None,
 			'unrealized_pnl_pct': round(float(unrealized_pct), 2) if unrealized_pct is not None else None,
+			'avg_cost': round(float(avg_cost), 4) if avg_cost is not None else None,
+			'shares': float(holding.shares or 0) if hasattr(holding, 'shares') else None,
 			'win_rate': round(float(win_rate), 2) if win_rate is not None else None,
 			'sharpe': round(float(sharpe), 2) if sharpe is not None else None,
 			'price': round(price_value, 4),
@@ -4714,141 +4771,162 @@ class PortfolioOptimizerView(APIView):
 		}
 
 	def get(self, request):
-		portfolio_id = request.query_params.get('portfolio_id')
-		lookback_days = int(os.getenv('OPTIMIZER_LOOKBACK_DAYS', '90'))
-		buy_threshold = float(os.getenv('OPTIMIZER_BUY_THRESHOLD', '0.64'))
-		sell_threshold = float(os.getenv('OPTIMIZER_SELL_THRESHOLD', '0.35'))
-		min_win_rate = float(os.getenv('OPTIMIZER_MIN_WIN_RATE', '0.52'))
-		fast_mode = str(request.query_params.get('fast', '')).lower() in {'1', 'true', 'yes'}
-		portfolio = None
-		if portfolio_id:
-			portfolio = Portfolio.objects.filter(id=portfolio_id).first()
-		if not portfolio:
-			portfolio = Portfolio.objects.first()
-		portfolio_payload = {'id': portfolio.id, 'name': portfolio.name} if portfolio else None
+		try:
+			portfolio_id = request.query_params.get('portfolio_id')
+			lookback_days = int(os.getenv('OPTIMIZER_LOOKBACK_DAYS', '90'))
+			buy_threshold = float(os.getenv('OPTIMIZER_BUY_THRESHOLD', '0.64'))
+			sell_threshold = float(os.getenv('OPTIMIZER_SELL_THRESHOLD', '0.35'))
+			min_win_rate = float(os.getenv('OPTIMIZER_MIN_WIN_RATE', '0.52'))
+			fast_mode = str(request.query_params.get('fast', '')).lower() in {'1', 'true', 'yes'}
+			portfolio = None
+			if portfolio_id:
+				portfolio = Portfolio.objects.filter(id=portfolio_id).first()
+			if not portfolio:
+				portfolio = Portfolio.objects.first()
+			portfolio_payload = {'id': portfolio.id, 'name': portfolio.name} if portfolio else None
 
-		holdings = list(PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)) if portfolio else []
-		if not holdings:
-			stocks_by_symbol: dict[str, Stock] = {}
-			if portfolio:
-				transactions = Transaction.objects.select_related('stock').filter(portfolio=portfolio)
-			else:
-				transactions = Transaction.objects.select_related('stock').all()
-			for tx in transactions:
-				if not tx.stock or not tx.stock.symbol:
-					continue
-				symbol = tx.stock.symbol.strip().upper()
-				if symbol and symbol not in stocks_by_symbol:
-					stocks_by_symbol[symbol] = tx.stock
-			if not stocks_by_symbol:
+			holdings = list(PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)) if portfolio else []
+			if not holdings:
+				stocks_by_symbol: dict[str, Stock] = {}
 				if portfolio:
-						account_transactions = AccountTransaction.objects.select_related('stock', 'account').all()
+					transactions = Transaction.objects.select_related('stock').filter(portfolio=portfolio)
 				else:
-					account_transactions = AccountTransaction.objects.select_related('stock', 'account').all()
-				for tx in account_transactions:
+					transactions = Transaction.objects.select_related('stock').all()
+				for tx in transactions:
 					if not tx.stock or not tx.stock.symbol:
 						continue
 					symbol = tx.stock.symbol.strip().upper()
 					if symbol and symbol not in stocks_by_symbol:
 						stocks_by_symbol[symbol] = tx.stock
-			holdings = [SimpleNamespace(stock=stock) for stock in stocks_by_symbol.values()]
+				if not stocks_by_symbol:
+					if portfolio:
+							account_transactions = AccountTransaction.objects.select_related('stock', 'account').all()
+					else:
+						account_transactions = AccountTransaction.objects.select_related('stock', 'account').all()
+					for tx in account_transactions:
+						if not tx.stock or not tx.stock.symbol:
+							continue
+						symbol = tx.stock.symbol.strip().upper()
+						if symbol and symbol not in stocks_by_symbol:
+							stocks_by_symbol[symbol] = tx.stock
+				holdings = [SimpleNamespace(stock=stock) for stock in stocks_by_symbol.values()]
 
-		if fast_mode:
-			max_holdings = int(os.getenv('OPTIMIZER_MAX_HOLDINGS', '20'))
-			if len(holdings) > max_holdings:
-				holdings = holdings[:max_holdings]
+			if fast_mode:
+				max_holdings = int(os.getenv('OPTIMIZER_MAX_HOLDINGS', '20'))
+				if len(holdings) > max_holdings:
+					holdings = holdings[:max_holdings]
 
-		actions: list[dict[str, Any]] = []
-		existing = set()
-		for holding in holdings:
-			symbol = (holding.stock.symbol or '').strip().upper()
-			if not symbol:
-				continue
-			existing.add(symbol)
-			is_stable = float(holding.stock.latest_price or 0) >= 5 or float(holding.stock.dividend_yield or 0) >= 0.02
-			universe = 'BLUECHIP' if is_stable else 'PENNY'
-			action = self._build_action(holding, universe, lookback_days, buy_threshold, sell_threshold, fast_mode=fast_mode)
-			if action:
-				actions.append(action)
+			actions: list[dict[str, Any]] = []
+			existing = set()
+			for holding in holdings:
+				symbol = (holding.stock.symbol or '').strip().upper()
+				if not symbol:
+					continue
+				existing.add(symbol)
+				is_stable = float(holding.stock.latest_price or 0) >= 5 or float(holding.stock.dividend_yield or 0) >= 0.02
+				universe = 'BLUECHIP' if is_stable else 'PENNY'
+				try:
+					action = self._build_action(holding, universe, lookback_days, buy_threshold, sell_threshold, fast_mode=fast_mode)
+					except Exception:
+					action = None
+				if action:
+					actions.append(action)
 
-		bluechip_candidates = self._candidate_symbols(
-			'OPTIMIZER_UNIVERSE_BLUECHIP',
-			'SPY,AAPL,MSFT,NVDA,AMZN,GOOGL,TSLA,AVGO,LLY',
-		)
-		penny_candidates = self._candidate_symbols('OPTIMIZER_UNIVERSE_PENNY', '')
-		if fast_mode:
-			max_candidates = int(os.getenv('OPTIMIZER_MAX_CANDIDATES', '20'))
-			bluechip_candidates = bluechip_candidates[:max_candidates]
-			penny_candidates = penny_candidates[:max_candidates]
-		suggestions: list[dict[str, Any]] = []
-		for symbol in bluechip_candidates:
-			if symbol in existing:
-				continue
-			suggestion = self._build_suggestion(
-				symbol,
-				'BLUECHIP',
-				lookback_days,
-				buy_threshold,
-				sell_threshold,
-				min_win_rate,
-				fast_mode=fast_mode,
+			bluechip_candidates = self._candidate_symbols(
+				'OPTIMIZER_UNIVERSE_BLUECHIP',
+				'SPY,AAPL,MSFT,NVDA,AMZN,GOOGL,TSLA,AVGO,LLY',
 			)
-			if suggestion:
-				suggestions.append(suggestion)
-		for symbol in penny_candidates:
-			if symbol in existing:
-				continue
-			suggestion = self._build_suggestion(
-				symbol,
-				'PENNY',
-				lookback_days,
-				buy_threshold,
-				sell_threshold,
-				min_win_rate,
-				fast_mode=fast_mode,
-			)
-			if suggestion:
-				suggestions.append(suggestion)
+			penny_candidates = self._candidate_symbols('OPTIMIZER_UNIVERSE_PENNY', '')
+			if fast_mode:
+				max_candidates = int(os.getenv('OPTIMIZER_MAX_CANDIDATES', '20'))
+				bluechip_candidates = bluechip_candidates[:max_candidates]
+				penny_candidates = penny_candidates[:max_candidates]
+			suggestions: list[dict[str, Any]] = []
+			for symbol in bluechip_candidates:
+				if symbol in existing:
+					continue
+				suggestion = self._build_suggestion(
+					symbol,
+					'BLUECHIP',
+					lookback_days,
+					buy_threshold,
+					sell_threshold,
+					min_win_rate,
+					fast_mode=fast_mode,
+				)
+				if suggestion:
+					suggestions.append(suggestion)
+			for symbol in penny_candidates:
+				if symbol in existing:
+					continue
+				suggestion = self._build_suggestion(
+					symbol,
+					'PENNY',
+					lookback_days,
+					buy_threshold,
+					sell_threshold,
+					min_win_rate,
+					fast_mode=fast_mode,
+				)
+				if suggestion:
+					suggestions.append(suggestion)
 
-		def _priority(item: dict[str, Any]) -> tuple[int, float, float]:
-			altman_z = item.get('altman_z')
-			altman_ok = 1 if altman_z is not None and float(altman_z) > 3.0 else 0
-			altman_score = float(altman_z) if altman_z is not None else 0.0
-			return (altman_ok, altman_score, float(item.get('confidence', 0)))
+			def _priority(item: dict[str, Any]) -> tuple[int, float, float]:
+				altman_z = item.get('altman_z')
+				altman_ok = 1 if altman_z is not None and float(altman_z) > 3.0 else 0
+				altman_score = float(altman_z) if altman_z is not None else 0.0
+				return (altman_ok, altman_score, float(item.get('confidence', 0)))
 
-		suggestions.sort(key=_priority, reverse=True)
-		max_suggestions = int(os.getenv('OPTIMIZER_SUGGESTIONS_LIMIT', '8'))
-		if not actions and not suggestions:
-			fallback = []
-			for symbol in bluechip_candidates + penny_candidates:
-				fallback.append({
-					'ticker': symbol,
-					'name': symbol,
-					'signal': 'ADD',
-					'confidence': 50,
-					'reason': 'Modèle indisponible; suggestion basée sur l’univers par défaut.',
-					'drivers': ['Univers par défaut', 'Données de marché manquantes'],
-					'metrics': [],
-					'risks': ['Données insuffisantes'],
-					'type': 'Bluechip' if symbol in bluechip_candidates else 'Penny',
-				})
-				if len(fallback) >= max_suggestions:
-					break
-			suggestions = suggestions or fallback
+			suggestions.sort(key=_priority, reverse=True)
+			max_suggestions = int(os.getenv('OPTIMIZER_SUGGESTIONS_LIMIT', '8'))
+			if not actions and not suggestions:
+				fallback = []
+				for symbol in bluechip_candidates + penny_candidates:
+					fallback.append({
+						'ticker': symbol,
+						'name': symbol,
+						'signal': 'ADD',
+						'confidence': 50,
+						'reason': 'Modèle indisponible; suggestion basée sur l’univers par défaut.',
+						'drivers': ['Univers par défaut', 'Données de marché manquantes'],
+						'metrics': [],
+						'risks': ['Données insuffisantes'],
+						'type': 'Bluechip' if symbol in bluechip_candidates else 'Penny',
+					})
+					if len(fallback) >= max_suggestions:
+						break
+				suggestions = suggestions or fallback
 
-		return Response({
-			'portfolio': portfolio_payload,
-			'as_of': timezone.now().isoformat(),
-			'actions': actions,
-			'suggestions': suggestions[:max_suggestions],
-			'params': {
-				'lookback_days': lookback_days,
-				'buy_threshold': buy_threshold,
-				'sell_threshold': sell_threshold,
-				'min_win_rate': min_win_rate,
-			},
-			'fast_mode': fast_mode,
-		})
+			gemini_cache_key = f"optimizer:gemini:{portfolio_payload.get('id') if portfolio_payload else 'default'}"
+			gemini_report = cache.get(gemini_cache_key)
+			if gemini_report is None:
+				gemini_report = self._gemini_optimizer_report(portfolio_payload, actions, suggestions)
+				cache.set(gemini_cache_key, gemini_report, timeout=60 * 15)
+
+			return Response({
+				'portfolio': portfolio_payload,
+				'as_of': timezone.now().isoformat(),
+				'actions': actions,
+				'suggestions': suggestions[:max_suggestions],
+				'params': {
+					'lookback_days': lookback_days,
+					'buy_threshold': buy_threshold,
+					'sell_threshold': sell_threshold,
+					'min_win_rate': min_win_rate,
+				},
+				'fast_mode': fast_mode,
+				'gemini_report': gemini_report,
+			})
+		except Exception as exc:
+			return Response({
+				'portfolio': None,
+				'as_of': timezone.now().isoformat(),
+				'actions': [],
+				'suggestions': [],
+				'params': {},
+				'fast_mode': False,
+				'error': str(exc),
+			}, status=200)
 
 
 class HealthCheckView(APIView):
