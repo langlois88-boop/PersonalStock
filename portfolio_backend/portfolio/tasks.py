@@ -29,6 +29,7 @@ import praw
 from newsapi import NewsApiClient
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.ensemble import RandomForestClassifier
+import google.generativeai as genai
 try:
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.units import inch
@@ -2901,7 +2902,6 @@ def market_scanner_task() -> dict[str, Any]:
         symbols = get_tradable_symbols(limit=800)
 
     if not symbols:
-        cache.set('market_scanner_results', [], timeout=300)
         return {'status': 'empty', 'count': 0}
 
     candidates: list[dict[str, Any]] = []
@@ -2992,7 +2992,8 @@ def market_scanner_task() -> dict[str, Any]:
             'news_note': news_note,
         })
 
-    cache.set('market_scanner_results', results, timeout=300)
+    if results:
+        cache.set('market_scanner_results', results, timeout=60 * 60 * 24)
 
     if update_watchlist and results:
         SandboxWatchlist.objects.update_or_create(
@@ -5403,6 +5404,60 @@ CORRELATION_MAP: dict[str, str] = {
 CRYPTO_TICKERS = {'HIVE', 'HUT', 'BITF', 'MARA', 'RIOT', 'CLSK'}
 
 
+def _intraday_ohlc_5m(symbol: str, minutes: int = 120) -> pd.DataFrame:
+    bars = get_intraday_bars(symbol, minutes=minutes)
+    if bars is None or bars.empty:
+        return pd.DataFrame()
+    frame = bars.copy()
+    if 'timestamp' in frame.columns:
+        frame['timestamp'] = pd.to_datetime(frame['timestamp'], errors='coerce', utc=True)
+        frame = frame.dropna(subset=['timestamp']).set_index('timestamp')
+    if not isinstance(frame.index, pd.DatetimeIndex):
+        return pd.DataFrame()
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        if col not in frame.columns:
+            frame[col] = pd.NA
+    ohlc = frame.resample('5min').agg({
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum',
+    })
+    ohlc = ohlc.dropna(subset=['open', 'high', 'low', 'close'])
+    return ohlc
+
+
+def analyze_with_gemini(
+    ticker: str,
+    df_ohlc: pd.DataFrame,
+    news_sentiment: float | None,
+    correlation_data: dict[str, Any] | None,
+) -> str | None:
+    api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
+    if not api_key:
+        return None
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        ohlc_text = 'n/a'
+        if df_ohlc is not None and not df_ohlc.empty:
+            ohlc_text = df_ohlc.tail(10).to_string(index=False)
+        prompt = (
+            "Tu es un expert en Day Trading de Penny Stocks. Analyse les données suivantes pour "
+            f"{ticker}. Données Techniques (5min) : {ohlc_text}. Sentiment des News : {news_sentiment}. "
+            f"Corrélation avec actif parent : {correlation_data}. Donne un verdict clair : ACHAT, ATTENTE ou DANGER. "
+            "Inclus un prix d'entrée, un objectif de profit (+10%) et un stop-loss (-4%). Sois concis pour un message Telegram."
+        )
+        response = model.generate_content(prompt)
+        return (getattr(response, 'text', None) or '').strip() or None
+    except Exception as exc:
+        message = str(exc).lower()
+        if 'quota' in message or 'resource_exhausted' in message or '429' in message:
+            return "Analyse Gemini indisponible (quota gratuit dépassé)."
+        return f"Analyse Gemini indisponible ({str(exc)})"
+
+
 def _penny_sniper_candidate(symbol: str) -> dict[str, Any] | None:
     symbol = (symbol or '').strip().upper()
     if not symbol:
@@ -5514,6 +5569,14 @@ def penny_sniper_alert() -> dict[str, Any]:
                 else:
                     parent_txt = f"{candidate['parent']} n/a"
 
+            news_sentiment, _ = _news_sentiment_score(symbol, days=1)
+            correlation_data = {
+                'parent': candidate.get('parent'),
+                'parent_change_pct': round(float(candidate.get('parent_change') or 0) * 100, 2),
+            }
+            df_ohlc = _intraday_ohlc_5m(symbol, minutes=120)
+            gemini_note = analyze_with_gemini(symbol, df_ohlc, news_sentiment, correlation_data)
+
             message = (
                 f"🎯 Opportunité à Rabais : {symbol}\n\n"
                 f"Prix : {candidate['price']:.2f}$ (RSI: {candidate['rsi']:.1f})\n"
@@ -5521,6 +5584,8 @@ def penny_sniper_alert() -> dict[str, Any]:
                 f"Plan : In @ {candidate['price']:.2f}$ / Out @ {candidate['target']:.2f}$ (+{candidate['roi_pct']:.1f}%) "
                 f"/ Stop @ {candidate['stop']:.2f}$"
             )
+            if gemini_note:
+                message = f"{message}\n\n🧠 Gemini : {gemini_note}"
             _send_telegram_alert(message, allow_during_blackout=True, category='signal')
             alerts.append(symbol)
 

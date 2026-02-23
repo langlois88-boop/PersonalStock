@@ -27,6 +27,7 @@ newsapi-python
 python-dotenv
 prophet
 openai
+google-generativeai
 psycopg2-binary
 reportlab
 plotly
