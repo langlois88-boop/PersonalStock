@@ -3334,7 +3334,18 @@ def send_morning_scout_report() -> dict[str, Any]:
                 sharpe = float(active.backtest_sharpe or 0)
                 lines.append(f"• {model_name}: WinRate {win_rate:.2f}% | Sharpe {sharpe:.2f}")
             else:
-                lines.append(f"• {model_name}: n/a")
+                latest_eval = (
+                    ModelEvaluationDaily.objects.filter(model_name=model_name)
+                    .order_by('-as_of')
+                    .first()
+                )
+                if latest_eval:
+                    win_rate = float(latest_eval.win_rate or 0) * 100
+                    lines.append(
+                        f"• {model_name}: WinRate {win_rate:.2f}% | (dernier suivi {latest_eval.as_of})"
+                    )
+                else:
+                    lines.append(f"• {model_name}: Aucun modèle actif")
         lines.append('')
 
         payload_summary: dict[str, Any] = {}
@@ -3408,6 +3419,55 @@ def send_morning_scout_report() -> dict[str, Any]:
                 'watchlist': len(watchlist),
             }
 
+        def _build_table_rows(items: list[tuple[Any, float, float | None]]) -> tuple[list[list[str]], dict[str, list[str]]]:
+            table_rows: list[list[str]] = []
+            news_map: dict[str, list[str]] = {}
+            for stock, shares, avg_cost in items:
+                latest_price = (
+                    float(stock.latest_price)
+                    if stock.latest_price is not None
+                    else None
+                )
+                value_now = latest_price * shares if latest_price is not None else None
+                cost_now = avg_cost * shares if avg_cost is not None else None
+                pnl = (value_now - cost_now) if value_now is not None and cost_now is not None else None
+
+                prediction = (
+                    Prediction.objects.filter(stock=stock)
+                    .order_by('-date')
+                    .first()
+                )
+                projection = _fmt_money(prediction.predicted_price) if prediction else 'n/a'
+                reco = prediction.recommendation if prediction else 'n/a'
+
+                day_low = _fmt_money(stock.day_low) if stock.day_low is not None else 'n/a'
+                day_high = _fmt_money(stock.day_high) if stock.day_high is not None else 'n/a'
+
+                table_rows.append(
+                    [
+                        stock.symbol,
+                        _fmt_qty(shares),
+                        _fmt_money(latest_price),
+                        _fmt_money(avg_cost),
+                        _fmt_money(value_now),
+                        _fmt_money(pnl),
+                        f"{day_low}/{day_high}",
+                        projection,
+                        reco,
+                    ]
+                )
+
+                news_items = (
+                    StockNews.objects.filter(stock=stock)
+                    .order_by('-published_at')[:1]
+                )
+                if news_items:
+                    news_map[stock.symbol] = [
+                        f"{item.headline} ({item.url})" for item in news_items
+                    ]
+
+            return table_rows, news_map
+
         # Portfolio details
         portfolios = Portfolio.objects.all()
         if portfolios.exists():
@@ -3424,61 +3484,16 @@ def send_morning_scout_report() -> dict[str, Any]:
                     lines.append('')
                     continue
 
-                table_rows: list[list[str]] = []
-                news_map: dict[str, list[str]] = {}
+                items: list[tuple[Any, float, float | None]] = []
                 for holding in holdings:
                     stock = holding.stock
                     shares = float(holding.shares or 0)
                     if shares <= 0:
                         continue
-
-                    latest_price = (
-                        float(stock.latest_price)
-                        if stock.latest_price is not None
-                        else None
-                    )
                     avg_cost = _avg_cost_for_stock(portfolio, stock)
-                    value_now = latest_price * shares if latest_price is not None else None
-                    cost_now = avg_cost * shares if avg_cost is not None else None
-                    pnl = (value_now - cost_now) if value_now is not None and cost_now is not None else None
+                    items.append((stock, shares, avg_cost))
 
-                    prediction = (
-                        Prediction.objects.filter(stock=stock)
-                        .order_by('-date')
-                        .first()
-                    )
-                    projection = (
-                        _fmt_money(prediction.predicted_price)
-                        if prediction else 'n/a'
-                    )
-                    reco = prediction.recommendation if prediction else 'n/a'
-
-                    open_price = 'n/a'
-                    day_low = _fmt_money(stock.day_low) if stock.day_low is not None else 'n/a'
-                    day_high = _fmt_money(stock.day_high) if stock.day_high is not None else 'n/a'
-
-                    table_rows.append(
-                        [
-                            stock.symbol,
-                            _fmt_qty(shares),
-                            _fmt_money(latest_price),
-                            _fmt_money(avg_cost),
-                            _fmt_money(value_now),
-                            _fmt_money(pnl),
-                            f"{day_low}/{day_high}",
-                            projection,
-                            reco,
-                        ]
-                    )
-
-                    news_items = (
-                        StockNews.objects.filter(stock=stock)
-                        .order_by('-published_at')[:1]
-                    )
-                    if news_items:
-                        news_map[stock.symbol] = [
-                            f"{item.headline} ({item.url})" for item in news_items
-                        ]
+                table_rows, news_map = _build_table_rows(items)
 
                 headers = ['Symbole', 'Qté', 'Prix', 'Achat', 'Valeur', 'PnL', 'Jour', 'Projection', 'Reco']
                 lines.extend(_format_table_block(headers, table_rows))
@@ -3490,6 +3505,37 @@ def send_morning_scout_report() -> dict[str, Any]:
 
         # Account details
         accounts = Account.objects.all().order_by('name')
+        portfolio_accounts = accounts.filter(account_type__in=['TFSA', 'CRYPTO'])
+        if portfolio_accounts.exists():
+            if not portfolios.exists():
+                lines.append('💼 *Portefeuilles*')
+            for account in portfolio_accounts:
+                lines.append(f"*{_tg_safe(account.name)}* ({_tg_safe(account.account_type)}):")
+                positions = _positions_from_account(account)
+                if not positions:
+                    lines.append('— Aucun titre')
+                    lines.append('')
+                    continue
+
+                items: list[tuple[Any, float, float | None]] = []
+                for pos in positions:
+                    stock = pos['stock']
+                    shares = float(pos['shares'] or 0)
+                    if shares <= 0:
+                        continue
+                    avg_cost = pos.get('avg_cost')
+                    items.append((stock, shares, avg_cost))
+
+                table_rows, news_map = _build_table_rows(items)
+                headers = ['Symbole', 'Qté', 'Prix', 'Achat', 'Valeur', 'PnL', 'Jour', 'Projection', 'Reco']
+                lines.extend(_format_table_block(headers, table_rows))
+                if news_map:
+                    for symbol, headlines in news_map.items():
+                        for headline in headlines:
+                            lines.append(f"📰 {_tg_safe(symbol)}: {_tg_safe(headline)}")
+                lines.append('')
+
+        accounts = accounts.exclude(id__in=portfolio_accounts.values_list('id', flat=True))
         if accounts.exists():
             lines.append('🏦 *Comptes*')
             for account in accounts:
@@ -3500,59 +3546,16 @@ def send_morning_scout_report() -> dict[str, Any]:
                     lines.append('')
                     continue
 
-                table_rows = []
-                news_map: dict[str, list[str]] = {}
+                items: list[tuple[Any, float, float | None]] = []
                 for pos in positions:
                     stock = pos['stock']
                     shares = float(pos['shares'] or 0)
+                    if shares <= 0:
+                        continue
                     avg_cost = pos.get('avg_cost')
-                    latest_price = (
-                        float(stock.latest_price)
-                        if stock.latest_price is not None
-                        else None
-                    )
-                    value_now = latest_price * shares if latest_price is not None else None
-                    cost_now = avg_cost * shares if avg_cost is not None else None
-                    pnl = (value_now - cost_now) if value_now is not None and cost_now is not None else None
+                    items.append((stock, shares, avg_cost))
 
-                    prediction = (
-                        Prediction.objects.filter(stock=stock)
-                        .order_by('-date')
-                        .first()
-                    )
-                    projection = (
-                        _fmt_money(prediction.predicted_price)
-                        if prediction else 'n/a'
-                    )
-                    reco = prediction.recommendation if prediction else 'n/a'
-
-                    open_price = 'n/a'
-                    day_low = _fmt_money(stock.day_low) if stock.day_low is not None else 'n/a'
-                    day_high = _fmt_money(stock.day_high) if stock.day_high is not None else 'n/a'
-
-                    table_rows.append(
-                        [
-                            stock.symbol,
-                            _fmt_qty(shares),
-                            _fmt_money(latest_price),
-                            _fmt_money(avg_cost),
-                            _fmt_money(value_now),
-                            _fmt_money(pnl),
-                            f"{day_low}/{day_high}",
-                            projection,
-                            reco,
-                        ]
-                    )
-
-                    news_items = (
-                        StockNews.objects.filter(stock=stock)
-                        .order_by('-published_at')[:1]
-                    )
-                    if news_items:
-                        news_map[stock.symbol] = [
-                            f"{item.headline} ({item.url})" for item in news_items
-                        ]
-
+                table_rows, news_map = _build_table_rows(items)
                 headers = ['Symbole', 'Qté', 'Prix', 'Achat', 'Valeur', 'PnL', 'Jour', 'Projection', 'Reco']
                 lines.extend(_format_table_block(headers, table_rows))
                 if news_map:
@@ -4807,6 +4810,173 @@ def morning_status_check() -> dict[str, Any]:
         return {'status': 'failed', 'error': str(exc)}
 
 
+def _fear_greed_from_vix(vix_level: float | None) -> tuple[str, int]:
+    if vix_level is None:
+        return 'n/a', 50
+    index = int(round(max(0.0, min(100.0, 100 - (float(vix_level) - 10) * 4))))
+    if index <= 10:
+        label = 'Extreme Fear'
+    elif index <= 30:
+        label = 'Fear'
+    elif index <= 55:
+        label = 'Neutral'
+    elif index <= 75:
+        label = 'Greed'
+    else:
+        label = 'Extreme Greed'
+    return label, index
+
+
+def _format_diag_price(value: float | None) -> str:
+    if value is None:
+        return 'n/a'
+    price = float(value)
+    if price >= 1:
+        return f"{price:.2f}$"
+    if price >= 0.1:
+        return f"{price:.3f}$"
+    return f"{price:.4f}$"
+
+
+def _penny_diagnostic_item(symbol: str) -> dict[str, Any] | None:
+    symbol = (symbol or '').strip().upper()
+    if not symbol:
+        return None
+
+    snapshot = (
+        PennyStockSnapshot.objects.select_related('stock')
+        .filter(stock__symbol__iexact=symbol)
+        .order_by('-as_of')
+        .first()
+    )
+
+    price = None
+    rsi = None
+    ai_score = None
+    if snapshot:
+        price = _safe_float(snapshot.price)
+        rsi = _safe_float(snapshot.rsi)
+        ai_score = _safe_float(snapshot.ai_score)
+
+    if price is None or rsi is None:
+        try:
+            hist = yf.Ticker(symbol).history(period='30d', interval='1d', timeout=10)
+            close = _extract_close_series(hist)
+            if close is not None and not close.empty:
+                if price is None:
+                    price = _safe_float(close.iloc[-1])
+                if rsi is None:
+                    rsi = _compute_rsi(close, 14)
+        except Exception:
+            pass
+
+    if price is None:
+        return None
+
+    buy_rsi = float(os.getenv('PENNY_DIAG_BUY_RSI', '32'))
+    wait_rsi = float(os.getenv('PENNY_DIAG_WAIT_RSI', '40'))
+    min_ai_buy = float(os.getenv('PENNY_DIAG_MIN_AI', '0.55'))
+
+    action = '⏳ WAIT'
+    if rsi is not None and rsi <= buy_rsi and (ai_score is None or ai_score >= min_ai_buy):
+        action = '🚀 BUY'
+    elif rsi is not None and rsi <= wait_rsi:
+        action = '⏳ WAIT'
+    elif ai_score is not None and ai_score >= min_ai_buy:
+        action = '⏳ WAIT'
+    else:
+        action = '⚠️ HOLD'
+
+    base_target = float(os.getenv('PENNY_DIAG_TARGET_BASE_PCT', '0.12'))
+    ai_mult = float(os.getenv('PENNY_DIAG_TARGET_AI_MULT', '0.6'))
+    score = ai_score if ai_score is not None else 0.5
+    target_pct = base_target + (score * ai_mult)
+    if rsi is not None and rsi < 30:
+        target_pct += 0.1
+    target_pct = max(0.05, min(0.8, target_pct))
+
+    stop_pct = float(os.getenv('PENNY_DIAG_STOP_PCT', '0.12'))
+    if rsi is not None and rsi < 30:
+        stop_pct = float(os.getenv('PENNY_DIAG_STOP_PCT_OVERSOLD', '0.16'))
+
+    target_price = price * (1 + target_pct)
+    stop_price = price * (1 - stop_pct)
+    roi_pct = target_pct * 100
+
+    bncd_threshold = float(os.getenv('PENNY_DIAG_BNCD_THRESHOLD', '0.4'))
+    bncd_txt = f" 🎯 BNCD: {_format_diag_price(target_price)}" if target_pct >= bncd_threshold else ''
+
+    rsi_txt = f"{rsi:.1f}" if rsi is not None else 'N/A'
+    return {
+        'symbol': symbol,
+        'price': price,
+        'action': action,
+        'rsi': rsi,
+        'roi_pct': roi_pct,
+        'target_price': target_price,
+        'stop_price': stop_price,
+        'bncd_txt': bncd_txt,
+        'rsi_txt': rsi_txt,
+    }
+
+
+@shared_task
+def send_penny_rebound_diagnostic() -> dict[str, Any]:
+    log = _task_log_start('send_penny_rebound_diagnostic')
+    try:
+        limit = int(os.getenv('PENNY_DIAGNOSTIC_LIMIT', '5'))
+        vix_level = _get_vix_level()
+        label, index = _fear_greed_from_vix(vix_level)
+
+        symbols: list[str] = []
+        watch = SandboxWatchlist.objects.filter(sandbox='AI_PENNY').first()
+        if watch and watch.symbols:
+            symbols = [str(s).strip().upper() for s in watch.symbols if str(s).strip()]
+
+        if not symbols:
+            snapshots = PennyStockSnapshot.objects.select_related('stock').order_by('-as_of', '-ai_score')
+            if snapshots.exists():
+                latest_date = snapshots.first().as_of
+                snapshots = snapshots.filter(as_of=latest_date)
+            symbols = [s.stock.symbol for s in snapshots[:limit]]
+
+        diagnostics: list[dict[str, Any]] = []
+        for symbol in symbols:
+            item = _penny_diagnostic_item(symbol)
+            if item:
+                diagnostics.append(item)
+            if len(diagnostics) >= limit:
+                break
+
+        lines = [
+            "DIAGNOSTIC GLOBAL",
+            f"🌍 Sentiment: {label} ({index}/100)",
+            "━━━━━━━━━━━━━━━",
+        ]
+
+        if diagnostics:
+            for item in diagnostics:
+                lines.append(f"{item['symbol']}: {_format_diag_price(item['price'])} ({item['action']})")
+                lines.append(f"└ RSI: {item['rsi_txt']} | ROI: {item['roi_pct']:.1f}%")
+                lines.append(
+                    f"└ Obj: {_format_diag_price(item['target_price'])}{item['bncd_txt']}"
+                )
+                lines.append(f"└ 🛡️ SL: {_format_diag_price(item['stop_price'])}")
+                lines.append("")
+        else:
+            lines.append("Aucune donnée penny disponible.")
+
+        message = "\n".join(lines).strip()
+        _send_telegram_alert(message, allow_during_blackout=True, category='report')
+
+        payload = {'status': 'sent', 'count': len(diagnostics), 'sentiment_index': index}
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
 def _opening_price_today(symbol: str) -> float | None:
     symbol = (symbol or '').strip().upper()
     if not symbol:
@@ -5057,6 +5227,8 @@ def daily_profit_tracker() -> dict[str, Any]:
         wins = 0
         losses = 0
         profit_total = 0.0
+        win_details: list[str] = []
+        loss_details: list[str] = []
         for signal in signals:
             entry = float(signal.entry_price or 0)
             exit_price = float(signal.closed_price or 0)
@@ -5067,8 +5239,14 @@ def daily_profit_tracker() -> dict[str, Any]:
             profit_total += pnl
             if pnl >= 0:
                 wins += 1
+                win_details.append(
+                    f"• {signal.ticker}: {entry:.2f} → {exit_price:.2f} | +{pnl:.2f}$ (+{ret_pct * 100:.2f}%)"
+                )
             else:
                 losses += 1
+                loss_details.append(
+                    f"• {signal.ticker}: {entry:.2f} → {exit_price:.2f} | {pnl:.2f}$ ({ret_pct * 100:.2f}%)"
+                )
 
         wallet = _load_profit_wallet()
         week_start = _week_start_date(timezone.now()).isoformat()
@@ -5083,16 +5261,32 @@ def daily_profit_tracker() -> dict[str, Any]:
             "🏦 *BILAN DE TA JOURNÉE (Swing Mode)*",
             f"✅ Trades Gagnants : {wins}",
             f"❌ Trades Perdants : {losses}",
-            "",
-            f"💰 Profit du jour : {profit_total:+.2f}$",
-            f"📈 Rendement : {day_pct:+.2f}%",
-            "",
-            f"📅 CAGNOTTE DE LA SEMAINE : {wallet['weekly_total']:+.2f}$",
-            "Objectif Vendredi : 100$",
-            "",
-            "🧠 Note de l'IA : Sentiment news stable aujourd'hui.",
-            "Le modèle sera réentraîné ce soir. Prêt pour demain !",
         ]
+        if win_details or loss_details:
+            lines.append("")
+            if win_details:
+                lines.append("✅ Détails gagnants:")
+                lines.extend(win_details[:5])
+            else:
+                lines.append("✅ Détails gagnants: Aucun")
+            if loss_details:
+                lines.append("❌ Détails perdants:")
+                lines.extend(loss_details[:5])
+            else:
+                lines.append("❌ Détails perdants: Aucun")
+        lines.extend(
+            [
+                "",
+                f"💰 Profit du jour : {profit_total:+.2f}$",
+                f"📈 Rendement : {day_pct:+.2f}% (base {investment:.0f}$ par trade)",
+                "",
+                f"📅 CAGNOTTE DE LA SEMAINE : {wallet['weekly_total']:+.2f}$",
+                "Objectif Vendredi : 100$",
+                "",
+                "🧠 Note de l'IA : Sentiment news stable aujourd'hui.",
+                "Le modèle sera réentraîné ce soir. Prêt pour demain !",
+            ]
+        )
         _send_telegram_alert("\n".join(lines).strip(), allow_during_blackout=True, category='report')
 
         payload = {
@@ -5120,6 +5314,222 @@ def _portfolio_news_sentiment(symbol: str, hours: int = 24) -> float:
         sentiment, _ = _news_sentiment_score(symbol, days=1)
         return float(sentiment)
     return float(avg)
+
+
+def _pct_change_from_open(symbol: str) -> float | None:
+    try:
+        hist = yf.download(tickers=symbol, period='1d', interval='1m')
+    except Exception:
+        hist = None
+    if hist is None or hist.empty:
+        return None
+    if 'Open' not in hist.columns or 'Close' not in hist.columns:
+        return None
+    first_open = float(hist['Open'].iloc[0]) if float(hist['Open'].iloc[0]) else None
+    last_close = float(hist['Close'].iloc[-1]) if float(hist['Close'].iloc[-1]) else None
+    if not first_open or not last_close:
+        return None
+    return (last_close - first_open) / first_open
+
+
+def _intraday_pct_change(symbol: str, minutes: int = 20) -> float | None:
+    try:
+        hist = yf.download(tickers=symbol, period='1d', interval='1m')
+    except Exception:
+        hist = None
+    if hist is None or hist.empty or 'Close' not in hist.columns:
+        return None
+    close = hist['Close'].dropna()
+    if close.empty:
+        return None
+    if minutes <= 1 or len(close) < minutes:
+        minutes = min(len(close), max(2, minutes))
+    start_price = float(close.iloc[-minutes]) if float(close.iloc[-minutes]) else None
+    end_price = float(close.iloc[-1]) if float(close.iloc[-1]) else None
+    if not start_price or not end_price:
+        return None
+    return (end_price - start_price) / start_price
+
+
+def _is_market_dump() -> bool:
+    dump_pct = float(os.getenv('PENNY_SNIPER_MARKET_DUMP_PCT', '-0.007'))
+    parent = os.getenv('PENNY_SNIPER_MARKET_PARENT', 'SPY').strip().upper() or 'SPY'
+    change = _intraday_pct_change(parent, minutes=int(os.getenv('PENNY_SNIPER_MARKET_MINUTES', '30')))
+    if change is None:
+        return False
+    return change <= dump_pct
+
+
+def _intraday_volume(symbol: str) -> float | None:
+    try:
+        hist = yf.download(tickers=symbol, period='1d', interval='1m')
+    except Exception:
+        hist = None
+    if hist is None or hist.empty or 'Volume' not in hist.columns:
+        return None
+    return float(hist['Volume'].sum())
+
+
+def _daily_history(symbol: str, days: int = 365) -> pd.DataFrame:
+    try:
+        hist = yf.download(tickers=symbol, period=f'{days}d', interval='1d')
+    except Exception:
+        return pd.DataFrame()
+    return hist if isinstance(hist, pd.DataFrame) else pd.DataFrame()
+
+
+CORRELATION_MAP: dict[str, str] = {
+    # CRYPTO
+    'HIVE': 'BTC-USD',
+    'HUT': 'BTC-USD',
+    'BITF': 'BTC-USD',
+    'MARA': 'BTC-USD',
+    'RIOT': 'BTC-USD',
+    'CLSK': 'BTC-USD',
+    # MINING / METALS
+    'TECK.TO': 'HG=F',
+    'ABX.TO': 'GC=F',
+    'FNV.TO': 'GC=F',
+    # BANKS (Canada)
+    'RY.TO': 'ZEB.TO',
+    'TD.TO': 'ZEB.TO',
+    # ENERGY
+    'SU.TO': 'CL=F',
+    'CNQ.TO': 'CL=F',
+    # RETAIL / CONSUMER
+    'ATD.TO': 'CADUSD=X',
+}
+
+CRYPTO_TICKERS = {'HIVE', 'HUT', 'BITF', 'MARA', 'RIOT', 'CLSK'}
+
+
+def _penny_sniper_candidate(symbol: str) -> dict[str, Any] | None:
+    symbol = (symbol or '').strip().upper()
+    if not symbol:
+        return None
+
+    parent = CORRELATION_MAP.get(symbol) or os.getenv('PENNY_SNIPER_DEFAULT_PARENT', 'SPY').strip().upper() or 'SPY'
+    corr_minutes = int(os.getenv('PENNY_SNIPER_CORR_MINUTES', '20'))
+    parent_change = _intraday_pct_change(parent, minutes=corr_minutes)
+    require_parent_up = True
+    if symbol in CRYPTO_TICKERS:
+        require_parent_up = True
+    if require_parent_up and parent_change is not None and parent_change <= 0:
+        return None
+
+    hist = _daily_history(symbol, days=365)
+    if hist.empty or 'Close' not in hist.columns:
+        return None
+
+    close = hist['Close'].dropna()
+    if close.empty:
+        return None
+    price = float(close.iloc[-1])
+    min_price = float(os.getenv('PENNY_SNIPER_MIN_PRICE', '0.5'))
+    max_price = float(os.getenv('PENNY_SNIPER_MAX_PRICE', '4.5'))
+    if price < min_price or price > max_price:
+        return None
+
+    avg_volume = float(hist['Volume'].tail(90).mean()) if 'Volume' in hist.columns else 0.0
+    min_volume = float(os.getenv('PENNY_SNIPER_MIN_VOLUME', '500000'))
+    if avg_volume < min_volume:
+        return None
+
+    rsi = _compute_rsi(close, 14)
+    if rsi is None:
+        return None
+    max_rsi = float(os.getenv('PENNY_SNIPER_MAX_RSI', '30'))
+    if symbol.endswith('.TO') and symbol not in CRYPTO_TICKERS:
+        max_rsi = float(os.getenv('PENNY_SNIPER_MAX_RSI_BLUECHIP', '40'))
+    if rsi > max_rsi:
+        return None
+
+    high_52w = float(close.tail(252).max()) if len(close) >= 252 else float(close.max())
+    if high_52w <= 0:
+        return None
+    dist_from_high = (price - high_52w) / high_52w
+    if dist_from_high > -0.70:
+        return None
+
+    change_from_open = _pct_change_from_open(symbol)
+    if change_from_open is None or change_from_open <= 0:
+        return None
+
+    intraday_vol = _intraday_volume(symbol)
+    if intraday_vol is None or avg_volume <= 0:
+        return None
+    rvol = intraday_vol / avg_volume if avg_volume else 0.0
+    if rvol < float(os.getenv('PENNY_SNIPER_MIN_RVOL', '2.0')):
+        return None
+
+    target_pct = float(os.getenv('PENNY_SNIPER_TARGET_PCT', '0.14'))
+    stop_pct = float(os.getenv('PENNY_SNIPER_STOP_PCT', '0.05'))
+    if _is_market_dump():
+        stop_pct = float(os.getenv('PENNY_SNIPER_STOP_PCT_DUMP', '0.03'))
+    target = price * (1 + target_pct)
+    stop = price * (1 - stop_pct)
+
+    return {
+        'symbol': symbol,
+        'price': price,
+        'rsi': rsi,
+        'rvol': rvol,
+        'change_from_open': change_from_open,
+        'parent': parent,
+        'parent_change': parent_change,
+        'target': target,
+        'stop': stop,
+        'roi_pct': target_pct * 100,
+    }
+
+
+@shared_task
+def penny_sniper_alert() -> dict[str, Any]:
+    log = _task_log_start('penny_sniper_alert')
+    try:
+        enabled = os.getenv('PENNY_SNIPER_ENABLED', 'true').lower() in {'1', 'true', 'yes', 'y'}
+        if not enabled:
+            return {'status': 'disabled'}
+
+        watch = SandboxWatchlist.objects.filter(sandbox='WATCHLIST').first()
+        symbols = [str(s).strip().upper() for s in (watch.symbols if watch else []) if str(s).strip()]
+        if not symbols:
+            return {'status': 'no_symbols'}
+
+        alerts = []
+        for symbol in symbols:
+            candidate = _penny_sniper_candidate(symbol)
+            if not candidate:
+                continue
+            cache_key = _cache_key(symbol, 'penny_sniper')
+            if cache.get(cache_key):
+                continue
+            cache.set(cache_key, True, timeout=60 * 20)
+
+            parent_txt = 'n/a'
+            if candidate.get('parent'):
+                change = candidate.get('parent_change')
+                if change is not None:
+                    parent_txt = f"{candidate['parent']} {change * 100:+.1f}%"
+                else:
+                    parent_txt = f"{candidate['parent']} n/a"
+
+            message = (
+                f"🎯 Opportunité à Rabais : {symbol}\n\n"
+                f"Prix : {candidate['price']:.2f}$ (RSI: {candidate['rsi']:.1f})\n"
+                f"Signal : Volume {candidate['rvol']:.1f}x · Corrélation {parent_txt}\n"
+                f"Plan : In @ {candidate['price']:.2f}$ / Out @ {candidate['target']:.2f}$ (+{candidate['roi_pct']:.1f}%) "
+                f"/ Stop @ {candidate['stop']:.2f}$"
+            )
+            _send_telegram_alert(message, allow_during_blackout=True, category='signal')
+            alerts.append(symbol)
+
+        payload = {'status': 'ok', 'alerts': alerts}
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
 
 
 def _portfolio_symbols_from_env() -> tuple[list[str], list[str]]:

@@ -124,11 +124,17 @@ function LivePaperTrading() {
                 <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-slate-300">
                   <span className="text-white font-semibold">{trade.ticker}</span>
                   <span>Entrée ${trade.entry_price}</span>
-                  <span>Actuel ${livePositions[trade.ticker]?.current_price ?? '—'}</span>
+                  <span>
+                    Actuel ${livePositions[trade.ticker]?.current_price ?? trade.current_price ?? '—'}
+                  </span>
                   <span>Stop ${trade.stop_loss}</span>
                   <span>Qté {trade.quantity}</span>
-                  <span className={Number(livePositions[trade.ticker]?.unrealized_pnl) >= 0 ? 'text-emerald-400' : 'text-red-400'}>
-                    U-P&L {livePositions[trade.ticker]?.unrealized_pnl ?? '—'}
+                  <span
+                    className={Number(
+                      livePositions[trade.ticker]?.unrealized_pnl ?? trade.unrealized_pnl
+                    ) >= 0 ? 'text-emerald-400' : 'text-red-400'}
+                  >
+                    U-P&L {livePositions[trade.ticker]?.unrealized_pnl ?? trade.unrealized_pnl ?? '—'}
                   </span>
                   <button
                     type="button"

@@ -21,6 +21,7 @@ from .models import (
     Transaction,
     UserPreference,
     MacroIndicator,
+    SandboxWatchlist,
 )
 
 
@@ -176,6 +177,12 @@ class AccountTransactionSerializer(serializers.ModelSerializer):
     class Meta:
         model = AccountTransaction
         fields = '__all__'
+
+
+class SandboxWatchlistSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SandboxWatchlist
+        fields = ['sandbox', 'symbols', 'source', 'updated_at']
 
 
 class DividendSerializer(serializers.ModelSerializer):

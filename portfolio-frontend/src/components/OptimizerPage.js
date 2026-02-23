@@ -58,10 +58,16 @@ function OptimizerPage() {
   const [suggestions, setSuggestions] = useState([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [activeTab, setActiveTab] = useState('core');
+  const [loadDuration, setLoadDuration] = useState(null);
+  const [lastLoadedAt, setLastLoadedAt] = useState(null);
+  const [optimizerError, setOptimizerError] = useState('');
+  const [fastMode, setFastMode] = useState(true);
 
   const loadOptimizer = useCallback(async () => {
     let isMounted = true;
     setIsRefreshing(true);
+    setOptimizerError('');
+    const startedAt = performance.now();
 
     const applyPayload = (payload) => {
       if (!isMounted) return;
@@ -69,32 +75,53 @@ function OptimizerPage() {
       setSuggestions(Array.isArray(payload?.suggestions) ? payload.suggestions : []);
     };
 
+    const finalize = () => {
+      if (!isMounted) return;
+      const duration = (performance.now() - startedAt) / 1000;
+      setLoadDuration(duration);
+      setLastLoadedAt(new Date());
+      setIsRefreshing(false);
+    };
+
     try {
-      const res = await api.get('optimizer/');
+      const res = await api.get('optimizer/', {
+        params: fastMode ? { fast: 1 } : {},
+        timeout: 60000,
+      });
       const payload = res?.data || {};
       if (Array.isArray(payload.actions)) {
         applyPayload(payload);
-        return;
+        finalize();
+        return () => {
+          isMounted = false;
+        };
       }
     } catch (err) {
       // fall through to direct fetch
+      const isTimeout = String(err?.message || '').toLowerCase().includes('timeout')
+        || err?.code === 'ECONNABORTED';
+      if (isTimeout) {
+        setOptimizerError('Délai dépassé. Passage en mode rapide…');
+      }
     }
 
     try {
       const fallbackUrl = `${window.location.protocol}//${window.location.hostname}:8001/api/optimizer/`;
-      const fallbackRes = await fetch(fallbackUrl);
+      const params = fastMode ? '?fast=1' : '';
+      const fallbackRes = await fetch(`${fallbackUrl}${params}`);
       const fallbackPayload = await fallbackRes.json();
       applyPayload(fallbackPayload);
     } catch (err) {
       applyPayload({ actions: [], suggestions: [] });
+      setOptimizerError('Impossible de charger les données (optimizer).');
     } finally {
-      if (isMounted) setIsRefreshing(false);
+      finalize();
     }
 
     return () => {
       isMounted = false;
     };
-  }, []);
+  }, [fastMode]);
 
   useEffect(() => {
     loadOptimizer();
@@ -124,6 +151,40 @@ function OptimizerPage() {
   return (
     <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
       <div className="xl:col-span-2 space-y-4">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-xs uppercase tracking-[0.2em] text-slate-400">AI Portfolio Optimizer</p>
+              <p className="text-sm text-slate-300">
+                {loadDuration !== null
+                  ? `Chargé en ${loadDuration.toFixed(2)}s`
+                  : 'Chargement en cours…'}
+                {lastLoadedAt ? ` · ${lastLoadedAt.toLocaleTimeString()}` : ''}
+              </p>
+              {optimizerError ? (
+                <p className="text-xs text-rose-300 mt-1">{optimizerError}</p>
+              ) : null}
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="flex items-center gap-2 text-xs text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={fastMode}
+                  onChange={(event) => setFastMode(event.target.checked)}
+                />
+                Mode rapide
+              </label>
+              <button
+                className="px-3 py-1.5 rounded-lg text-xs bg-indigo-500/20 text-indigo-200 border border-indigo-400/40"
+                type="button"
+                onClick={loadOptimizer}
+                disabled={isRefreshing}
+              >
+                {isRefreshing ? 'Actualisation…' : 'Rafraîchir'}
+              </button>
+            </div>
+          </div>
+        </div>
         {!hasActions ? (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-slate-400">
             Aucune position détectée. Ajoute des transactions pour obtenir des recommandations.

@@ -54,6 +54,7 @@ from .views import (
     ModelDriftDailyView,
     ModelEvaluationDailyView,
     ModelMonitoringSummaryView,
+    SandboxWatchlistView,
 )
 
 router = routers.DefaultRouter()
@@ -87,6 +88,7 @@ urlpatterns = [
     path('paper-trades/performance/', PaperTradePerformanceView.as_view()),
     path('paper-trades/equity/', PaperTradeEquityCurveView.as_view()),
     path('paper-trades/explanations/', PaperTradeExplanationLogView.as_view()),
+    path('watchlist/', SandboxWatchlistView.as_view()),
     path('dashboard/portfolio/', PortfolioDashboardView.as_view()),
     path('dashboard/news/', PortfolioNewsView.as_view()),
     path('dashboard/sentiment/', SentimentScannerView.as_view()),

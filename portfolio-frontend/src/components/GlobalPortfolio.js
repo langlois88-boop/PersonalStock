@@ -61,6 +61,36 @@ function GlobalPortfolio() {
   const [wave2Amounts, setWave2Amounts] = useState({});
   const [chartRange, setChartRange] = useState('3M');
   const [chartMode, setChartMode] = useState('value');
+  const [watchlistInput, setWatchlistInput] = useState('');
+  const [watchlistItems, setWatchlistItems] = useState([]);
+
+  const watchlistKey = 'ps_watchlist';
+  const saveWatchlist = (items) => {
+    const unique = Array.from(new Set(items.map((s) => s.trim().toUpperCase()).filter(Boolean)));
+    setWatchlistItems(unique);
+    try {
+      window.localStorage.setItem(watchlistKey, JSON.stringify(unique));
+    } catch (err) {
+      // ignore storage errors
+    }
+    api
+      .post('watchlist/', { sandbox: 'WATCHLIST', symbols: unique })
+      .catch(() => {
+        // keep local fallback
+      });
+  };
+
+  const addWatchlistItems = () => {
+    const raw = watchlistInput || '';
+    const parts = raw.split(/[\s,;]+/).map((s) => s.trim()).filter(Boolean);
+    if (!parts.length) return;
+    saveWatchlist([...watchlistItems, ...parts]);
+    setWatchlistInput('');
+  };
+
+  const removeWatchlistItem = (symbol) => {
+    saveWatchlist(watchlistItems.filter((item) => item !== symbol));
+  };
 
   useEffect(() => {
     setLoading(true);
@@ -73,6 +103,37 @@ function GlobalPortfolio() {
         setData(emptyState);
       })
       .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+    api
+      .get('watchlist/', { params: { sandbox: 'WATCHLIST' } })
+      .then((res) => {
+        if (!isMounted) return;
+        const symbols = Array.isArray(res.data?.symbols) ? res.data.symbols : [];
+        const clean = symbols.map((item) => String(item).trim().toUpperCase()).filter(Boolean);
+        setWatchlistItems(clean);
+        try {
+          window.localStorage.setItem(watchlistKey, JSON.stringify(clean));
+        } catch (err) {
+          // ignore storage errors
+        }
+      })
+      .catch(() => {
+        try {
+          const saved = window.localStorage.getItem(watchlistKey);
+          const parsed = saved ? JSON.parse(saved) : [];
+          if (Array.isArray(parsed)) {
+            setWatchlistItems(parsed.map((item) => String(item).trim().toUpperCase()).filter(Boolean));
+          }
+        } catch (err) {
+          setWatchlistItems([]);
+        }
+      });
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -735,6 +796,58 @@ function GlobalPortfolio() {
         </div>
       ) : null}
 
+      <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h3 className="text-lg font-semibold text-white">Watchlist</h3>
+          <span className="text-xs text-slate-400">Local · rapide</span>
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <input
+            value={watchlistInput}
+            onChange={(event) => setWatchlistInput(event.target.value.toUpperCase())}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                addWatchlistItems();
+              }
+            }}
+            placeholder="Ajouter tickers (ex: NVDA, SHOP.TO)"
+            className="flex-1 min-w-[220px] bg-slate-950/60 border border-slate-800 text-slate-200 text-xs rounded-lg px-3 py-2"
+          />
+          <button
+            type="button"
+            onClick={addWatchlistItems}
+            className="text-xs px-3 py-2 rounded-lg bg-indigo-500/20 text-indigo-200 border border-indigo-400/40"
+          >
+            Ajouter
+          </button>
+          <button
+            type="button"
+            onClick={() => saveWatchlist([])}
+            className="text-xs px-3 py-2 rounded-lg bg-slate-800 text-slate-300 border border-slate-700"
+          >
+            Vider
+          </button>
+        </div>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {watchlistItems.length ? (
+            watchlistItems.map((item) => (
+              <button
+                type="button"
+                key={item}
+                onClick={() => removeWatchlistItem(item)}
+                className="text-xs px-2.5 py-1 rounded-full border border-slate-700 text-slate-200 bg-slate-950/60 hover:border-rose-500/40 hover:text-rose-200"
+                title="Cliquer pour retirer"
+              >
+                {item}
+              </button>
+            ))
+          ) : (
+            <p className="text-xs text-slate-400">Aucun symbole pour l'instant.</p>
+          )}
+        </div>
+      </div>
+
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         <div className="xl:col-span-2 bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
           <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
@@ -914,19 +1027,33 @@ function GlobalPortfolio() {
                             </td>
                             <td className="py-2 text-right">{pos.stop_price ? `$${Number(pos.stop_price).toFixed(2)}` : '—'}</td>
                             <td className="py-2 text-right">
-                              {pos.rsi !== null && pos.rsi !== undefined ? (
-                                <span
-                                  className={`text-[10px] px-2 py-0.5 rounded-full border ${
-                                    pos.rsi <= 30
-                                      ? 'bg-emerald-500/30 text-emerald-200 border-emerald-400/50'
-                                      : pos.rsi >= 70
-                                        ? 'bg-rose-500/30 text-rose-200 border-rose-400/50'
-                                        : 'bg-slate-700/40 text-slate-200 border-slate-600'
-                                  }`}
-                                >
-                                  {Number(pos.rsi).toFixed(0)}
-                                </span>
-                              ) : '—'}
+                              {pos.rsi !== null && pos.rsi !== undefined ? (() => {
+                                const rsiValue = Number(pos.rsi);
+                                const rsiLevel = rsiValue <= 30
+                                  ? 'Low (survente)'
+                                  : rsiValue >= 70
+                                    ? 'High (surachat)'
+                                    : 'Medium (neutre)';
+                                const tooltip = `RSI ${rsiValue.toFixed(1)} · ${rsiLevel}. Low < 30 · Medium 30–70 · High > 70.`;
+                                return (
+                                  <span className="relative inline-flex group">
+                                    <span
+                                      className={`text-[10px] px-2 py-0.5 rounded-full border ${
+                                        rsiValue <= 30
+                                          ? 'bg-emerald-500/30 text-emerald-200 border-emerald-400/50'
+                                          : rsiValue >= 70
+                                            ? 'bg-rose-500/30 text-rose-200 border-rose-400/50'
+                                            : 'bg-slate-700/40 text-slate-200 border-slate-600'
+                                      }`}
+                                    >
+                                      {rsiValue.toFixed(0)}
+                                    </span>
+                                    <span className="pointer-events-none absolute right-0 top-full mt-2 w-52 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 text-[10px] text-slate-200 opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
+                                      {tooltip}
+                                    </span>
+                                  </span>
+                                );
+                              })() : '—'}
                             </td>
                             <td
                               className={`py-2 text-right ${

@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import api from '../api/api';
 
 function TransactionForm() {
+  const today = new Date().toISOString().split('T')[0];
   const [accounts, setAccounts] = useState([]);
   const [stocks, setStocks] = useState([]);
   const [stockQuery, setStockQuery] = useState('');
@@ -15,7 +16,7 @@ function TransactionForm() {
     stock: '',
     shares: '',
     price_per_share: '',
-    date: '',
+    date: today,
     transaction_type: 'BUY',
   });
   const [message, setMessage] = useState('');

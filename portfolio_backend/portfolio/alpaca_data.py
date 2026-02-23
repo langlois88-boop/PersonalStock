@@ -146,50 +146,78 @@ def get_intraday_bars(symbol: str, minutes: int = 390) -> pd.DataFrame:
     
     # 3. Si Alpaca échoue ou est vide, on utilise le Fallback Yahoo
     if df is None or df.empty:
-        return _get_yahoo_fallback(symbol, minutes, max_days)
+        return _get_yahoo_fallback(symbol, minutes, max_days, start=start, end=end)
     
     return df.tail(minutes)
 
 
-def _get_yahoo_fallback(symbol: str, minutes: int, max_days: int) -> pd.DataFrame:
+def _get_yahoo_fallback(
+    symbol: str,
+    minutes: int,
+    max_days: int,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> pd.DataFrame:
     """Fonction de secours robuste utilisant Yahoo Finance via market_data"""
     try:
-        # Placeholder for actual fallback logic.
-        return pd.DataFrame()
-        # ...existing code...
+        from . import market_data
+
+        symbol = (symbol or '').strip().upper()
+        if not symbol:
+            return pd.DataFrame()
+
+        period = f"{max_days}d"
+        df = market_data.download(
+            symbol,
+            period=period,
+            interval='1m',
+            start=start,
+            end=end,
+        )
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        if isinstance(df.columns, pd.MultiIndex):
+            if symbol in df.columns.get_level_values(0):
+                df = df[symbol]
+            else:
+                df = df.xs(df.columns.levels[0][0], axis=1)
+
+        df = df.copy()
+        if 'timestamp' not in df.columns:
+            if isinstance(df.index, pd.DatetimeIndex):
+                df['timestamp'] = df.index
+            elif 'Datetime' in df.columns:
+                df = df.rename(columns={'Datetime': 'timestamp'})
+            elif 'Date' in df.columns:
+                df = df.rename(columns={'Date': 'timestamp'})
+
+        if 'Adj Close' in df.columns and 'Close' in df.columns:
+            df = df.drop(columns=['Adj Close'])
+
         rename_map = {
+            'Open': 'open',
+            'High': 'high',
+            'Low': 'low',
             'Close': 'close',
-            'Volume': 'volume'
+            'Adj Close': 'close',
+            'Volume': 'volume',
         }
-        hist = hist.rename(columns={k: v for k, v in rename_map.items() if k in hist.columns})
-        
-        # On s'assure d'avoir les colonnes minimales en minuscules
-        cols_needed = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-        # On vérifie lesquelles sont disponibles
-        existing_cols = [c for c in cols_needed if c in hist.columns]
-        
-        if 'timestamp' not in existing_cols:
-            return pd.DataFrame()
-            
-        return hist[existing_cols].tail(minutes)
-        # If you need market_data, move the import outside or refactor the dependency.
-        # Placeholder for actual fallback logic.
-        return pd.DataFrame()
-        # ...existing code...
-            'Close': 'close',
-            'Volume': 'volume'
-        }
-        hist = hist.rename(columns={k: v for k, v in rename_map.items() if k in hist.columns})
-        
-        # On s'assure d'avoir les colonnes minimales en minuscules
-        cols_needed = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-        # On vérifie lesquelles sont disponibles
-        existing_cols = [c for c in cols_needed if c in hist.columns]
-        
-        if 'timestamp' not in existing_cols:
-            return pd.DataFrame()
-            
-        return hist[existing_cols].tail(minutes)
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+        if df.columns.duplicated().any():
+            df = df.loc[:, ~df.columns.duplicated()]
+
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce', utc=True)
+            df = df.dropna(subset=['timestamp'])
+
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            if col not in df.columns:
+                df[col] = pd.NA
+
+        df = df.sort_values('timestamp')
+        return df.tail(minutes)
     except Exception:
         return pd.DataFrame()
 

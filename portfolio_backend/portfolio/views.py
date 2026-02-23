@@ -79,6 +79,7 @@ from .serializers import (
 	StockNewsSerializer,
 	TransactionSerializer,
 	UserPreferenceSerializer,
+	SandboxWatchlistSerializer,
 )
 from .ai_module import run_predictions
 from .tasks import _fetch_yahoo_screener, _fetch_yfinance_screeners
@@ -930,6 +931,17 @@ class PaperTradeSummaryView(APIView):
 		sandbox = (request.query_params.get('sandbox') or '').strip().upper()
 		initial_capital = float(os.getenv('PAPER_CAPITAL', '10000'))
 		try:
+			def _latest_price(symbol: str) -> float | None:
+				symbol = (symbol or '').strip().upper()
+				if not symbol:
+					return None
+				try:
+					hist = yf.Ticker(symbol).history(period='1d', interval='1m', timeout=10)
+					close = hist['Close'].iloc[-1] if hist is not None and not hist.empty and 'Close' in hist else None
+					return float(close) if close is not None else None
+				except Exception:
+					return None
+
 			open_trades = PaperTrade.objects.filter(status='OPEN')
 			closed_trades = PaperTrade.objects.filter(status='CLOSED')
 			if sandbox:
@@ -947,6 +959,18 @@ class PaperTradeSummaryView(APIView):
 					total_risk += (entry_price - stop_loss) * float(t.quantity)
 
 			available = initial_capital + closed_pnl - open_value
+			open_payload = PaperTradeSerializer(open_trades, many=True).data
+			for trade in open_payload:
+				symbol = trade.get('ticker') or ''
+				current_price = _latest_price(symbol)
+				trade['current_price'] = None if current_price is None else round(float(current_price), 4)
+				try:
+					entry = float(trade.get('entry_price') or 0)
+					qty = float(trade.get('quantity') or 0)
+					trade['unrealized_pnl'] = None if current_price is None else round((current_price - entry) * qty, 2)
+				except Exception:
+					trade['unrealized_pnl'] = None
+
 			return Response({
 				'sandbox': sandbox or 'ALL',
 				'initial_capital': initial_capital,
@@ -954,7 +978,7 @@ class PaperTradeSummaryView(APIView):
 				'open_value': round(open_value, 2),
 				'total_risk': round(total_risk, 2),
 				'closed_pnl': round(closed_pnl, 2),
-				'open_positions': PaperTradeSerializer(open_trades, many=True).data,
+				'open_positions': open_payload,
 				'closed_positions': PaperTradeSerializer(closed_trades[:25], many=True).data,
 			})
 		except Exception:
@@ -968,6 +992,34 @@ class PaperTradeSummaryView(APIView):
 				'open_positions': [],
 				'closed_positions': [],
 			})
+
+
+class SandboxWatchlistView(APIView):
+	def get(self, request):
+		sandbox = (request.query_params.get('sandbox') or 'WATCHLIST').strip().upper()
+		if sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'}:
+			raise ValidationError({'sandbox': 'Invalid sandbox.'})
+		watch = SandboxWatchlist.objects.filter(sandbox=sandbox).first()
+		if not watch:
+			watch = SandboxWatchlist.objects.create(sandbox=sandbox, symbols=[], source='manual')
+		return Response(SandboxWatchlistSerializer(watch).data)
+
+	def post(self, request):
+		sandbox = (request.data.get('sandbox') or 'WATCHLIST').strip().upper()
+		if sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'}:
+			raise ValidationError({'sandbox': 'Invalid sandbox.'})
+		symbols = request.data.get('symbols') or []
+		if isinstance(symbols, str):
+			symbols = [s.strip() for s in symbols.replace(',', ' ').split() if s.strip()]
+		if not isinstance(symbols, list):
+			symbols = []
+		clean = [str(s).strip().upper() for s in symbols if str(s).strip()]
+		clean = list(dict.fromkeys(clean))
+		watch, _ = SandboxWatchlist.objects.update_or_create(
+			sandbox=sandbox,
+			defaults={'symbols': clean, 'source': 'manual'},
+		)
+		return Response(SandboxWatchlistSerializer(watch).data)
 
 
 class PaperTradeExplanationLogView(APIView):
@@ -1072,6 +1124,8 @@ class PaperTradePerformanceView(APIView):
 			closed = PaperTrade.objects.filter(status='CLOSED', sandbox=sandbox).order_by('exit_date')
 			trades = closed.count()
 			wins = closed.filter(outcome='WIN').count()
+			if wins == 0 and trades:
+				wins = sum([1 for t in closed if float(t.pnl or 0) > 0])
 			win_rate = (wins / trades) * 100 if trades else 0.0
 			total_pnl = float(sum([float(t.pnl or 0) for t in closed]))
 			total_return_pct = (total_pnl / initial_capital) * 100 if initial_capital else 0.0
@@ -3634,7 +3688,52 @@ class AIBacktesterView(APIView):
 		engine = DataFusionEngine(symbol)
 		data = engine.fuse_all()
 		if data is None or data.empty:
-			return Response({'error': 'No data available for backtest.'}, status=400)
+			try:
+				fallback = yf.download(symbol, period=f"{days}d", interval='1d')
+				except Exception:
+				fallback = None
+			if fallback is None or fallback.empty or 'Close' not in fallback.columns:
+				return Response({'error': 'No data available for backtest.'}, status=400)
+			close = fallback['Close'].dropna()
+			if close.empty:
+				return Response({'error': 'No data available for backtest.'}, status=400)
+			base_capital = float(os.getenv('PAPER_CAPITAL', '10000'))
+			first_price = float(close.iloc[0]) if float(close.iloc[0]) else 1.0
+			buy_hold_curve = [round(base_capital * (float(price) / first_price), 2) for price in close]
+			return Response({
+				'symbol': symbol,
+				'days': days,
+				'universe': universe,
+				'buy_threshold': None,
+				'sell_threshold': None,
+				'model_version': 'fallback',
+				'feature_importance': [],
+				'logs': [
+					'Backtester fallback: Data Fusion unavailable, using price-only curve.',
+				],
+				'final_balance': buy_hold_curve[-1] if buy_hold_curve else base_capital,
+				'total_return_pct': 0.0,
+				'win_rate': 0.0,
+				'sharpe_ratio': 0.0,
+				'sortino_ratio': 0.0,
+				'profit_factor': 0.0,
+				'recovery_factor': 0.0,
+				'monte_carlo_ruin_pct': 0.0,
+				'max_drawdown': 0.0,
+				'expert_advice': ['Données insuffisantes pour un backtest IA complet.'],
+				'paper_vs_portfolio': {},
+				'equity_curve': buy_hold_curve,
+				'buy_hold_curve': buy_hold_curve,
+				'dates': [d.date().isoformat() for d in close.index],
+				'raw': {
+					'final_balance': buy_hold_curve[-1] if buy_hold_curve else base_capital,
+					'total_return_pct': 0.0,
+					'win_rate': 0.0,
+					'sharpe_ratio': 0.0,
+					'max_drawdown': 0.0,
+					'equity_curve': buy_hold_curve,
+				},
+			})
 
 		payload = load_or_train_model(data, model_path=get_model_path(universe))
 		backtester = AIBacktester(data, payload, symbol=symbol)
