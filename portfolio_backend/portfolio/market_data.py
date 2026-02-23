@@ -23,7 +23,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     _yfinance = None
 
-from .alpaca_data import get_daily_bars, get_intraday_bars_range, get_latest_trade_price
+
 
 
 SYMBOL_ALIASES = {

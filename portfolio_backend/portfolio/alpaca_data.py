@@ -30,6 +30,7 @@ from .patterns import enrich_bars_with_patterns
 from . import market_data as market_data
 
 
+
 def _alpaca_client() -> StockHistoricalDataClient | None:
     if StockHistoricalDataClient is None:
         return None
@@ -154,6 +155,7 @@ def get_intraday_bars(symbol: str, minutes: int = 390) -> pd.DataFrame:
 def _get_yahoo_fallback(symbol: str, minutes: int, max_days: int) -> pd.DataFrame:
     """Fonction de secours robuste utilisant Yahoo Finance via market_data"""
     try:
+        from . import market_data  # <--- L'IMPORT DOIT ÊTRE ICI
         # On demande un peu plus de jours pour être sûr de couvrir les gaps du week-end
         hist = market_data.Ticker(symbol).history(period=f'{max_days+2}d', interval='1m', timeout=8)
         if hist is None or hist.empty:
