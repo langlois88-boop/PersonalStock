@@ -82,7 +82,14 @@ from .serializers import (
 	SandboxWatchlistSerializer,
 )
 from .ai_module import run_predictions
-from .tasks import _fetch_yahoo_screener, _fetch_yfinance_screeners
+from .tasks import (
+	_fetch_yahoo_screener,
+	_fetch_yfinance_screeners,
+	_google_news_titles,
+	_finbert_score_from_titles,
+	_intraday_pct_change,
+	CORRELATION_MAP,
+)
 from .ai_scout import build_scout_summary
 from .alpaca_data import get_intraday_bars, get_intraday_context
 from .patterns import build_pattern_annotations, enrich_bars_with_patterns
@@ -202,6 +209,92 @@ def _rss_sentiment_window(ticker: str, hours: int, offset_hours: int = 0) -> flo
 	if not scores:
 		return 0.0
 	return float(sum(scores) / len(scores))
+
+
+def _fusion_close_series(frame: pd.DataFrame) -> pd.Series | None:
+	if frame is None or frame.empty:
+		return None
+	if 'Close' in frame.columns:
+		return frame['Close']
+	if 'close' in frame.columns:
+		return frame['close']
+	return None
+
+
+def _compute_rsi_from_series(series: pd.Series, period: int = 14) -> float | None:
+	if series is None or series.empty or len(series) < period:
+		return None
+	delta = series.diff().fillna(0)
+	gain = delta.clip(lower=0).rolling(period).mean()
+	loss = (-delta.clip(upper=0)).rolling(period).mean()
+	last_gain = float(gain.iloc[-1]) if pd.notna(gain.iloc[-1]) else None
+	last_loss = float(loss.iloc[-1]) if pd.notna(loss.iloc[-1]) else None
+	if last_gain is None or last_loss is None:
+		return None
+	if last_loss == 0:
+		return 100.0 if last_gain > 0 else 0.0
+	rs = last_gain / last_loss
+	rsi = 100 - (100 / (1 + rs))
+	return float(rsi)
+
+
+def _daily_correlation(symbol: str, parent: str, days: int = 60) -> float | None:
+	try:
+		data = yf.download(
+			tickers=f"{symbol} {parent}",
+			period=f"{days}d",
+			interval='1d',
+			group_by='ticker',
+			threads=True,
+			auto_adjust=False,
+		)
+		if data is None or data.empty:
+			return None
+		def _series(sym: str) -> pd.Series | None:
+			if isinstance(data.columns, pd.MultiIndex) and sym in data:
+				return _extract_close_series(data[sym])
+			return _extract_close_series(data)
+		s1 = _series(symbol)
+		s2 = _series(parent)
+		if s1 is None or s2 is None:
+			return None
+		returns = pd.concat([s1.pct_change(), s2.pct_change()], axis=1).dropna()
+		if returns.shape[0] < 10:
+			return None
+		return float(returns.iloc[:, 0].corr(returns.iloc[:, 1]))
+	except Exception:
+		return None
+
+
+def _load_signal_model_payload(model_path: Path) -> dict[str, Any] | None:
+	if model_path.exists():
+		try:
+			payload = joblib.load(model_path)
+			if isinstance(payload, dict) and payload.get('model') and payload.get('features'):
+				return payload
+			if hasattr(payload, 'predict_proba'):
+				return {'model': payload, 'features': FEATURE_COLUMNS}
+		except Exception:
+			return None
+	return None
+
+
+def _predict_model_signal(payload: dict[str, Any], fusion_df: pd.DataFrame) -> float | None:
+	if not payload or fusion_df is None or fusion_df.empty:
+		return None
+	feature_list = payload.get('features') or []
+	if not feature_list:
+		return None
+	last_row = fusion_df.tail(1).copy()
+	for col in feature_list:
+		if col not in last_row.columns:
+			last_row[col] = 0.0
+	features = last_row[feature_list].fillna(0).values
+	try:
+		signal = float(payload['model'].predict_proba(features)[0][1])
+		return float(apply_feature_weighting_to_signal(signal, last_row.iloc[0], ''))
+	except Exception:
+		return None
 
 
 class StockViewSet(viewsets.ModelViewSet):
@@ -3558,6 +3651,113 @@ class AIScoutView(APIView):
 			return Response(result)
 		except Exception as exc:
 			return Response({'error': str(exc)}, status=500)
+
+
+class ValueNavigatorAPI(APIView):
+	def get(self, request):
+		limit = int(request.query_params.get('limit') or 25)
+		limit = max(5, min(limit, 100))
+		min_signal = float(request.query_params.get('min_signal') or 0.7)
+		min_sentiment = float(request.query_params.get('min_sentiment') or 0.6)
+		min_corr = float(request.query_params.get('min_corr') or 0.2)
+		cache_key = f"value-navigator:{limit}:{min_signal}:{min_sentiment}:{min_corr}"
+		cached = cache.get(cache_key)
+		if cached:
+			return Response(cached)
+
+		model_path = get_model_path('BLUECHIP')
+		payload = _load_signal_model_payload(model_path)
+		if payload is None:
+			return Response({'error': 'model not available'}, status=500)
+
+		watchlist: list[str] = []
+		try:
+			quotes = _fetch_yfinance_screeners(
+				['most_actives', 'day_gainers', 'undervalued_large_caps', 'growth_technology_stocks'],
+				count=200,
+			)
+			watchlist.extend([
+				str(q.get('symbol') or '').strip().upper()
+				for q in quotes
+				if isinstance(q, dict)
+			])
+			quotes = _fetch_yahoo_screener('most_actives', count=200)
+			watchlist.extend([
+				str(q.get('symbol') or '').strip().upper()
+				for q in quotes
+				if isinstance(q, dict)
+			])
+			quotes = _fetch_yahoo_screener('day_gainers', count=200)
+			watchlist.extend([
+				str(q.get('symbol') or '').strip().upper()
+				for q in quotes
+				if isinstance(q, dict)
+			])
+		except Exception:
+			watchlist = []
+
+		seen: set[str] = set()
+		symbols: list[str] = []
+		for sym in watchlist:
+			if not sym or sym in seen:
+				continue
+			seen.add(sym)
+			symbols.append(sym)
+			if len(symbols) >= 500:
+				break
+
+		results: list[dict[str, Any]] = []
+		for symbol in symbols:
+			try:
+				fusion = DataFusionEngine(symbol, use_alpaca=False)
+				fusion_df = fusion.fuse_all()
+				if fusion_df is None or fusion_df.empty:
+					continue
+				signal = _predict_model_signal(payload, fusion_df)
+				if signal is None or signal < min_signal:
+					continue
+
+				close_series = _fusion_close_series(fusion_df)
+				rsi = _compute_rsi_from_series(close_series) if close_series is not None else None
+				sentiment_titles = _google_news_titles(symbol, days=2)
+				sentiment_raw = _finbert_score_from_titles(sentiment_titles)
+				sentiment_score = max(0.0, min(1.0, (sentiment_raw + 1.0) / 2.0))
+				if sentiment_score < min_sentiment:
+					continue
+
+				parent = (CORRELATION_MAP.get(symbol) or os.getenv('VALUE_NAV_PARENT_DEFAULT', 'SPY')).strip().upper()
+				parent_change = _intraday_pct_change(parent, minutes=60) or 0.0
+				corr = _daily_correlation(symbol, parent, days=60)
+				corr_value = float(corr or 0.0)
+				if parent_change <= 0 or corr_value < min_corr:
+					continue
+
+				reasons = []
+				if rsi is not None:
+					if rsi <= 35:
+						reasons.append(f"RSI sortie de survente ({rsi:.1f})")
+					else:
+						reasons.append(f"RSI {rsi:.1f}")
+				reasons.append(f"Sentiment News {sentiment_score:.2f}")
+				reasons.append(f"Corrélation {parent} ascendante")
+
+				results.append({
+					'symbol': symbol,
+					'signal': round(float(signal), 3),
+					'sentiment': round(float(sentiment_score), 3),
+					'parent': parent,
+					'parent_change_pct': round(float(parent_change) * 100, 2),
+					'correlation': round(float(corr_value), 3),
+					'explanation': "Acheter car " + " + ".join(reasons),
+				})
+				if len(results) >= limit:
+					break
+			except Exception:
+				continue
+
+		payload_out = {'results': results, 'count': len(results)}
+		cache.set(cache_key, payload_out, timeout=60 * 10)
+		return Response(payload_out)
 
 
 class AIScoutBatchView(APIView):
