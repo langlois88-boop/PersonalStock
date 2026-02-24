@@ -2578,6 +2578,48 @@ def _get_vix_level() -> float | None:
     return None
 
 
+def get_market_sentiment() -> tuple[str, dict[str, float | None]]:
+    def _index_change(symbol: str) -> float | None:
+        try:
+            hist = yf.Ticker(symbol).history(period='2d', interval='1d', timeout=10)
+            if hist is None or hist.empty or 'Close' not in hist or len(hist) < 2:
+                return None
+            prev = _safe_float(hist['Close'].iloc[-2])
+            last = _safe_float(hist['Close'].iloc[-1])
+            if not prev or not last:
+                return None
+            return ((last - prev) / prev) * 100
+        except Exception:
+            return None
+
+    spy_change = _index_change('SPY')
+    tsx_change = _index_change('^GSPTSE')
+    vix_level = _get_vix_level()
+
+    bear_threshold = float(os.getenv('MARKET_BEAR_THRESHOLD', '-1.5'))
+    bull_threshold = float(os.getenv('MARKET_BULL_THRESHOLD', '1.5'))
+    vix_caution = float(os.getenv('MARKET_VIX_CAUTION', '25'))
+
+    if (spy_change is not None and spy_change <= bear_threshold) or (
+        tsx_change is not None and tsx_change <= bear_threshold
+    ):
+        sentiment = 'BEARISH'
+    elif vix_level is not None and vix_level >= vix_caution:
+        sentiment = 'CAUTION'
+    elif (spy_change is not None and spy_change >= bull_threshold) or (
+        tsx_change is not None and tsx_change >= bull_threshold
+    ):
+        sentiment = 'BULLISH'
+    else:
+        sentiment = 'NEUTRAL'
+
+    return sentiment, {
+        'spy_change': None if spy_change is None else round(float(spy_change), 2),
+        'tsx_change': None if tsx_change is None else round(float(tsx_change), 2),
+        'vix': None if vix_level is None else round(float(vix_level), 2),
+    }
+
+
 def _model_signal(
     symbol: str,
     universe: str,
@@ -3050,6 +3092,8 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     created = 0
     closed = 0
 
+    market_sentiment, market_meta = get_market_sentiment()
+
     for symbol, trades in open_trades_by_symbol.items():
         price = _latest_price(symbol)
         if price is None:
@@ -3152,6 +3196,18 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             multiplier = _bluechip_aggressive_multiplier()
             if multiplier > 1.0:
                 signal = min(1.0, float(signal) * multiplier)
+        if market_sentiment in {'BEARISH', 'CAUTION'}:
+            notify_key = f"market_sentiment_block:{sandbox}:{_ny_time_now().strftime('%Y%m%d%H')}"
+            if not cache.get(notify_key):
+                cache.set(notify_key, True, timeout=60 * 60)
+                _send_telegram_alert(
+                    "🧭 Marché défavorable : trade bloqué ("
+                    f"{market_sentiment}). SPY {market_meta.get('spy_change')}%, "
+                    f"TSX {market_meta.get('tsx_change')}%, VIX {market_meta.get('vix')}.",
+                    allow_during_blackout=True,
+                    category='risk',
+                )
+            continue
         if signal is None or signal < buy_threshold:
             continue
         if existing_trades and signal < reinforce_min_score:
