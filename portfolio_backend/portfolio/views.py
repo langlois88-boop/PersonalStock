@@ -5074,7 +5074,7 @@ class PortfolioOptimizerView(APIView):
 				universe = 'BLUECHIP' if is_stable else 'PENNY'
 				try:
 					action = self._build_action(holding, universe, lookback_days, buy_threshold, sell_threshold, fast_mode=fast_mode)
-					except Exception:
+				except Exception:
 					action = None
 				if action:
 					actions.append(action)
