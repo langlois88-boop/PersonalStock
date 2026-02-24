@@ -5165,13 +5165,14 @@ def deep_learning_retro_train() -> dict[str, Any]:
                 daily = yf.download(symbol, period='5y', interval='1d')
                 if daily is None or daily.empty:
                     continue
-                daily = daily.rename(columns={
-                    'Open': 'open',
-                    'High': 'high',
-                    'Low': 'low',
-                    'Close': 'close',
-                    'Volume': 'volume',
-                })
+                if not isinstance(daily.columns, pd.MultiIndex):
+                    daily = daily.rename(columns={
+                        'Open': 'open',
+                        'High': 'high',
+                        'Low': 'low',
+                        'Close': 'close',
+                        'Volume': 'volume',
+                    })
                 if isinstance(daily.index, pd.DatetimeIndex):
                     daily['timestamp'] = daily.index
 
@@ -5475,6 +5476,10 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
                 close_series = daily['Close']
                 if isinstance(close_series, pd.DataFrame):
                     close_series = close_series.iloc[:, 0] if not close_series.empty else None
+            elif 'close' in level0:
+                close_series = daily['close']
+                if isinstance(close_series, pd.DataFrame):
+                    close_series = close_series.iloc[:, 0] if not close_series.empty else None
             elif 'Close' in daily.columns.get_level_values(-1):
                 try:
                     close_series = daily.xs('Close', axis=1, level=-1)
@@ -5536,6 +5541,16 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
                 high = daily['High']
                 low = daily['Low']
                 close = daily['Close']
+                if isinstance(high, pd.DataFrame):
+                    high = high.iloc[:, 0] if not high.empty else None
+                if isinstance(low, pd.DataFrame):
+                    low = low.iloc[:, 0] if not low.empty else None
+                if isinstance(close, pd.DataFrame):
+                    close = close.iloc[:, 0] if not close.empty else None
+            elif {'high', 'low', 'close'}.issubset(set(level0)):
+                high = daily['high']
+                low = daily['low']
+                close = daily['close']
                 if isinstance(high, pd.DataFrame):
                     high = high.iloc[:, 0] if not high.empty else None
                 if isinstance(low, pd.DataFrame):
