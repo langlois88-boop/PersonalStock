@@ -482,9 +482,6 @@ def _bluechip_aggressive_multiplier() -> float:
 
 def _calc_stop_target_from_prev_candle(bars: pd.DataFrame, current_price: float) -> tuple[float, float, float]:
     if bars is None or bars.empty or len(bars) < 2:
-            'penalty_note': (
-                f"Le modèle a été pénalisé sur {penalized} trades perdants pour améliorer sa prudence"
-            ),
         stop_loss = max(current_price * 0.98, current_price - 0.05)
         risk = max(current_price - stop_loss, 0.01)
         target_price = current_price + (2 * risk)
