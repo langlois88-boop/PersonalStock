@@ -1074,9 +1074,10 @@ def fetch_news_daily(days: int = 1, page_size: int = 10, language: str = 'en') -
 
             for a in articles:
                 seen += 1
-                url = a.get('url')
+                url = (a.get('url') or '').strip()
                 if not url:
                     continue
+                url = url[:500]
 
                 published_at = None
                 published_raw = a.get('publishedAt')
@@ -1142,9 +1143,10 @@ def fetch_finnhub_news_daily(days: int = 1) -> dict[str, int]:
             news = client.company_news(stock.symbol, _from=str(from_dt), to=str(to_dt))
             for item in news:
                 seen += 1
-                url = item.get('url')
+                url = (item.get('url') or '').strip()
                 if not url:
                     continue
+                url = url[:500]
 
                 headline = (item.get('headline') or '').strip()[:300] or url
                 summary = (item.get('summary') or '').strip()
@@ -1202,9 +1204,10 @@ def fetch_google_news_daily(days: int = 1) -> dict[str, int]:
 
             for entry in feed.entries:
                 seen += 1
-                link = entry.get('link')
+                link = (entry.get('link') or '').strip()
                 if not link:
                     continue
+                link = link[:500]
 
                 headline = (entry.get('title') or '').strip()[:300] or link
                 summary = (entry.get('summary') or '').strip()
@@ -1335,9 +1338,10 @@ def fetch_press_releases_hourly(hours: int = 24) -> dict[str, int]:
 
             for entry in feed.entries:
                 seen += 1
-                link = entry.get('link')
+                link = (entry.get('link') or '').strip()
                 if not link:
                     continue
+                link = link[:500]
 
                 headline = (entry.get('title') or '').strip()[:300] or link
                 summary = (entry.get('summary') or '').strip()
