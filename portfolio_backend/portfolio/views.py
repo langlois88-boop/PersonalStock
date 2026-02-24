@@ -1683,6 +1683,9 @@ class PortfolioDashboardView(APIView):
 	def _fast_mode(self) -> bool:
 		return str(os.getenv('DASHBOARD_FAST_MODE', '1')).strip().lower() in {'1', 'true', 'yes', 'y'}
 
+	def get(self, request):
+		return _portfolio_dashboard_get(self, request)
+
 	def _current_drawdown(self, values: list[float]) -> float:
 		if not values:
 			return 0.0
@@ -2301,7 +2304,8 @@ def _gemini_macro_ok(symbol: str, sector: str, news_titles: list[str]) -> bool:
 			'change_7d': change_7d,
 		}
 
-	def get(self, request):
+
+def _portfolio_dashboard_get(self, request):
 		portfolio_id = request.query_params.get('portfolio_id')
 		enrich = self._should_enrich(request)
 		portfolio = None
