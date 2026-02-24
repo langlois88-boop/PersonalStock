@@ -5448,7 +5448,19 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
                 'Volume': 'volume',
             })
 
-        last_price = float(daily['close'].iloc[-1]) if 'close' in daily else float(daily['Close'].iloc[-1])
+        close_series = None
+        if 'close' in daily:
+            close_series = daily['close']
+        elif 'Close' in daily:
+            close_series = daily['Close']
+        elif 'Adj Close' in daily:
+            close_series = daily['Adj Close']
+        else:
+            close_series = _extract_close_series(daily)
+
+        if close_series is None or close_series.empty:
+            return {'error': f"Données introuvables pour {symbol}"}
+        last_price = float(close_series.iloc[-1])
 
         is_bluechip = last_price >= 5
         universe = 'BLUECHIP' if is_bluechip else 'PENNY'
