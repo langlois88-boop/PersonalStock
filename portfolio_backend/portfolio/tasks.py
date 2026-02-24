@@ -5461,13 +5461,14 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
         if daily is None or daily.empty:
             return {'error': f"Données introuvables pour {symbol}"}
         symbol = selected_symbol or symbol
-        daily = daily.rename(columns={
-            'Open': 'open',
-            'High': 'high',
-            'Low': 'low',
-            'Close': 'close',
-            'Volume': 'volume',
-        })
+        if not isinstance(daily.columns, pd.MultiIndex):
+            daily = daily.rename(columns={
+                'Open': 'open',
+                'High': 'high',
+                'Low': 'low',
+                'Close': 'close',
+                'Volume': 'volume',
+            })
 
         close_series = None
         if isinstance(daily.columns, pd.MultiIndex):
