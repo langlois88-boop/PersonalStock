@@ -235,6 +235,16 @@ def download(
     return pd.concat(frames, axis=1)
 
 
+def _sanitize_period_start_end(
+    period: str | None,
+    start: Any | None,
+    end: Any | None,
+) -> tuple[str | None, Any | None, Any | None]:
+    if period and (start or end):
+        return None, start, end
+    return period, start, end
+
+
 def _yf_download_fallback(
     symbols: list[str],
     period: str | None,
@@ -255,6 +265,7 @@ def _yf_download_fallback(
         return pd.DataFrame()
     timeout = _yf_timeout()
     tickers = ' '.join(symbols)
+    period, start, end = _sanitize_period_start_end(period, start, end)
     fallback = _with_timeout(
         lambda: _yfinance.download(
             tickers=tickers,
@@ -353,6 +364,7 @@ class Ticker:
         if _yfinance is None or not _allow_yf_price_fallback(self.symbol):
             return pd.DataFrame()
         fallback_timeout = float(timeout) if timeout else _yf_timeout()
+        period, start, end = _sanitize_period_start_end(period, start, end)
         fallback = _with_timeout(
             lambda: _yfinance.Ticker(self.symbol).history(
                 period=period,
