@@ -5469,7 +5469,20 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
         })
 
         close_series = None
-        if 'close' in daily:
+        if isinstance(daily.columns, pd.MultiIndex):
+            level0 = daily.columns.get_level_values(0)
+            if 'Close' in level0:
+                close_series = daily['Close']
+                if isinstance(close_series, pd.DataFrame):
+                    close_series = close_series.iloc[:, 0] if not close_series.empty else None
+            elif 'Close' in daily.columns.get_level_values(-1):
+                try:
+                    close_series = daily.xs('Close', axis=1, level=-1)
+                    if isinstance(close_series, pd.DataFrame):
+                        close_series = close_series.iloc[:, 0] if not close_series.empty else None
+                except Exception:
+                    close_series = None
+        elif 'close' in daily:
             close_series = daily['close']
         elif 'Close' in daily:
             close_series = daily['Close']
@@ -5506,7 +5519,34 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
         sentiment_score = max(0.0, min(1.0, (float(news_sentiment) + 1.0) / 2.0))
 
         atr = None
-        if {'high', 'low', 'close'}.issubset(set(daily.columns)):
+        if isinstance(daily.columns, pd.MultiIndex):
+            level0 = daily.columns.get_level_values(0)
+            if {'High', 'Low', 'Close'}.issubset(set(level0)):
+                high = daily['High']
+                low = daily['Low']
+                close = daily['Close']
+                if isinstance(high, pd.DataFrame):
+                    high = high.iloc[:, 0] if not high.empty else None
+                if isinstance(low, pd.DataFrame):
+                    low = low.iloc[:, 0] if not low.empty else None
+                if isinstance(close, pd.DataFrame):
+                    close = close.iloc[:, 0] if not close.empty else None
+            elif {'High', 'Low', 'Close'}.issubset(set(daily.columns.get_level_values(-1))):
+                try:
+                    high = daily.xs('High', axis=1, level=-1)
+                    low = daily.xs('Low', axis=1, level=-1)
+                    close = daily.xs('Close', axis=1, level=-1)
+                    if isinstance(high, pd.DataFrame):
+                        high = high.iloc[:, 0] if not high.empty else None
+                    if isinstance(low, pd.DataFrame):
+                        low = low.iloc[:, 0] if not low.empty else None
+                    if isinstance(close, pd.DataFrame):
+                        close = close.iloc[:, 0] if not close.empty else None
+                except Exception:
+                    high = low = close = None
+            else:
+                high = low = close = None
+        elif {'high', 'low', 'close'}.issubset(set(daily.columns)):
             high = daily['high']
             low = daily['low']
             close = daily['close']
