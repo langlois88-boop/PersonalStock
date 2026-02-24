@@ -3257,8 +3257,18 @@ def execute_paper_trades_ai_penny() -> dict[str, Any]:
     return _execute_paper_trades_for_sandbox('AI_PENNY', 'AI_PENNY')
 
 
+def _default_scanner_symbols() -> list[str]:
+    return [
+        'AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'TSLA', 'AVGO', 'AMD', 'INTC',
+        'QCOM', 'NFLX', 'ASML', 'AMAT', 'ADBE', 'CSCO', 'TMUS', 'ORCL', 'CRM', 'PANW',
+        'SNOW', 'PLTR', 'MU', 'SMCI', 'TSM', 'COIN', 'SOFI', 'RIVN', 'LCID', 'NIO',
+        'SHOP', 'SQ', 'PYPL', 'UBER', 'LYFT', 'ABNB', 'ROKU', 'PINS', 'DKNG', 'HOOD',
+        'MARA', 'RIOT', 'HUT', 'HIVE', 'BITF', 'CLSK', 'MSTR', 'PLUG', 'FCEL', 'SOUN',
+    ]
+
+
 @shared_task
-def market_scanner_task() -> dict[str, Any]:
+def market_scanner_task(symbols: list[str] | None = None) -> dict[str, Any]:
     """Scan market for high-momentum candidates and cache results."""
     min_price = float(os.getenv('SCANNER_MIN_PRICE', '0.5'))
     max_price = float(os.getenv('SCANNER_MAX_PRICE', '10'))
@@ -3279,7 +3289,9 @@ def market_scanner_task() -> dict[str, Any]:
     notify = os.getenv('AI_SCANNER_TELEGRAM', 'false').lower() in {'1', 'true', 'yes', 'y'}
 
     symbols_env = os.getenv('SCANNER_SYMBOLS', '').strip()
-    if symbols_env:
+    if symbols:
+        symbols = [s.strip().upper() for s in symbols if s and str(s).strip()]
+    elif symbols_env:
         symbols = [s.strip().upper() for s in symbols_env.split(',') if s.strip()]
     else:
         symbols = get_tradable_symbols(limit=800)
@@ -3427,15 +3439,17 @@ def market_scanner_task() -> dict[str, Any]:
                 },
             )
 
-    return {'status': 'ok', 'count': len(results)}
+    return {'status': 'ok', 'count': len(results), 'results': results}
 
 
 @shared_task
-def scan_market_for_opportunities() -> dict[str, Any]:
+def scan_market_for_opportunities(min_score: float | None = None) -> dict[str, Any]:
     """Wrapper around market_scanner_task with a configurable score threshold."""
-    payload = market_scanner_task()
+    symbols_env = os.getenv('SCANNER_SYMBOLS', '').strip()
+    symbols = None if symbols_env else _default_scanner_symbols()
+    payload = market_scanner_task(symbols=symbols)
     try:
-        min_score = float(os.getenv('SCANNER_MIN_SCORE', '0.8'))
+        min_score = float(min_score if min_score is not None else os.getenv('SCANNER_MIN_SCORE', '0.8'))
         results = payload.get('results') or []
         filtered = [r for r in results if float(r.get('score') or 0) >= min_score]
         if filtered:
