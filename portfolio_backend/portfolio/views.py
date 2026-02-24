@@ -1686,6 +1686,147 @@ class PortfolioDashboardView(APIView):
 	def get(self, request):
 		return _portfolio_dashboard_get(self, request)
 
+	def _should_enrich(self, request) -> bool:
+		flag = request.query_params.get('enrich')
+		if flag is not None:
+			return str(flag).strip().lower() in {'1', 'true', 'yes', 'y'}
+		return False
+
+	def _build_confidence_meter(self) -> dict[str, Any]:
+		return {
+			'symbol': None,
+			'ai_score': None,
+			'volume_z': None,
+			'vol_regime': None,
+			'win_rate': None,
+			'sharpe': None,
+			'status': 'neutral',
+			'label': 'Observation',
+			'note': "Indicateurs indisponibles.",
+			'thresholds': {
+				'ai_score_min': None,
+				'volume_z_min': None,
+				'vol_regime_max': None,
+			},
+		}
+
+	def _stop_price(self, price: float | None) -> float:
+		if not price:
+			return 0.0
+		return round(float(price) * 0.97, 2)
+
+	def _get_rsi(self, symbol: str) -> float | None:
+		return None
+
+	def _get_rsi_history(self, symbol: str, window: int = 5) -> list[float]:
+		return []
+
+	def _get_ma20(self, symbol: str) -> float | None:
+		return None
+
+	def _model_stats(self, symbol: str) -> dict[str, Any]:
+		return {'win_rate': None, 'sharpe': None}
+
+	def _sector_relative_strength(self, stock: Stock) -> float | None:
+		return None
+
+	def _earnings_blacklist(self, symbol: str) -> tuple[bool, date | None]:
+		return False, None
+
+	def _ai_score(self, symbol: str) -> tuple[float | None, str | None]:
+		return None, None
+
+	def _build_holdings_from_account_transactions(
+		self,
+		transactions: list[AccountTransaction],
+		enrich: bool,
+	) -> dict[str, Any]:
+		position_map: dict[str, dict[str, Any]] = {}
+		for tx in transactions:
+			if tx.type == 'DIVIDEND':
+				continue
+			sign = 1 if tx.type == 'BUY' else -1
+			symbol_key = (tx.stock.symbol or '').strip().upper() or str(tx.stock_id)
+			entry = position_map.setdefault(
+				symbol_key,
+				{'stock': tx.stock, 'shares': 0.0, 'buy_qty': 0.0, 'buy_cost': 0.0},
+			)
+			qty = float(tx.quantity or 0)
+			entry['shares'] += qty * sign
+			if tx.type == 'BUY':
+				entry['buy_qty'] += qty
+				entry['buy_cost'] += qty * float(tx.price or 0)
+
+		items = []
+		total_value = 0.0
+		stable_value = 0.0
+		risky_value = 0.0
+		change_1d = 0.0
+		change_7d = 0.0
+		total_cost_value = 0.0
+		for payload in position_map.values():
+			shares = float(payload['shares'] or 0)
+			if shares <= 0:
+				continue
+			stock = payload['stock']
+			buy_qty = float(payload.get('buy_qty') or 0)
+			buy_cost = float(payload.get('buy_cost') or 0)
+			avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
+			price = stock.latest_price
+			if price is None:
+				last = PriceHistory.objects.filter(stock=stock).order_by('-date').first()
+				price = float(last.close_price) if last else 0.0
+			price = float(price or 0)
+			effective_price = price if price > 0 else avg_cost
+			value = shares * effective_price
+			cost_value = avg_cost * shares
+			unrealized = value - cost_value
+			unrealized_pct = (unrealized / cost_value * 100) if cost_value else 0
+			total_cost_value += cost_value
+			total_value += value
+			is_stable = effective_price >= 5 or float(stock.dividend_yield or 0) >= 0.02
+			if is_stable:
+				stable_value += value
+			else:
+				risky_value += value
+
+			items.append({
+				'ticker': stock.symbol,
+				'name': stock.name,
+				'sector': stock.sector,
+				'dividend_yield': float(stock.dividend_yield or 0),
+				'shares': shares,
+				'price': effective_price,
+				'value': value,
+				'avg_cost': round(avg_cost, 4),
+				'cost_value': round(cost_value, 2),
+				'unrealized_pnl': round(unrealized, 2),
+				'unrealized_pnl_pct': round(unrealized_pct, 2),
+				'volume_z': None,
+				'ai_score': None,
+				'rsi': None,
+				'rsi_history': [],
+				'ma20': None,
+				'stop_price': self._stop_price(effective_price),
+				'exit_strategy': None,
+				'model_win_rate': None,
+				'model_sharpe': None,
+				'relative_strength': None,
+				'earnings_blacklisted': False,
+				'earnings_date': None,
+				'category': 'Stable' if is_stable else 'Risky',
+			})
+
+		return {
+			'items': items,
+			'total_value': total_value,
+			'stable_value': stable_value,
+			'risky_value': risky_value,
+			'total_cost_value': total_cost_value,
+			'change_1d': change_1d,
+			'change_7d': change_7d,
+		}
+
 	def _current_drawdown(self, values: list[float]) -> float:
 		if not values:
 			return 0.0
