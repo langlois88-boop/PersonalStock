@@ -3272,6 +3272,55 @@ def _default_scanner_symbols() -> list[str]:
 
 
 @shared_task
+def auto_discover_top_movers(min_score: float | None = None) -> dict[str, Any]:
+    """Discover active TSX/NASDAQ movers and run the scanner on them."""
+    screener_ids = [
+        s.strip()
+        for s in os.getenv('TOP_MOVER_SCREENERS', 'most_actives,day_gainers').split(',')
+        if s.strip()
+    ]
+    tsx_top = [
+        'SHOP.TO', 'TD.TO', 'RY.TO', 'ENB.TO', 'CNQ.TO', 'ATD.TO', 'CS.TO',
+        'BCE.TO', 'BNS.TO', 'SU.TO',
+    ]
+    discovered: list[str] = []
+    try:
+        quotes = _fetch_yfinance_screeners(screener_ids, count=40)
+        discovered.extend([
+            str(item.get('symbol') or '').strip().upper()
+            for item in quotes
+            if item.get('symbol')
+        ])
+    except Exception:
+        pass
+    discovered.extend(tsx_top)
+    discovered = [s for s in dict.fromkeys(discovered) if s]
+    if not discovered:
+        return {'status': 'empty', 'count': 0, 'symbols': []}
+
+    payload = market_scanner_task(symbols=discovered)
+    try:
+        threshold = float(min_score if min_score is not None else os.getenv('SCANNER_MIN_SCORE', '0.8'))
+        results = payload.get('results') or []
+        filtered = [r for r in results if float(r.get('score') or 0) >= threshold]
+        if filtered:
+            top = filtered[0]
+            _send_telegram_alert(
+                f"🚀 Top Movers: {top['symbol']} score {top['score']:.2f} RVOL {top['rvol']}",
+                allow_during_blackout=True,
+                category='signal',
+            )
+        payload['filtered'] = filtered[:5]
+        payload['min_score'] = threshold
+    except Exception:
+        pass
+    payload['symbols'] = discovered
+    payload['count'] = len(payload.get('results') or [])
+    payload['status'] = payload.get('status') or 'ok'
+    return payload
+
+
+@shared_task
 def market_scanner_task(symbols: list[str] | None = None) -> dict[str, Any]:
     """Scan market for high-momentum candidates and cache results."""
     min_price = float(os.getenv('SCANNER_MIN_PRICE', '0.5'))

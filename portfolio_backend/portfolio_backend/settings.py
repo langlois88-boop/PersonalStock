@@ -383,6 +383,14 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.penny_sniper_alert',
         'schedule': crontab(minute='*/1', hour='9-16', day_of_week='mon-fri'),
     },
+    'discover-opportunities-morning': {
+        'task': 'portfolio.tasks.auto_discover_top_movers',
+        'schedule': crontab(hour=9, minute=35, day_of_week='mon-fri'),
+    },
+    'market-scan-hourly': {
+        'task': 'portfolio.tasks.scan_market_for_opportunities',
+        'schedule': crontab(minute=0, hour='10-16', day_of_week='mon-fri'),
+    },
 }
 
 # Alerting / Email (dev defaults)
