@@ -196,6 +196,10 @@ def _ensure_features(df: pd.DataFrame) -> pd.DataFrame:
     for col in FEATURE_COLUMNS:
         if col not in data.columns:
             data[col] = 0.0
+    if "VolumeZ" in data.columns:
+        data["VolumeZ"] = pd.to_numeric(data["VolumeZ"], errors="coerce").fillna(0.0)
+    if "sector_code" in data.columns:
+        data["sector_code"] = pd.to_numeric(data["sector_code"], errors="coerce").fillna(0).astype(int)
     if "sector_code" in data.columns and "VolumeZ" in data.columns:
         grouped = data.groupby("sector_code")["VolumeZ"]
         mean = grouped.transform("mean")
