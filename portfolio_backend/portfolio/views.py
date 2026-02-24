@@ -1690,51 +1690,329 @@ class PortfolioDashboardView(APIView):
 		flag = request.query_params.get('enrich')
 		if flag is not None:
 			return str(flag).strip().lower() in {'1', 'true', 'yes', 'y'}
-		return False
+		return True
 
-	def _build_confidence_meter(self) -> dict[str, Any]:
-		return {
-			'symbol': None,
-			'ai_score': None,
-			'volume_z': None,
-			'vol_regime': None,
-			'win_rate': None,
-			'sharpe': None,
-			'status': 'neutral',
-			'label': 'Observation',
-			'note': "Indicateurs indisponibles.",
-			'thresholds': {
-				'ai_score_min': None,
-				'volume_z_min': None,
-				'vol_regime_max': None,
-			},
-		}
+	def _build_confidence_meter(self) -> dict[str, Any] | None:
+		symbol = (os.getenv('CONFIDENCE_SYMBOL') or os.getenv('PAPER_WATCHLIST', 'SPY').split(',')[0]).strip().upper()
+		if not symbol:
+			return None
+		try:
+			force_full = str(os.getenv('CONFIDENCE_FORCE_FULL', '')).strip().lower() in {'1', 'true', 'yes', 'y'}
+			fast_mode = False if force_full else self._fast_mode()
+			fusion = DataFusionEngine(symbol, fast_mode=fast_mode)
+			fusion_df = fusion.fuse_all()
+			if fusion_df is None or fusion_df.empty:
+				return {'symbol': symbol, 'status': 'unavailable'}
+			payload = load_or_train_model(fusion_df, model_path=get_model_path('BLUECHIP'))
+			if not payload or not payload.get('model'):
+				return {'symbol': symbol, 'status': 'unavailable'}
+			last_row = fusion_df.tail(1).copy()
+			feature_list = payload.get('features') or FEATURE_COLUMNS
+			for col in feature_list:
+				if col not in last_row.columns:
+					last_row[col] = 0.0
+			features = last_row[feature_list].fillna(0).values
+			try:
+				signal = float(payload['model'].predict_proba(features)[0][1])
+			except Exception:
+				signal = 0.0
+			volume_z = self._safe_float(last_row.iloc[0].get('VolumeZ', 0.0))
+			vol_regime = self._safe_float(last_row.iloc[0].get('vol_regime', 0.0))
+			if volume_z is None:
+				volume_z = 0.0
+			if vol_regime is None:
+				vol_regime = 0.0
+			ai_score = round(signal * 100, 2)
+			stats = None
+			try:
+				backtester = AIBacktester(fusion_df, payload, symbol=symbol)
+				result = backtester.run_simulation(lookback_days=90)
+				stats = {'win_rate': float(result.win_rate), 'sharpe': float(result.sharpe_ratio)}
+			except Exception:
+				stats = {'win_rate': None, 'sharpe': None}
+			min_score = float(os.getenv('CONFIDENCE_AI_SCORE_MIN', '80'))
+			min_volume_z = float(os.getenv('CONFIDENCE_VOLUME_Z_MIN', '0.5'))
+			max_vol_regime = float(os.getenv('CONFIDENCE_VOL_REGIME_MAX', '1.6'))
+			note = None
+			recent_closed = list(PaperTrade.objects.filter(status='CLOSED').order_by('-exit_date')[:3])
+			if len(recent_closed) == 3 and all(t.outcome == 'LOSS' for t in recent_closed):
+				ai_score = max(0.0, ai_score - 10)
+				note = 'Le marché a changé de régime (Volatilité haute), réduisez la taille de vos positions.'
+			status = 'neutral'
+			label = 'Signal en attente'
+			if max_vol_regime and vol_regime >= max_vol_regime:
+				status = 'red'
+				label = 'Volatilité instable'
+			elif ai_score >= min_score and volume_z > min_volume_z:
+				status = 'green'
+				label = 'Signal confirmé'
+			elif ai_score >= min_score:
+				status = 'orange'
+				label = 'Attendre le volume'
+			return {
+				'symbol': symbol,
+				'ai_score': ai_score,
+				'volume_z': round(volume_z, 3),
+				'vol_regime': round(vol_regime, 3),
+				'win_rate': stats.get('win_rate') if stats else None,
+				'sharpe': stats.get('sharpe') if stats else None,
+				'status': status,
+				'label': label,
+				'note': note,
+				'thresholds': {
+					'ai_score_min': min_score,
+					'volume_z_min': min_volume_z,
+					'vol_regime_max': max_vol_regime,
+				},
+			}
+		except Exception:
+			return {'symbol': symbol, 'status': 'unavailable'}
 
-	def _stop_price(self, price: float | None) -> float:
-		if not price:
-			return 0.0
-		return round(float(price) * 0.97, 2)
+	def _stop_price(self, price: float) -> float | None:
+		try:
+			return round(float(price) * 0.95, 4) if price else None
+		except Exception:
+			return None
 
 	def _get_rsi(self, symbol: str) -> float | None:
-		return None
+		try:
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				if self._fast_mode():
+					stock = Stock.objects.filter(symbol__iexact=symbol).first()
+					return self._rsi_from_history(stock)
+				return None
+			last_val = self._safe_float(frame.tail(1).iloc[0].get('RSI14'))
+			if last_val is None and self._fast_mode():
+				stock = Stock.objects.filter(symbol__iexact=symbol).first()
+				return self._rsi_from_history(stock)
+			return last_val
+		except Exception:
+			return None
 
 	def _get_rsi_history(self, symbol: str, window: int = 5) -> list[float]:
-		return []
+		try:
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty or 'RSI14' not in frame:
+				if self._fast_mode():
+					stock = Stock.objects.filter(symbol__iexact=symbol).first()
+					return self._rsi_history_from_history(stock, window=window)
+				return []
+			values = [float(v) for v in frame['RSI14'].tail(window).tolist() if v is not None and not pd.isna(v)]
+			if not values and self._fast_mode():
+				stock = Stock.objects.filter(symbol__iexact=symbol).first()
+				return self._rsi_history_from_history(stock, window=window)
+			return values
+		except Exception:
+			return []
+
+	def _rsi_from_history(self, stock: Stock | None, window: int = 14) -> float | None:
+		if not stock:
+			return None
+		try:
+			closes = list(
+				PriceHistory.objects.filter(stock=stock).order_by('date').values_list('close_price', flat=True)
+			)
+			if len(closes) < window + 1:
+				return None
+			series = pd.Series([float(val) for val in closes])
+			delta = series.diff()
+			gain = delta.clip(lower=0).rolling(window, min_periods=window).mean()
+			loss = (-delta.clip(upper=0)).rolling(window, min_periods=window).mean()
+			rs = gain / loss.replace(0, pd.NA)
+			rsi = 100 - (100 / (1 + rs))
+			last = rsi.iloc[-1]
+			if pd.isna(last):
+				return None
+			return float(last)
+		except Exception:
+			return None
+
+	def _rsi_history_from_history(self, stock: Stock | None, window: int = 5) -> list[float]:
+		if not stock:
+			return []
+		try:
+			closes = list(
+				PriceHistory.objects.filter(stock=stock).order_by('date').values_list('close_price', flat=True)
+			)
+			if len(closes) < 15:
+				return []
+			series = pd.Series([float(val) for val in closes])
+			delta = series.diff()
+			gain = delta.clip(lower=0).rolling(14, min_periods=14).mean()
+			loss = (-delta.clip(upper=0)).rolling(14, min_periods=14).mean()
+			rs = gain / loss.replace(0, pd.NA)
+			rsi = 100 - (100 / (1 + rs))
+			values = rsi.tail(window).tolist()
+			return [float(v) for v in values if v is not None and not pd.isna(v)]
+		except Exception:
+			return []
 
 	def _get_ma20(self, symbol: str) -> float | None:
-		return None
+		try:
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				if self._fast_mode():
+					stock = Stock.objects.filter(symbol__iexact=symbol).first()
+					return self._ma20_from_history(stock)
+				return None
+			return self._safe_float(frame.tail(1).iloc[0].get('MA20'))
+		except Exception:
+			return None
 
-	def _model_stats(self, symbol: str) -> dict[str, Any]:
-		return {'win_rate': None, 'sharpe': None}
-
-	def _sector_relative_strength(self, stock: Stock) -> float | None:
-		return None
-
-	def _earnings_blacklist(self, symbol: str) -> tuple[bool, date | None]:
-		return False, None
+	def _ma20_from_history(self, stock: Stock | None) -> float | None:
+		if not stock:
+			return None
+		try:
+			closes = list(
+				PriceHistory.objects.filter(stock=stock).order_by('date').values_list('close_price', flat=True)
+			)
+			if len(closes) < 10:
+				return None
+			series = pd.Series([float(val) for val in closes])
+			ma20 = series.rolling(20, min_periods=10).mean().iloc[-1]
+			if pd.isna(ma20):
+				return None
+			return float(ma20)
+		except Exception:
+			return None
 
 	def _ai_score(self, symbol: str) -> tuple[float | None, str | None]:
-		return None, None
+		if self._fast_mode():
+			return None, None
+		try:
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				return None, None
+			payload = load_or_train_model(frame, model_path=get_model_path('BLUECHIP'))
+			if not payload or not payload.get('model'):
+				return None, None
+			last_row = frame.tail(2).copy()
+			feature_list = payload.get('features') or FEATURE_COLUMNS
+			for col in feature_list:
+				if col not in last_row.columns:
+					last_row[col] = 0.0
+			features = last_row[feature_list].fillna(0).values
+			signal = float(payload['model'].predict_proba(features[-1:])[0][1])
+			ai_score = round(signal * 100, 2)
+			trend = None
+			if len(last_row) >= 2:
+				ma20_now = float(last_row.iloc[-1].get('MA20') or 0)
+				ma20_prev = float(last_row.iloc[-2].get('MA20') or 0)
+				rsi_now = float(last_row.iloc[-1].get('RSI14') or 0)
+				trend = 'descending' if ma20_now < ma20_prev or rsi_now < 50 else 'ascending'
+			return ai_score, trend
+		except Exception:
+			return None, None
+
+	def _model_stats(self, symbol: str) -> dict[str, float | None]:
+		if self._fast_mode():
+			return {'win_rate': None, 'sharpe': None}
+		try:
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				return {'win_rate': None, 'sharpe': None}
+			stock = Stock.objects.filter(symbol__iexact=symbol).first()
+			is_stable = False
+			if stock:
+				is_stable = float(stock.latest_price or 0) >= 5 or float(stock.dividend_yield or 0) >= 0.02
+			universe = 'BLUECHIP' if is_stable else 'PENNY'
+			payload = load_or_train_model(frame, model_path=get_model_path(universe))
+			if not payload or not payload.get('model'):
+				return {'win_rate': None, 'sharpe': None}
+			backtester = AIBacktester(frame, payload, symbol=symbol)
+			result = backtester.run_simulation(lookback_days=90)
+			return {'win_rate': float(result.win_rate), 'sharpe': float(result.sharpe_ratio)}
+		except Exception:
+			return {'win_rate': None, 'sharpe': None}
+
+	def _coerce_date(self, value: Any) -> date | None:
+		if value is None:
+			return None
+		try:
+			if isinstance(value, pd.Series):
+				if value.empty:
+					return None
+				value = value.iloc[0]
+			elif isinstance(value, (list, tuple)):
+				if not value:
+					return None
+				value = value[0]
+			parsed = pd.to_datetime(value, errors='coerce')
+			if parsed is None or pd.isna(parsed):
+				return None
+			if hasattr(parsed, 'to_pydatetime'):
+				parsed = parsed.to_pydatetime()
+			if isinstance(parsed, datetime):
+				return parsed.date()
+			if isinstance(parsed, date):
+				return parsed
+		except Exception:
+			return None
+		return None
+
+	def _earnings_date(self, symbol: str) -> date | None:
+		try:
+			calendar = yf.Ticker(symbol).calendar
+			if calendar is None:
+				return None
+			if isinstance(calendar, pd.DataFrame):
+				if 'Earnings Date' in calendar.index:
+					return self._coerce_date(calendar.loc['Earnings Date'][0])
+				if 'Earnings Date' in calendar.columns:
+					return self._coerce_date(calendar['Earnings Date'].iloc[0])
+			if isinstance(calendar, dict):
+				return self._coerce_date(calendar.get('Earnings Date'))
+		except Exception:
+			return None
+		return None
+
+	def _earnings_blacklist(self, symbol: str, days: int = 7) -> tuple[bool, date | None]:
+		if self._fast_mode():
+			return False, None
+		try:
+			earnings_date = self._earnings_date(symbol)
+			if not earnings_date:
+				return False, None
+			cutoff = (timezone.now() + timedelta(days=days)).date()
+			return earnings_date <= cutoff, earnings_date
+		except Exception:
+			return False, None
+
+	def _sector_relative_strength(self, stock: Stock, days: int = 30) -> dict[str, Any]:
+		today = timezone.now().date()
+		start = today - timedelta(days=days)
+		stock_now = self._safe_float(stock.latest_price)
+		if stock_now is None or stock_now <= 0:
+			stock_now = self._price_at_or_before(stock, today)
+		stock_then = self._price_at_or_before(stock, start)
+		stock_ret = None
+		if stock_now and stock_then:
+			stock_ret = ((stock_now - stock_then) / stock_then) * 100
+		sector_returns = []
+		if stock.sector:
+			peers = Stock.objects.filter(sector=stock.sector).exclude(id=stock.id)[:50]
+			for peer in peers:
+				peer_now = self._safe_float(peer.latest_price)
+				if peer_now is None or peer_now <= 0:
+					peer_now = self._price_at_or_before(peer, today)
+				peer_then = self._price_at_or_before(peer, start)
+				if peer_now and peer_then:
+					sector_returns.append(((peer_now - peer_then) / peer_then) * 100)
+		sector_median = float(np.median(sector_returns)) if sector_returns else None
+		outperform = None
+		if stock_ret is not None and sector_median is not None:
+			outperform = stock_ret >= sector_median
+		return {
+			'stock_return_30d': round(stock_ret, 2) if stock_ret is not None else None,
+			'sector_median_30d': round(sector_median, 2) if sector_median is not None else None,
+			'outperform': outperform,
+		}
 
 	def _build_holdings_from_account_transactions(
 		self,
@@ -1758,11 +2036,7 @@ class PortfolioDashboardView(APIView):
 				entry['buy_cost'] += qty * float(tx.price or 0)
 
 		items = []
-		total_value = 0.0
-		stable_value = 0.0
-		risky_value = 0.0
-		change_1d = 0.0
-		change_7d = 0.0
+		pre_entries = []
 		total_cost_value = 0.0
 		for payload in position_map.values():
 			shares = float(payload['shares'] or 0)
@@ -1783,12 +2057,82 @@ class PortfolioDashboardView(APIView):
 			unrealized = value - cost_value
 			unrealized_pct = (unrealized / cost_value * 100) if cost_value else 0
 			total_cost_value += cost_value
+			pre_entries.append({
+				'stock': stock,
+				'symbol': (stock.symbol or '').strip().upper(),
+				'shares': shares,
+				'price': price,
+				'effective_price': effective_price,
+				'avg_cost': avg_cost,
+				'value': value,
+				'cost_value': cost_value,
+				'unrealized': unrealized,
+				'unrealized_pct': unrealized_pct,
+			})
+
+		max_enrich = int(os.getenv('DASHBOARD_ENRICH_LIMIT', '6'))
+		sorted_entries = sorted(pre_entries, key=lambda item: item['value'], reverse=True)
+		enriched_symbols = {item['symbol'] for item in sorted_entries[:max_enrich] if item.get('symbol')}
+
+		total_value = 0.0
+		stable_value = 0.0
+		risky_value = 0.0
+		change_1d = 0.0
+		change_7d = 0.0
+
+		for entry in sorted_entries:
+			stock = entry['stock']
+			symbol = entry['symbol']
+			shares = entry['shares']
+			price = entry['price']
+			effective_price = entry['effective_price']
+			avg_cost = entry['avg_cost']
+			value = entry['value']
+			cost_value = entry['cost_value']
+			unrealized = entry['unrealized']
+			unrealized_pct = entry['unrealized_pct']
 			total_value += value
+
+			prev_1d = PriceHistory.objects.filter(stock=stock).order_by('-date')[1:2].first()
+			if prev_1d:
+				change_1d += (price - float(prev_1d.close_price)) * shares
+
+			prev_7d = PriceHistory.objects.filter(stock=stock).order_by('-date')[7:8].first()
+			if prev_7d:
+				change_7d += (price - float(prev_7d.close_price)) * shares
+
 			is_stable = effective_price >= 5 or float(stock.dividend_yield or 0) >= 0.02
 			if is_stable:
 				stable_value += value
 			else:
 				risky_value += value
+
+			volume_z = None
+			rsi = None
+			rsi_history = []
+			ma20 = None
+			stats = {'win_rate': None, 'sharpe': None}
+			rel_strength = None
+			earnings_blacklisted, earnings_date = False, None
+			ai_score, trend = None, None
+			exit_strategy = None
+			if enrich and symbol in enriched_symbols:
+				volume_z = self._get_volume_z(symbol)
+				rsi = self._get_rsi(symbol)
+				rsi_history = self._get_rsi_history(symbol)
+				ma20 = self._get_ma20(symbol)
+				stats = self._model_stats(symbol)
+				rel_strength = self._sector_relative_strength(stock)
+				earnings_blacklisted, earnings_date = self._earnings_blacklist(symbol)
+				ai_score, trend = self._ai_score(symbol)
+				if ai_score is not None and volume_z is not None and trend == 'descending':
+					if volume_z < 0 and ai_score < 65:
+						stop_loss = round(effective_price * 0.97, 2)
+						exit_strategy = {
+							'action': 'VENDRE 50%',
+							'instructions': f"Vendre la moitié maintenant. Placer un Stop-Loss à {stop_loss}$ sur le solde pour 15 jours.",
+							'reason': 'Divergence Volume/Prix + Baisse du score IA.',
+						}
 
 			items.append({
 				'ticker': stock.symbol,
@@ -1802,18 +2146,18 @@ class PortfolioDashboardView(APIView):
 				'cost_value': round(cost_value, 2),
 				'unrealized_pnl': round(unrealized, 2),
 				'unrealized_pnl_pct': round(unrealized_pct, 2),
-				'volume_z': None,
-				'ai_score': None,
-				'rsi': None,
-				'rsi_history': [],
-				'ma20': None,
+				'volume_z': round(volume_z, 2) if volume_z is not None else None,
+				'ai_score': round(float(ai_score), 2) if ai_score is not None else None,
+				'rsi': round(rsi, 2) if rsi is not None else None,
+				'rsi_history': [round(val, 2) for val in rsi_history] if rsi_history else [],
+				'ma20': round(ma20, 4) if ma20 is not None else None,
 				'stop_price': self._stop_price(effective_price),
-				'exit_strategy': None,
-				'model_win_rate': None,
-				'model_sharpe': None,
-				'relative_strength': None,
-				'earnings_blacklisted': False,
-				'earnings_date': None,
+				'exit_strategy': exit_strategy,
+				'model_win_rate': round(float(stats.get('win_rate') or 0), 2) if stats.get('win_rate') is not None else None,
+				'model_sharpe': round(float(stats.get('sharpe') or 0), 2) if stats.get('sharpe') is not None else None,
+				'relative_strength': rel_strength,
+				'earnings_blacklisted': earnings_blacklisted,
+				'earnings_date': earnings_date.isoformat() if earnings_date else None,
 				'category': 'Stable' if is_stable else 'Risky',
 			})
 
