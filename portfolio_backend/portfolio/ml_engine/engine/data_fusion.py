@@ -99,8 +99,11 @@ class DataFusionEngine:
         if df is None or df.empty:
             return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
-            tickers = df.columns.get_level_values(-1)
-            if self.ticker in tickers:
+            level_0 = df.columns.get_level_values(0)
+            level_last = df.columns.get_level_values(-1)
+            if self.ticker in level_0:
+                df = df.xs(self.ticker, level=0, axis=1)
+            elif self.ticker in level_last:
                 df = df.xs(self.ticker, level=-1, axis=1)
             else:
                 df.columns = [
