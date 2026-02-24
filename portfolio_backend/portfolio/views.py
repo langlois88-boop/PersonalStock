@@ -5592,8 +5592,8 @@ class PortfolioOptimizerView(APIView):
 			portfolio_payload = {'id': portfolio.id, 'name': portfolio.name} if portfolio else None
 
 			holdings = list(PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)) if portfolio else []
+			stocks_by_symbol: dict[str, Stock] = {}
 			if not holdings:
-				stocks_by_symbol: dict[str, Stock] = {}
 				if portfolio:
 					transactions = Transaction.objects.select_related('stock').filter(portfolio=portfolio)
 				else:
@@ -5604,18 +5604,22 @@ class PortfolioOptimizerView(APIView):
 					symbol = tx.stock.symbol.strip().upper()
 					if symbol and symbol not in stocks_by_symbol:
 						stocks_by_symbol[symbol] = tx.stock
-				if not stocks_by_symbol:
-					if portfolio:
-							account_transactions = AccountTransaction.objects.select_related('stock', 'account').all()
-					else:
-						account_transactions = AccountTransaction.objects.select_related('stock', 'account').all()
-					for tx in account_transactions:
-						if not tx.stock or not tx.stock.symbol:
-							continue
-						symbol = tx.stock.symbol.strip().upper()
-						if symbol and symbol not in stocks_by_symbol:
-							stocks_by_symbol[symbol] = tx.stock
-				holdings = [SimpleNamespace(stock=stock) for stock in stocks_by_symbol.values()]
+				if stocks_by_symbol:
+					holdings = [SimpleNamespace(stock=stock) for stock in stocks_by_symbol.values()]
+
+			existing_symbols = {((holding.stock.symbol or '').strip().upper()) for holding in holdings if holding.stock}
+			account_qs = AccountTransaction.objects.select_related('stock', 'account').filter(
+				account__account_type__in=['TFSA', 'CRI', 'CASH']
+			)
+			if request.user and request.user.is_authenticated:
+				account_qs = account_qs.filter(account__user=request.user)
+			for tx in account_qs:
+				if not tx.stock or not tx.stock.symbol:
+					continue
+				symbol = tx.stock.symbol.strip().upper()
+				if symbol and symbol not in existing_symbols:
+					holdings.append(SimpleNamespace(stock=tx.stock))
+					existing_symbols.add(symbol)
 
 			if fast_mode:
 				max_holdings = int(os.getenv('OPTIMIZER_MAX_HOLDINGS', '20'))
