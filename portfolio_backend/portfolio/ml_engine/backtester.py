@@ -23,23 +23,43 @@ FEATURE_COLUMNS = [
     "MA20",
     "MA50",
     "MA200",
+    "EMA9",
+    "EMA20",
+    "price_to_ema9",
+    "price_to_ema20",
     "vol_regime",
     "Volatility",
     "Momentum20",
     "VolumeZ",
+    "RVOL10",
+    "VPT",
+    "VPT_roc",
     "RSI14",
     "MACD_HIST",
     "CandleBodyPct",
     "CandleRangePct",
+    "gap_pct",
+    "intraday_range_pct",
+    "close_pos_in_range",
+    "pattern_doji",
+    "pattern_hammer",
+    "pattern_engulfing",
+    "pattern_morning_star",
     "sentiment_score",
     "news_count",
+    "VIXCLS",
     "DCOILWTICO",
     "CPIAUCSL",
+    "spy_corr_60",
+    "tsx_corr_60",
 ]
 
 TRIPLE_BARRIER_UP_PCT = float(os.getenv("TRIPLE_BARRIER_UP_PCT", "0.05"))
 TRIPLE_BARRIER_DOWN_PCT = float(os.getenv("TRIPLE_BARRIER_DOWN_PCT", "0.03"))
 TRIPLE_BARRIER_MAX_DAYS = int(os.getenv("TRIPLE_BARRIER_MAX_DAYS", "20"))
+PENNY_TRIPLE_BARRIER_UP_PCT = float(os.getenv("PENNY_TRIPLE_BARRIER_UP_PCT", "0.03"))
+PENNY_TRIPLE_BARRIER_DOWN_PCT = float(os.getenv("PENNY_TRIPLE_BARRIER_DOWN_PCT", "0.02"))
+PENNY_TRIPLE_BARRIER_MAX_DAYS = int(os.getenv("PENNY_TRIPLE_BARRIER_MAX_DAYS", "2"))
 TIME_SERIES_SPLITS = int(os.getenv("TIME_SERIES_SPLITS", "4"))
 TX_COST_PCT = float(os.getenv("BACKTEST_TX_COST_PCT", "0.002"))
 SLIPPAGE_PCT = float(os.getenv("BACKTEST_SLIPPAGE_PCT", "0.001"))
@@ -208,17 +228,67 @@ def _triple_barrier_labels(close: pd.Series) -> pd.Series:
     return pd.Series(labels, index=close.index)
 
 
+def _triple_barrier_labels_with_bands(
+    close: pd.Series,
+    high: pd.Series | None,
+    low: pd.Series | None,
+    up_pct: float,
+    down_pct: float,
+    max_days: int,
+) -> pd.Series:
+    if close is None or close.empty:
+        return pd.Series(dtype=float)
+    prices = close.values
+    highs = high.values if high is not None and not high.empty else prices
+    lows = low.values if low is not None and not low.empty else prices
+    labels = np.full(len(prices), np.nan)
+    for i in range(len(prices) - 1):
+        entry = prices[i]
+        if entry <= 0:
+            continue
+        upper = entry * (1 + up_pct)
+        lower = entry * (1 - down_pct)
+        end = min(len(prices), i + max_days + 1)
+        hit = 0
+        for j in range(i + 1, end):
+            if highs[j] >= upper:
+                hit = 1
+                break
+            if lows[j] <= lower:
+                hit = 0
+                break
+        labels[i] = hit
+    return pd.Series(labels, index=close.index)
+
+
+def _infer_universe(model_path: Path | None = None) -> str | None:
+    if model_path is None:
+        return None
+    try:
+        resolved = model_path.resolve()
+    except Exception:
+        resolved = model_path
+    penny_path = Path(os.getenv('PENNY_MODEL_PATH', str(PENNY_MODEL_PATH)))
+    blue_path = Path(os.getenv('BLUECHIP_MODEL_PATH', str(BLUECHIP_MODEL_PATH)))
+    if resolved == penny_path:
+        return 'PENNY'
+    if resolved == blue_path:
+        return 'BLUECHIP'
+    return None
+
+
 def _select_features(X_df: pd.DataFrame, y: np.ndarray) -> list[str]:
     min_features = int(os.getenv("MIN_FEATURE_SELECTION", "6"))
     try:
         selector = LogisticRegression(
-            penalty="l1",
-            solver="liblinear",
-            max_iter=200,
+            solver="saga",
+            l1_ratio=1.0,
+            max_iter=2000,
+            tol=1e-3,
             class_weight="balanced",
             random_state=42,
         )
-        pipeline = make_pipeline(StandardScaler(with_mean=False), selector)
+        pipeline = make_pipeline(StandardScaler(), selector)
         pipeline.fit(X_df.values, y)
         coef = selector.coef_[0]
         selected = [col for col, weight in zip(X_df.columns, coef) if abs(weight) > 1e-6]
@@ -229,7 +299,7 @@ def _select_features(X_df: pd.DataFrame, y: np.ndarray) -> list[str]:
         return list(X_df.columns)
 
 
-def _build_training_set(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[str]]:
+def _build_training_set(df: pd.DataFrame, universe: str | None = None) -> tuple[np.ndarray, np.ndarray, list[str]]:
     data = _ensure_features(df)
     data = data.dropna(subset=["Returns"])
     if data.empty:
@@ -237,7 +307,18 @@ def _build_training_set(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[
 
     X_df = data[FEATURE_COLUMNS].fillna(0)
     if "Close" in data.columns:
-        labels = _triple_barrier_labels(data["Close"])
+        is_penny = (universe or '').strip().upper() in {'PENNY', 'AI_PENNY'}
+        if is_penny:
+            labels = _triple_barrier_labels_with_bands(
+                data["Close"],
+                data.get("High"),
+                data.get("Low"),
+                PENNY_TRIPLE_BARRIER_UP_PCT,
+                PENNY_TRIPLE_BARRIER_DOWN_PCT,
+                PENNY_TRIPLE_BARRIER_MAX_DAYS,
+            )
+        else:
+            labels = _triple_barrier_labels(data["Close"])
     else:
         labels = (data["Returns"].shift(-1) > 0).astype(int)
     labels = labels.astype(float)
@@ -253,7 +334,8 @@ def _build_training_set(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[
 
 
 def train_fusion_model(df: pd.DataFrame, model_path: Path = MODEL_PATH) -> dict | None:
-    X, y, selected = _build_training_set(df)
+    universe = _infer_universe(model_path)
+    X, y, selected = _build_training_set(df, universe=universe)
     if X.size == 0 or y.size == 0:
         return None
 

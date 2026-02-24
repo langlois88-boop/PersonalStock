@@ -161,6 +161,10 @@ class DataFusionEngine:
         fused["MA20"] = fused["Close"].rolling(window=20, min_periods=10).mean()
         fused["MA50"] = fused["Close"].rolling(window=50, min_periods=20).mean()
         fused["MA200"] = fused["Close"].rolling(window=200, min_periods=60).mean()
+        fused["EMA9"] = fused["Close"].ewm(span=9, adjust=False).mean()
+        fused["EMA20"] = fused["Close"].ewm(span=20, adjust=False).mean()
+        fused["price_to_ema9"] = (fused["Close"] - fused["EMA9"]) / fused["EMA9"].replace(0, pd.NA)
+        fused["price_to_ema20"] = (fused["Close"] - fused["EMA20"]) / fused["EMA20"].replace(0, pd.NA)
         fused["Volatility"] = fused["Returns"].rolling(window=21, min_periods=10).std()
         fused["Momentum20"] = fused["Close"].pct_change(20)
         fused["vol_regime"] = fused["Volatility"] / fused["Volatility"].rolling(window=252, min_periods=60).mean()
@@ -169,6 +173,10 @@ class DataFusionEngine:
         vol_mean = fused["Volume"].rolling(window=20, min_periods=10).mean()
         vol_std = fused["Volume"].rolling(window=20, min_periods=10).std()
         fused["VolumeZ"] = (fused["Volume"] - vol_mean) / vol_std.replace(0, pd.NA)
+        rvol_base = fused["Volume"].rolling(window=10, min_periods=5).mean()
+        fused["RVOL10"] = fused["Volume"] / rvol_base.replace(0, pd.NA)
+        fused["VPT"] = (fused["Returns"].fillna(0.0) * fused["Volume"]).cumsum()
+        fused["VPT_roc"] = fused["VPT"].pct_change().replace([pd.NA, float('inf'), float('-inf')], 0.0)
         fused["sector_code"] = _get_sector_code(self.ticker)
 
         delta = fused["Close"].diff()
@@ -192,6 +200,41 @@ class DataFusionEngine:
             fused["CandleRange"] = range_
             fused["CandleBodyPct"] = body.abs() / range_.replace(0, pd.NA)
             fused["CandleRangePct"] = range_ / fused["Close"].replace(0, pd.NA)
+            prev_close = fused["Close"].shift(1)
+            fused["gap_pct"] = (fused["Open"] - prev_close) / prev_close.replace(0, pd.NA)
+            fused["intraday_range_pct"] = range_ / fused["Open"].replace(0, pd.NA)
+            fused["close_pos_in_range"] = (fused["Close"] - fused["Low"]) / (range_.replace(0, pd.NA))
+            fused = _add_candlestick_patterns(fused)
+
+        try:
+            spy = yf.download(
+                "SPY",
+                start=self.start_date,
+                end=self.end_date,
+                progress=False,
+                timeout=8,
+            )
+            tsx = yf.download(
+                "^GSPTSE",
+                start=self.start_date,
+                end=self.end_date,
+                progress=False,
+                timeout=8,
+            )
+            spy_close = spy["Close"].dropna() if spy is not None and not spy.empty and "Close" in spy else pd.Series(dtype=float)
+            tsx_close = tsx["Close"].dropna() if tsx is not None and not tsx.empty and "Close" in tsx else pd.Series(dtype=float)
+            if not spy_close.empty:
+                spy_ret = spy_close.pct_change()
+                aligned = pd.concat([fused["Returns"], spy_ret], axis=1).dropna()
+                if not aligned.empty:
+                    fused["spy_corr_60"] = aligned.iloc[:, 0].rolling(60).corr(aligned.iloc[:, 1])
+            if not tsx_close.empty:
+                tsx_ret = tsx_close.pct_change()
+                aligned = pd.concat([fused["Returns"], tsx_ret], axis=1).dropna()
+                if not aligned.empty:
+                    fused["tsx_corr_60"] = aligned.iloc[:, 0].rolling(60).corr(aligned.iloc[:, 1])
+        except Exception:
+            pass
 
         if self.fast_mode:
             return fused.dropna(subset=["Close"])
@@ -251,3 +294,77 @@ def _get_sector_code(ticker: str) -> int:
     except Exception:
         sector = ""
     return SECTOR_CODES.get(sector, 0)
+
+
+def _add_candlestick_patterns(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return frame
+    if not {"Open", "High", "Low", "Close"}.issubset(frame.columns):
+        return frame
+    df = frame.copy()
+    df[["Open", "High", "Low", "Close"]] = df[["Open", "High", "Low", "Close"]].apply(
+        pd.to_numeric, errors="coerce"
+    )
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    if df.empty:
+        return frame
+
+    df["pattern_doji"] = 0
+    df["pattern_hammer"] = 0
+    df["pattern_engulfing"] = 0
+    df["pattern_morning_star"] = 0
+
+    try:
+        import pandas_ta as ta
+
+        patterns = ta.cdl_pattern(
+            open_=df["Open"],
+            high=df["High"],
+            low=df["Low"],
+            close=df["Close"],
+            name=["doji", "hammer", "engulfing", "morningstar"],
+        )
+        if patterns is not None and not patterns.empty:
+            if "CDL_DOJI" in patterns:
+                df["pattern_doji"] = (patterns["CDL_DOJI"] != 0).astype(int)
+            if "CDL_HAMMER" in patterns:
+                df["pattern_hammer"] = (patterns["CDL_HAMMER"] != 0).astype(int)
+            if "CDL_ENGULFING" in patterns:
+                df["pattern_engulfing"] = (patterns["CDL_ENGULFING"] > 0).astype(int)
+            if "CDL_MORNINGSTAR" in patterns:
+                df["pattern_morning_star"] = (patterns["CDL_MORNINGSTAR"] != 0).astype(int)
+            return frame.join(df[["pattern_doji", "pattern_hammer", "pattern_engulfing", "pattern_morning_star"]])
+    except Exception:
+        pass
+
+    for idx in range(len(df)):
+        row = df.iloc[idx]
+        prev = df.iloc[idx - 1] if idx > 0 else None
+        prev2 = df.iloc[idx - 2] if idx > 1 else None
+
+        body = abs(float(row["Close"]) - float(row["Open"]))
+        candle_range = max(float(row["High"]) - float(row["Low"]), 0.0)
+        lower_shadow = min(float(row["Open"]), float(row["Close"])) - float(row["Low"])
+        upper_shadow = float(row["High"]) - max(float(row["Open"]), float(row["Close"]))
+        if candle_range > 0 and body <= candle_range * 0.1:
+            df.at[df.index[idx], "pattern_doji"] = 1
+        if body > 0 and lower_shadow >= 2 * body and upper_shadow <= body * 0.5:
+            df.at[df.index[idx], "pattern_hammer"] = 1
+        if prev is not None:
+            prev_red = float(prev["Close"]) < float(prev["Open"])
+            curr_green = float(row["Close"]) > float(row["Open"])
+            engulfs = float(row["Close"]) >= float(prev["Open"]) and float(row["Open"]) <= float(prev["Close"])
+            if prev_red and curr_green and engulfs:
+                df.at[df.index[idx], "pattern_engulfing"] = 1
+        if prev is not None and prev2 is not None:
+            prev2_red = float(prev2["Close"]) < float(prev2["Open"])
+            prev_small = abs(float(prev["Close"]) - float(prev["Open"])) <= (
+                max(float(prev["High"]) - float(prev["Low"]), 0.0) * 0.3
+            )
+            curr_green = float(row["Close"]) > float(row["Open"])
+            gap_down = float(prev["Close"]) < float(prev2["Close"])
+            recover = float(row["Close"]) >= (float(prev2["Open"]) + float(prev2["Close"])) / 2
+            if prev2_red and prev_small and curr_green and gap_down and recover:
+                df.at[df.index[idx], "pattern_morning_star"] = 1
+
+    return frame.join(df[["pattern_doji", "pattern_hammer", "pattern_engulfing", "pattern_morning_star"]])
