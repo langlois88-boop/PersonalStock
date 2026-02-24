@@ -385,7 +385,7 @@ CELERY_BEAT_SCHEDULE = {
     },
     'discover-opportunities-morning': {
         'task': 'portfolio.tasks.auto_discover_top_movers',
-        'schedule': crontab(hour=9, minute=35, day_of_week='mon-fri'),
+        'schedule': crontab(hour=14, minute=30, day_of_week='mon-fri'),
     },
     'market-scan-hourly': {
         'task': 'portfolio.tasks.scan_market_for_opportunities',

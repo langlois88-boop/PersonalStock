@@ -3339,24 +3339,29 @@ def auto_discover_top_movers(min_score: float | None = None) -> dict[str, Any]:
     """Discover active TSX/NASDAQ movers and run the scanner on them."""
     screener_ids = [
         s.strip()
-        for s in os.getenv('TOP_MOVER_SCREENERS', 'most_actives,day_gainers').split(',')
+        for s in os.getenv('TOP_MOVER_SCREENERS', 'day_gainers,most_actives').split(',')
         if s.strip()
     ]
-    tsx_top = [
-        'SHOP.TO', 'TD.TO', 'RY.TO', 'ENB.TO', 'CNQ.TO', 'ATD.TO', 'CS.TO',
-        'BCE.TO', 'BNS.TO', 'SU.TO',
+    tsx_hot = [
+        'SHOP.TO', 'HIVE.V', 'BITF.TO', 'WEED.TO', 'LSPD.TO',
     ]
+    fallback_hot = ['NVDA', 'TSLA', 'MARA', 'RIOT', 'HIVE']
     discovered: list[str] = []
     try:
-        quotes = _fetch_yfinance_screeners(screener_ids, count=40)
-        discovered.extend([
+        quotes = _fetch_yfinance_screeners(screener_ids, count=25)
+        gainers = [
             str(item.get('symbol') or '').strip().upper()
             for item in quotes
             if item.get('symbol')
-        ])
+        ]
+        discovered.extend(gainers[:5])
     except Exception:
-        pass
-    discovered.extend(tsx_top)
+        discovered.extend([])
+
+    discovered.extend(tsx_hot)
+    if not discovered:
+        discovered.extend(fallback_hot)
+
     discovered = [s for s in dict.fromkeys(discovered) if s]
     if not discovered:
         return {'status': 'empty', 'count': 0, 'symbols': []}
