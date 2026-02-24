@@ -5492,6 +5492,17 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
             close_series = _extract_close_series(daily)
 
         if close_series is None or close_series.empty:
+            if isinstance(daily.columns, pd.MultiIndex):
+                try:
+                    flat = daily.copy()
+                    flat.columns = [col[0] for col in flat.columns]
+                    flat_close = flat.get('Close')
+                    if flat_close is None:
+                        flat_close = flat.get('close')
+                    close_series = flat_close
+                except Exception:
+                    close_series = None
+        if close_series is None or close_series.empty:
             return {'error': f"Données introuvables pour {symbol}"}
         last_price = float(close_series.iloc[-1])
 
