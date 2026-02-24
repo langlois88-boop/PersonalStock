@@ -113,6 +113,7 @@ class DataFusionEngine:
                 df = df.set_index("Date")
         df.index = pd.to_datetime(df.index, errors="coerce")
         df = df[~df.index.isna()]
+        df = _normalize_datetime_index(df)
         df = df.rename(columns={"Adj Close": "Adj_Close"})
         df["Returns"] = df["Close"].pct_change()
         return df
@@ -139,6 +140,7 @@ class DataFusionEngine:
                 macro = macro.set_index("date")
         macro.index = pd.to_datetime(macro.index, errors="coerce")
         macro = macro[~macro.index.isna()]
+        macro = _normalize_datetime_index(macro)
         return macro.resample("D").ffill()
 
     def fuse_all(self) -> pd.DataFrame:
@@ -146,12 +148,15 @@ class DataFusionEngine:
         if market.empty:
             return pd.DataFrame()
 
+        market = _normalize_datetime_index(market)
+
         if self.fast_mode:
             fused = market.copy()
             fused["sentiment_score"] = 0.0
             fused["news_count"] = 0
         else:
             macro = self.get_macro_data()
+            macro = _normalize_datetime_index(macro)
             fused = market.join(macro, how="left").ffill()
             sentiment_days = int(os.getenv("NEWS_SENTIMENT_DAYS", "7"))
             sentiment = fetch_news_sentiment(self.ticker, days=sentiment_days)
@@ -294,6 +299,18 @@ def _get_sector_code(ticker: str) -> int:
     except Exception:
         sector = ""
     return SECTOR_CODES.get(sector, 0)
+
+
+def _normalize_datetime_index(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty or not isinstance(frame.index, pd.DatetimeIndex):
+        return frame
+    if frame.index.tz is not None:
+        frame = frame.copy()
+        frame.index = frame.index.tz_convert(None)
+        return frame
+    frame = frame.copy()
+    frame.index = frame.index.tz_localize(None)
+    return frame
 
 
 def _add_candlestick_patterns(frame: pd.DataFrame) -> pd.DataFrame:

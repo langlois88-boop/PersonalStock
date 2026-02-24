@@ -28,6 +28,7 @@ python-dotenv
 prophet
 openai
 google-genai
+google-generativeai
 pandas_ta
 psycopg2-binary
 reportlab
