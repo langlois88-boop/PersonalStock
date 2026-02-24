@@ -1,4 +1,6 @@
+import { useState } from 'react';
 import { X, TrendingUp, ShieldAlert } from 'lucide-react';
+import api from '../api/api';
 
 const Gauge = ({ value, label, color }) => (
   <div className="flex flex-col gap-2">
@@ -16,11 +18,35 @@ const Gauge = ({ value, label, color }) => (
 );
 
 function AnalysisModal({ open, loading, error, data, onClose }) {
+  const [tradeStatus, setTradeStatus] = useState(null);
+  const [tradeLoading, setTradeLoading] = useState(false);
   if (!open) return null;
 
   const confidence = data?.confidence || 0;
   const sentiment = data?.sentiment === 'Positif' ? 85 : data?.sentiment === 'Négatif' ? 25 : 55;
   const verdict = data?.summary?.includes('VENDRE') ? 'VENTE' : data?.summary?.includes('ACHETER') ? 'ACHAT' : 'ATTENTE';
+
+  const handlePaperTrade = async () => {
+    if (!data?.symbol || tradeLoading) return;
+    setTradeLoading(true);
+    setTradeStatus(null);
+    try {
+      const res = await api.post('paper-trades/manual/', {
+        ticker: data.symbol,
+        price: data.price,
+        stop_loss: data.stop_loss,
+        suggested_investment: data.suggested_investment,
+        confidence: data.confidence,
+        sandbox: 'WATCHLIST',
+      });
+      const status = res?.data?.status || 'created';
+      setTradeStatus(status === 'exists' ? 'Trade déjà ouvert.' : 'Paper trade créé.');
+    } catch (err) {
+      setTradeStatus(err?.response?.data?.error || 'Échec du paper trade.');
+    } finally {
+      setTradeLoading(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
@@ -79,6 +105,9 @@ function AnalysisModal({ open, loading, error, data, onClose }) {
                     ⚠️ Earnings imminents : risque de volatilité élevé.
                   </div>
                 )}
+                  {tradeStatus && (
+                    <p className="text-xs text-slate-300">{tradeStatus}</p>
+                  )}
               </div>
             </>
           )}
@@ -91,8 +120,10 @@ function AnalysisModal({ open, loading, error, data, onClose }) {
           <button
             type="button"
             className="px-4 py-2 rounded-xl bg-emerald-500/80 text-white text-xs font-semibold hover:bg-emerald-500"
+            onClick={handlePaperTrade}
+            disabled={tradeLoading || !data}
           >
-            Exécuter le Paper Trade
+            {tradeLoading ? 'Exécution...' : 'Exécuter le Paper Trade'}
           </button>
         </div>
       </div>

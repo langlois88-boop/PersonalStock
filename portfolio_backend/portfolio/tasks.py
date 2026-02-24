@@ -8,6 +8,7 @@ from math import isfinite
 from typing import Any
 
 from . import market_data as yf
+import yfinance as yfin
 import requests
 import random
 import json
@@ -5435,18 +5436,37 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
         if not symbol:
             return {'error': 'Ticker requis'}
 
-        daily = get_daily_bars(symbol, days=45)
-        if daily is None or daily.empty:
-            daily = yf.download(symbol, period='2mo', interval='1d')
+        candidates = [symbol]
+        if '.' not in symbol:
+            candidates.extend([f"{symbol}.TO", f"{symbol}.V"])
+        else:
+            candidates.append(symbol.split('.')[0])
+
+        selected_symbol = None
+        daily = None
+        for candidate in candidates:
+            daily = get_daily_bars(candidate, days=45)
             if daily is None or daily.empty:
-                return {'error': f"Données introuvables pour {symbol}"}
-            daily = daily.rename(columns={
-                'Open': 'open',
-                'High': 'high',
-                'Low': 'low',
-                'Close': 'close',
-                'Volume': 'volume',
-            })
+                daily = yf.download(candidate, period='2mo', interval='1d')
+            if daily is None or daily.empty:
+                try:
+                    daily = yfin.download(candidate, period='2mo', interval='1d')
+                except Exception:
+                    daily = None
+            if daily is not None and not daily.empty:
+                selected_symbol = candidate
+                break
+
+        if daily is None or daily.empty:
+            return {'error': f"Données introuvables pour {symbol}"}
+        symbol = selected_symbol or symbol
+        daily = daily.rename(columns={
+            'Open': 'open',
+            'High': 'high',
+            'Low': 'low',
+            'Close': 'close',
+            'Volume': 'volume',
+        })
 
         close_series = None
         if 'close' in daily:

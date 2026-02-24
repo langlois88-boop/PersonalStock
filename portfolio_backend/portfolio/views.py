@@ -1091,6 +1091,76 @@ class PaperTradeSummaryView(APIView):
 			})
 
 
+class PaperTradeManualCreateView(APIView):
+	def post(self, request):
+		ticker = (request.data.get('ticker') or '').strip().upper()
+		if not ticker:
+			return Response({'error': 'Ticker requis.'}, status=400)
+		sandbox = (request.data.get('sandbox') or 'WATCHLIST').strip().upper()
+		if sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'}:
+			return Response({'error': 'Sandbox invalide.'}, status=400)
+
+		price = request.data.get('price')
+		try:
+			price = float(price) if price is not None else None
+		except (TypeError, ValueError):
+			price = None
+
+		if not price or price <= 0:
+			try:
+				hist = yf.download(ticker, period='5d', interval='1d')
+				if hist is not None and not hist.empty:
+					close_col = 'close' if 'close' in hist.columns else 'Close'
+					if close_col in hist:
+						price = float(hist[close_col].iloc[-1])
+			except Exception:
+				price = None
+
+		if not price or price <= 0:
+			return Response({'error': f"Prix introuvable pour {ticker}."}, status=400)
+
+		suggested = request.data.get('suggested_investment')
+		try:
+			suggested = float(suggested) if suggested is not None else 0.0
+		except (TypeError, ValueError):
+			suggested = 0.0
+		if suggested <= 0:
+			suggested = float(os.getenv('PAPER_TRADE_MANUAL_DEFAULT', '100'))
+
+		quantity = max(1, int(suggested / price)) if price else 0
+		if quantity <= 0:
+			return Response({'error': 'Quantité invalide.'}, status=400)
+
+		stop_loss = request.data.get('stop_loss')
+		try:
+			stop_loss = float(stop_loss) if stop_loss is not None else None
+		except (TypeError, ValueError):
+			stop_loss = None
+		if not stop_loss or stop_loss <= 0:
+			stop_loss = round(float(price) * 0.95, 2)
+
+		confidence = request.data.get('confidence')
+		try:
+			entry_signal = float(confidence) / 100 if confidence is not None else None
+		except (TypeError, ValueError):
+			entry_signal = None
+
+		existing = PaperTrade.objects.filter(status='OPEN', sandbox=sandbox, ticker__iexact=ticker).first()
+		if existing:
+			return Response({'status': 'exists', 'trade': PaperTradeSerializer(existing).data}, status=200)
+
+		trade = PaperTrade.objects.create(
+			ticker=ticker,
+			sandbox=sandbox,
+			entry_price=round(float(price), 4),
+			quantity=quantity,
+			entry_signal=entry_signal,
+			stop_loss=round(float(stop_loss), 2),
+			notes='Manual quick analysis trade',
+		)
+		return Response({'status': 'created', 'trade': PaperTradeSerializer(trade).data}, status=201)
+
+
 class SandboxWatchlistView(APIView):
 	def get(self, request):
 		sandbox = (request.query_params.get('sandbox') or 'WATCHLIST').strip().upper()
