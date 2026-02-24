@@ -255,11 +255,10 @@ def _risk_manager_allocation(
     atr: float | None,
 ) -> float:
     if confidence_score < 60:
-        return {
-    if confidence_score < 75:
+        allocation = float(os.getenv('RISK_ALLOC_MIN', '50'))
+    elif confidence_score < 75:
         allocation = float(os.getenv('RISK_ALLOC_MIN', '50'))
     elif confidence_score < 90:
-            'penalized_trades': penalized,
         allocation = float(os.getenv('RISK_ALLOC_STD', '150'))
     else:
         allocation = float(os.getenv('RISK_ALLOC_MAX', '250'))
