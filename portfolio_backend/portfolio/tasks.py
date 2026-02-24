@@ -5630,14 +5630,16 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
                 gemini_summary = None
 
         if not gemini_summary:
-            trend = "haussière" if confidence_score >= 0.5 else "baissière"
-            volatility_note = "" if atr is None else f" Volatilité (ATR): {atr:.3f}."
+            trend = "HAUSSIÈRE" if confidence_score > 0.5 else "BAISSIÈRE"
+            strength = "forte" if confidence_score > 0.8 else "modérée"
+            suggested_amount = allocation
             gemini_summary = (
-                f"Analyse technique automatique : Le modèle détecte une tendance {trend} "
-                f"avec une confiance de {confidence_score * 100:.1f}%."
-                " Prudence recommandée en raison de la volatilité actuelle."
-                f"{volatility_note}"
+                f"Analyse Algorithmique : Le modèle détecte une tendance {trend} {strength}. "
+                f"Score de confiance : {confidence_score * 100:.1f}%. "
+                f"La mise a été ajustée à {suggested_amount}$ conformément aux paramètres de risque (Max Drawdown 8%)."
             )
+            if days_to_earnings and days_to_earnings < 7:
+                gemini_summary += " ⚠️ RISQUE ÉLEVÉ : Résultats financiers imminents."
 
         target_price = round(last_price * (1 + (confidence_score / 5)), 2)
         stop_loss = round(last_price * 0.95, 2)
