@@ -30,6 +30,7 @@ openai
 google-genai
 google-generativeai
 pandas_ta
+TA-Lib
 psycopg2-binary
 reportlab
 plotly
