@@ -115,6 +115,9 @@ class DataFusionEngine:
         df = df[~df.index.isna()]
         df = _normalize_datetime_index(df)
         df = df.rename(columns={"Adj Close": "Adj_Close"})
+        df = _normalize_ohlc_columns(df)
+        if "Close" not in df.columns:
+            return pd.DataFrame()
         df["Returns"] = df["Close"].pct_change()
         return df
 
@@ -310,6 +313,33 @@ def _normalize_datetime_index(frame: pd.DataFrame) -> pd.DataFrame:
         return frame
     frame = frame.copy()
     frame.index = frame.index.tz_localize(None)
+    return frame
+
+
+def _normalize_ohlc_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return frame
+    normalize = {
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "adj_close": "Adj_Close",
+        "adjclose": "Adj_Close",
+        "adj close": "Adj_Close",
+        "volume": "Volume",
+    }
+    rename_map = {}
+    for col in frame.columns:
+        key = str(col).strip().lower().replace(" ", "_")
+        target = normalize.get(key)
+        if target and col != target:
+            rename_map[col] = target
+    if rename_map:
+        frame = frame.rename(columns=rename_map)
+    if "Close" not in frame.columns and "Adj_Close" in frame.columns:
+        frame = frame.copy()
+        frame["Close"] = frame["Adj_Close"]
     return frame
 
 
