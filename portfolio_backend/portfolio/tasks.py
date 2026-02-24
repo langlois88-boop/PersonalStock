@@ -30,7 +30,10 @@ import praw
 from newsapi import NewsApiClient
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-import google.generativeai as genai
+try:
+    from google import genai
+except Exception:  # pragma: no cover - optional dependency
+    genai = None
 try:
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.units import inch
@@ -3450,6 +3453,12 @@ def scan_market_for_opportunities() -> dict[str, Any]:
 
 
 @shared_task
+def task_global_market_discovery() -> dict[str, Any]:
+    """Backward-compatible alias for legacy task imports."""
+    return scan_market_for_opportunities()
+
+
+@shared_task
 def monitor_active_signals() -> dict[str, Any]:
     open_signals = ActiveSignal.objects.filter(status='OPEN')
     if not open_signals.exists():
@@ -5296,20 +5305,17 @@ def _error_category(label: str | None) -> str:
 
 def _gemini_error_label(symbol: str, headlines: list[str], parent: str | None, parent_change: float | None) -> str | None:
     api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
-    if not api_key:
+    if not api_key or genai is None:
         return None
     try:
-        import google.generativeai as genai
-
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        client = genai.Client(api_key=api_key)
         headline_text = " | ".join(headlines[:5]) if headlines else 'n/a'
         prompt = (
             "Tu analyses un trade perdant de paper trading. Donne une étiquette courte d'erreur "
             "parmi: 'Fausse cassure', 'Baisse du Bitcoin', 'Dilution', 'News négatives', 'Macro défavorable'. "
             f"Ticker: {symbol}. Headlines: {headline_text}. Parent: {parent}, change: {parent_change}."
         )
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
         label = (getattr(response, 'text', None) or '').strip()
         return label or None
     except Exception:
@@ -5611,10 +5617,9 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
             earnings_date = None
 
         gemini_summary = None
-        if getattr(settings, 'GEMINI_AI_API_KEY', None):
+        if getattr(settings, 'GEMINI_AI_API_KEY', None) and genai is not None:
             try:
-                genai.configure(api_key=settings.GEMINI_AI_API_KEY)
-                model = genai.GenerativeModel('gemini-1.5-flash')
+                client = genai.Client(api_key=settings.GEMINI_AI_API_KEY)
                 prompt = (
                     f"Analyse {symbol} au prix {last_price:.2f}. "
                     f"Confidence ML: {confidence_score:.2f}, Sentiment News: {sentiment_score:.2f}. "
@@ -5624,7 +5629,7 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
                     "Si earnings dans <7 jours, ajoute ⚠️ PRUDENCE : Résultats imminents. "
                     "Termine par un verdict ACHETER, VENDRE ou ATTENDRE."
                 )
-                response = model.generate_content(prompt)
+                response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
                 gemini_summary = (getattr(response, 'text', None) or '').strip() or None
             except Exception:
                 gemini_summary = None
@@ -6497,11 +6502,10 @@ def analyze_with_gemini(
     correlation_data: dict[str, Any] | None,
 ) -> str | None:
     api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
-    if not api_key:
+    if not api_key or genai is None:
         return None
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        client = genai.Client(api_key=api_key)
         ohlc_text = 'n/a'
         if df_ohlc is not None and not df_ohlc.empty:
             ohlc_text = df_ohlc.tail(10).to_string(index=False)
@@ -6511,7 +6515,7 @@ def analyze_with_gemini(
             f"Corrélation avec actif parent : {correlation_data}. Donne un verdict clair : ACHAT, ATTENTE ou DANGER. "
             "Inclus un prix d'entrée, un objectif de profit (+10%) et un stop-loss (-4%). Sois concis pour un message Telegram."
         )
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
         return (getattr(response, 'text', None) or '').strip() or None
     except Exception as exc:
         message = str(exc).lower()
@@ -6720,20 +6724,19 @@ def task_audit_portfolio_complet(is_close: bool = False) -> dict[str, Any]:
             })
 
         api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
-        if not api_key:
+        if not api_key or genai is None:
             payload = {'status': 'no_api_key', 'count': len(rows)}
             _task_log_finish(log, 'SUCCESS', payload)
             return payload
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        client = genai.Client(api_key=api_key)
         prompt = (
             f"Voici mon portfolio actuel : {rows}. En tant qu'expert en gestion de risque, analyse chaque ligne. "
             "Pour chacune, réponds brièvement : 1. Statut (HOLD/SELL/TAKE PROFIT), 2. Raison rapide (ex: News négative, "
             "Bitcoin chute, ou Momentum haussier), et 3. Urgence (Bas/Moyen/Haut). Termine par un conseil sur mon exposition totale."
         )
         try:
-            response = model.generate_content(prompt)
+            response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
             analysis = (getattr(response, 'text', None) or '').strip()
         except Exception as exc:
             message = str(exc).lower()

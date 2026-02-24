@@ -27,7 +27,7 @@ newsapi-python
 python-dotenv
 prophet
 openai
-google-generativeai
+google-genai
 pandas_ta
 psycopg2-binary
 reportlab
