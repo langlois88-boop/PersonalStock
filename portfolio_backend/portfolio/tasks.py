@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from functools import lru_cache
-from datetime import date, datetime, timedelta, time as dt_time
+from datetime import date, datetime, timedelta, time as dt_time, timezone as dt_timezone
 from math import isfinite
 from typing import Any
 
@@ -230,7 +230,7 @@ def _entry_time_features(symbol: str, now: datetime | None = None) -> dict[str, 
 
 
 def _price_move_after_entry(symbol: str, entry_time: datetime, hours: int) -> tuple[float | None, float | None]:
-    start = entry_time.astimezone(timezone.utc)
+    start = entry_time.astimezone(dt_timezone.utc)
     end = start + timedelta(hours=hours)
     df = get_intraday_bars_range(symbol, start=start, end=end)
     if df is None or df.empty or 'close' not in df.columns:
