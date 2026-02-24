@@ -1,4 +1,4 @@
-import { BarChart3, Brain, Eye, LayoutDashboard, Activity, UploadCloud, TrendingUp } from 'lucide-react';
+import { BarChart3, Brain, Eye, LayoutDashboard, Activity, UploadCloud, TrendingUp, Shield } from 'lucide-react';
 
 const navItems = [
   { id: 'home', label: 'Dashboard Home', icon: LayoutDashboard },
@@ -8,6 +8,7 @@ const navItems = [
   { id: 'lab', label: 'Analytics & ML Lab', icon: BarChart3 },
   { id: 'paper', label: 'Live Paper Trading', icon: Activity },
   { id: 'intraday', label: 'Intraday AI Guide', icon: TrendingUp },
+  { id: 'risk', label: 'Risk Control Center', icon: Shield },
 ];
 
 function Sidebar({ active, onSelect }) {

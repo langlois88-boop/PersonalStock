@@ -483,6 +483,9 @@ def _bluechip_aggressive_multiplier() -> float:
 
 def _calc_stop_target_from_prev_candle(bars: pd.DataFrame, current_price: float) -> tuple[float, float, float]:
     if bars is None or bars.empty or len(bars) < 2:
+            'penalty_note': (
+                f"Le modèle a été pénalisé sur {penalized} trades perdants pour améliorer sa prudence"
+            ),
         stop_loss = max(current_price * 0.98, current_price - 0.05)
         risk = max(current_price - stop_loss, 0.01)
         target_price = current_price + (2 * risk)
@@ -3428,6 +3431,28 @@ def market_scanner_task() -> dict[str, Any]:
 
 
 @shared_task
+def scan_market_for_opportunities() -> dict[str, Any]:
+    """Wrapper around market_scanner_task with a configurable score threshold."""
+    payload = market_scanner_task()
+    try:
+        min_score = float(os.getenv('SCANNER_MIN_SCORE', '0.8'))
+        results = payload.get('results') or []
+        filtered = [r for r in results if float(r.get('score') or 0) >= min_score]
+        if filtered:
+            top = filtered[0]
+            _send_telegram_alert(
+                f"🚀 Scanner Opportunité: {top['symbol']} score {top['score']:.2f} RVOL {top['rvol']}",
+                allow_during_blackout=True,
+                category='signal',
+            )
+        payload['filtered'] = filtered[:5]
+        payload['min_score'] = min_score
+        return payload
+    except Exception:
+        return payload
+
+
+@shared_task
 def monitor_active_signals() -> dict[str, Any]:
     open_signals = ActiveSignal.objects.filter(status='OPEN')
     if not open_signals.exists():
@@ -4101,6 +4126,8 @@ def retrain_from_paper_trades_daily(sandbox_override: str | None = None) -> dict
         model_path = get_model_path(selected_sandbox)
 
         holdout_accuracy = None
+        holdout_accuracy_current = None
+        guard_failed = False
         holdout_ok = True
         if not holdout_df.empty and len(holdout_df) >= min_holdout_samples:
             train_df = _ensure_feature_cols(train_df.copy())
@@ -4133,6 +4160,29 @@ def retrain_from_paper_trades_daily(sandbox_override: str | None = None) -> dict
 
         model_version = get_model_version(payload, model_path)
 
+        if not holdout_df.empty and len(holdout_df) >= min_holdout_samples:
+            try:
+                import joblib
+
+                current_payload = None
+                if model_path.exists():
+                    loaded = joblib.load(model_path)
+                    if isinstance(loaded, dict) and loaded.get('model') and loaded.get('features'):
+                        current_payload = loaded
+                    elif hasattr(loaded, 'predict'):
+                        current_payload = {'model': loaded, 'features': FEATURE_COLUMNS}
+                if current_payload and current_payload.get('model'):
+                    feature_list = current_payload.get('features') or FEATURE_COLUMNS
+                    X_holdout = holdout_df[feature_list].fillna(0).values
+                    y_holdout = holdout_df['label'].fillna(0).astype(int).values
+                    preds_current = current_payload['model'].predict(X_holdout)
+                    holdout_accuracy_current = float((preds_current == y_holdout).mean())
+                    if holdout_accuracy is not None and holdout_accuracy_current is not None:
+                        if holdout_accuracy < (holdout_accuracy_current - 0.05):
+                            guard_failed = True
+            except Exception:
+                guard_failed = False
+
         symbol = os.getenv('BACKTEST_SYMBOL', 'SPY').strip().upper()
         lookback_days = int(os.getenv('BACKTEST_LOOKBACK_DAYS', '60'))
         engine = DataFusionEngine(symbol)
@@ -4155,6 +4205,8 @@ def retrain_from_paper_trades_daily(sandbox_override: str | None = None) -> dict
         )
         paper_ok = paper_trades_count >= min_promote_trades and paper_win_rate >= min_promote_win_rate
 
+        if guard_failed:
+            improved = False
         if improved and paper_ok and holdout_ok:
             save_model_payload(payload, model_path=model_path)
             ModelRegistry.objects.filter(model_name=model_name, status='ACTIVE').update(status='ARCHIVED')
@@ -4175,6 +4227,8 @@ def retrain_from_paper_trades_daily(sandbox_override: str | None = None) -> dict
                         'current_sharpe': current_result.sharpe_ratio,
                         'candidate_sharpe': candidate_result.sharpe_ratio,
                         'holdout_accuracy': holdout_accuracy,
+                        'holdout_accuracy_current': holdout_accuracy_current,
+                        'guard_failed': guard_failed,
                         'holdout_ok': holdout_ok,
                         'holdout_days': holdout_days,
                         'penalized_trades': penalized,
