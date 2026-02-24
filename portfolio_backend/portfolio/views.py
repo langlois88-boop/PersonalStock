@@ -2362,13 +2362,14 @@ def _gemini_macro_ok(symbol: str, sector: str, news_titles: list[str]) -> bool:
 	try:
 		from google import genai
 		client = genai.Client(api_key=api_key)
+		model_name = getattr(settings, 'GEMINI_AI_MODEL', 'models/gemini-2.5-flash')
 		news_text = " | ".join(news_titles[:5]) if news_titles else 'n/a'
 		prompt = (
 			"Tu es un analyste macro. Réponds uniquement par OK ou NO. "
 			f"Ticker: {symbol}. Secteur: {sector}. News: {news_text}. "
 			"Le contexte macro/secteur est-il sain pour un achat court terme?"
 		)
-		response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
+		response = client.models.generate_content(model=model_name, contents=prompt)
 		text = (getattr(response, 'text', None) or '').strip().upper()
 		return text.startswith('OK') or text.startswith('YES')
 	except Exception:
@@ -4906,7 +4907,8 @@ class PortfolioOptimizerView(APIView):
 				"Donne un diagnostic: sur-exposition, titres à alléger, titres à renforcer. "
 				"Utilise des phrases du type: 'Attention, tu es trop exposé aux Penny Stocks...'"
 			)
-			response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
+			model_name = getattr(settings, 'GEMINI_AI_MODEL', 'models/gemini-2.5-flash')
+			response = client.models.generate_content(model=model_name, contents=prompt)
 			return (getattr(response, 'text', None) or '').strip() or None
 		except Exception:
 			return None

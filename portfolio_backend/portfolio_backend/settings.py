@@ -28,6 +28,7 @@ USD_CAD_RATE = float(os.getenv('USD_CAD_RATE', '1.36'))
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = 'django-insecure-6=^b)&0^4goj9ix@877=&ka%6y+lfci!e$kw_hh#-hi@0u$qju'
 GEMINI_AI_API_KEY = os.getenv('GEMINI_AI_API_KEY', '')
+GEMINI_AI_MODEL = os.getenv('GEMINI_AI_MODEL', 'models/gemini-2.5-flash')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
