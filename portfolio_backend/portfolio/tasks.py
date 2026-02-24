@@ -3264,6 +3264,10 @@ def _default_scanner_symbols() -> list[str]:
         'SNOW', 'PLTR', 'MU', 'SMCI', 'TSM', 'COIN', 'SOFI', 'RIVN', 'LCID', 'NIO',
         'SHOP', 'SQ', 'PYPL', 'UBER', 'LYFT', 'ABNB', 'ROKU', 'PINS', 'DKNG', 'HOOD',
         'MARA', 'RIOT', 'HUT', 'HIVE', 'BITF', 'CLSK', 'MSTR', 'PLUG', 'FCEL', 'SOUN',
+        'SNDL', 'RIG',
+        'HIVE.V', 'DMGI.V',
+        'WEED.TO', 'BITF.TO', 'NINE.TO',
+        'RY.TO', 'TD.TO', 'SHOP.TO', 'ATD.TO', 'ENB.TO',
     ]
 
 
