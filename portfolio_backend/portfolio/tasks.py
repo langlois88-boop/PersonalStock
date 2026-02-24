@@ -3722,6 +3722,62 @@ def monitor_active_signals() -> dict[str, Any]:
 
 
 @shared_task
+def generate_daily_performance_report() -> dict[str, Any]:
+    """Daily recap of AI signals for the day."""
+    log = _task_log_start('generate_daily_performance_report')
+    try:
+        today = _ny_time_now().date()
+        signals = ActiveSignal.objects.filter(opened_at__date=today)
+        if not signals.exists():
+            message = (
+                f"📋 **BILAN DE JOURNÉE IA** ({today})\n"
+                "---\n"
+                "Aucun signal généré aujourd'hui."
+            )
+            _send_telegram_alert(message, allow_during_blackout=True, category='report')
+            payload = {'status': 'empty', 'count': 0, 'date': today.isoformat()}
+            _task_log_finish(log, 'SUCCESS', payload)
+            return payload
+
+        total_signals = signals.count()
+        avg_confidence = signals.aggregate(avg=models.Avg('confidence')).get('avg')
+
+        def _fmt_conf(value: float | None) -> str:
+            if value is None:
+                return 'n/a'
+            conf = float(value)
+            if conf <= 1:
+                conf *= 100
+            return f"{conf:.1f}%"
+
+        top_picks = signals.order_by('-confidence', '-opened_at')[:3]
+        picks_lines = [f"• {signal.ticker}: {_fmt_conf(signal.confidence)}" for signal in top_picks]
+        picks_str = "\n".join(picks_lines) if picks_lines else "—"
+
+        report = (
+            f"📋 **BILAN DE JOURNÉE IA** ({today})\n"
+            "---\n"
+            f"🔍 **Opportunités scannées :** {total_signals}\n"
+            f"🧠 **Confiance moyenne :** {_fmt_conf(avg_confidence)}\n\n"
+            f"🏆 **Top 3 de l'IA :**\n{picks_str}\n\n"
+            "💰 **Statut Risk Manager :** Opérationnel (Limite 300$/trade)"
+        )
+
+        _send_telegram_alert(report, allow_during_blackout=True, category='report')
+        payload = {
+            'status': 'sent',
+            'count': total_signals,
+            'date': today.isoformat(),
+            'avg_confidence': avg_confidence,
+        }
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+@shared_task
 def send_morning_scout_report() -> dict[str, Any]:
     log = _task_log_start('send_morning_scout_report')
     try:

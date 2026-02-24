@@ -173,7 +173,7 @@ CELERY_RESULT_BACKEND = REDIS_URL
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = TIME_ZONE
+CELERY_TIMEZONE = 'America/New_York'
 
 CHANNEL_LAYERS = {
     'default': {
@@ -358,6 +358,10 @@ CELERY_BEAT_SCHEDULE = {
     'daily-profit-tracker': {
         'task': 'portfolio.tasks.daily_profit_tracker',
         'schedule': crontab(minute=30, hour=16, day_of_week='mon-fri'),
+    },
+    'daily-performance-report': {
+        'task': 'portfolio.tasks.generate_daily_performance_report',
+        'schedule': crontab(minute=5, hour=17, day_of_week='mon-fri'),
     },
     'monitor-my-portfolio-hourly': {
         'task': 'portfolio.tasks.monitor_my_portfolio',
