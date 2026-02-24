@@ -3176,13 +3176,9 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
 
     for symbol in watchlist:
         existing_trades = open_trades_by_symbol.get(symbol, [])
-        signal_payload = _signal(symbol, intraday_ctx=intraday_ctx)
-        signal = signal_payload['signal'] if signal_payload else None
-        if signal is not None and intraday_ctx:
-            now_ny = _ny_time_now()
-            if now_ny.time() >= dt_time(14, 30) and float(intraday_ctx.get('rvol') or 0) < 1.0:
-                signal = float(signal) * 0.9
         intraday_ctx = None
+        pattern_signal = None
+        rvol = None
         if use_alpaca:
             intraday_ctx = get_intraday_context(
                 symbol,
@@ -3192,10 +3188,17 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             if intraday_ctx:
                 pattern_signal = float(intraday_ctx.get('pattern_signal') or 0)
                 rvol = float(intraday_ctx.get('rvol') or 0)
-                if pattern_signal < 0 and rvol >= 2:
-                    continue
-                if signal is not None and pattern_signal > 0 and rvol >= 2:
-                    signal = min(1.0, float(signal) * 1.02)
+        signal_payload = _signal(symbol, intraday_ctx=intraday_ctx)
+        signal = signal_payload['signal'] if signal_payload else None
+        if pattern_signal is not None and rvol is not None:
+            if pattern_signal < 0 and rvol >= 2:
+                continue
+            if signal is not None and pattern_signal > 0 and rvol >= 2:
+                signal = min(1.0, float(signal) * 1.02)
+        if signal is not None and intraday_ctx:
+            now_ny = _ny_time_now()
+            if now_ny.time() >= dt_time(14, 30) and float(intraday_ctx.get('rvol') or 0) < 1.0:
+                signal = float(signal) * 0.9
         if signal is not None and sandbox == 'AI_BLUECHIP':
             multiplier = _bluechip_aggressive_multiplier()
             if multiplier > 1.0:
