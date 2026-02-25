@@ -1048,6 +1048,7 @@ class UserPreferenceViewSet(viewsets.ModelViewSet):
 class PaperTradeSummaryView(APIView):
 	def get(self, request):
 		sandbox = (request.query_params.get('sandbox') or '').strip().upper()
+		broker = (request.query_params.get('broker') or '').strip().upper()
 		initial_capital = float(os.getenv('PAPER_CAPITAL', '10000'))
 		try:
 			def _latest_price(symbol: str, use_alpaca: bool = False) -> float | None:
@@ -1112,6 +1113,11 @@ class PaperTradeSummaryView(APIView):
 
 			open_trades = PaperTrade.objects.filter(status='OPEN')
 			closed_trades = PaperTrade.objects.filter(status='CLOSED')
+			if broker:
+				if broker not in {'SIM', 'ALPACA'}:
+					return Response({'error': 'Invalid broker.'}, status=400)
+				open_trades = open_trades.filter(broker=broker)
+				closed_trades = closed_trades.filter(broker=broker)
 			if sandbox:
 				open_trades = open_trades.filter(sandbox=sandbox)
 				closed_trades = closed_trades.filter(sandbox=sandbox)
@@ -1143,6 +1149,7 @@ class PaperTradeSummaryView(APIView):
 
 			return Response({
 				'sandbox': sandbox or 'ALL',
+				'broker': broker or 'ALL',
 				'initial_capital': initial_capital,
 				'available_capital': round(available, 2),
 				'open_value': round(open_value, 2),
@@ -1154,6 +1161,7 @@ class PaperTradeSummaryView(APIView):
 		except Exception:
 			return Response({
 				'sandbox': sandbox or 'ALL',
+				'broker': broker or 'ALL',
 				'initial_capital': initial_capital,
 				'available_capital': round(initial_capital, 2),
 				'open_value': 0,
@@ -1509,11 +1517,16 @@ class PaperTradePerformanceView(APIView):
 
 	def get(self, request):
 		sandbox_param = (request.query_params.get('sandbox') or '').strip().upper()
+		broker = (request.query_params.get('broker') or '').strip().upper()
 		sandboxes = [sandbox_param] if sandbox_param else ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY']
+		if broker and broker not in {'SIM', 'ALPACA'}:
+			return Response({'error': 'Invalid broker.'}, status=400)
 		results = []
 		for sandbox in sandboxes:
 			initial_capital = self._initial_capital(sandbox)
 			closed = PaperTrade.objects.filter(status='CLOSED', sandbox=sandbox).order_by('exit_date')
+			if broker:
+				closed = closed.filter(broker=broker)
 			trades = closed.count()
 			wins = closed.filter(outcome='WIN').count()
 			if wins == 0 and trades:
@@ -1536,6 +1549,7 @@ class PaperTradePerformanceView(APIView):
 			max_drawdown = self._max_drawdown(equity_curve)
 			results.append({
 				'sandbox': sandbox,
+				'broker': broker or 'ALL',
 				'initial_capital': round(initial_capital, 2),
 				'trades': trades,
 				'win_rate': round(win_rate, 2),
@@ -1557,6 +1571,9 @@ class PaperTradeEquityCurveView(APIView):
 		return float(os.getenv('PAPER_CAPITAL', '10000'))
 
 	def get(self, request):
+		broker = (request.query_params.get('broker') or '').strip().upper()
+		if broker and broker not in {'SIM', 'ALPACA'}:
+			return Response({'error': 'Invalid broker.'}, status=400)
 		sandboxes = ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY']
 		curves: dict[str, dict[str, float]] = {s: {} for s in sandboxes}
 		all_dates: set[str] = set()
@@ -1564,6 +1581,8 @@ class PaperTradeEquityCurveView(APIView):
 		for sandbox in sandboxes:
 			capital = self._initial_capital(sandbox)
 			closed = PaperTrade.objects.filter(status='CLOSED', sandbox=sandbox).exclude(exit_date__isnull=True).order_by('exit_date')
+			if broker:
+				closed = closed.filter(broker=broker)
 			for trade in closed:
 				date_key = trade.exit_date.date().isoformat()
 				capital += float(trade.pnl or 0)

@@ -51,6 +51,7 @@ function AnalyticsLabPage() {
   const reportRef = useRef(null);
   const [backtest, setBacktest] = useState(null);
   const [sandboxStats, setSandboxStats] = useState([]);
+  const [alpacaStats, setAlpacaStats] = useState([]);
   const [calibration, setCalibration] = useState(null);
   const [sandboxCurve, setSandboxCurve] = useState({ dates: [], series: [] });
   const [health, setHealth] = useState(null);
@@ -68,15 +69,17 @@ function AnalyticsLabPage() {
     const loadBacktest = async () => {
       try {
         const backtestParams = { symbol: 'SPY', days: 365, universe };
-        const [backtestData, sandboxData, curveData, healthData] = await Promise.all([
+        const [backtestData, sandboxData, alpacaData, curveData, healthData] = await Promise.all([
           cachedGet('backtester/', backtestParams, 60000),
           cachedGet('paper-trades/performance/', {}, 30000),
+          cachedGet('paper-trades/performance/', { broker: 'ALPACA' }, 30000),
           cachedGet('paper-trades/equity/', {}, 60000),
           cachedGet('health/', {}, 60000),
         ]);
         if (!isMounted) return;
         setBacktest(backtestData);
         setSandboxStats(sandboxData?.results || []);
+        setAlpacaStats(alpacaData?.results || []);
         setSandboxCurve(curveData || { dates: [], series: [] });
         setHealth(healthData || null);
         const calibrationSandbox = sandboxFilter === 'ALL' ? 'WATCHLIST' : sandboxFilter;
@@ -93,6 +96,7 @@ function AnalyticsLabPage() {
         if (!isMounted) return;
         setBacktest(null);
         setSandboxStats([]);
+        setAlpacaStats([]);
         setCalibration(null);
         setSandboxCurve({ dates: [], series: [] });
         setHealth(null);
@@ -228,6 +232,22 @@ function AnalyticsLabPage() {
       }
     ));
   }, [sandboxStats]);
+
+  const orderedAlpacaStats = useMemo(() => {
+    const map = new Map((alpacaStats || []).map((stat) => [stat.sandbox, stat]));
+    return ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'].map((key) => (
+      map.get(key) || {
+        sandbox: key,
+        initial_capital: 0,
+        trades: 0,
+        win_rate: 0,
+        total_return_pct: 0,
+        sharpe_ratio: 0,
+        max_drawdown: 0,
+        final_balance: 0,
+      }
+    ));
+  }, [alpacaStats]);
 
   const exportPerformanceCsv = () => {
     if (!sandboxStats.length) return;
@@ -439,6 +459,34 @@ function AnalyticsLabPage() {
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               {orderedSandboxStats.map((stat) => (
                 <div key={stat.sandbox} className="bg-slate-950/60 border border-slate-800 rounded-2xl p-4">
+                  <p className="text-xs text-slate-400 uppercase tracking-[0.2em]">
+                    {sandboxLabels[stat.sandbox] || stat.sandbox}
+                  </p>
+                  <div className="mt-3 space-y-2 text-sm text-slate-200">
+                    <div className="flex justify-between"><span>Win Rate</span><span>{formatPct(stat.win_rate, 2)}</span></div>
+                    <div className="flex justify-between"><span>Total Return</span><span>{formatPct(stat.total_return_pct, 2)}</span></div>
+                    <div className="flex justify-between"><span>Sharpe Ratio</span><span>{formatNumber(stat.sharpe_ratio, 3)}</span></div>
+                    <div className="flex justify-between"><span>Max Drawdown</span><span>{formatPct(stat.max_drawdown, 2)}</span></div>
+                    <div className="flex justify-between"><span>Final Balance</span><span>{formatMoney(stat.final_balance)}</span></div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+          <div className="flex items-center justify-between mb-4">
+            <p className="text-white font-semibold">Alpaca Paper Performance</p>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-slate-400">Broker: Alpaca</span>
+            </div>
+          </div>
+          {alpacaStats.length === 0 ? (
+            <p className="text-slate-400 text-sm">No Alpaca paper trades yet.</p>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              {orderedAlpacaStats.map((stat) => (
+                <div key={`alpaca-${stat.sandbox}`} className="bg-slate-950/60 border border-slate-800 rounded-2xl p-4">
                   <p className="text-xs text-slate-400 uppercase tracking-[0.2em]">
                     {sandboxLabels[stat.sandbox] || stat.sandbox}
                   </p>

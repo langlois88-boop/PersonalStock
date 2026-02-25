@@ -6,6 +6,7 @@ function LivePaperTrading() {
   const [selectedTrade, setSelectedTrade] = useState(null);
   const [loading, setLoading] = useState(true);
   const [livePositions, setLivePositions] = useState({});
+  const [brokerFilter, setBrokerFilter] = useState('ALL');
 
   const formatExplanation = (explanations = []) => {
     if (!Array.isArray(explanations) || explanations.length === 0) return '—';
@@ -23,7 +24,8 @@ function LivePaperTrading() {
     let active = true;
     const load = async () => {
       try {
-        const data = await cachedGet('paper-trades/summary/', {}, 30000);
+        const params = brokerFilter === 'ALL' ? {} : { broker: brokerFilter };
+        const data = await cachedGet('paper-trades/summary/', params, 30000);
         if (!active) return;
         setSummary(data);
       } catch (err) {
@@ -40,7 +42,7 @@ function LivePaperTrading() {
       active = false;
       clearInterval(interval);
     };
-  }, []);
+  }, [brokerFilter]);
 
   useEffect(() => {
     const wsEnabled = (process.env.REACT_APP_WS_UPDATES || '').toLowerCase() === 'true';
@@ -116,7 +118,18 @@ function LivePaperTrading() {
       </div>
 
       <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
-        <h3 className="text-white font-semibold mb-4">Positions ouvertes</h3>
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-white font-semibold">Positions ouvertes</h3>
+          <select
+            value={brokerFilter}
+            onChange={(event) => setBrokerFilter(event.target.value)}
+            className="bg-slate-950/60 border border-slate-800 text-slate-200 text-xs rounded-lg px-2 py-1"
+          >
+            <option value="ALL">Broker: All</option>
+            <option value="SIM">Broker: SIM</option>
+            <option value="ALPACA">Broker: Alpaca</option>
+          </select>
+        </div>
         {summary.open_positions?.length ? (
           <div className="space-y-3">
             {summary.open_positions.map((trade) => (
