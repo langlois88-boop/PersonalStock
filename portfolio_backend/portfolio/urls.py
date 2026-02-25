@@ -64,6 +64,7 @@ from .views import (
     ModelEvaluationDailyView,
     ModelMonitoringSummaryView,
     SandboxWatchlistView,
+    TradingDiagnosticView,
 )
 
 router = routers.DefaultRouter()
@@ -129,5 +130,6 @@ urlpatterns = [
     path('sector-compare/', SectorTrendCompareView.as_view()),
     path('forecast/', ForecastView.as_view()),
     path('health/', HealthCheckView.as_view()),
+    path('trading/diagnostics/', TradingDiagnosticView.as_view()),
     path('', include(router.urls)),
 ]

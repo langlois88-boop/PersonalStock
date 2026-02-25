@@ -5,7 +5,7 @@ import os
 import math
 import time
 from pathlib import Path
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time as dt_time
 from typing import Any
 import unicodedata
 from types import SimpleNamespace
@@ -31,7 +31,13 @@ from rest_framework.exceptions import ValidationError
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 
-from .alpaca_data import get_latest_trade_price
+from zoneinfo import ZoneInfo
+
+from .alpaca_data import (
+	get_latest_trade_price,
+	get_latest_bid_ask_spread_pct,
+	get_order_book_imbalance,
+)
 from .models import (
 	Account,
 	AccountTransaction,
@@ -127,6 +133,13 @@ def generate_expert_advice(metrics: dict[str, float | None]) -> list[str]:
 	if max_drawdown is not None and max_drawdown > 10:
 		advice.append('🚨 Danger de perte en capital importante. Resserrez les Stops.')
 	return advice
+
+
+def _ny_time_now() -> datetime:
+	try:
+		return timezone.now().astimezone(ZoneInfo('America/New_York'))
+	except Exception:
+		return timezone.now()
 
 
 def _portfolio_return_snapshot() -> dict[str, float | None]:
@@ -5262,6 +5275,100 @@ class AIBacktesterView(APIView):
 				'max_drawdown': result.raw_max_drawdown,
 				'equity_curve': result.raw_equity_curve,
 			},
+		})
+
+
+class TradingDiagnosticView(APIView):
+	def _market_closed(self) -> tuple[bool, str]:
+		now_ny = _ny_time_now()
+		if now_ny.weekday() >= 5:
+			return True, 'Market Closed - weekend'
+		start = dt_time(9, 30)
+		end = dt_time(16, 0)
+		if not (start <= now_ny.time() <= end):
+			return True, 'Market Closed - outside regular hours'
+		return False, ''
+
+	def get(self, request):
+		symbols_param = (request.query_params.get('symbols') or '').strip()
+		sandbox_param = (request.query_params.get('sandbox') or 'WATCHLIST').strip().upper()
+		symbols: list[str] = []
+		if symbols_param:
+			symbols = [s.strip().upper() for s in symbols_param.split(',') if s.strip()]
+		else:
+			watch = SandboxWatchlist.objects.filter(sandbox=sandbox_param).first()
+			if watch and watch.symbols:
+				symbols = [str(s).strip().upper() for s in watch.symbols if str(s).strip()]
+		if not symbols:
+			return Response({'results': [], 'message': 'No symbols to diagnose.'})
+
+		min_conf = float(os.getenv('ALPACA_MIN_CONFIDENCE', '0.7'))
+		min_sent = float(os.getenv('ALPACA_MIN_SENTIMENT', '0.0'))
+		min_imb = float(os.getenv('ALPACA_MIN_IMBALANCE', '1.0'))
+		max_cost_pct = float(os.getenv('ALPACA_MAX_COST_PCT', '0.01'))
+		commission_pct = float(os.getenv('ALPACA_COMMISSION_PCT', '0.0'))
+
+		penny_watch = SandboxWatchlist.objects.filter(sandbox='AI_PENNY').first()
+		penny_symbols = set([
+			str(s).strip().upper() for s in (penny_watch.symbols if penny_watch else []) if str(s).strip()
+		])
+
+		market_closed, market_note = self._market_closed()
+		results: list[dict[str, Any]] = []
+		for symbol in symbols:
+			universe = 'PENNY' if symbol in penny_symbols else 'BLUECHIP'
+			engine = DataFusionEngine(symbol)
+			frame = engine.fuse_all()
+			if frame is None or frame.empty:
+				results.append({'symbol': symbol, 'error': 'no_data'})
+				continue
+			payload = load_or_train_model(frame, model_path=get_model_path(universe))
+			if not payload or not payload.get('model'):
+				results.append({'symbol': symbol, 'error': 'model_unavailable'})
+				continue
+			last_row = frame.tail(1).copy()
+			feature_list = payload.get('features') or []
+			for col in feature_list:
+				if col not in last_row.columns:
+					last_row[col] = 0.0
+			features = last_row[feature_list].fillna(0).values
+			try:
+				signal = float(payload['model'].predict_proba(features)[0][1])
+			except Exception:
+				signal = float(payload['model'].predict(features)[0]) if hasattr(payload['model'], 'predict') else 0.0
+			signal = apply_feature_weighting_to_signal(signal, last_row.iloc[0], symbol)
+			feature_snapshot = {col: float(last_row.iloc[0].get(col, 0.0)) for col in FEATURE_COLUMNS}
+			sentiment = float(feature_snapshot.get('sentiment_score') or 0.0)
+			imbalance = get_order_book_imbalance(symbol)
+			spread_pct = get_latest_bid_ask_spread_pct(symbol)
+			cost_pct = (float(spread_pct) if spread_pct is not None else 0.0) + commission_pct
+			price = get_latest_trade_price(symbol)
+			results.append({
+				'symbol': symbol,
+				'universe': universe,
+				'confidence': round(signal, 4),
+				'confidence_ok': signal >= min_conf,
+				'sentiment': round(sentiment, 4),
+				'sentiment_ok': sentiment >= min_sent,
+				'imbalance': None if imbalance is None else round(float(imbalance), 4),
+				'imbalance_ok': None if imbalance is None else float(imbalance) >= min_imb,
+				'spread_pct': None if spread_pct is None else round(float(spread_pct), 4),
+				'cost_pct': round(cost_pct, 4),
+				'cost_ok': cost_pct <= max_cost_pct,
+				'price': None if price is None else round(float(price), 4),
+			})
+
+		return Response({
+			'market_closed': market_closed,
+			'message': market_note,
+			'thresholds': {
+				'min_confidence': min_conf,
+				'min_sentiment': min_sent,
+				'min_imbalance': min_imb,
+				'max_cost_pct': max_cost_pct,
+				'commission_pct': commission_pct,
+			},
+			'results': results,
 		})
 
 

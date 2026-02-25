@@ -11,7 +11,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { cachedGet } from '../api/cachedApi';
+import { cachedGet, invalidateCache } from '../api/cachedApi';
 import html2canvas from 'html2canvas';
 import jsPDF from 'jspdf';
 
@@ -57,6 +57,10 @@ function AnalyticsLabPage() {
   const [loading, setLoading] = useState(true);
   const [universe, setUniverse] = useState('BLUECHIP');
   const [sandboxFilter, setSandboxFilter] = useState('ALL');
+  const [diagnostics, setDiagnostics] = useState([]);
+  const [diagnosticMeta, setDiagnosticMeta] = useState(null);
+  const [diagnosticLoading, setDiagnosticLoading] = useState(false);
+  const [diagnosticError, setDiagnosticError] = useState(null);
 
   useEffect(() => {
     let isMounted = true;
@@ -278,6 +282,24 @@ function AnalyticsLabPage() {
     pdf.save('analytics_report.pdf');
   };
 
+  const runDiagnostics = async () => {
+    const sandbox = sandboxFilter === 'ALL' ? 'WATCHLIST' : sandboxFilter;
+    setDiagnosticLoading(true);
+    setDiagnosticError(null);
+    try {
+      invalidateCache('trading/diagnostics/', { sandbox });
+      const res = await cachedGet('trading/diagnostics/', { sandbox }, 0);
+      setDiagnostics(res?.results || []);
+      setDiagnosticMeta(res || null);
+    } catch (err) {
+      setDiagnostics([]);
+      setDiagnosticMeta(null);
+      setDiagnosticError('Unable to load diagnostics.');
+    } finally {
+      setDiagnosticLoading(false);
+    }
+  };
+
   return (
     <div className="space-y-4" ref={reportRef}>
       <div className="flex items-center justify-between">
@@ -480,6 +502,75 @@ function AnalyticsLabPage() {
                   </div>
                 );
               })}
+            </div>
+          )}
+        </div>
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <p className="text-white font-semibold">Live Diagnostics</p>
+              <p className="text-xs text-slate-400">Alpaca filters (confidence, sentiment, imbalance, spread)</p>
+            </div>
+            <button
+              type="button"
+              onClick={runDiagnostics}
+              className="text-xs text-indigo-300 hover:text-indigo-200"
+              disabled={diagnosticLoading}
+            >
+              {diagnosticLoading ? 'Running…' : 'Run Live Diagnostic'}
+            </button>
+          </div>
+          {diagnosticMeta?.message && (
+            <div className="text-xs text-amber-300 mb-3">{diagnosticMeta.message}</div>
+          )}
+          {diagnosticError ? (
+            <p className="text-slate-400 text-sm">{diagnosticError}</p>
+          ) : diagnostics.length === 0 ? (
+            <p className="text-slate-400 text-sm">No diagnostics yet.</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-xs text-slate-200">
+                <thead className="text-slate-400">
+                  <tr className="border-b border-slate-800">
+                    <th className="px-2 py-2 text-left">Symbol</th>
+                    <th className="px-2 py-2">Confidence</th>
+                    <th className="px-2 py-2">Sentiment</th>
+                    <th className="px-2 py-2">Imbalance</th>
+                    <th className="px-2 py-2">Spread+Fees</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {diagnostics.map((row) => (
+                    <tr key={row.symbol} className="border-b border-slate-800/60">
+                      <td className="px-2 py-2 text-left">{row.symbol}</td>
+                      <td className="px-2 py-2">
+                        <span className={`rounded-full px-2 py-0.5 ${row.confidence_ok ? 'bg-emerald-500/20 text-emerald-300' : 'bg-rose-500/20 text-rose-300'}`}>
+                          {formatNumber(row.confidence, 2)}
+                        </span>
+                      </td>
+                      <td className="px-2 py-2">
+                        <span className={`rounded-full px-2 py-0.5 ${row.sentiment_ok ? 'bg-emerald-500/20 text-emerald-300' : 'bg-rose-500/20 text-rose-300'}`}>
+                          {formatNumber(row.sentiment, 2)}
+                        </span>
+                      </td>
+                      <td className="px-2 py-2">
+                        {row.imbalance === null ? (
+                          <span className="rounded-full px-2 py-0.5 bg-slate-500/20 text-slate-300">n/a</span>
+                        ) : (
+                          <span className={`rounded-full px-2 py-0.5 ${row.imbalance_ok ? 'bg-emerald-500/20 text-emerald-300' : 'bg-rose-500/20 text-rose-300'}`}>
+                            {formatNumber(row.imbalance, 2)}
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-2 py-2">
+                        <span className={`rounded-full px-2 py-0.5 ${row.cost_ok ? 'bg-emerald-500/20 text-emerald-300' : 'bg-rose-500/20 text-rose-300'}`}>
+                          {formatPct((row.cost_pct || 0) * 100, 2)}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           )}
         </div>
