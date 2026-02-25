@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/4.2/ref/settings/
 
 import os
 from pathlib import Path
+from datetime import timedelta
 
 from celery.schedules import crontab
 
@@ -301,6 +302,10 @@ CELERY_BEAT_SCHEDULE = {
     'active-signal-monitor-1min': {
         'task': 'portfolio.tasks.monitor_active_signals',
         'schedule': crontab(minute='*/1', hour='9-16', day_of_week='mon-fri'),
+    },
+    'tsx-guardian-30s': {
+        'task': 'portfolio.tasks.monitor_active_trade',
+        'schedule': timedelta(seconds=30),
     },
     'paper-trade-retrain-daily': {
         'task': 'portfolio.tasks.retrain_from_paper_trades_daily',

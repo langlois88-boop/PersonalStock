@@ -171,6 +171,29 @@ def _gemini_trade_reason(symbol: str, signal_payload: dict[str, Any] | None) -> 
         return None
 
 
+def _gemini_dynamic_recommendation(symbol: str, action: str, context: dict[str, Any]) -> str | None:
+    api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
+    if not api_key:
+        return None
+    try:
+        from google import genai
+
+        client = genai.Client(api_key=api_key)
+        model_name = getattr(settings, 'GEMINI_AI_MODEL', 'models/gemini-2.5-flash')
+        prompt = (
+            "Reformule en 1-2 phrases une recommandation de trading, claire et actionnable. "
+            "Le verbe d'action doit être l'un des suivants: Vendre, Garder, Étendre.\n"
+            f"Ticker: {symbol}\n"
+            f"Action: {action}\n"
+            f"Contexte: {json.dumps(context, ensure_ascii=False)}"
+        )
+        response = client.models.generate_content(model=model_name, contents=prompt)
+        text = (getattr(response, 'text', None) or '').strip()
+        return text or None
+    except Exception:
+        return None
+
+
 def _compute_adx(frame: pd.DataFrame, length: int = 14) -> tuple[float | None, float | None]:
     if frame is None or frame.empty or not {'High', 'Low', 'Close'}.issubset(frame.columns):
         return None, None
@@ -1081,6 +1104,241 @@ def _build_swing_signal_message(
     if news_note:
         lines.append(f"{news_note}")
     return "\n".join(lines)
+
+
+def _sentiment_label(score: float | None) -> str:
+    if score is None:
+        return 'Neutre'
+    if score >= 0.5:
+        return 'Très Positif'
+    if score >= 0.2:
+        return 'Positif'
+    if score <= -0.5:
+        return 'Très Négatif'
+    if score <= -0.2:
+        return 'Négatif'
+    return 'Neutre'
+
+
+def _rsi_label(rsi: float | None) -> str:
+    if rsi is None:
+        return 'n/a'
+    if rsi <= 30:
+        return 'Survendu'
+    if rsi >= 70:
+        return 'Suracheté'
+    return 'Neutre'
+
+
+def _tsx_driver_for_symbol(symbol: str) -> str:
+    base_map = {
+        'BTO.TO': 'GC=F',
+        'AEM.TO': 'GC=F',
+        'K.TO': 'GC=F',
+        'CNQ.TO': 'CL=F',
+        'SU.TO': 'CL=F',
+    }
+    base_map.update(_parse_driver_map(os.getenv('CROSS_CORR_DRIVER_MAP')))
+    symbol_upper = (symbol or '').strip().upper()
+    return base_map.get(symbol_upper, _default_driver_for_symbol(symbol_upper))
+
+
+def _tsx_driver_correlation(symbol: str) -> tuple[float | None, str | None]:
+    symbol_upper = (symbol or '').strip().upper()
+    if not symbol_upper:
+        return None, None
+    cache_key = f"cross_corr:{symbol_upper}"
+    cached = cache.get(cache_key)
+    if isinstance(cached, dict) and cached.get('status') == 'ok':
+        return float(cached.get('corr') or 0.0), cached.get('driver')
+    driver = _tsx_driver_for_symbol(symbol_upper)
+    try:
+        sym_df = yf.download(symbol_upper, period="90d", interval='1d')
+        drv_df = yf.download(driver, period="90d", interval='1d')
+        if sym_df is None or sym_df.empty or drv_df is None or drv_df.empty:
+            return None, driver
+        sym_close = sym_df['Close'].dropna()
+        drv_close = drv_df['Close'].dropna()
+        aligned = pd.concat([sym_close.pct_change(), drv_close.pct_change()], axis=1).dropna()
+        if aligned.empty:
+            return None, driver
+        corr = float(aligned.iloc[:, 0].rolling(60).corr(aligned.iloc[:, 1]).iloc[-1])
+        cache.set(cache_key, {'status': 'ok', 'driver': driver, 'corr': corr}, timeout=60 * 60 * 6)
+        return corr, driver
+    except Exception:
+        return None, driver
+
+
+def _tsx_move_type(rvol: float | None, volatility: float | None, sentiment: float | None) -> str:
+    rvol_val = float(rvol or 0.0)
+    vol_val = float(volatility or 0.0)
+    sent_val = float(sentiment or 0.0)
+    if rvol_val >= 4 or vol_val >= 0.05:
+        return 'DAY TRADE'
+    if sent_val >= 0.3:
+        return '3-DAY HOLD'
+    return 'BIG SWING'
+
+
+def _tsx_strategy_text(patterns: list[str], rvol: float | None, rsi: float | None, sentiment: float | None) -> str:
+    notes: list[str] = []
+    if rsi is not None and rsi <= 35:
+        notes.append('Gros Dip détecté avec RSI survendu.')
+    if rvol is not None and float(rvol) >= 3:
+        notes.append('Volume 3x supérieur à la moyenne (RVOL).')
+    if patterns:
+        nice = ', '.join(patterns[:2])
+        notes.append(f"Pattern haussier: {nice}.")
+    if sentiment is not None and float(sentiment) >= 0.3:
+        notes.append('Sentiment news positif.')
+    return ' '.join(notes).strip() or 'Setup technique confirmé sur support.'
+
+
+def _build_tsx_signal_message(
+    ticker: str,
+    move_type: str,
+    strategy: str,
+    buy_limit: float,
+    target_price: float,
+    stop_price: float,
+    rsi: float | None,
+    sentiment: float | None,
+    corr: float | None,
+    driver: str | None,
+) -> str:
+    currency = _symbol_currency(ticker)
+    profit_pct = ((target_price - buy_limit) / buy_limit) * 100 if buy_limit else 0.0
+    corr_txt = f"{corr:.2f}" if corr is not None else 'n/a'
+    driver_txt = driver or 'n/a'
+    rsi_txt = f"{rsi:.0f}" if rsi is not None else 'n/a'
+    duration = 'session (intraday)' if move_type == 'DAY TRADE' else '3 jours' if move_type == '3-DAY HOLD' else '5-7 jours'
+    lines = [
+        f"🚀 SIGNAL DE TRADING : [{ticker}]",
+        f"💡 TYPE DE MOVE : {move_type}",
+        f"🎯 STRATÉGIE : {strategy}",
+        "",
+        "📊 ENTRÉE & SORTIE :",
+        f"Achat (In) : < {buy_limit:.2f} {currency}",
+        f"Cible (Out) : {target_price:.2f} {currency} (Profit +{profit_pct:.1f}%)",
+        f"Stop Loss : {stop_price:.2f} {currency}",
+        "",
+        "🧠 ANALYSE IA :",
+        f"RSI : {rsi_txt} ({_rsi_label(rsi)})",
+        f"Sentiment : {_sentiment_label(sentiment)}",
+        f"Corrélation {driver_txt} : {corr_txt}",
+        f"⏱️ DURÉE PRÉVUE : {duration} ou clôture si cible atteinte.",
+    ]
+    return "\n".join(lines)
+
+
+def _build_tsx_manual_trade_alert(
+    ticker: str,
+    action_label: str,
+    confidence: float | None,
+    confidence_threshold: float,
+    sentiment: float | None,
+    sentiment_threshold: float,
+    corr: float | None,
+    driver: str | None,
+    price: float | None,
+    entry_low: float | None,
+    entry_high: float | None,
+    target_price: float | None,
+    stop_price: float | None,
+) -> str:
+    conf_val = float(confidence or 0.0)
+    sent_val = float(sentiment or 0.0)
+    conf_mark = '✅' if conf_val >= confidence_threshold else '❌'
+    sent_mark = '✅' if sent_val >= sentiment_threshold else '❌'
+    corr_txt = f"{corr:+.2f}" if corr is not None else 'n/a'
+    driver_txt = driver or 'n/a'
+    price_txt = f"{price:.2f}$" if price is not None else 'n/a'
+    entry_txt = (
+        f"{entry_low:.2f}$ - {entry_high:.2f}$" if entry_low is not None and entry_high is not None else 'n/a'
+    )
+    target_txt = f"{target_price:.2f}$" if target_price is not None else 'n/a'
+    stop_txt = f"{stop_price:.2f}$" if stop_price is not None else 'n/a'
+    lines = [
+        "🇨🇦 ALERTE TRADE MANUEL (TSX)",
+        f"Symbole : {ticker}",
+        f"Action suggérée : {action_label}",
+        "",
+        "🧠 Validation IA :",
+        f"Confiance ML : {conf_val:.2f} (Seuil {confidence_threshold:.2f} {conf_mark})",
+        f"Sentiment Gemini : {sent_val:.2f} ({_sentiment_label(sentiment)} {sent_mark})",
+        f"Corrélation {driver_txt} : {corr_txt}",
+        "",
+        "📈 Niveaux d'exécution :",
+        f"Prix actuel : ~{price_txt}",
+        f"Entrée idéale (Dip) : {entry_txt}",
+        f"Cible de sortie : {target_txt}",
+        f"Stop-Loss : {stop_txt}",
+        "",
+        "🔍 Observation Live :",
+        "Le bot surveille les bougies 5min. Je t'enverrai une mise à jour si le RSI dépasse 70 "
+        "ou si le carnet d'ordres montre une sortie massive des acheteurs.",
+    ]
+    return "\n".join(lines)
+
+
+def _guardian_score(
+    pattern_signal: float | None,
+    rvol: float | None,
+    sentiment: float | None,
+    imbalance: float | None,
+) -> float:
+    score = 0.5
+    if pattern_signal is not None:
+        score += max(-1.0, min(1.0, float(pattern_signal))) * 0.2
+    if rvol is not None:
+        score += min(1.0, float(rvol) / 3.0) * 0.15
+    if sentiment is not None:
+        score += max(-1.0, min(1.0, float(sentiment))) * 0.1
+    if imbalance is not None:
+        score += max(-1.0, min(1.0, (float(imbalance) - 1.0))) * 0.1
+    return max(0.0, min(1.0, score))
+
+
+def _latest_price_snapshot(symbol: str) -> float | None:
+    price = get_latest_trade_price(symbol)
+    if _is_valid_price(price):
+        return price
+    try:
+        info = yfin.Ticker(symbol).fast_info or {}
+        for key in ('last_price', 'lastPrice', 'last', 'regularMarketPrice'):
+            val = info.get(key)
+            if _is_valid_price(val):
+                return float(val)
+    except Exception:
+        return None
+    return None
+
+
+def _bid_ask_spread_pct(symbol: str) -> float | None:
+    spread = get_latest_bid_ask_spread_pct(symbol)
+    if spread is not None:
+        return float(spread)
+    bid, ask = _latest_bid_ask(symbol)
+    if bid is None or ask is None or ask <= 0:
+        return None
+    mid = (bid + ask) / 2
+    if mid <= 0:
+        return None
+    return float((ask - bid) / mid)
+
+
+def _leader_drop_pct(symbol: str, minutes: int = 240) -> float | None:
+    bars = get_intraday_bars(symbol, minutes=minutes)
+    if bars is None or bars.empty or 'close' not in bars.columns:
+        return None
+    series = bars['close'].dropna()
+    if series.empty:
+        return None
+    first = float(series.iloc[0])
+    last = float(series.iloc[-1])
+    if first <= 0:
+        return None
+    return (last - first) / first
 
 
 def _compute_rsi(series: pd.Series, period: int = 14) -> float | None:
@@ -3881,8 +4139,45 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
             notify_key = f"alpaca_cad_alert:{symbol}:{_ny_time_now().strftime('%Y%m%d')}"
             if not cache.get(notify_key):
                 cache.set(notify_key, True, timeout=60 * 60 * 6)
+                signal_payload = _model_signal(symbol, universe, model_path, use_alpaca=False)
+                confidence = float(signal_payload.get('signal') or 0.0) if signal_payload else 0.0
+                feature_snapshot = (signal_payload or {}).get('features') or {}
+                sentiment_score = _safe_float(feature_snapshot.get('sentiment_score'))
+                if sentiment_score is None:
+                    sentiment_score, _ = _news_sentiment_score(symbol, days=1)
+                corr, driver = _tsx_driver_correlation(symbol)
+                price = _latest_price_snapshot(symbol)
+                dip_low_pct = float(os.getenv('TSX_ENTRY_DIP_LOW', '0.006'))
+                dip_high_pct = float(os.getenv('TSX_ENTRY_DIP_HIGH', '0.012'))
+                target_pct = float(os.getenv('TSX_TARGET_PCT', '0.04'))
+                stop_pct = float(os.getenv('TSX_STOP_PCT', '0.03'))
+                entry_low = price * (1 - dip_high_pct) if price else None
+                entry_high = price * (1 - dip_low_pct) if price else None
+                target_price = price * (1 + target_pct) if price else None
+                stop_price = price * (1 - stop_pct) if price else None
+                move_type = _tsx_move_type(
+                    rvol=float(feature_snapshot.get('RVOL10') or 0.0),
+                    volatility=float(feature_snapshot.get('Volatility') or 0.0),
+                    sentiment=sentiment_score,
+                )
+                action_label = f"ACHAT ({move_type.title()})" if confidence >= min_confidence else "SURVEILLER"
+                message = _build_tsx_manual_trade_alert(
+                    ticker=symbol,
+                    action_label=action_label,
+                    confidence=confidence,
+                    confidence_threshold=min_confidence,
+                    sentiment=sentiment_score,
+                    sentiment_threshold=min_sentiment,
+                    corr=corr,
+                    driver=driver,
+                    price=price,
+                    entry_low=entry_low,
+                    entry_high=entry_high,
+                    target_price=target_price,
+                    stop_price=stop_price,
+                )
                 _send_telegram_alert(
-                    f"🇨🇦 Ticker canadien détecté: {symbol}. Trade manuel sur Wealthsimple requis.",
+                    message,
                     allow_during_blackout=True,
                     category='signal',
                 )
@@ -4295,23 +4590,58 @@ def market_scanner_task(symbols: list[str] | None = None) -> dict[str, Any]:
         entry_price = float(top['price'])
         buy_limit = entry_price * (1 + buy_limit_buffer)
         target_pct = swing_target_pct
-        if rvol > 3:
+        if float(top.get('rvol') or 0) > 3:
             target_pct = max(target_pct, swing_min_rvol_target_pct)
         target_price = buy_limit * (1 + target_pct)
         stop_price = buy_limit * (1 - swing_stop_pct)
         title = (top.get('news_titles') or [''])[0] or None
-        message = _build_swing_signal_message(
-            ticker=top['symbol'],
-            confidence_pct=float(top.get('confidence_pct') or 0),
-            entry_price=entry_price,
-            buy_limit=buy_limit,
-            target_price=target_price,
-            stop_price=stop_price,
-            investment=investment,
-            news_title=title,
-            news_source='Google News' if title else None,
-            news_note=top.get('news_note'),
-        )
+        if _symbol_currency(top['symbol']) == 'CAD':
+            ctx_5m = _intraday_context_for_timeframe(
+                top['symbol'],
+                minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
+                timeframe=int(os.getenv('REVERSAL_TIMEFRAME', '5')),
+                rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
+            )
+            bars = ctx_5m.get('bars') if ctx_5m else None
+            rsi = _compute_rsi(bars['close']) if bars is not None and 'close' in bars else None
+            sentiment = float(top.get('news_sentiment') or 0.0)
+            corr, driver = _tsx_driver_correlation(top['symbol'])
+            move_type = _tsx_move_type(
+                rvol=float(top.get('rvol') or 0.0),
+                volatility=float(ctx_5m.get('volatility') or 0.0) if ctx_5m else 0.0,
+                sentiment=sentiment,
+            )
+            strategy = _tsx_strategy_text(
+                patterns=top.get('patterns') or [],
+                rvol=float(top.get('rvol') or 0.0),
+                rsi=rsi,
+                sentiment=sentiment,
+            )
+            message = _build_tsx_signal_message(
+                ticker=top['symbol'],
+                move_type=move_type,
+                strategy=strategy,
+                buy_limit=buy_limit,
+                target_price=target_price,
+                stop_price=stop_price,
+                rsi=rsi,
+                sentiment=sentiment,
+                corr=corr,
+                driver=driver,
+            )
+        else:
+            message = _build_swing_signal_message(
+                ticker=top['symbol'],
+                confidence_pct=float(top.get('confidence_pct') or 0),
+                entry_price=entry_price,
+                buy_limit=buy_limit,
+                target_price=target_price,
+                stop_price=stop_price,
+                investment=investment,
+                news_title=title,
+                news_source='Google News' if title else None,
+                news_note=top.get('news_note'),
+            )
         _send_telegram_alert(message, category='signal')
         if not _active_signal_exists(top['symbol']):
             ActiveSignal.objects.create(
@@ -4364,6 +4694,260 @@ def scan_market_for_opportunities(min_score: float | None = None) -> dict[str, A
 def task_global_market_discovery() -> dict[str, Any]:
     """Backward-compatible alias for legacy task imports."""
     return scan_market_for_opportunities()
+
+
+@shared_task
+def monitor_active_trade() -> dict[str, Any]:
+    log = _task_log_start('monitor_active_trade')
+    try:
+        enabled = os.getenv('TSX_GUARDIAN_ENABLED', 'true').lower() in {'1', 'true', 'yes', 'y'}
+        if not enabled:
+            result = {'status': 'disabled'}
+            _task_log_finish(log, 'SUCCESS', result)
+            return result
+
+        now_ny = _ny_time_now()
+        if now_ny.weekday() >= 5:
+            result = {'status': 'weekend'}
+            _task_log_finish(log, 'SUCCESS', result)
+            return result
+
+        start_time = dt_time(9, 30)
+        end_time = dt_time(16, 0)
+        if not (start_time <= now_ny.time() <= end_time):
+            result = {'status': 'outside_market_hours'}
+            _task_log_finish(log, 'SUCCESS', result)
+            return result
+
+        watch = SandboxWatchlist.objects.filter(sandbox='WATCHLIST').first()
+        symbols = [str(s).strip().upper() for s in (watch.symbols if watch else []) if str(s).strip()]
+        symbols = [s for s in symbols if _symbol_currency(s) == 'CAD']
+        if not symbols:
+            result = {'status': 'no_symbols'}
+            _task_log_finish(log, 'SUCCESS', result)
+            return result
+
+        open_signals = ActiveSignal.objects.filter(status='OPEN', ticker__in=symbols)
+        if not open_signals.exists():
+            result = {'status': 'empty', 'checked': 0}
+            _task_log_finish(log, 'SUCCESS', result)
+            return result
+
+        min_delta = float(os.getenv('TSX_GUARDIAN_MIN_DELTA', '0.10'))
+        danger_imbalance = float(os.getenv('TSX_GUARDIAN_IMBALANCE_SELL', '0.5'))
+        spread_limit = float(os.getenv('TSX_GUARDIAN_SPREAD_MAX', '0.02'))
+        rsi_sell = float(os.getenv('TSX_GUARDIAN_RSI_SELL', '70'))
+        rvol_fade = float(os.getenv('TSX_GUARDIAN_RVOL_FADE', '1.2'))
+        sentiment_extend = float(os.getenv('TSX_GUARDIAN_SENTIMENT_EXTEND', '0.35'))
+        extend_pct = float(os.getenv('TSX_GUARDIAN_EXTEND_PCT', '0.03'))
+        trail_trigger_pct = float(os.getenv('TSX_TRAIL_TRIGGER_PCT', '0.03'))
+        trail_stop_pct = float(os.getenv('TSX_TRAIL_STOP_PCT', '0.0'))
+        exhaustion_wick_ratio = float(os.getenv('TSX_EXHAUSTION_WICK_RATIO', '2.0'))
+        exhaustion_rvol = float(os.getenv('TSX_EXHAUSTION_RVOL', '2.5'))
+        corr_inverse_threshold = float(os.getenv('TSX_CORR_INVERSE_PCT', '0.02'))
+        leader_symbol = os.getenv('TSX_LEADER_SYMBOL', 'AEM.TO').strip().upper()
+        leader_follower = os.getenv('TSX_LEADER_FOLLOWER', 'BTO.TO').strip().upper()
+        leader_drop_threshold = float(os.getenv('TSX_LEADER_DROP_PCT', '0.02'))
+
+        results: list[dict[str, Any]] = []
+        for signal in open_signals:
+            symbol = (signal.ticker or '').strip().upper()
+            if not symbol:
+                continue
+
+            meta = signal.meta or {}
+            if not meta.get('guardian_started'):
+                _send_telegram_alert(
+                    f"🛡️ Guardian actif pour {symbol}. Suivi des bougies & carnet toutes 30s.",
+                    allow_during_blackout=True,
+                    category='tracker',
+                )
+                meta['guardian_started'] = True
+                signal.meta = meta
+                signal.save(update_fields=['meta'])
+
+            ctx_5m = _intraday_context_for_timeframe(
+                symbol,
+                minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
+                timeframe=5,
+                rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
+            )
+            ctx_15m = _intraday_context_for_timeframe(
+                symbol,
+                minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
+                timeframe=15,
+                rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
+            )
+            bars = ctx_5m.get('bars') if ctx_5m else None
+            rsi = _compute_rsi(bars['close']) if bars is not None and 'close' in bars else None
+            price = float(ctx_5m.get('last_close') or 0.0) if ctx_5m else None
+            if not _is_valid_price(price):
+                price = _latest_price_snapshot(symbol)
+            if not _is_valid_price(price):
+                continue
+
+            currency = _symbol_currency(symbol)
+            entry_price = float(signal.entry_price)
+            target_price = float(signal.target_price)
+            stop_price = float(signal.stop_loss)
+
+            rvol = float(ctx_5m.get('rvol') or 0.0) if ctx_5m else 0.0
+            pattern_signal = float(ctx_15m.get('pattern_signal') or 0.0) if ctx_15m else 0.0
+            patterns = ctx_5m.get('patterns') or [] if ctx_5m else []
+            sentiment, news_titles = _news_sentiment_score(symbol, days=1)
+            imbalance = get_order_book_imbalance(symbol)
+            spread_pct = _bid_ask_spread_pct(symbol)
+
+            if price >= (entry_price * (1 + trail_trigger_pct)):
+                trail_key = _cache_key(symbol, 'trail_profit')
+                if not cache.get(trail_key):
+                    cache.set(trail_key, True, timeout=60 * 60)
+                    new_stop = entry_price if trail_stop_pct <= 0 else price * (1 - trail_stop_pct)
+                    _send_telegram_alert(
+                        f"✅ Trailing Profit : {symbol} touche {price:.2f} {currency}. "
+                        f"Remonte ton Stop-Loss à {new_stop:.2f} {currency} pour sécuriser le profit.",
+                        allow_during_blackout=True,
+                        category='tracker',
+                    )
+
+            if bars is not None and not bars.empty and {'open', 'high', 'low', 'close'}.issubset(bars.columns):
+                last_bar = bars.tail(1).iloc[0]
+                open_p = float(last_bar.get('open') or 0.0)
+                close_p = float(last_bar.get('close') or 0.0)
+                high_p = float(last_bar.get('high') or 0.0)
+                body = abs(close_p - open_p)
+                upper_wick = max(0.0, high_p - max(open_p, close_p))
+                if upper_wick > 0 and body > 0 and upper_wick >= (body * exhaustion_wick_ratio):
+                    if rvol >= exhaustion_rvol and close_p < open_p:
+                        wick_key = _cache_key(symbol, 'exhaustion_wick')
+                        if not cache.get(wick_key):
+                            cache.set(wick_key, True, timeout=60 * 60)
+                            _send_telegram_alert(
+                                f"⚠️ Bougie d'épuisement : rejet détecté sur {symbol}. "
+                                "Mèche haute + volume rouge massif. Vends 50% de ta position maintenant.",
+                                allow_during_blackout=True,
+                                category='alert',
+                            )
+
+            driver = _tsx_driver_for_symbol(symbol)
+            driver_drop = _leader_drop_pct(driver)
+            if driver_drop is not None and driver_drop <= -abs(corr_inverse_threshold):
+                corr_key = _cache_key(symbol, 'driver_inverse')
+                if not cache.get(corr_key):
+                    cache.set(corr_key, True, timeout=60 * 60)
+                    _send_telegram_alert(
+                        f"⚠️ Divergence {driver}/{symbol} : {driver} chute {driver_drop * 100:.2f}% "
+                        "alors que le titre tient. Prépare-toi à sortir.",
+                        allow_during_blackout=True,
+                        category='alert',
+                    )
+
+            if symbol == leader_follower and leader_symbol:
+                leader_drop = _leader_drop_pct(leader_symbol)
+                if leader_drop is not None and leader_drop <= -abs(leader_drop_threshold):
+                    alert_key = _cache_key(symbol, 'leader_drop')
+                    if not cache.get(alert_key):
+                        cache.set(alert_key, True, timeout=60 * 60)
+                        _send_telegram_alert(
+                            f"🚨 ALERTE LEADER : {leader_symbol} chute {leader_drop * 100:.2f}%. "
+                            f"{symbol} suit souvent le leader. ACTION : VENDRE IMMÉDIATEMENT.",
+                            allow_during_blackout=True,
+                            category='alert',
+                        )
+
+            action = 'GARDER'
+            level = 'update'
+            reason = None
+            new_target = None
+
+            if spread_pct is not None and spread_pct >= spread_limit:
+                action = 'VENDRE'
+                level = 'danger'
+                reason = f"Spread élevé ({spread_pct * 100:.2f}%)"
+            elif imbalance is not None and imbalance <= danger_imbalance:
+                action = 'VENDRE'
+                level = 'danger'
+                reason = f"Imbalance vente {imbalance:.2f}"
+            elif rsi is not None and rsi >= rsi_sell and rvol <= rvol_fade:
+                action = 'VENDRE'
+                level = 'update'
+                reason = f"RSI {rsi:.0f} + RVOL en baisse"
+            elif sentiment is not None and sentiment >= sentiment_extend and pattern_signal >= 0.5:
+                action = 'ÉTENDRE'
+                level = 'boost'
+                new_target = float(signal.target_price) * (1 + extend_pct)
+                headline = (news_titles or [''])[0] or 'News positive'
+                reason = f"{headline} + patterns bullish"
+
+            score = _guardian_score(pattern_signal, rvol, sentiment, imbalance)
+            score_key = _cache_key(symbol, 'guardian_score')
+            action_key = _cache_key(symbol, 'guardian_action')
+            last_score = cache.get(score_key)
+            last_action = cache.get(action_key)
+
+            urgent = level == 'danger'
+            if last_score is not None and not urgent:
+                if abs(float(score) - float(last_score)) < min_delta and action == last_action:
+                    results.append({'symbol': symbol, 'status': 'skipped_delta'})
+                    continue
+
+            if action == 'GARDER' and not urgent:
+                results.append({'symbol': symbol, 'status': 'hold'})
+                cache.set(score_key, score, timeout=60 * 30)
+                cache.set(action_key, action, timeout=60 * 30)
+                continue
+
+            cache.set(score_key, score, timeout=60 * 30)
+            cache.set(action_key, action, timeout=60 * 30)
+
+            if action == 'VENDRE' and level == 'danger':
+                exit_price = max(entry_price, price)
+                message = (
+                    f"🚨 ALERTE DANGER : Grosse pression vendeuse sur {symbol} ({reason}). "
+                    f"On sort à {exit_price:.2f} {currency} pour protéger le capital."
+                )
+            elif action == 'VENDRE':
+                sell_price = max(price * 0.995, entry_price)
+                message = (
+                    f"⚠️ UPDATE {symbol} : Le momentum s'essouffle ({reason}). "
+                    f"On sécurise le profit maintenant à {sell_price:.2f} {currency} "
+                    f"au lieu d'attendre {target_price:.2f}. ACTION : VENDRE TOUT."
+                )
+            else:
+                final_target = new_target if new_target else target_price
+                message = (
+                    f"🔥 UPDATE {symbol} : Sentiment renforcé ({reason}). "
+                    f"On garde (HOLD) pour un swing. Nouvelle cible : {final_target:.2f} {currency}."
+                )
+
+            gemini_note = _gemini_dynamic_recommendation(
+                symbol,
+                action,
+                {
+                    'price': price,
+                    'target': target_price,
+                    'stop': stop_price,
+                    'rsi': rsi,
+                    'rvol': rvol,
+                    'pattern_signal': pattern_signal,
+                    'patterns': patterns,
+                    'sentiment': sentiment,
+                    'spread_pct': spread_pct,
+                    'imbalance': imbalance,
+                },
+            )
+            if gemini_note:
+                message = f"{message}\n🧠 Recommandation IA: {gemini_note}"
+
+            _send_telegram_alert(message, allow_during_blackout=True, category='tracker')
+            results.append({'symbol': symbol, 'action': action, 'score': score})
+
+        payload = {'status': 'ok', 'checked': len(open_signals), 'results': results}
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
 
 
 @shared_task
