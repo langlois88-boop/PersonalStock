@@ -62,6 +62,15 @@ function OptimizerPage() {
   const [lastLoadedAt, setLastLoadedAt] = useState(null);
   const [optimizerError, setOptimizerError] = useState('');
   const [fastMode, setFastMode] = useState(true);
+  const [geminiReport, setGeminiReport] = useState('');
+  const [geminiReview, setGeminiReview] = useState(null);
+  const [hoverGemini, setHoverGemini] = useState({});
+  const [hoverLoading, setHoverLoading] = useState({});
+  const [hoverPlacement, setHoverPlacement] = useState({});
+  const [trackForm, setTrackForm] = useState({ ticker: '', entry: '', targetPct: '0.1', stopPct: '0.05' });
+  const [trackStatus, setTrackStatus] = useState('');
+  const [trackedSignals, setTrackedSignals] = useState([]);
+  const [trackLoading, setTrackLoading] = useState(false);
 
   const loadOptimizer = useCallback(async () => {
     let isMounted = true;
@@ -73,6 +82,8 @@ function OptimizerPage() {
       if (!isMounted) return;
       setActions(Array.isArray(payload?.actions) ? payload.actions : []);
       setSuggestions(Array.isArray(payload?.suggestions) ? payload.suggestions : []);
+      setGeminiReport(payload?.gemini_report || '');
+      setGeminiReview(payload?.gemini_review || null);
     };
 
     const finalize = () => {
@@ -85,7 +96,7 @@ function OptimizerPage() {
 
     try {
       const res = await api.get('optimizer/', {
-        params: fastMode ? { fast: 1 } : {},
+        params: { fast: fastMode ? 1 : 0 },
         timeout: 60000,
       });
       const payload = res?.data || {};
@@ -107,7 +118,7 @@ function OptimizerPage() {
 
     try {
       const fallbackUrl = `${window.location.protocol}//${window.location.hostname}:8001/api/optimizer/`;
-      const params = fastMode ? '?fast=1' : '';
+      const params = fastMode ? '?fast=1' : '?fast=0';
       const fallbackRes = await fetch(`${fallbackUrl}${params}`);
       const fallbackPayload = await fallbackRes.json();
       applyPayload(fallbackPayload);
@@ -122,10 +133,96 @@ function OptimizerPage() {
       isMounted = false;
     };
   }, [fastMode]);
+  const submitTracking = useCallback(async () => {
+    const ticker = String(trackForm.ticker || '').trim().toUpperCase();
+    if (!ticker) {
+      setTrackStatus('Ticker requis.');
+      return;
+    }
+    setTrackStatus('Envoi…');
+    try {
+      await api.post('active-signals/manual/', {
+        ticker,
+        entry_price: trackForm.entry ? Number(trackForm.entry) : undefined,
+        target_pct: trackForm.targetPct ? Number(trackForm.targetPct) : 0.1,
+        stop_pct: trackForm.stopPct ? Number(trackForm.stopPct) : 0.05,
+        daytrade: true,
+        note: 'Daytrade - Achat manuel (tracker UI)',
+      });
+      setTrackStatus(`Tracking activé pour ${ticker}.`);
+      setTrackForm((prev) => ({ ...prev, ticker: '', entry: '' }));
+      setTrackLoading(true);
+      const res = await api.get('active-signals/', { params: { status: 'OPEN', manual: 1, daytrade: 1 } });
+      setTrackedSignals(Array.isArray(res?.data?.results) ? res.data.results : []);
+    } catch (err) {
+      setTrackStatus('Impossible d’activer le tracking.');
+    } finally {
+      setTrackLoading(false);
+    }
+  }, [trackForm]);
+
+  const loadTrackedSignals = useCallback(async () => {
+    setTrackLoading(true);
+    try {
+      const res = await api.get('active-signals/', { params: { status: 'OPEN', manual: 1, daytrade: 1 } });
+      setTrackedSignals(Array.isArray(res?.data?.results) ? res.data.results : []);
+    } catch (err) {
+      setTrackedSignals([]);
+    } finally {
+      setTrackLoading(false);
+    }
+  }, []);
+
+  const closeTrackedSignal = useCallback(async (signal) => {
+    if (!signal) return;
+    try {
+      await api.post('active-signals/close/', { id: signal.id, ticker: signal.ticker });
+      setTrackedSignals((prev) => prev.filter((item) => item.id !== signal.id));
+    } catch (err) {
+      setTrackStatus('Impossible de fermer le tracking.');
+    }
+  }, []);
+
+  const loadHoverGemini = useCallback(async (ticker) => {
+    if (!fastMode) return;
+    const symbol = String(ticker || '').trim();
+    if (!symbol) return;
+    if (hoverGemini[symbol] || hoverLoading[symbol]) return;
+    setHoverLoading((prev) => ({ ...prev, [symbol]: true }));
+    try {
+      const res = await api.get('optimizer/', {
+        params: { hover: 1, ticker: symbol },
+        timeout: 30000,
+      });
+      setHoverGemini((prev) => ({ ...prev, [symbol]: res?.data || null }));
+    } catch (err) {
+      setHoverGemini((prev) => ({ ...prev, [symbol]: { error: true } }));
+    } finally {
+      setHoverLoading((prev) => ({ ...prev, [symbol]: false }));
+    }
+  }, [fastMode, hoverGemini, hoverLoading]);
+
+  const tooltipClass = (ticker) =>
+    hoverPlacement[ticker] === 'bottom'
+      ? 'left-4 top-full mt-3'
+      : 'left-4 bottom-full mb-3';
+
+  const handleHover = useCallback((event, ticker) => {
+    const symbol = String(ticker || '').trim();
+    if (!symbol) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const placeBelow = rect.top < 260;
+    setHoverPlacement((prev) => ({ ...prev, [symbol]: placeBelow ? 'bottom' : 'top' }));
+    loadHoverGemini(symbol);
+  }, [loadHoverGemini]);
 
   useEffect(() => {
     loadOptimizer();
   }, [loadOptimizer]);
+
+  useEffect(() => {
+    loadTrackedSignals();
+  }, [loadTrackedSignals]);
 
   const coreActions = useMemo(
     () =>
@@ -190,6 +287,47 @@ function OptimizerPage() {
             Aucune position détectée. Ajoute des transactions pour obtenir des recommandations.
           </div>
         ) : null}
+        {!fastMode && (geminiReview || geminiReport) ? (
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-slate-200 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Avis Gemini</p>
+              {geminiReview?.score != null && (
+                <span className={`text-xs font-semibold ${scoreColor(geminiReview.score)}`}>
+                  Score Gemini {normalizeScore(geminiReview.score).toFixed(0)}%
+                </span>
+              )}
+            </div>
+            {(geminiReview?.summary || geminiReport) && (
+              <p className="text-sm text-slate-200 whitespace-pre-line">
+                {geminiReview?.summary || geminiReport}
+              </p>
+            )}
+            {geminiReview?.exposure ? (
+              <p className="text-xs text-slate-300">{geminiReview.exposure}</p>
+            ) : null}
+            {Array.isArray(geminiReview?.audit) && geminiReview.audit.length > 0 && (
+              <div className="text-xs text-slate-300 space-y-1">
+                {geminiReview.audit.map((item, index) => (
+                  <p key={`${item}-${index}`}>• {item}</p>
+                ))}
+              </div>
+            )}
+            {Array.isArray(geminiReview?.advice) && geminiReview.advice.length > 0 && (
+              <div className="text-xs text-slate-300 space-y-1">
+                {geminiReview.advice.map((item, index) => (
+                  <p key={`${item}-${index}`}>• {item}</p>
+                ))}
+              </div>
+            )}
+            {Array.isArray(geminiReview?.risks) && geminiReview.risks.length > 0 && (
+              <div className="text-xs text-rose-200 space-y-1">
+                {geminiReview.risks.map((item, index) => (
+                  <p key={`${item}-${index}`}>⚠️ {item}</p>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : null}
         <div className="flex items-center gap-2">
           <button
             type="button"
@@ -221,6 +359,7 @@ function OptimizerPage() {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.3, delay: idx * 0.05 }}
             className="bg-slate-900 border border-slate-800 rounded-2xl p-5 relative group/action"
+            onMouseEnter={(event) => handleHover(event, item.ticker)}
           >
             <div className="flex items-start justify-between">
               <div>
@@ -286,7 +425,7 @@ function OptimizerPage() {
                   : '⚠️ SORTIE DE CAPITAL DÉTECTÉE'}
               </div>
             ) : null}
-            <div className="absolute z-20 hidden group-hover/action:block left-4 top-full mt-3 w-[22rem] bg-slate-950 border border-slate-800 rounded-xl p-4 text-sm text-slate-200 shadow-xl">
+            <div className={`absolute z-20 hidden group-hover/action:block ${tooltipClass(item.ticker)} w-[22rem] max-h-[60vh] overflow-auto bg-slate-950 border border-slate-800 rounded-xl p-4 text-sm text-slate-200 shadow-xl`}>
               <p className="text-slate-100 font-semibold text-base">{item.ticker} · Détails IA</p>
               <p className="text-slate-300 mt-1">{item.reason}</p>
               <div className="mt-3 space-y-2">
@@ -333,6 +472,30 @@ function OptimizerPage() {
                     ))}
                   </ul>
                 </div>
+                {fastMode ? (
+                  <div>
+                    <p className="text-[11px] uppercase tracking-widest text-slate-500">Gemini (checkup rapide)</p>
+                    {hoverLoading[item.ticker] ? (
+                      <p className="mt-1 text-xs text-slate-400">Analyse rapide en cours…</p>
+                    ) : hoverGemini[item.ticker]?.error ? (
+                      <p className="mt-1 text-xs text-rose-300">Checkup indisponible.</p>
+                    ) : hoverGemini[item.ticker] ? (
+                      <div className="mt-1 text-xs text-slate-200 space-y-1">
+                        {hoverGemini[item.ticker]?.gemini_confidence != null ? (
+                          <p>Confiance: {Number(hoverGemini[item.ticker].gemini_confidence).toFixed(0)}%</p>
+                        ) : null}
+                        {hoverGemini[item.ticker]?.gemini_verdict ? (
+                          <p>Verdict: {hoverGemini[item.ticker].gemini_verdict}</p>
+                        ) : null}
+                        {hoverGemini[item.ticker]?.gemini_note ? (
+                          <p className="text-slate-300">{hoverGemini[item.ticker].gemini_note}</p>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <p className="mt-1 text-xs text-slate-400">Survol pour lancer le checkup.</p>
+                    )}
+                  </div>
+                ) : null}
               </div>
             </div>
             <div className="mt-4">
@@ -348,6 +511,20 @@ function OptimizerPage() {
                   style={{ width: `${normalizeScore(item.ai_score ?? item.confidence)}%` }}
                 ></div>
               </div>
+              {!fastMode && (item.gemini_verdict || item.gemini_note || item.gemini_confidence !== null) ? (
+                <div className="mt-2 text-xs text-slate-300">
+                  <span className="text-slate-400">Confiance Gemini</span>
+                  {item.gemini_confidence !== null && item.gemini_confidence !== undefined ? (
+                    <span className="ml-2 text-emerald-300 font-semibold">{Number(item.gemini_confidence).toFixed(0)}%</span>
+                  ) : null}
+                  {item.gemini_verdict ? (
+                    <span className="ml-2 text-indigo-300">{item.gemini_verdict}</span>
+                  ) : null}
+                  {item.gemini_note ? (
+                    <div className="mt-1 text-slate-300">{item.gemini_note}</div>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
           </motion.div>
         ))}
@@ -367,6 +544,85 @@ function OptimizerPage() {
         onRefresh={loadOptimizer}
         isRefreshing={isRefreshing}
       />
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
+        <div>
+          <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Suivi manuel</p>
+          <p className="text-xs text-slate-500 mt-1">Déclare un achat pour recevoir les alertes de suivi.</p>
+        </div>
+        <div className="grid grid-cols-2 gap-2 text-xs">
+          <p className="col-span-2 text-[11px] text-slate-500">
+            Exemple: Ticker BTO.TO · Prix d’entrée 8.18 · Target % 0.10 (= +10%) · Stop % 0.05 (= -5%).
+          </p>
+          <input
+            className="col-span-2 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-slate-200"
+            placeholder="Ticker (ex: BTO.TO)"
+            value={trackForm.ticker}
+            onChange={(e) => setTrackForm((prev) => ({ ...prev, ticker: e.target.value }))}
+          />
+          <input
+            className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-slate-200"
+            placeholder="Prix d’entrée (ex: 8.18)"
+            value={trackForm.entry}
+            onChange={(e) => setTrackForm((prev) => ({ ...prev, entry: e.target.value }))}
+          />
+          <input
+            className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-slate-200"
+            placeholder="Target % (ex: 0.10 = +10%)"
+            value={trackForm.targetPct}
+            onChange={(e) => setTrackForm((prev) => ({ ...prev, targetPct: e.target.value }))}
+          />
+          <input
+            className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-slate-200"
+            placeholder="Stop % (ex: 0.05 = -5%)"
+            value={trackForm.stopPct}
+            onChange={(e) => setTrackForm((prev) => ({ ...prev, stopPct: e.target.value }))}
+          />
+          <button
+            type="button"
+            className="col-span-2 rounded-lg border border-indigo-400/40 bg-indigo-500/20 px-3 py-2 text-xs text-indigo-100"
+            onClick={submitTracking}
+          >
+            Activer le tracking
+          </button>
+        </div>
+        {trackStatus ? <p className="text-xs text-slate-400">{trackStatus}</p> : null}
+        <div className="border-t border-slate-800 pt-3 space-y-2">
+          <div className="flex items-center justify-between text-xs text-slate-400">
+            <span>Positions suivies</span>
+            <button
+              type="button"
+              className="text-xs text-indigo-300 hover:text-indigo-200"
+              onClick={loadTrackedSignals}
+              disabled={trackLoading}
+            >
+              {trackLoading ? 'Chargement…' : 'Rafraîchir'}
+            </button>
+          </div>
+          {trackedSignals.length === 0 ? (
+            <p className="text-xs text-slate-500">Aucun suivi actif.</p>
+          ) : (
+            <div className="space-y-2">
+              {trackedSignals.map((signal) => (
+                <div key={signal.id} className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-200">
+                  <div className="flex flex-col">
+                    <span className="font-semibold text-white">{signal.ticker}</span>
+                    <span className="text-[11px] text-slate-400">
+                      Entrée {Number(signal.entry_price).toFixed(4)} · Target {Number(signal.target_price).toFixed(4)} · Stop {Number(signal.stop_loss).toFixed(4)}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="text-rose-300 hover:text-rose-200"
+                    onClick={() => closeTrackedSignal(signal)}
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

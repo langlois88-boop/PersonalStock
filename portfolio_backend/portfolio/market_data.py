@@ -260,11 +260,12 @@ def _yf_download_fallback(
         return pd.DataFrame()
     if not symbols:
         return pd.DataFrame()
-    allow = any(_allow_yf_price_fallback(symbol) for symbol in symbols)
+    mapped_symbols = [s for s in (_map_symbol(sym) for sym in symbols) if s]
+    allow = any(_allow_yf_price_fallback(symbol) for symbol in mapped_symbols or symbols)
     if not allow:
         return pd.DataFrame()
     timeout = _yf_timeout()
-    tickers = ' '.join(symbols)
+    tickers = ' '.join(mapped_symbols or symbols)
     period, start, end = _sanitize_period_start_end(period, start, end)
     fallback = _with_timeout(
         lambda: _yfinance.download(

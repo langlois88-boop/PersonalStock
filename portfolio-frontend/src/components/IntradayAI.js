@@ -11,6 +11,7 @@ function IntradayAI() {
   const [markers, setMarkers] = useState([]);
   const [guidance, setGuidance] = useState([]);
   const [stats, setStats] = useState(null);
+  const [gemini, setGemini] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const chartContainerRef = useRef(null);
@@ -74,20 +75,25 @@ function IntradayAI() {
     seriesRef.current.setMarkers(markers);
   }, [bars, markers]);
 
-  const fetchData = async () => {
-    if (!symbol) return;
+  const fetchData = async (overrideSymbol) => {
+    const finalSymbol = String(overrideSymbol || symbol || '').trim().toUpperCase();
+    if (!finalSymbol) return;
+    if (finalSymbol !== symbol) {
+      setSymbol(finalSymbol);
+    }
     setLoading(true);
     setError(null);
     try {
-      const response = await api.get(`/alpaca/intraday/?symbol=${encodeURIComponent(symbol)}`);
+      const response = await api.get(`/alpaca/intraday/?symbol=${encodeURIComponent(finalSymbol)}`);
       const payload = response.data || {};
       if (payload.error || !payload.bars || payload.bars.length === 0) {
         setBars([]);
         setMarkers([]);
         setGuidance(payload.guidance || []);
         setStats(null);
+        setGemini(payload.gemini || null);
         setError(payload.error || 'Aucune donnée intraday disponible.');
-        if (payload.symbol && payload.symbol !== symbol) {
+        if (payload.symbol && payload.symbol !== finalSymbol) {
           setSymbol(payload.symbol);
         }
         return;
@@ -95,6 +101,7 @@ function IntradayAI() {
       setBars(payload.bars || []);
       setGuidance(payload.guidance || []);
       setStats(payload.stats || null);
+      setGemini(payload.gemini || null);
       const mapped = (payload.annotations || []).map((item) => {
         const isBull = (item.signal || 0) >= 0;
         return {
@@ -143,7 +150,7 @@ function IntradayAI() {
           />
           <button
             type="button"
-            onClick={fetchData}
+            onClick={() => fetchData()}
             className="px-4 py-2 rounded-xl bg-indigo-500/90 text-white text-sm font-semibold hover:bg-indigo-500"
           >
             Charger
@@ -157,8 +164,7 @@ function IntradayAI() {
         </div>
         <MarketScannerPanel
           onSelect={(nextSymbol) => {
-            setSymbol(nextSymbol);
-            fetchData();
+            fetchData(nextSymbol);
           }}
         />
       </div>
@@ -208,6 +214,17 @@ function IntradayAI() {
               {potentialProfitPct != null ? `${potentialProfitPct.toFixed(2)}%` : 'n/a'}
             </p>
           </div>
+          {gemini && (
+            <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
+              <p className="text-xs uppercase text-slate-500">Score Gemini</p>
+              <p className="text-lg font-semibold">
+                {gemini.score != null ? `${Number(gemini.score).toFixed(0)}%` : 'n/a'}
+              </p>
+              {gemini.verdict && (
+                <p className="text-xs text-slate-400 mt-1">Avis: {gemini.verdict}</p>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -221,6 +238,16 @@ function IntradayAI() {
           <p className="text-slate-500 text-sm">Aucune guidance disponible.</p>
         )}
       </div>
+
+      {gemini && (gemini.summary || (gemini.guidance || []).length > 0) && (
+        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 space-y-2">
+          <h3 className="text-sm uppercase tracking-[0.2em] text-slate-400">Avis Gemini</h3>
+          {gemini.summary && <p className="text-slate-200 text-sm">{gemini.summary}</p>}
+          {(gemini.guidance || []).map((item, index) => (
+            <p key={`${item}-${index}`} className="text-slate-400 text-sm">• {item}</p>
+          ))}
+        </div>
+      )}
     </section>
   );
 }

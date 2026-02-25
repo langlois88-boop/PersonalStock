@@ -69,6 +69,19 @@ services:
       - backend_models:/app/portfolio/ml_engine
     restart: unless-stopped
 
+  realtime_tracker:
+    build:
+      context: ./portfolio_backend
+      dockerfile: Dockerfile
+    command: python manage.py realtime_tracker
+    env_file:
+      - ./deploy/.env
+    depends_on:
+      - postgres
+      - redis
+      - backend
+    restart: unless-stopped
+
   frontend:
     build:
       context: ./portfolio-frontend

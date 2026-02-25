@@ -30,6 +30,9 @@ function AnalysisModal({ open, loading, error, data, onClose }) {
     if (!data?.symbol || tradeLoading) return;
     setTradeLoading(true);
     setTradeStatus(null);
+    const universe = String(data?.universe || '').toUpperCase();
+    const defaultSandbox = universe === 'PENNY' ? 'AI_PENNY' : 'AI_BLUECHIP';
+    const sandbox = String(data?.sandbox || defaultSandbox || 'WATCHLIST').toUpperCase();
     try {
       const res = await api.post('paper-trades/manual/', {
         ticker: data.symbol,
@@ -37,7 +40,7 @@ function AnalysisModal({ open, loading, error, data, onClose }) {
         stop_loss: data.stop_loss,
         suggested_investment: data.suggested_investment,
         confidence: data.confidence,
-        sandbox: 'WATCHLIST',
+        sandbox,
       });
       const status = res?.data?.status || 'created';
       setTradeStatus(status === 'exists' ? 'Trade déjà ouvert.' : 'Paper trade créé.');

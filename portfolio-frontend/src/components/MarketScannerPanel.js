@@ -38,7 +38,16 @@ function MarketScannerPanel({ onSelect }) {
         <p className="text-slate-500 text-sm">Aucune cible détectée.</p>
       )}
       <div className="space-y-2">
-        {results.map((item) => (
+        {results.map((item) => {
+          const patternText = (item.patterns || [])
+            .map((pattern) => {
+              if (!pattern) return null;
+              if (typeof pattern === 'string') return pattern;
+              return pattern?.text || pattern?.name || pattern?.label || null;
+            })
+            .filter(Boolean)
+            .join(', ');
+          return (
           <button
             key={item.symbol}
             type="button"
@@ -51,11 +60,12 @@ function MarketScannerPanel({ onSelect }) {
             </div>
             <div className="flex flex-wrap gap-2 text-xs text-slate-400 mt-1">
               <span>RVOL {item.rvol}</span>
-              <span>{(item.patterns || []).join(', ')}</span>
+              {patternText && <span>{patternText}</span>}
               <span>Score {item.score}</span>
             </div>
           </button>
-        ))}
+          );
+        })}
       </div>
     </div>
   );

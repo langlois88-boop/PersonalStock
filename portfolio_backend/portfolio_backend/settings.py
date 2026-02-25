@@ -27,7 +27,7 @@ USD_CAD_RATE = float(os.getenv('USD_CAD_RATE', '1.36'))
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = 'django-insecure-6=^b)&0^4goj9ix@877=&ka%6y+lfci!e$kw_hh#-hi@0u$qju'
-GEMINI_AI_API_KEY = os.getenv('GEMINI_AI_API_KEY', '')
+GEMINI_AI_API_KEY = os.getenv('GEMINI_AI_API_KEY') or os.getenv('GEMINI_API_KEY')
 GEMINI_AI_MODEL = os.getenv('GEMINI_AI_MODEL', 'models/gemini-2.5-flash')
 
 # SECURITY WARNING: don't run with debug turned on in production!
@@ -308,7 +308,7 @@ CELERY_BEAT_SCHEDULE = {
     },
     'audit-portfolio-matin': {
         'task': 'portfolio.tasks.task_audit_portfolio_complet',
-        'schedule': crontab(hour=9, minute=31, day_of_week='mon-fri'),
+        'schedule': crontab(hour=9, minute=35, day_of_week='mon-fri'),
         'kwargs': {'is_close': False},
     },
     'audit-portfolio-cloture': {
@@ -374,11 +374,15 @@ CELERY_BEAT_SCHEDULE = {
     },
     'hive-opening-rebound-alert': {
         'task': 'portfolio.tasks.hive_opening_rebound_alert',
-        'schedule': crontab(minute=31, hour=9, day_of_week='mon-fri'),
+        'schedule': crontab(minute=35, hour=9, day_of_week='mon-fri'),
     },
     'penny-rebound-diagnostic': {
         'task': 'portfolio.tasks.send_penny_rebound_diagnostic',
-        'schedule': crontab(minute=31, hour=9, day_of_week='mon-fri'),
+        'schedule': crontab(minute=35, hour=9, day_of_week='mon-fri'),
+    },
+    'penny-rebound-diagnostic-confirm': {
+        'task': 'portfolio.tasks.send_penny_rebound_diagnostic',
+        'schedule': crontab(minute=45, hour=9, day_of_week='mon-fri'),
     },
     'monitor-hive-trade-1min': {
         'task': 'portfolio.tasks.monitor_hive_trade',
