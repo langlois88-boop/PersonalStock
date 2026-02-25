@@ -484,31 +484,9 @@ function AnalyticsLabPage() {
       </div>
         <div className="space-y-6">
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
-          <p className="text-white font-semibold mb-4">Health</p>
-          {loading ? (
-            <div className="space-y-2">
-              {[1, 2, 3].map((item) => (
-                <div key={item} className="h-10 rounded-lg bg-slate-900/60 animate-pulse" />
-              ))}
-            </div>
-          ) : (
-            <div className="space-y-2 text-xs text-slate-300">
-              {healthTasks.map((task) => {
-                const status = health?.tasks?.[task.key]?.status || 'UNKNOWN';
-                return (
-                  <div key={task.key} className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2">
-                    <span>{task.label}</span>
-                    <span className={`rounded-full px-2 py-0.5 ${statusStyle(status)}`}>{status}</span>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
           <div className="flex items-center justify-between mb-4">
             <div>
-              <p className="text-white font-semibold">Live Diagnostics</p>
+              <p className="text-white font-semibold">Live Diagnostics (Alpaca)</p>
               <p className="text-xs text-slate-400">Alpaca filters (confidence, sentiment, imbalance, spread)</p>
             </div>
             <button
@@ -571,6 +549,28 @@ function AnalyticsLabPage() {
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+        </div>
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+          <p className="text-white font-semibold mb-4">Health</p>
+          {loading ? (
+            <div className="space-y-2">
+              {[1, 2, 3].map((item) => (
+                <div key={item} className="h-10 rounded-lg bg-slate-900/60 animate-pulse" />
+              ))}
+            </div>
+          ) : (
+            <div className="space-y-2 text-xs text-slate-300">
+              {healthTasks.map((task) => {
+                const status = health?.tasks?.[task.key]?.status || 'UNKNOWN';
+                return (
+                  <div key={task.key} className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2">
+                    <span>{task.label}</span>
+                    <span className={`rounded-full px-2 py-0.5 ${statusStyle(status)}`}>{status}</span>
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
