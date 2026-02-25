@@ -1536,6 +1536,54 @@ def cleanup_task_run_logs() -> dict[str, Any]:
     return result
 
 
+@shared_task
+def send_morning_log_email(limit: int = 200) -> dict[str, Any]:
+    log = _task_log_start('send_morning_log_email')
+    try:
+        email_to = settings.ALERT_EMAIL_TO
+        if not email_to:
+            result = {'status': 'skipped', 'reason': 'no email configured'}
+            _task_log_finish(log, 'SUCCESS', result)
+            return result
+
+        limit = max(10, min(500, int(limit)))
+        logs = list(TaskRunLog.objects.order_by('-started_at')[:limit])
+        lines = []
+        failed_recent = TaskRunLog.objects.filter(
+            started_at__gte=timezone.now() - timedelta(hours=24),
+            status='FAILED',
+        ).exists()
+        confirmation = 'OK' if not failed_recent else 'ATTENTION'
+
+        for entry in logs:
+            started = entry.started_at.isoformat() if entry.started_at else 'n/a'
+            duration = f"{entry.duration_ms}ms" if entry.duration_ms is not None else 'n/a'
+            error = (entry.error or '').strip().replace('\n', ' ')
+            if len(error) > 200:
+                error = error[:200] + '...'
+            lines.append(
+                f"{started} | {entry.task_name} | {entry.status} | {duration} | {error}"
+            )
+
+        subject = f"Morning Logs ({confirmation}) - last {len(logs)} lines"
+        header = f"Confirmation: {confirmation}\nLast 24h failed tasks: {'none' if not failed_recent else 'present'}\n\n"
+        message = header + "\n".join(lines)
+
+        send_mail(
+            subject=subject,
+            message=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email_to],
+            fail_silently=True,
+        )
+        payload = {'status': 'sent', 'count': len(logs), 'confirmation': confirmation}
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
 def _is_valid_price(value: float | None) -> bool:
     return value is not None and isfinite(value) and value > 0
 

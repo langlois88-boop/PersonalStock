@@ -385,6 +385,11 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.nightly_summary_report',
         'schedule': crontab(minute=0, hour=8),
     },
+    'morning-log-email': {
+        'task': 'portfolio.tasks.send_morning_log_email',
+        'schedule': crontab(minute=5, hour=8, day_of_week='mon-fri'),
+        'kwargs': {'limit': 200},
+    },
     'premarket-report-0845': {
         'task': 'portfolio.tasks.send_telegram_report',
         'schedule': crontab(minute=45, hour=8, day_of_week='mon-fri'),
