@@ -278,6 +278,22 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.execute_paper_trades_ai_penny',
         'schedule': crontab(minute='*/15', hour='9-16', day_of_week='mon-fri'),
     },
+    'alpaca-paper-watchlist-1min': {
+        'task': 'portfolio.tasks.execute_alpaca_paper_trades_watchlist',
+        'schedule': crontab(minute='*/1', hour='9-16', day_of_week='mon-fri'),
+    },
+    'alpaca-paper-bluechip-1min': {
+        'task': 'portfolio.tasks.execute_alpaca_paper_trades_ai_bluechip',
+        'schedule': crontab(minute='*/1', hour='9-16', day_of_week='mon-fri'),
+    },
+    'alpaca-paper-penny-1min': {
+        'task': 'portfolio.tasks.execute_alpaca_paper_trades_ai_penny',
+        'schedule': crontab(minute='*/1', hour='9-16', day_of_week='mon-fri'),
+    },
+    'alpaca-paper-sync-5min': {
+        'task': 'portfolio.tasks.sync_alpaca_paper_trades',
+        'schedule': crontab(minute='*/5', hour='*'),
+    },
     'market-scanner-5min': {
         'task': 'portfolio.tasks.market_scanner_task',
         'schedule': crontab(minute='*/5', hour='9-16', day_of_week='mon-fri'),

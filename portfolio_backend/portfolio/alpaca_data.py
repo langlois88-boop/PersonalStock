@@ -13,8 +13,8 @@ try:
     from alpaca.data.timeframe import TimeFrame
     from alpaca.data.enums import DataFeed  # <--- Crucial pour le plan gratuit
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import GetAssetsRequest
-    from alpaca.trading.enums import AssetClass
+    from alpaca.trading.requests import GetAssetsRequest, MarketOrderRequest
+    from alpaca.trading.enums import AssetClass, OrderSide, TimeInForce
 except Exception:  # pragma: no cover
     StockHistoricalDataClient = None
     StockBarsRequest = None
@@ -24,7 +24,10 @@ except Exception:  # pragma: no cover
     DataFeed = None
     TradingClient = None
     GetAssetsRequest = None
+    MarketOrderRequest = None
     AssetClass = None
+    OrderSide = None
+    TimeInForce = None
 
 from .patterns import enrich_bars_with_patterns
 
@@ -61,6 +64,66 @@ def _alpaca_trading_client() -> TradingClient | None:
 
 def get_trading_client() -> TradingClient | None:
     return _alpaca_trading_client()
+
+
+def get_account() -> Any | None:
+    client = _alpaca_trading_client()
+    if client is None:
+        return None
+    try:
+        return client.get_account()
+    except Exception:
+        return None
+
+
+def get_open_positions() -> list[Any]:
+    client = _alpaca_trading_client()
+    if client is None:
+        return []
+    try:
+        return client.get_all_positions() or []
+    except Exception:
+        return []
+
+
+def submit_market_order(symbol: str, qty: int, side: str) -> Any | None:
+    client = _alpaca_trading_client()
+    if client is None or MarketOrderRequest is None or OrderSide is None or TimeInForce is None:
+        return None
+    symbol = (symbol or '').strip().upper()
+    if not symbol or qty <= 0:
+        return None
+    try:
+        side_enum = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
+        request = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=side_enum,
+            time_in_force=TimeInForce.DAY,
+        )
+        return client.submit_order(request)
+    except Exception:
+        return None
+
+
+def get_order_by_id(order_id: str) -> Any | None:
+    client = _alpaca_trading_client()
+    if client is None:
+        return None
+    try:
+        return client.get_order_by_id(order_id)
+    except Exception:
+        return None
+
+
+def close_position(symbol: str) -> Any | None:
+    client = _alpaca_trading_client()
+    if client is None:
+        return None
+    try:
+        return client.close_position(symbol)
+    except Exception:
+        return None
 
 
 def get_tradable_symbols(limit: int = 500) -> list[str]:

@@ -83,6 +83,11 @@ from .alpaca_data import (
     get_latest_trade_price,
     get_latest_bid_ask_spread_pct,
     get_order_book_imbalance,
+    get_account,
+    get_open_positions,
+    submit_market_order,
+    get_order_by_id,
+    close_position,
     get_stock_snapshots,
     get_trading_client,
     get_tradable_symbols,
@@ -138,6 +143,32 @@ def _latest_bid_ask(symbol: str) -> tuple[float | None, float | None]:
         return bid, ask
     except Exception:
         return None, None
+
+
+def _gemini_trade_reason(symbol: str, signal_payload: dict[str, Any] | None) -> str | None:
+    api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
+    if not api_key:
+        return None
+    try:
+        from google import genai
+
+        client = genai.Client(api_key=api_key)
+        model_name = getattr(settings, 'GEMINI_AI_MODEL', 'models/gemini-2.5-flash')
+        features = (signal_payload or {}).get('features') or {}
+        explanations = (signal_payload or {}).get('explanations') or []
+        prompt = (
+            "Explique en 2 phrases max pourquoi ce trade paper est pris. "
+            "Sois concis et factuel.\n"
+            f"Ticker: {symbol}\n"
+            f"Signal: {(signal_payload or {}).get('signal')}\n"
+            f"Features: {json.dumps(features, ensure_ascii=False)}\n"
+            f"Top factors: {json.dumps(explanations, ensure_ascii=False)}"
+        )
+        response = client.models.generate_content(model=model_name, contents=prompt)
+        text = (getattr(response, 'text', None) or '').strip()
+        return text or None
+    except Exception:
+        return None
 
 
 def _parse_driver_map(raw: str | None) -> dict[str, str]:
@@ -3616,6 +3647,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             entry_explanations=(signal_payload or {}).get('explanations'),
             model_name=(signal_payload or {}).get('model_name', universe),
             model_version=(signal_payload or {}).get('model_version', ''),
+            broker='SIM',
             stop_loss=round(stop_loss, 2),
             status='OPEN',
             pnl=0,
@@ -3634,6 +3666,231 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         'entries_blocked_low_capital': block_new_entries,
         'market_regime': regime,
     }
+
+
+def _alpaca_position_qty(position: Any | None) -> float:
+    if position is None:
+        return 0.0
+    qty = getattr(position, 'qty', None) or getattr(position, 'quantity', None)
+    try:
+        return float(qty)
+    except Exception:
+        return 0.0
+
+
+def _alpaca_position_avg_price(position: Any | None) -> float:
+    if position is None:
+        return 0.0
+    price = getattr(position, 'avg_entry_price', None) or getattr(position, 'average_entry_price', None)
+    try:
+        return float(price)
+    except Exception:
+        return 0.0
+
+
+def _alpaca_buying_power() -> float:
+    account = get_account()
+    if not account:
+        return 0.0
+    for attr in ('buying_power', 'cash', 'equity'):
+        val = getattr(account, attr, None)
+        try:
+            if val is not None:
+                return float(val)
+        except Exception:
+            continue
+    return 0.0
+
+
+def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, Any]:
+    """Execute paper trades on Alpaca using model signals."""
+    watchlist = _get_watchlist(sandbox, prefix, 'SPY,AAPL,MSFT,NVDA,AMZN')
+    universe = 'PENNY' if sandbox == 'AI_PENNY' else 'BLUECHIP'
+    model_path = get_model_path(universe)
+    buy_threshold = _env_float(prefix, 'BUY_THRESHOLD', '0.82')
+    sell_threshold = _env_float(prefix, 'SELL_THRESHOLD', '0.4')
+    risk_pct = _env_float(prefix, 'RISK_PCT', '0.015')
+    position_cap_pct = _env_float(prefix, 'POSITION_CAP_PCT', '0.10')
+    min_volume_z = _env_float(prefix, 'VOLUME_ZSCORE_MIN', '0.5')
+    max_cost_pct = _env_float(prefix, 'ALPACA_MAX_COST_PCT', '0.01')
+    commission_pct = _env_float(prefix, 'ALPACA_COMMISSION_PCT', '0.0')
+    allow_gemini = os.getenv('ALPACA_GEMINI_REASON', 'true').lower() in {'1', 'true', 'yes', 'y'}
+
+    positions = {getattr(p, 'symbol', '').strip().upper(): p for p in get_open_positions() if getattr(p, 'symbol', None)}
+    market_sentiment, market_meta = get_market_sentiment()
+    regime = get_market_regime_context()
+    risk_off = bool(regime.get('risk_off')) if isinstance(regime, dict) else False
+    regime_risk_factor = float(os.getenv('MARKET_RISK_OFF_POSITION_FACTOR', '0.5')) if risk_off else 1.0
+
+    created = 0
+    closed = 0
+    buying_power = _alpaca_buying_power()
+
+    def _alpaca_latest_price(symbol: str) -> float | None:
+        price = get_latest_trade_price(symbol)
+        if price is not None:
+            return float(price)
+        try:
+            hist = yf.Ticker(symbol).history(period='5d', interval='1d', timeout=10)
+            if hist is not None and not hist.empty and 'Close' in hist:
+                return float(hist['Close'].iloc[-1])
+        except Exception:
+            return None
+        return None
+
+    for symbol in watchlist:
+        symbol = (symbol or '').strip().upper()
+        if not symbol:
+            continue
+        if market_sentiment in {'BEARISH', 'CAUTION'}:
+            continue
+
+        signal_payload = _model_signal(symbol, universe, model_path, use_alpaca=True)
+        signal = signal_payload.get('signal') if signal_payload else None
+        if signal is None:
+            continue
+
+        if sandbox != 'AI_PENNY':
+            volume_z = _safe_float((signal_payload or {}).get('features', {}).get('VolumeZ'))
+            if volume_z is not None and volume_z < min_volume_z:
+                continue
+
+        spread_pct = get_latest_bid_ask_spread_pct(symbol)
+        if spread_pct is None:
+            bid, ask = _latest_bid_ask(symbol)
+            if bid and ask and ask > 0:
+                spread_pct = float((ask - bid) / ((ask + bid) / 2))
+        if spread_pct is None:
+            spread_pct = 0.0
+        if (spread_pct + commission_pct) > max_cost_pct:
+            continue
+
+        price = _alpaca_latest_price(symbol)
+        if price is None:
+            continue
+
+        existing_pos = positions.get(symbol)
+        open_trade = PaperTrade.objects.filter(broker='ALPACA', status='OPEN', ticker__iexact=symbol).first()
+
+        if existing_pos and signal < sell_threshold:
+            qty = int(abs(_alpaca_position_qty(existing_pos)))
+            if qty <= 0:
+                continue
+            order = submit_market_order(symbol, qty, 'sell')
+            if order is None:
+                continue
+            if open_trade:
+                open_trade.broker_order_id = str(getattr(order, 'id', '') or '')
+                open_trade.broker_status = str(getattr(order, 'status', '') or '')
+                open_trade.broker_side = 'SELL'
+                open_trade.broker_updated_at = timezone.now()
+                open_trade.save(update_fields=['broker_order_id', 'broker_status', 'broker_side', 'broker_updated_at'])
+            closed += 1
+            continue
+
+        if existing_pos:
+            continue
+        if signal < buy_threshold:
+            continue
+
+        position_cap = buying_power * position_cap_pct
+        risk_budget = buying_power * risk_pct
+        allocation = _risk_manager_allocation(float(signal) * 100, None, price, None)
+        position_value = min(position_cap, risk_budget, allocation) * regime_risk_factor
+        qty = int(position_value / price) if price else 0
+        if qty <= 0:
+            continue
+
+        order = submit_market_order(symbol, qty, 'buy')
+        if order is None:
+            continue
+
+        notes = _gemini_trade_reason(symbol, signal_payload) if allow_gemini else None
+        PaperTrade.objects.create(
+            ticker=symbol,
+            sandbox=sandbox,
+            entry_price=round(price, 2),
+            quantity=qty,
+            entry_signal=signal,
+            entry_features=(signal_payload or {}).get('features'),
+            entry_explanations=(signal_payload or {}).get('explanations'),
+            model_name=(signal_payload or {}).get('model_name', universe),
+            model_version=(signal_payload or {}).get('model_version', ''),
+            broker='ALPACA',
+            broker_order_id=str(getattr(order, 'id', '') or ''),
+            broker_status=str(getattr(order, 'status', '') or ''),
+            broker_side='BUY',
+            broker_updated_at=timezone.now(),
+            stop_loss=round(price * 0.96, 2),
+            status='OPEN',
+            pnl=0,
+            notes=notes or '',
+        )
+        created += 1
+
+    return {
+        'created': created,
+        'closed': closed,
+        'buying_power': round(buying_power, 2),
+        'market_regime': regime,
+        'market_meta': market_meta,
+    }
+
+
+@shared_task
+def sync_alpaca_paper_trades() -> dict[str, Any]:
+    """Sync Alpaca order status and update PaperTrade rows."""
+    updated = 0
+    trades = PaperTrade.objects.filter(broker='ALPACA', status='OPEN')
+    for trade in trades:
+        if not trade.broker_order_id:
+            continue
+        order = get_order_by_id(trade.broker_order_id)
+        if order is None:
+            continue
+        status = str(getattr(order, 'status', '') or '')
+        filled_qty = getattr(order, 'filled_qty', None) or getattr(order, 'filled_qty', None)
+        filled_avg_price = getattr(order, 'filled_avg_price', None)
+        trade.broker_status = status
+        trade.broker_updated_at = timezone.now()
+        try:
+            if filled_qty is not None:
+                trade.broker_filled_qty = float(filled_qty)
+        except Exception:
+            pass
+        try:
+            if filled_avg_price is not None:
+                trade.broker_avg_price = float(filled_avg_price)
+        except Exception:
+            pass
+
+        if status.lower() == 'filled' and trade.broker_side == 'BUY' and filled_avg_price:
+            trade.entry_price = round(float(filled_avg_price), 2)
+        if status.lower() == 'filled' and trade.broker_side == 'SELL' and filled_avg_price:
+            trade.exit_price = round(float(filled_avg_price), 2)
+            trade.exit_date = timezone.now()
+            trade.status = 'CLOSED'
+            trade.pnl = float(trade.exit_price - trade.entry_price) * float(trade.quantity)
+            trade.outcome = 'WIN' if float(trade.pnl or 0) > 0 else 'LOSS'
+        trade.save()
+        updated += 1
+
+    return {'updated': updated}
+
+
+@shared_task
+def execute_alpaca_paper_trades_watchlist() -> dict[str, Any]:
+    return _execute_alpaca_paper_trades_for_sandbox('WATCHLIST', 'ALPACA_WATCHLIST')
+
+
+@shared_task
+def execute_alpaca_paper_trades_ai_bluechip() -> dict[str, Any]:
+    return _execute_alpaca_paper_trades_for_sandbox('AI_BLUECHIP', 'ALPACA_BLUECHIP')
+
+
+@shared_task
+def execute_alpaca_paper_trades_ai_penny() -> dict[str, Any]:
+    return _execute_alpaca_paper_trades_for_sandbox('AI_PENNY', 'ALPACA_PENNY')
 
 
 @shared_task

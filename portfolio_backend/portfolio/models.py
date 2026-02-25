@@ -80,6 +80,10 @@ class PaperTrade(models.Model):
 		('OPEN', 'OPEN'),
 		('CLOSED', 'CLOSED'),
 	)
+	BROKER_CHOICES = (
+		('SIM', 'SIM'),
+		('ALPACA', 'ALPACA'),
+	)
 	SANDBOX_CHOICES = (
 		('WATCHLIST', 'WATCHLIST'),
 		('AI_BLUECHIP', 'AI_BLUECHIP'),
@@ -96,6 +100,13 @@ class PaperTrade(models.Model):
 	entry_explanations = models.JSONField(null=True, blank=True)
 	model_name = models.CharField(max_length=20, default='BLUECHIP', blank=True)
 	model_version = models.CharField(max_length=120, default='', blank=True)
+	broker = models.CharField(max_length=20, choices=BROKER_CHOICES, default='SIM', db_index=True)
+	broker_order_id = models.CharField(max_length=120, blank=True, default='')
+	broker_status = models.CharField(max_length=40, blank=True, default='')
+	broker_side = models.CharField(max_length=10, blank=True, default='')
+	broker_filled_qty = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+	broker_avg_price = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+	broker_updated_at = models.DateTimeField(null=True, blank=True)
 	stop_loss = models.DecimalField(max_digits=10, decimal_places=2)
 	status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='OPEN')
 	pnl = models.DecimalField(max_digits=10, decimal_places=2, default=0)

@@ -973,6 +973,7 @@ class PaperTradeViewSet(viewsets.ReadOnlyModelViewSet):
 		outcome = self.request.query_params.get('outcome')
 		entry_from = self.request.query_params.get('entry_from')
 		entry_to = self.request.query_params.get('entry_to')
+		broker = self.request.query_params.get('broker')
 		if status:
 			status = status.upper()
 			if status not in {'OPEN', 'CLOSED'}:
@@ -1006,6 +1007,11 @@ class PaperTradeViewSet(viewsets.ReadOnlyModelViewSet):
 			except ValueError:
 				raise ValidationError({'entry_to': 'Invalid entry_to.'})
 			queryset = queryset.filter(entry_date__lte=entry_to)
+		if broker:
+			broker = broker.upper()
+			if broker not in {'SIM', 'ALPACA'}:
+				raise ValidationError({'broker': 'Invalid broker.'})
+			queryset = queryset.filter(broker=broker)
 		return queryset
 
 
