@@ -3801,6 +3801,9 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
     max_cost_pct = _env_float(prefix, 'ALPACA_MAX_COST_PCT', '0.01')
     commission_pct = _env_float(prefix, 'ALPACA_COMMISSION_PCT', '0.0')
     allow_gemini = os.getenv('ALPACA_GEMINI_REASON', 'true').lower() in {'1', 'true', 'yes', 'y'}
+    min_confidence = _env_float(prefix, 'ALPACA_MIN_CONFIDENCE', '0.7')
+    min_sentiment = _env_float(prefix, 'ALPACA_MIN_SENTIMENT', '0.0')
+    min_imbalance = _env_float(prefix, 'ALPACA_MIN_IMBALANCE', '1.0')
 
     positions = {getattr(p, 'symbol', '').strip().upper(): p for p in get_open_positions() if getattr(p, 'symbol', None)}
     market_sentiment, market_meta = get_market_sentiment()
@@ -3874,12 +3877,29 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
         symbol = (symbol or '').strip().upper()
         if not symbol:
             continue
+        if _symbol_currency(symbol) == 'CAD':
+            notify_key = f"alpaca_cad_alert:{symbol}:{_ny_time_now().strftime('%Y%m%d')}"
+            if not cache.get(notify_key):
+                cache.set(notify_key, True, timeout=60 * 60 * 6)
+                _send_telegram_alert(
+                    f"🇨🇦 Ticker canadien détecté: {symbol}. Trade manuel sur Wealthsimple requis.",
+                    allow_during_blackout=True,
+                    category='signal',
+                )
+            continue
         if market_sentiment in {'BEARISH', 'CAUTION'}:
             continue
 
         signal_payload = _model_signal(symbol, universe, model_path, use_alpaca=True)
         signal = signal_payload.get('signal') if signal_payload else None
         if signal is None:
+            continue
+        if signal < min_confidence:
+            continue
+
+        feature_snapshot = (signal_payload or {}).get('features') or {}
+        sentiment_score = float(feature_snapshot.get('sentiment_score') or 0.0)
+        if sentiment_score < min_sentiment:
             continue
 
         if sandbox != 'AI_PENNY':
@@ -3895,6 +3915,10 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
         if spread_pct is None:
             spread_pct = 0.0
         if (spread_pct + commission_pct) > max_cost_pct:
+            continue
+
+        imbalance = get_order_book_imbalance(symbol)
+        if imbalance is not None and imbalance < min_imbalance:
             continue
 
         price = _alpaca_latest_price(symbol)
