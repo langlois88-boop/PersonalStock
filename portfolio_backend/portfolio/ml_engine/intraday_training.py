@@ -9,6 +9,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.compose import ColumnTransformer
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler
@@ -131,7 +132,7 @@ def build_dataset(symbols: Iterable[str], market_symbol: str = 'QQQ', days: int 
 def train_xgboost_model(dataset: pd.DataFrame, labels: pd.Series, feature_cols: list[str]) -> IntradayModelResult:
     if dataset.empty:
         raise ValueError('No dataset for training')
-    X = dataset[feature_cols].values
+    X = dataset[feature_cols]
     y = labels.values
     if XGBClassifier is None:
         model = RandomForestClassifier(n_estimators=200, max_depth=8, random_state=42)
@@ -145,16 +146,25 @@ def train_xgboost_model(dataset: pd.DataFrame, labels: pd.Series, feature_cols: 
             eval_metric='logloss',
             random_state=42,
         )
+    volume_cols = [col for col in ['rvol', 'volatility'] if col in feature_cols]
+    base_cols = [col for col in feature_cols if col not in volume_cols]
+    scaler = ColumnTransformer(
+        transformers=[
+            ('volume', RobustScaler(), volume_cols),
+            ('base', RobustScaler(), base_cols),
+        ],
+        remainder='drop',
+    )
     pipeline = Pipeline([
-        ('scaler', RobustScaler()),
+        ('scaler', scaler),
         ('model', model),
     ])
 
     splits = TimeSeriesSplit(n_splits=5)
     scores = []
     for train_idx, test_idx in splits.split(X):
-        pipeline.fit(X[train_idx], y[train_idx])
-        score = pipeline.score(X[test_idx], y[test_idx])
+        pipeline.fit(X.iloc[train_idx], y[train_idx])
+        score = pipeline.score(X.iloc[test_idx], y[test_idx])
         scores.append(float(score))
 
     pipeline.fit(X, y)
@@ -201,19 +211,24 @@ def train_voting_ensemble(
         weights=[1, 2],
     )
 
-    X_blue = blue_df[feature_cols].values
+    X_blue = blue_df[feature_cols]
     y_blue = blue_y.values
-    X_penny = penny_df[feature_cols].values
+    X_penny = penny_df[feature_cols]
     y_penny = penny_y.values
 
-    scaler = RobustScaler()
-    X_blue_scaled = scaler.fit_transform(X_blue)
-    X_penny_scaled = scaler.transform(X_penny)
-
-    ensemble.fit(
-        np.vstack([X_blue_scaled, X_penny_scaled]),
-        np.concatenate([y_blue, y_penny]),
+    volume_cols = [col for col in ['rvol', 'volatility'] if col in feature_cols]
+    base_cols = [col for col in feature_cols if col not in volume_cols]
+    scaler = ColumnTransformer(
+        transformers=[
+            ('volume', RobustScaler(), volume_cols),
+            ('base', RobustScaler(), base_cols),
+        ],
+        remainder='drop',
     )
+    X_all = pd.concat([X_blue, X_penny], ignore_index=True)
+    y_all = np.concatenate([y_blue, y_penny])
+    X_all_scaled = scaler.fit_transform(X_all)
+    ensemble.fit(X_all_scaled, y_all)
 
     pipeline = Pipeline([
         ('scaler', scaler),

@@ -81,6 +81,8 @@ from .alpaca_data import (
     get_intraday_bars,
     get_intraday_bars_range,
     get_latest_trade_price,
+    get_latest_bid_ask_spread_pct,
+    get_order_book_imbalance,
     get_stock_snapshots,
     get_trading_client,
     get_tradable_symbols,
@@ -136,6 +138,306 @@ def _latest_bid_ask(symbol: str) -> tuple[float | None, float | None]:
         return bid, ask
     except Exception:
         return None, None
+
+
+def _parse_driver_map(raw: str | None) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    raw = (raw or '').strip()
+    if not raw:
+        return mapping
+    for chunk in raw.split(','):
+        if '=' not in chunk:
+            continue
+        symbol, driver = chunk.split('=', 1)
+        symbol = symbol.strip().upper()
+        driver = driver.strip().upper()
+        if symbol and driver:
+            mapping[symbol] = driver
+    return mapping
+
+
+def _default_driver_for_symbol(symbol: str) -> str:
+    symbol_upper = (symbol or '').strip().upper()
+    if symbol_upper.endswith(('.TO', '.V', '.CN')):
+        return '^GSPTSE'
+    return 'SPY'
+
+
+def get_market_regime_context() -> dict[str, Any]:
+    cache_key = 'market_regime_context'
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        engine = DataFusionEngine('SPY')
+        df = engine.fuse_all()
+        if df is None or df.empty:
+            result = {'status': 'no_data'}
+            cache.set(cache_key, result, timeout=60 * 5)
+            return result
+        last = df.tail(1).iloc[0]
+        spy_close = float(last.get('Close') or 0.0)
+        ema200 = float(last.get('MA200') or 0.0)
+        vix = float(last.get('VIXCLS') or 0.0)
+        risk_off = (vix >= float(os.getenv('MARKET_RISK_OFF_VIX', '25'))) or (ema200 > 0 and spy_close < ema200)
+        result = {
+            'status': 'ok',
+            'spy_close': spy_close,
+            'spy_ema200': ema200,
+            'vix': vix,
+            'risk_off': bool(risk_off),
+        }
+        cache.set(cache_key, result, timeout=60 * 5)
+        return result
+    except Exception as exc:
+        result = {'status': 'error', 'error': str(exc)}
+        cache.set(cache_key, result, timeout=60 * 2)
+        return result
+
+
+@shared_task
+def market_guard_check() -> dict[str, Any]:
+    """Audit market regime and high spread risks on open trades."""
+    regime = get_market_regime_context()
+    spread_limit = float(os.getenv('MARKET_GUARD_SPREAD_LIMIT', '0.02'))
+    results: list[dict[str, Any]] = []
+    open_trades = PaperTrade.objects.filter(status='OPEN')
+    for trade in open_trades:
+        symbol = (trade.ticker or '').strip().upper()
+        if not symbol:
+            continue
+        spread_pct = get_latest_bid_ask_spread_pct(symbol)
+        if spread_pct is None:
+            bid, ask = _latest_bid_ask(symbol)
+            if bid and ask and ask > 0:
+                spread_pct = float((ask - bid) / ((ask + bid) / 2))
+        if spread_pct is None:
+            continue
+        if spread_pct >= spread_limit:
+            message = f"⚠️ Spread élevé sur {symbol}: {spread_pct * 100:.2f}%"
+            AlertEvent.objects.create(category='MARKET_GUARD_SPREAD', message=message)
+            results.append({'symbol': symbol, 'spread_pct': spread_pct})
+    return {
+        'regime': regime,
+        'spread_limit': spread_limit,
+        'alerts': results,
+    }
+
+
+@shared_task
+def order_book_imbalance_alerts(symbols: list[str] | None = None) -> dict[str, Any]:
+    """Emit alerts when bid/ask depth is weak (if data available)."""
+    if symbols is None:
+        symbols = []
+        for sandbox in ['AI_PENNY', 'AI_BLUECHIP', 'WATCHLIST']:
+            stored = SandboxWatchlist.objects.filter(sandbox=sandbox).first()
+            if stored and stored.symbols:
+                symbols.extend([str(s).strip().upper() for s in stored.symbols if str(s).strip()])
+    symbols = sorted(set([s for s in symbols if s]))
+    threshold = float(os.getenv('ORDER_BOOK_IMBALANCE_MIN', '1.0'))
+    cooldown = int(os.getenv('ORDER_BOOK_IMBALANCE_COOLDOWN_MIN', '30'))
+    results: dict[str, Any] = {}
+    for symbol in symbols:
+        imbalance = get_order_book_imbalance(symbol)
+        if imbalance is None:
+            results[symbol] = {'status': 'empty'}
+            continue
+        results[symbol] = {'status': 'ok', 'imbalance': imbalance}
+        if imbalance < threshold:
+            cache_key = f"order_book_imbalance:{symbol}"
+            if not cache.get(cache_key):
+                message = f"⚠️ Imbalance carnet {symbol}: bid/ask {imbalance:.2f}"
+                stock = Stock.objects.filter(symbol__iexact=symbol).first()
+                AlertEvent.objects.create(category='ORDER_BOOK_IMBALANCE', message=message, stock=stock)
+                cache.set(cache_key, True, timeout=60 * cooldown)
+    return {'threshold': threshold, 'results': results}
+
+
+@shared_task
+def scan_candlestick_patterns(symbols: list[str] | None = None) -> dict[str, Any]:
+    """Scan last 5 candles and cache bullish hammer + volume support flags."""
+    if symbols is None:
+        symbols = []
+        for sandbox in ['AI_PENNY', 'AI_BLUECHIP']:
+            stored = SandboxWatchlist.objects.filter(sandbox=sandbox).first()
+            if stored and stored.symbols:
+                symbols.extend([str(s).strip().upper() for s in stored.symbols if str(s).strip()])
+    symbols = sorted(set([s for s in symbols if s]))
+    results: dict[str, Any] = {}
+    for symbol in symbols:
+        try:
+            engine = DataFusionEngine(symbol)
+            df = engine.fuse_all()
+            if df is None or df.empty or not {'Open', 'High', 'Low', 'Close'}.issubset(df.columns):
+                results[symbol] = {'status': 'no_data'}
+                continue
+            recent = df.tail(5)
+            hammer_flag = False
+            patterns_found: list[str] = []
+            try:
+                import talib
+
+                groups = talib.get_function_groups().get('Pattern Recognition', [])
+                for func_name in groups:
+                    func = getattr(talib, func_name, None)
+                    if func is None:
+                        continue
+                    out = func(recent['Open'], recent['High'], recent['Low'], recent['Close'])
+                    if out is not None and len(out) and float(out.iloc[-1]) != 0:
+                        patterns_found.append(func_name)
+                hammer_flag = any('HAMMER' in name for name in patterns_found)
+            except Exception:
+                try:
+                    import pandas_ta as ta
+
+                    patterns = ta.cdl_pattern(
+                        open_=recent['Open'],
+                        high=recent['High'],
+                        low=recent['Low'],
+                        close=recent['Close'],
+                        name=['hammer'],
+                    )
+                    if patterns is not None and not patterns.empty and 'CDL_HAMMER' in patterns:
+                        hammer_flag = float(patterns['CDL_HAMMER'].iloc[-1]) != 0
+                        if hammer_flag:
+                            patterns_found.append('CDL_HAMMER')
+                except Exception:
+                    hammer_flag = False
+
+            last = df.tail(1).iloc[0]
+            volume_z = float(last.get('VolumeZ') or 0.0)
+            ema200 = float(last.get('MA200') or 0.0)
+            close = float(last.get('Close') or 0.0)
+            near_support = ema200 > 0 and abs(close - ema200) / ema200 <= float(os.getenv('PATTERN_EMA200_BAND', '0.02'))
+            hammer_support = bool(hammer_flag and volume_z >= float(os.getenv('PATTERN_VOLUMEZ_MIN', '2.0')) and near_support)
+
+            payload = {
+                'status': 'ok',
+                'patterns': patterns_found,
+                'hammer_support': hammer_support,
+                'volume_z': volume_z,
+                'ema200': ema200,
+                'close': close,
+            }
+            cache.set(f"pattern_scan:{symbol}", payload, timeout=60 * 60 * 6)
+            results[symbol] = payload
+        except Exception as exc:
+            results[symbol] = {'status': 'error', 'error': str(exc)}
+    return {'count': len(results), 'results': results}
+
+
+@shared_task
+def calculate_cross_correlations() -> dict[str, Any]:
+    """Compute cross-asset correlations and emit laggard alerts."""
+    driver_map = {
+        'BTO.TO': 'GC=F',
+        'AEM.TO': 'GC=F',
+        'K.TO': 'GC=F',
+        'CNQ.TO': 'CL=F',
+        'SU.TO': 'CL=F',
+        'HIVE.V': 'BTC-USD',
+        'BITF.TO': 'BTC-USD',
+    }
+    driver_map.update(_parse_driver_map(os.getenv('CROSS_CORR_DRIVER_MAP')))
+
+    symbols: list[str] = []
+    for sandbox in ['AI_PENNY', 'AI_BLUECHIP', 'WATCHLIST']:
+        stored = SandboxWatchlist.objects.filter(sandbox=sandbox).first()
+        if stored and stored.symbols:
+            symbols.extend([str(s).strip().upper() for s in stored.symbols if str(s).strip()])
+    symbols = sorted(set([s for s in symbols if s]))
+
+    lookback_days = int(os.getenv('CROSS_CORR_LOOKBACK_DAYS', '90'))
+    corr_window = int(os.getenv('CROSS_CORR_WINDOW', '60'))
+    corr_threshold = float(os.getenv('CROSS_CORR_ALERT_THRESHOLD', '0.85'))
+    driver_move = float(os.getenv('CROSS_CORR_DRIVER_MOVE', '0.01'))
+    laggard_move = float(os.getenv('CROSS_CORR_LAGGARD_MOVE', '0.002'))
+
+    results: dict[str, Any] = {}
+    for symbol in symbols:
+        driver = driver_map.get(symbol) or _default_driver_for_symbol(symbol)
+        try:
+            sym_df = yf.download(symbol, period=f"{lookback_days}d", interval='1d')
+            drv_df = yf.download(driver, period=f"{lookback_days}d", interval='1d')
+            if sym_df is None or sym_df.empty or drv_df is None or drv_df.empty:
+                results[symbol] = {'status': 'no_data'}
+                continue
+            sym_close = sym_df['Close'].dropna()
+            drv_close = drv_df['Close'].dropna()
+            aligned = pd.concat([sym_close.pct_change(), drv_close.pct_change()], axis=1).dropna()
+            if aligned.empty:
+                results[symbol] = {'status': 'no_data'}
+                continue
+            corr = float(aligned.iloc[:, 0].rolling(corr_window).corr(aligned.iloc[:, 1]).iloc[-1])
+            sym_last = float(sym_close.iloc[-1])
+            sym_prev = float(sym_close.iloc[-2]) if len(sym_close) > 1 else sym_last
+            drv_last = float(drv_close.iloc[-1])
+            drv_prev = float(drv_close.iloc[-2]) if len(drv_close) > 1 else drv_last
+            sym_ret = (sym_last - sym_prev) / sym_prev if sym_prev else 0.0
+            drv_ret = (drv_last - drv_prev) / drv_prev if drv_prev else 0.0
+            payload = {
+                'status': 'ok',
+                'driver': driver,
+                'corr': corr,
+                'symbol_return': sym_ret,
+                'driver_return': drv_ret,
+            }
+            results[symbol] = payload
+            cache.set(f"cross_corr:{symbol}", payload, timeout=60 * 60 * 12)
+
+            if corr >= corr_threshold and drv_ret >= driver_move and abs(sym_ret) <= laggard_move:
+                stock = Stock.objects.filter(symbol__iexact=symbol).first()
+                message = (
+                    f"{symbol} laggard: corr {corr:.2f} avec {driver}, {driver} +{drv_ret*100:.2f}% "
+                    f"vs {symbol} {sym_ret*100:.2f}%"
+                )
+                AlertEvent.objects.create(category='LAGGARD_ALERT', message=message, stock=stock)
+        except Exception as exc:
+            results[symbol] = {'status': 'error', 'error': str(exc)}
+    return {'count': len(results), 'results': results}
+
+
+@shared_task
+def audit_volume_news_lag(symbol: str) -> dict[str, Any]:
+    """Audit whether volume spikes precede news for a symbol."""
+    symbol = (symbol or '').strip().upper()
+    if not symbol:
+        return {'status': 'invalid_symbol'}
+    try:
+        engine = DataFusionEngine(symbol)
+        df = engine.fuse_all()
+        if df is None or df.empty or 'VolumeZ' not in df:
+            return {'status': 'no_data'}
+        window_days = int(os.getenv('VOLUME_NEWS_LAG_DAYS', '30'))
+        recent = df.tail(window_days)
+        if recent.empty:
+            return {'status': 'no_data'}
+        vol_idx = recent['VolumeZ'].idxmax()
+        vol_time = pd.to_datetime(vol_idx)
+        stock = Stock.objects.filter(symbol__iexact=symbol).first()
+        if not stock:
+            return {'status': 'no_stock'}
+        news_qs = StockNews.objects.filter(stock=stock).exclude(published_at__isnull=True)
+        if not news_qs.exists():
+            return {'status': 'no_news'}
+        news_first = news_qs.order_by('published_at').first()
+        news_time = news_first.published_at
+        if not news_time:
+            return {'status': 'no_news_time'}
+        lag_hours = (news_time - vol_time).total_seconds() / 3600.0
+        payload = {
+            'status': 'ok',
+            'volume_peak_at': str(vol_time),
+            'news_first_at': str(news_time),
+            'lag_hours': lag_hours,
+        }
+        cache.set(f"volume_news_lag:{symbol}", payload, timeout=60 * 60 * 12)
+        if lag_hours >= float(os.getenv('VOLUME_NEWS_LAG_ALERT_HOURS', '2')):
+            message = f"{symbol} volume spike precedes news by {lag_hours:.1f}h"
+            AlertEvent.objects.create(category='VOLUME_NEWS_LAG', message=message, stock=stock)
+        return payload
+    except Exception as exc:
+        return {'status': 'error', 'error': str(exc)}
 
 
 def _projection_price(symbol: str, entry_price: float) -> float | None:
@@ -2919,6 +3221,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     initial_capital = _env_float(prefix, 'CAPITAL', '10000')
     min_volume_z = _env_float(prefix, 'VOLUME_ZSCORE_MIN', '0.5')
     break_even_pct = _env_float(prefix, 'BREAK_EVEN_PCT', '0.015')
+    break_even_fee_pct = _env_float(prefix, 'BREAK_EVEN_FEE_PCT', '0.0')
     reinforce_min_score = _env_float(prefix, 'REINFORCE_MIN_SCORE', '0.85')
     min_altman_z = _env_float(prefix, 'MIN_ALTMAN_Z', '2.0')
     min_win_rate = _env_float(prefix, 'MIN_WIN_RATE', '0.40')
@@ -2964,6 +3267,12 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
 
     capital = initial_capital + closed_pnl
     available = max(0.0, capital - open_value)
+    min_available_capital = _env_float(prefix, 'MIN_AVAILABLE_CAPITAL', '0.0')
+    block_new_entries = sandbox == 'AI_PENNY' and min_available_capital > 0 and available < min_available_capital
+    regime = get_market_regime_context()
+    risk_off = bool(regime.get('risk_off')) if isinstance(regime, dict) else False
+    regime_risk_factor = float(os.getenv('MARKET_RISK_OFF_POSITION_FACTOR', '0.5')) if risk_off else 1.0
+    pattern_boost = float(os.getenv('PATTERN_SIGNAL_BOOST', '2.0'))
 
     def _penny_blocked() -> bool:
         if sandbox != 'AI_PENNY':
@@ -2978,7 +3287,8 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     def _latest_price(symbol: str) -> float | None:
         if use_alpaca:
             price = get_latest_trade_price(symbol)
-            return float(price) if price else None
+            if price is not None:
+                return float(price)
         try:
             hist = yf.Ticker(symbol).history(period='5d', interval='1d', timeout=10)
             if hist is not None and not hist.empty and 'Close' in hist:
@@ -3073,6 +3383,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         if sandbox == 'AI_PENNY':
             ctx = intraday_ctx or {}
             rvol = float(ctx.get('rvol') or 0.0)
+            bid_ask_spread_pct = float(ctx.get('bid_ask_spread_pct') or 0.0)
             breakout, breakout_score = _penny_breakout_score(ctx.get('bars'))
             sentiment, _ = _finbert_recent_sentiment(symbol, days=2)
             sentiment_score = max(0.0, min(1.0, (sentiment + 1.0) / 2.0))
@@ -3088,6 +3399,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 'finbert_sentiment': float(sentiment),
                 'breakout_1m': 1.0 if breakout else 0.0,
                 'breakout_score': float(breakout_score),
+                'bid_ask_spread_pct': bid_ask_spread_pct,
             })
             return payload
 
@@ -3136,7 +3448,8 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                             f"avec VolumeZ négatif depuis {take_profit_volume_days} jours (dernier {latest_z_text})."
                         )
                         AlertEvent.objects.create(category='TAKE_PROFIT_SUGGESTION', message=message, stock=stock)
-            break_even_stop = entry_price if entry_price and price >= (entry_price * (1 + break_even_pct)) else 0.0
+            break_even_trigger_pct = max(0.0, break_even_pct + break_even_fee_pct)
+            break_even_stop = entry_price if entry_price and price >= (entry_price * (1 + break_even_trigger_pct)) else 0.0
             atr = _atr(symbol)
             dynamic_atr_stop = 0.0
             if profit_pct >= trail_profit_trigger and atr > 0:
@@ -3203,6 +3516,10 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             multiplier = _bluechip_aggressive_multiplier()
             if multiplier > 1.0:
                 signal = min(1.0, float(signal) * multiplier)
+        if signal is not None:
+            pattern_payload = cache.get(f"pattern_scan:{symbol}") or {}
+            if pattern_payload.get('hammer_support'):
+                signal = min(1.0, float(signal) * pattern_boost)
         if market_sentiment in {'BEARISH', 'CAUTION'}:
             notify_key = f"market_sentiment_block:{sandbox}:{_ny_time_now().strftime('%Y%m%d%H')}"
             if not cache.get(notify_key):
@@ -3216,6 +3533,8 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 )
             continue
         if signal is None or signal < buy_threshold:
+            continue
+        if block_new_entries:
             continue
         if existing_trades and signal < reinforce_min_score:
             continue
@@ -3238,6 +3557,11 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             breakout_flag = float((signal_payload or {}).get('features', {}).get('breakout_1m') or 0.0)
             if intraday_rvol < min_rvol or breakout_flag <= 0:
                 continue
+            if os.getenv('ORDER_BOOK_IMBALANCE_ENABLED', 'false').lower() in {'1', 'true', 'yes', 'y'}:
+                imbalance = get_order_book_imbalance(symbol)
+                min_imbalance = float(os.getenv('ORDER_BOOK_IMBALANCE_MIN', '1.0'))
+                if imbalance is not None and imbalance < min_imbalance:
+                    continue
         price = _latest_price(symbol)
         if price is None:
             continue
@@ -3265,6 +3589,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         if allocation <= 0:
             continue
         position_value = min(position_value, allocation)
+        position_value *= regime_risk_factor
         position_value *= confidence_factor
         quantity = int(position_value / price) if price else 0
         if quantity <= 0:
@@ -3302,7 +3627,13 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         created += 1
         available = max(0.0, available - (quantity * price))
 
-    return {'created': created, 'closed': closed, 'available': round(available, 2)}
+    return {
+        'created': created,
+        'closed': closed,
+        'available': round(available, 2),
+        'entries_blocked_low_capital': block_new_entries,
+        'market_regime': regime,
+    }
 
 
 @shared_task
@@ -5231,10 +5562,14 @@ def _yahoo_fundamentals(symbol: str) -> dict[str, float]:
     symbol = (symbol or '').strip().upper()
     if not symbol:
         return {}
+    cache_key = f"fundamentals:yahoo:{symbol}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
     try:
         ticker = yf.Ticker(symbol)
         info = ticker.info or {}
-        return {
+        payload = {
             'quick_ratio': float(info.get('quickRatio') or 0),
             'current_ratio': float(info.get('currentRatio') or 0),
             'revenue_growth': float(info.get('revenueGrowth') or 0),
@@ -5243,6 +5578,8 @@ def _yahoo_fundamentals(symbol: str) -> dict[str, float]:
             'price_to_book': float(info.get('priceToBook') or 0),
             'trailing_pe': float(info.get('trailingPE') or 0),
         }
+        cache.set(cache_key, payload, timeout=60 * 60 * 24)
+        return payload
     except Exception:
         return {}
 
@@ -5851,6 +6188,8 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
             'target_price': target_price,
             'stop_loss': stop_loss,
             'news_titles': titles[:5],
+            'universe': universe,
+            'sandbox': 'AI_PENNY' if universe == 'PENNY' else 'AI_BLUECHIP',
         }
     except Exception as exc:
         return {'error': str(exc)}
@@ -6199,6 +6538,11 @@ def send_penny_rebound_diagnostic() -> dict[str, Any]:
                 snapshots = snapshots.filter(as_of=latest_date)
             symbols = [s.stock.symbol for s in snapshots[:limit]]
 
+        hive_symbol = os.getenv('HIVE_REBOUND_SYMBOL', 'HIVE.V').strip().upper()
+        if hive_symbol:
+            symbols = [s for s in symbols if str(s).strip().upper() != hive_symbol]
+            symbols.insert(0, hive_symbol)
+
         diagnostics: list[dict[str, Any]] = []
         for symbol in symbols:
             item = _penny_diagnostic_item(symbol)
@@ -6365,6 +6709,20 @@ def monitor_hive_trade() -> dict[str, Any]:
         stop_pct = float(os.getenv('HIVE_STOP_PCT', '0.05'))
         rsi_sell = float(os.getenv('HIVE_RSI_SELL', '60'))
         currency = _symbol_currency(symbol)
+        stock = Stock.objects.filter(symbol__iexact=symbol).first()
+        filled_cooldown = int(os.getenv('HIVE_FILLED_COOLDOWN_MIN', '480'))
+        rsi_cooldown = int(os.getenv('HIVE_RSI_COOLDOWN_MIN', '120'))
+        nofill_cooldown = int(os.getenv('HIVE_NOFILL_COOLDOWN_MIN', '360'))
+        target_cooldown = int(os.getenv('HIVE_TARGET_COOLDOWN_MIN', '480'))
+        stop_cooldown = int(os.getenv('HIVE_STOP_COOLDOWN_MIN', '480'))
+
+        def _send_hive_alert(category: str, message: str, cooldown_min: int) -> bool:
+            cutoff = timezone.now() - timedelta(minutes=cooldown_min)
+            if AlertEvent.objects.filter(category=category, stock=stock, created_at__gte=cutoff).exists():
+                return False
+            AlertEvent.objects.create(category=category, message=message, stock=stock)
+            _send_telegram_alert(message, allow_during_blackout=True, category='signal')
+            return True
         now_ny = _ny_time_now()
         if now_ny.weekday() >= 5:
             _task_log_finish(log, 'SUCCESS', {'status': 'market_closed'})
@@ -6387,10 +6745,10 @@ def monitor_hive_trade() -> dict[str, Any]:
         filled = cache.get(filled_key, False)
         if not filled and latest_price >= limit_price:
             cache.set(filled_key, True, timeout=60 * 60 * 8)
-            _send_telegram_alert(
+            _send_hive_alert(
+                'HIVE_FILLED',
                 f"✅ ORDRE PROBABLEMENT FILLED : {symbol} à {latest_price:.2f} {currency} (limite {limit_price:.2f}).",
-                allow_during_blackout=True,
-                category='signal',
+                filled_cooldown,
             )
             filled = True
 
@@ -6398,10 +6756,10 @@ def monitor_hive_trade() -> dict[str, Any]:
         stop_key = _cache_key(symbol, 'stop')
         if filled and latest_price <= stop_price and not cache.get(stop_key, False):
             cache.set(stop_key, True, timeout=60 * 60 * 8)
-            _send_telegram_alert(
+            _send_hive_alert(
+                'HIVE_STOP',
                 f"⛔ STOP-LOSS ATTEINT : {symbol} à {latest_price:.2f} {currency} (stop {stop_price:.2f}).",
-                allow_during_blackout=True,
-                category='signal',
+                stop_cooldown,
             )
 
         target1 = limit_price * (1 + target1_pct)
@@ -6410,17 +6768,17 @@ def monitor_hive_trade() -> dict[str, Any]:
         target2_key = _cache_key(symbol, 'target15')
         if filled and latest_price >= target1 and not cache.get(target1_key, False):
             cache.set(target1_key, True, timeout=60 * 60 * 8)
-            _send_telegram_alert(
+            _send_hive_alert(
+                'HIVE_TARGET_10',
                 f"✅ PALIER 10% ATTEINT : {symbol} à {latest_price:.2f} {currency} (cible {target1:.2f}).",
-                allow_during_blackout=True,
-                category='signal',
+                target_cooldown,
             )
         if filled and latest_price >= target2 and not cache.get(target2_key, False):
             cache.set(target2_key, True, timeout=60 * 60 * 8)
-            _send_telegram_alert(
+            _send_hive_alert(
+                'HIVE_TARGET_15',
                 f"🔥 CIBLE 15% ATTEINTE : {symbol} à {latest_price:.2f} {currency} (cible {target2:.2f}).",
-                allow_during_blackout=True,
-                category='signal',
+                target_cooldown,
             )
 
         intraday = yf.Ticker(symbol).history(period='5d', interval='15m')
@@ -6429,10 +6787,10 @@ def monitor_hive_trade() -> dict[str, Any]:
         rsi_key = _cache_key(symbol, 'rsi')
         if filled and rsi_15m is not None and rsi_15m >= rsi_sell and not cache.get(rsi_key, False):
             cache.set(rsi_key, True, timeout=60 * 60 * 8)
-            _send_telegram_alert(
+            _send_hive_alert(
+                'HIVE_RSI_HOT',
                 f"⚠️ RSI CHAUD : {symbol} RSI15m {rsi_15m:.1f} ≥ {rsi_sell:.0f}. Recommandation : vendre.",
-                allow_during_blackout=True,
-                category='signal',
+                rsi_cooldown,
             )
 
         if now_ny.time() >= dt_time(10, 0) and not filled:
@@ -6457,7 +6815,7 @@ def monitor_hive_trade() -> dict[str, Any]:
                         "⏰ 10:00 — ORDRE NON REMPLI. Carnet indisponible. "
                         "Recommandation : ajuster la limite si le prix reste sous 2.95."
                     )
-                _send_telegram_alert(message, allow_during_blackout=True, category='signal')
+                _send_hive_alert('HIVE_NOFILL_10AM', message, nofill_cooldown)
 
         payload = {
             'status': 'ok',
@@ -6575,9 +6933,23 @@ def _portfolio_news_sentiment(symbol: str, hours: int = 24) -> float:
     return float(avg)
 
 
+def _normalize_yf_symbol(symbol: str) -> str:
+    sym = (symbol or '').strip().upper()
+    if sym.startswith('$'):
+        sym = sym[1:]
+    if '.' not in sym:
+        force_v = [s.strip().upper() for s in os.getenv('FORCE_V_SUFFIX_SYMBOLS', '').split(',') if s.strip()]
+        force_to = [s.strip().upper() for s in os.getenv('FORCE_TO_SUFFIX_SYMBOLS', '').split(',') if s.strip()]
+        if sym in force_v:
+            sym = f"{sym}.V"
+        elif sym in force_to:
+            sym = f"{sym}.TO"
+    return sym
+
+
 def _pct_change_from_open(symbol: str) -> float | None:
     try:
-        hist = yf.download(tickers=symbol, period='1d', interval='1m')
+        hist = yf.download(tickers=_normalize_yf_symbol(symbol), period='1d', interval='1m')
     except Exception:
         hist = None
     if hist is None or hist.empty:
@@ -6593,7 +6965,7 @@ def _pct_change_from_open(symbol: str) -> float | None:
 
 def _intraday_pct_change(symbol: str, minutes: int = 20) -> float | None:
     try:
-        hist = yf.download(tickers=symbol, period='1d', interval='1m')
+        hist = yf.download(tickers=_normalize_yf_symbol(symbol), period='1d', interval='1m')
     except Exception:
         hist = None
     if hist is None or hist.empty or 'Close' not in hist.columns:
@@ -6621,7 +6993,7 @@ def _is_market_dump() -> bool:
 
 def _intraday_volume(symbol: str) -> float | None:
     try:
-        hist = yf.download(tickers=symbol, period='1d', interval='1m')
+        hist = yf.download(tickers=_normalize_yf_symbol(symbol), period='1d', interval='1m')
     except Exception:
         hist = None
     if hist is None or hist.empty or 'Volume' not in hist.columns:
@@ -6631,7 +7003,7 @@ def _intraday_volume(symbol: str) -> float | None:
 
 def _daily_history(symbol: str, days: int = 365) -> pd.DataFrame:
     try:
-        hist = yf.download(tickers=symbol, period=f'{days}d', interval='1d')
+        hist = yf.download(tickers=_normalize_yf_symbol(symbol), period=f'{days}d', interval='1d')
     except Exception:
         return pd.DataFrame()
     return hist if isinstance(hist, pd.DataFrame) else pd.DataFrame()

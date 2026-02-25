@@ -52,11 +52,15 @@ FEATURE_COLUMNS = [
     "CPIAUCSL",
     "spy_corr_60",
     "tsx_corr_60",
+    "bid_ask_spread_pct",
 ]
 
 TRIPLE_BARRIER_UP_PCT = float(os.getenv("TRIPLE_BARRIER_UP_PCT", "0.05"))
 TRIPLE_BARRIER_DOWN_PCT = float(os.getenv("TRIPLE_BARRIER_DOWN_PCT", "0.03"))
 TRIPLE_BARRIER_MAX_DAYS = int(os.getenv("TRIPLE_BARRIER_MAX_DAYS", "20"))
+TRIPLE_BARRIER_USE_ATR = os.getenv("TRIPLE_BARRIER_USE_ATR", "true").lower() in {"1", "true", "yes", "y"}
+TRIPLE_BARRIER_ATR_MULT_UP = float(os.getenv("TRIPLE_BARRIER_ATR_MULT_UP", "1.5"))
+TRIPLE_BARRIER_ATR_MULT_DOWN = float(os.getenv("TRIPLE_BARRIER_ATR_MULT_DOWN", "1.0"))
 PENNY_TRIPLE_BARRIER_UP_PCT = float(os.getenv("PENNY_TRIPLE_BARRIER_UP_PCT", "0.03"))
 PENNY_TRIPLE_BARRIER_DOWN_PCT = float(os.getenv("PENNY_TRIPLE_BARRIER_DOWN_PCT", "0.02"))
 PENNY_TRIPLE_BARRIER_MAX_DAYS = int(os.getenv("PENNY_TRIPLE_BARRIER_MAX_DAYS", "2"))
@@ -208,7 +212,40 @@ def _ensure_features(df: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
-def _triple_barrier_labels(close: pd.Series) -> pd.Series:
+def _atr_pct_series(close: pd.Series, high: pd.Series | None, low: pd.Series | None, window: int = 14) -> pd.Series:
+    if close is None or close.empty:
+        return pd.Series(dtype=float)
+    if high is None or low is None or high.empty or low.empty:
+        return pd.Series(dtype=float, index=close.index)
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = tr.rolling(window=window, min_periods=max(2, window // 2)).mean()
+    atr_pct = atr / close.replace(0, np.nan)
+    return atr_pct.replace([np.inf, -np.inf], np.nan)
+
+
+def _resolve_barrier_pcts(
+    up_pct: float,
+    down_pct: float,
+    atr_pct: float | None,
+) -> tuple[float, float]:
+    if not TRIPLE_BARRIER_USE_ATR:
+        return up_pct, down_pct
+    if atr_pct is None or np.isnan(atr_pct) or atr_pct <= 0:
+        return up_pct, down_pct
+    atr_up = atr_pct * TRIPLE_BARRIER_ATR_MULT_UP
+    atr_down = atr_pct * TRIPLE_BARRIER_ATR_MULT_DOWN
+    return max(up_pct, atr_up), max(down_pct, atr_down)
+
+
+def _triple_barrier_labels(close: pd.Series, atr_pct: pd.Series | None = None) -> pd.Series:
     if close is None or close.empty:
         return pd.Series(dtype=float)
     prices = close.values
@@ -217,8 +254,10 @@ def _triple_barrier_labels(close: pd.Series) -> pd.Series:
         entry = prices[i]
         if entry <= 0:
             continue
-        upper = entry * (1 + TRIPLE_BARRIER_UP_PCT)
-        lower = entry * (1 - TRIPLE_BARRIER_DOWN_PCT)
+        row_atr_pct = float(atr_pct.iloc[i]) if atr_pct is not None and i < len(atr_pct) else None
+        up_pct, down_pct = _resolve_barrier_pcts(TRIPLE_BARRIER_UP_PCT, TRIPLE_BARRIER_DOWN_PCT, row_atr_pct)
+        upper = entry * (1 + up_pct)
+        lower = entry * (1 - down_pct)
         end = min(len(prices), i + TRIPLE_BARRIER_MAX_DAYS + 1)
         hit = 0
         for j in range(i + 1, end):
@@ -239,6 +278,7 @@ def _triple_barrier_labels_with_bands(
     up_pct: float,
     down_pct: float,
     max_days: int,
+    atr_pct: pd.Series | None = None,
 ) -> pd.Series:
     if close is None or close.empty:
         return pd.Series(dtype=float)
@@ -250,8 +290,10 @@ def _triple_barrier_labels_with_bands(
         entry = prices[i]
         if entry <= 0:
             continue
-        upper = entry * (1 + up_pct)
-        lower = entry * (1 - down_pct)
+        row_atr_pct = float(atr_pct.iloc[i]) if atr_pct is not None and i < len(atr_pct) else None
+        resolved_up, resolved_down = _resolve_barrier_pcts(up_pct, down_pct, row_atr_pct)
+        upper = entry * (1 + resolved_up)
+        lower = entry * (1 - resolved_down)
         end = min(len(prices), i + max_days + 1)
         hit = 0
         for j in range(i + 1, end):
@@ -310,6 +352,9 @@ def _build_training_set(df: pd.DataFrame, universe: str | None = None) -> tuple[
         return np.array([]), np.array([]), []
 
     X_df = data[FEATURE_COLUMNS].fillna(0)
+    atr_pct = None
+    if "Close" in data.columns and "High" in data.columns and "Low" in data.columns:
+        atr_pct = _atr_pct_series(data["Close"], data.get("High"), data.get("Low"))
     if "Close" in data.columns:
         is_penny = (universe or '').strip().upper() in {'PENNY', 'AI_PENNY'}
         if is_penny:
@@ -320,9 +365,10 @@ def _build_training_set(df: pd.DataFrame, universe: str | None = None) -> tuple[
                 PENNY_TRIPLE_BARRIER_UP_PCT,
                 PENNY_TRIPLE_BARRIER_DOWN_PCT,
                 PENNY_TRIPLE_BARRIER_MAX_DAYS,
+                atr_pct=atr_pct,
             )
         else:
-            labels = _triple_barrier_labels(data["Close"])
+            labels = _triple_barrier_labels(data["Close"], atr_pct=atr_pct)
     else:
         labels = (data["Returns"].shift(-1) > 0).astype(int)
     labels = labels.astype(float)

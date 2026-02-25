@@ -49,9 +49,26 @@ class DataMerger:
         return {"fred_rate": rate}
 
     def fetch_fundamental_features(self, symbol: str) -> Dict[str, Optional[float]]:
+        cache_backend = None
+        try:
+            from django.core.cache import cache as django_cache
+
+            cache_backend = django_cache
+        except Exception:
+            cache_backend = None
+
+        cache_key = f"fmp_fundamentals:{symbol}"
+        if cache_backend is not None:
+            cached = cache_backend.get(cache_key)
+            if cached is not None:
+                return cached
+
         fundamentals = fetch_fmp_fundamentals(symbol)
         sentiment = fetch_fmp_sentiment(symbol)
-        return {**fundamentals, **sentiment}
+        payload = {**fundamentals, **sentiment}
+        if cache_backend is not None:
+            cache_backend.set(cache_key, payload, timeout=60 * 60 * 24)
+        return payload
 
     def fetch_news_features(self, symbol: str) -> Dict[str, float]:
         return fetch_news_sentiment(symbol)

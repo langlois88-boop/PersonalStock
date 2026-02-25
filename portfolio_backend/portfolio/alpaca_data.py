@@ -29,6 +29,14 @@ except Exception:  # pragma: no cover
 from .patterns import enrich_bars_with_patterns
 
 
+def _alpaca_data_feed() -> Any:
+    if DataFeed is None:
+        return None
+    feed = os.getenv('ALPACA_DATA_FEED', 'IEX').strip().upper()
+    if feed == 'SIP':
+        return DataFeed.SIP
+    return DataFeed.IEX
+
 
 def _alpaca_client() -> StockHistoricalDataClient | None:
     if StockHistoricalDataClient is None:
@@ -82,6 +90,69 @@ def get_stock_snapshots(symbols: list[str]) -> dict[str, Any]:
         return {}
 
 
+def get_latest_bid_ask_spread_pct(symbol: str) -> float | None:
+    symbol = (symbol or '').strip().upper()
+    if not symbol:
+        return None
+    snapshots = get_stock_snapshots([symbol])
+    if not snapshots:
+        return None
+    snapshot = snapshots.get(symbol) or next(iter(snapshots.values()), None)
+    if snapshot is None:
+        return None
+    quote = getattr(snapshot, 'latest_quote', None) or getattr(snapshot, 'quote', None)
+    if quote is None:
+        return None
+    bid = getattr(quote, 'bid_price', None)
+    ask = getattr(quote, 'ask_price', None)
+    if bid is None:
+        bid = getattr(quote, 'bp', None)
+    if ask is None:
+        ask = getattr(quote, 'ap', None)
+    try:
+        bid = float(bid) if bid is not None else None
+        ask = float(ask) if ask is not None else None
+    except Exception:
+        bid = None
+        ask = None
+    if bid is None or ask is None or ask <= 0:
+        return None
+    mid = (bid + ask) / 2
+    if mid <= 0:
+        return None
+    return float((ask - bid) / mid)
+
+
+def get_order_book_imbalance(symbol: str) -> float | None:
+    """Return bid/ask size ratio from latest quote if available."""
+    symbol = (symbol or '').strip().upper()
+    if not symbol:
+        return None
+    snapshots = get_stock_snapshots([symbol])
+    if not snapshots:
+        return None
+    snapshot = snapshots.get(symbol) or next(iter(snapshots.values()), None)
+    if snapshot is None:
+        return None
+    quote = getattr(snapshot, 'latest_quote', None) or getattr(snapshot, 'quote', None)
+    if quote is None:
+        return None
+    bid_size = getattr(quote, 'bid_size', None)
+    ask_size = getattr(quote, 'ask_size', None)
+    if bid_size is None:
+        bid_size = getattr(quote, 'bs', None)
+    if ask_size is None:
+        ask_size = getattr(quote, 'as', None)
+    try:
+        bid_size = float(bid_size) if bid_size is not None else None
+        ask_size = float(ask_size) if ask_size is not None else None
+    except Exception:
+        return None
+    if bid_size is None or ask_size is None or ask_size <= 0:
+        return None
+    return float(bid_size / ask_size)
+
+
 def _bars_to_frame(bars: Any) -> pd.DataFrame:
     if bars is None:
         return pd.DataFrame()
@@ -114,7 +185,7 @@ def get_intraday_bars_range(symbol: str, start: datetime, end: datetime) -> pd.D
             timeframe=TimeFrame.Minute,
             start=start,
             end=end,
-            feed=DataFeed.IEX  # <--- Utilisation du flux gratuit IEX
+            feed=_alpaca_data_feed()
         )
         bars = client.get_stock_bars(request)
         df = _bars_to_frame(bars)
@@ -147,6 +218,10 @@ def get_intraday_bars(symbol: str, minutes: int = 390) -> pd.DataFrame:
     
     # 2. Tentative via Alpaca
     df = get_intraday_bars_range(symbol, start=start, end=end)
+    if df is None or df.empty:
+        # Re-tente avec une fenêtre plus large (pré-marché / avant ouverture)
+        start = end - timedelta(days=max_days)
+        df = get_intraday_bars_range(symbol, start=start, end=end)
     
     # 3. Si Alpaca échoue ou est vide, on utilise le Fallback Yahoo
     if df is None or df.empty:
@@ -245,7 +320,7 @@ def get_daily_bars(symbol: str, days: int = 30) -> pd.DataFrame:
             timeframe=TimeFrame.Day,
             start=start,
             end=end,
-            feed=DataFeed.IEX if DataFeed else None
+            feed=_alpaca_data_feed()
         )
         bars = client.get_stock_bars(request)
         df = _bars_to_frame(bars)
@@ -269,7 +344,7 @@ def get_latest_trade_price(symbol: str) -> float | None:
         return None
     try:
         # Pour le prix "latest", Alpaca gratuit a souvent 15min de délai sur IEX
-        request = StockLatestTradeRequest(symbol_or_symbols=[symbol], feed=DataFeed.IEX if DataFeed else None)
+        request = StockLatestTradeRequest(symbol_or_symbols=[symbol], feed=_alpaca_data_feed())
         trade = client.get_stock_latest_trade(request)
         if isinstance(trade, dict):
             trade = trade.get(symbol) or next(iter(trade.values()), None)
@@ -294,6 +369,7 @@ def get_intraday_context(symbol: str, minutes: int = 390, rvol_window: int = 20)
         return None
     
     last = enriched.iloc[-1]
+    spread_pct = get_latest_bid_ask_spread_pct(symbol)
     return {
         'bars': enriched,
         'rvol': float(last.get('rvol') or 0.0),
@@ -304,4 +380,5 @@ def get_intraday_context(symbol: str, minutes: int = 390, rvol_window: int = 20)
         'ema20': float(last.get('ema20') or 0.0),
         'ema50': float(last.get('ema50') or 0.0),
         'last_close': float(last.get('close') or 0.0),
+        'bid_ask_spread_pct': float(spread_pct or 0.0),
     }

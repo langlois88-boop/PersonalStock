@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 from ... import market_data as yf
 
-from ...alpaca_data import get_daily_bars
+from ...alpaca_data import get_daily_bars, get_latest_bid_ask_spread_pct
 
 from ..collectors.news_rss import fetch_news_sentiment
 
@@ -217,6 +217,11 @@ class DataFusionEngine:
             fused["close_pos_in_range"] = (fused["Close"] - fused["Low"]) / (range_.replace(0, pd.NA))
             fused = _add_candlestick_patterns(fused)
 
+        spread_pct = get_latest_bid_ask_spread_pct(self.ticker)
+        if spread_pct is None:
+            spread_pct = _fallback_bid_ask_spread_pct(self.ticker)
+        fused["bid_ask_spread_pct"] = float(spread_pct or 0.0)
+
         try:
             spy = yf.download(
                 "SPY",
@@ -344,6 +349,23 @@ def _normalize_ohlc_columns(frame: pd.DataFrame) -> pd.DataFrame:
         frame = frame.copy()
         frame["Close"] = frame["Adj_Close"]
     return frame
+
+
+def _fallback_bid_ask_spread_pct(symbol: str) -> float | None:
+    try:
+        info = yf.Ticker(symbol).info or {}
+        bid = info.get("bid")
+        ask = info.get("ask")
+        bid = float(bid) if bid is not None else None
+        ask = float(ask) if ask is not None else None
+        if bid is None or ask is None or ask <= 0:
+            return None
+        mid = (bid + ask) / 2
+        if mid <= 0:
+            return None
+        return float((ask - bid) / mid)
+    except Exception:
+        return None
 
 
 def _add_candlestick_patterns(frame: pd.DataFrame) -> pd.DataFrame:

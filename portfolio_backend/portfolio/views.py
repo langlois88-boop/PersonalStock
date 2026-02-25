@@ -3,6 +3,7 @@ import io
 import json
 import os
 import math
+import time
 from pathlib import Path
 from datetime import datetime, timedelta, date
 from typing import Any
@@ -30,10 +31,12 @@ from rest_framework.exceptions import ValidationError
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 
+from .alpaca_data import get_latest_trade_price
 from .models import (
 	Account,
 	AccountTransaction,
 	AlertEvent,
+	ActiveSignal,
 	Dividend,
 	DripSnapshot,
 	Portfolio,
@@ -1028,13 +1031,62 @@ class PaperTradeSummaryView(APIView):
 		sandbox = (request.query_params.get('sandbox') or '').strip().upper()
 		initial_capital = float(os.getenv('PAPER_CAPITAL', '10000'))
 		try:
-			def _latest_price(symbol: str) -> float | None:
+			def _latest_price(symbol: str, use_alpaca: bool = False) -> float | None:
 				symbol = (symbol or '').strip().upper()
 				if not symbol:
 					return None
+				if use_alpaca:
+					price = get_latest_trade_price(symbol)
+					if price is not None:
+						return float(price)
 				try:
 					hist = yf.Ticker(symbol).history(period='1d', interval='1m', timeout=10)
-					close = hist['Close'].iloc[-1] if hist is not None and not hist.empty and 'Close' in hist else None
+					close = None
+					if hist is not None and not hist.empty:
+						if isinstance(hist.columns, pd.MultiIndex):
+							level0 = hist.columns.get_level_values(0)
+							level1 = hist.columns.get_level_values(-1)
+							if 'Close' in level0:
+								series = hist['Close']
+								if isinstance(series, pd.DataFrame):
+									series = series.iloc[:, 0] if not series.empty else None
+								close = series.iloc[-1] if series is not None and not series.empty else None
+							elif 'Close' in level1:
+								try:
+									series = hist.xs('Close', axis=1, level=-1)
+									if isinstance(series, pd.DataFrame):
+										series = series.iloc[:, 0] if not series.empty else None
+									close = series.iloc[-1] if series is not None and not series.empty else None
+								except Exception:
+									close = None
+						elif 'Close' in hist:
+							close = hist['Close'].iloc[-1]
+					if close is not None:
+						return float(close)
+				except Exception:
+					pass
+				try:
+					hist = yf.Ticker(symbol).history(period='5d', interval='1d', timeout=10)
+					close = None
+					if hist is not None and not hist.empty:
+						if isinstance(hist.columns, pd.MultiIndex):
+							level0 = hist.columns.get_level_values(0)
+							level1 = hist.columns.get_level_values(-1)
+							if 'Close' in level0:
+								series = hist['Close']
+								if isinstance(series, pd.DataFrame):
+									series = series.iloc[:, 0] if not series.empty else None
+								close = series.iloc[-1] if series is not None and not series.empty else None
+							elif 'Close' in level1:
+								try:
+									series = hist.xs('Close', axis=1, level=-1)
+									if isinstance(series, pd.DataFrame):
+										series = series.iloc[:, 0] if not series.empty else None
+									close = series.iloc[-1] if series is not None and not series.empty else None
+								except Exception:
+									close = None
+						elif 'Close' in hist:
+							close = hist['Close'].iloc[-1]
 					return float(close) if close is not None else None
 				except Exception:
 					return None
@@ -1059,7 +1111,9 @@ class PaperTradeSummaryView(APIView):
 			open_payload = PaperTradeSerializer(open_trades, many=True).data
 			for trade in open_payload:
 				symbol = trade.get('ticker') or ''
-				current_price = _latest_price(symbol)
+				trade_sandbox = (trade.get('sandbox') or '').strip().upper()
+				use_alpaca = trade_sandbox in {'AI_BLUECHIP', 'AI_PENNY'}
+				current_price = _latest_price(symbol, use_alpaca=use_alpaca)
 				trade['current_price'] = None if current_price is None else round(float(current_price), 4)
 				try:
 					entry = float(trade.get('entry_price') or 0)
@@ -1159,6 +1213,158 @@ class PaperTradeManualCreateView(APIView):
 			notes='Manual quick analysis trade',
 		)
 		return Response({'status': 'created', 'trade': PaperTradeSerializer(trade).data}, status=201)
+
+
+class ActiveSignalManualCreateView(APIView):
+	def post(self, request):
+		ticker = (request.data.get('ticker') or '').strip().upper()
+		if not ticker:
+			return Response({'error': 'Ticker requis.'}, status=400)
+
+		entry_price = request.data.get('entry_price') or request.data.get('price')
+		try:
+			entry_price = float(entry_price) if entry_price is not None else None
+		except (TypeError, ValueError):
+			entry_price = None
+
+		if not entry_price or entry_price <= 0:
+			try:
+				alpaca_price = get_latest_trade_price(ticker)
+				entry_price = float(alpaca_price) if alpaca_price else None
+			except Exception:
+				entry_price = None
+
+		if not entry_price or entry_price <= 0:
+			try:
+				hist = yf.Ticker(ticker).history(period='5d', interval='1d')
+				if hist is not None and not hist.empty:
+					close_col = 'close' if 'close' in hist.columns else 'Close'
+					if close_col in hist:
+						entry_price = float(hist[close_col].iloc[-1])
+			except Exception:
+				entry_price = None
+
+		if not entry_price or entry_price <= 0:
+			return Response({'error': f"Prix introuvable pour {ticker}."}, status=400)
+
+		try:
+			target_price = float(request.data.get('target_price') or 0)
+		except (TypeError, ValueError):
+			target_price = 0.0
+		try:
+			stop_loss = float(request.data.get('stop_loss') or 0)
+		except (TypeError, ValueError):
+			stop_loss = 0.0
+
+		try:
+			target_pct = float(request.data.get('target_pct') or 0.10)
+		except (TypeError, ValueError):
+			target_pct = 0.10
+		try:
+			stop_pct = float(request.data.get('stop_pct') or 0.05)
+		except (TypeError, ValueError):
+			stop_pct = 0.05
+
+		if target_price <= 0:
+			target_price = entry_price * (1 + target_pct)
+		if stop_loss <= 0:
+			stop_loss = entry_price * (1 - stop_pct)
+
+		confidence = request.data.get('confidence')
+		try:
+			confidence = float(confidence) if confidence is not None else None
+		except (TypeError, ValueError):
+			confidence = None
+
+		pattern = (request.data.get('pattern') or '').strip()
+		note = (request.data.get('note') or '').strip()
+		daytrade_flag = request.data.get('daytrade')
+		daytrade = str(daytrade_flag).strip().lower() in {'1', 'true', 'yes', 'y'} or 'daytrade' in note.lower()
+
+		existing = ActiveSignal.objects.filter(status='OPEN', ticker__iexact=ticker).first()
+		if existing:
+			return Response({'status': 'exists', 'signal_id': existing.id}, status=200)
+
+		signal = ActiveSignal.objects.create(
+			ticker=ticker,
+			pattern=pattern,
+			entry_price=float(entry_price),
+			target_price=float(target_price),
+			stop_loss=float(stop_loss),
+			confidence=confidence,
+			status='OPEN',
+			liquidity_note='manual',
+			meta={
+				'manual': True,
+				'daytrade': daytrade,
+				'note': note,
+				'target_pct': target_pct,
+				'stop_pct': stop_pct,
+			},
+		)
+		return Response({'status': 'created', 'signal_id': signal.id}, status=201)
+
+
+class ActiveSignalListView(APIView):
+	def get(self, request):
+		status = (request.query_params.get('status') or 'OPEN').strip().upper()
+		manual_only = (request.query_params.get('manual') or '1').strip().lower() in {'1', 'true', 'yes', 'y'}
+		daytrade_only = (request.query_params.get('daytrade') or '').strip().lower() in {'1', 'true', 'yes', 'y'}
+		if status and status not in {'OPEN', 'TARGET', 'STOP', 'TIMEOUT', 'CLOSED'}:
+			raise ValidationError({'status': 'Invalid status.'})
+		qs = ActiveSignal.objects.all().order_by('-opened_at')
+		if status:
+			qs = qs.filter(status=status)
+		if manual_only:
+			qs = qs.filter(meta__manual=True)
+		if daytrade_only:
+			qs = qs.filter(meta__daytrade=True)
+		rows = [
+			{
+				'id': sig.id,
+				'ticker': sig.ticker,
+				'entry_price': sig.entry_price,
+				'target_price': sig.target_price,
+				'stop_loss': sig.stop_loss,
+				'status': sig.status,
+				'opened_at': sig.opened_at,
+				'closed_at': sig.closed_at,
+				'closed_price': sig.closed_price,
+			}
+			for sig in qs
+		]
+		return Response({'count': len(rows), 'results': rows})
+
+
+class ActiveSignalCloseView(APIView):
+	def post(self, request):
+		signal_id = request.data.get('id')
+		ticker = (request.data.get('ticker') or '').strip().upper()
+		price = request.data.get('price')
+		try:
+			price = float(price) if price is not None else None
+		except (TypeError, ValueError):
+			price = None
+
+		qs = ActiveSignal.objects.filter(status='OPEN')
+		if signal_id:
+			qs = qs.filter(id=signal_id)
+		elif ticker:
+			qs = qs.filter(ticker__iexact=ticker)
+		else:
+			return Response({'error': 'ID ou ticker requis.'}, status=400)
+
+		signal = qs.first()
+		if not signal:
+			return Response({'error': 'Signal introuvable.'}, status=404)
+
+		signal.status = 'CLOSED'
+		signal.closed_at = timezone.now()
+		if price is not None:
+			signal.closed_price = price
+		signal.outcome = 'CLOSED'
+		signal.save(update_fields=['status', 'closed_at', 'closed_price', 'outcome'])
+		return Response({'status': 'closed', 'signal_id': signal.id})
 
 
 class SandboxWatchlistView(APIView):
@@ -1600,6 +1806,80 @@ class AlpacaIntradayView(APIView):
 				return value if math.isfinite(value) else 0.0
 			return value
 
+		def _normalize_patterns(patterns: Any) -> list[str]:
+			if not patterns:
+				return []
+			out: list[str] = []
+			for item in patterns:
+				if isinstance(item, str):
+					name = item.strip()
+					if name:
+						out.append(name)
+					continue
+				if isinstance(item, dict):
+					name = item.get('name') or item.get('label') or item.get('text')
+					if name:
+						out.append(str(name))
+			return out
+
+		def _gemini_intraday_review(payload: dict[str, Any]) -> dict[str, Any] | None:
+			api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
+			if not api_key:
+				return None
+			if str(os.getenv('INTRADAY_GEMINI', '1')).strip().lower() not in {'1', 'true', 'yes', 'y'}:
+				return None
+			try:
+				from google import genai
+				score_basis = payload.get('score_basis') or {}
+				symbol_val = payload.get('symbol') or ''
+				cache_bucket = int(time.time() / 300)
+				cache_key = f"intraday:gemini:{symbol_val}:{cache_bucket}"
+				cached = cache.get(cache_key)
+				if cached:
+					return cached
+				try:
+					client = genai.Client(api_key=api_key)
+					model_name = getattr(settings, 'GEMINI_AI_MODEL', 'models/gemini-2.5-flash')
+					prompt = (
+						"Tu es un auditeur de signaux intraday. Tu vérifies la cohérence des données "
+						"(pattern, RVOL, RSI, EMA, volatilité) et donnes un avis clair. "
+						"Réponds en JSON strict: "
+						"{\"score\":0-100,\"verdict\":\"bullish\"|\"neutral\"|\"bearish\","
+						"\"summary\":\"...\",\"guidance\":[\"...\"]}. "
+						"Résumé en français, concis, sans conseils d'investissement.\n"
+						f"Ticker: {symbol_val}\n"
+						f"Stats: {json.dumps(score_basis, ensure_ascii=False)}\n"
+						f"Patterns récents: {json.dumps(payload.get('recent_patterns') or [], ensure_ascii=False)}\n"
+						f"Guidage IA actuel: {json.dumps(payload.get('guidance') or [], ensure_ascii=False)}\n"
+						"Règle: score > 65 si pattern haussier + RVOL >= 2 + EMA20 > EMA50. "
+						"Score < 45 si pattern baissier ou volatilité extrême + RVOL faible."
+					)
+					response = client.models.generate_content(model=model_name, contents=prompt)
+					text = (getattr(response, 'text', None) or '').strip()
+					if not text:
+						return None
+					try:
+						parsed = json.loads(text)
+					except Exception:
+						json_start = text.find('{')
+						json_end = text.rfind('}')
+						if json_start >= 0 and json_end > json_start:
+							parsed = json.loads(text[json_start:json_end + 1])
+						else:
+							return None
+					result = {
+						'score': _safe_number(parsed.get('score')),
+						'verdict': parsed.get('verdict'),
+						'summary': parsed.get('summary'),
+						'guidance': parsed.get('guidance') or [],
+					}
+					cache.set(cache_key, result, timeout=60 * 5)
+					return result
+				except Exception:
+					return None
+			except Exception:
+				return None
+
 		symbol = (request.query_params.get('symbol') or '').strip().upper()
 		if not symbol:
 			return Response({'error': 'symbol is required'}, status=400)
@@ -1655,7 +1935,7 @@ class AlpacaIntradayView(APIView):
 				'ema20': _safe_number(row.get('ema20')),
 				'ema50': _safe_number(row.get('ema50')),
 				'rsi14': _safe_number(row.get('rsi14')),
-				'patterns': row.get('patterns') or [],
+				'patterns': _normalize_patterns(row.get('patterns') or []),
 			})
 
 		latest = bars.iloc[-1]
@@ -1694,48 +1974,144 @@ class AlpacaIntradayView(APIView):
 				f"RVOL {rvol:.2f} et volatilité {volatility:.4f}. Support {support:.2f}$, résistance {resistance:.2f}$."
 			)
 
+		recent_patterns = []
+		try:
+			seen: set[str] = set()
+			for _, row in bars.tail(120).iterrows():
+				for label in _normalize_patterns(row.get('patterns') or []):
+					if label not in seen:
+						seen.add(label)
+						recent_patterns.append(label)
+		except Exception:
+			recent_patterns = []
+
+		score_basis = {
+			'last_close': _safe_number(last_close),
+			'pattern_signal': _safe_number(pattern_signal),
+			'rvol': _safe_number(rvol),
+			'volatility': _safe_number(volatility),
+			'rsi14': _safe_number(latest.get('rsi14')),
+			'ema20': _safe_number(latest.get('ema20')),
+			'ema50': _safe_number(latest.get('ema50')),
+			'probability': _safe_number(round(float(probability), 4)),
+			'support': _safe_number(support, default=0.0),
+			'resistance': _safe_number(resistance, default=0.0),
+			'suggested_stop': _safe_number(stop_loss),
+			'suggested_target': _safe_number(profit_target),
+		}
+		gemini_review = _gemini_intraday_review({
+			'symbol': alt_symbol or resolved_symbol,
+			'score_basis': score_basis,
+			'recent_patterns': recent_patterns,
+			'guidance': guidance,
+		})
+
 		payload = {
 			'symbol': alt_symbol or resolved_symbol,
 			'bars': bars_payload,
 			'annotations': clean_annotations,
 			'guidance': [str(item) for item in guidance if item is not None],
 			'stats': {
-				'last_close': _safe_number(last_close),
-				'pattern_signal': _safe_number(pattern_signal),
-				'rvol': _safe_number(rvol),
-				'volatility': _safe_number(volatility),
-				'rsi14': _safe_number(latest.get('rsi14')),
-				'ema20': _safe_number(latest.get('ema20')),
-				'ema50': _safe_number(latest.get('ema50')),
-				'probability': _safe_number(round(float(probability), 4)),
-				'support': _safe_number(support, default=0.0),
-				'resistance': _safe_number(resistance, default=0.0),
-				'suggested_stop': _safe_number(stop_loss),
-				'suggested_target': _safe_number(profit_target),
+				**score_basis,
 			},
+			'gemini': gemini_review,
 		}
 		return Response(_clean_json(payload), status=200)
 
 
 class MarketScannerView(APIView):
 	def get(self, request):
+		def _clean_json(value: Any) -> Any:
+			if value is None:
+				return None
+			if isinstance(value, dict):
+				return {key: _clean_json(val) for key, val in value.items()}
+			if isinstance(value, list):
+				return [_clean_json(item) for item in value]
+			if isinstance(value, tuple):
+				return [_clean_json(item) for item in value]
+			if isinstance(value, pd.Timestamp):
+				try:
+					return int(value.timestamp())
+				except Exception:
+					return None
+			if isinstance(value, (np.generic,)):
+				try:
+					value = value.item()
+				except Exception:
+					return None
+			if isinstance(value, float):
+				return value if math.isfinite(value) else 0.0
+			return value
+
+		def _normalize_patterns(patterns: Any) -> list[str]:
+			if not patterns:
+				return []
+			out: list[str] = []
+			for item in patterns:
+				if isinstance(item, str):
+					name = item.strip()
+					if name:
+						out.append(name)
+					continue
+				if isinstance(item, dict):
+					name = item.get('name') or item.get('label') or item.get('text')
+					if name:
+						out.append(str(name))
+			return out
+
+		def _score_from_ctx(ctx: dict[str, Any]) -> float:
+			pattern_signal = float(ctx.get('pattern_signal') or 0.0)
+			rvol = float(ctx.get('rvol') or 0.0)
+			base_prob = 0.5 + (pattern_signal * 0.08)
+			if rvol >= 2:
+				base_prob += 0.05
+			return float(max(0.05, min(0.95, base_prob)))
+
 		results = cache.get('market_scanner_results') or []
 		if not results:
 			watch = SandboxWatchlist.objects.filter(sandbox='AI_PENNY').first()
 			if watch and watch.symbols:
-				results = [
-					{
-						'symbol': str(symbol).strip().upper(),
-						'change_pct': 0,
-						'rvol': 0,
-						'patterns': [],
-						'score': 0,
+				fallback_results: list[dict[str, Any]] = []
+				for symbol in watch.symbols[:25]:
+					clean_symbol = str(symbol).strip().upper()
+					if not clean_symbol:
+						continue
+					ctx = get_intraday_context(clean_symbol, minutes=390, rvol_window=20)
+					if not ctx:
+						fallback_results.append({
+							'symbol': clean_symbol,
+							'change_pct': 0,
+							'rvol': 0,
+							'patterns': [],
+							'score': 0,
+							'source': 'watchlist',
+						})
+						continue
+					bars = ctx.get('bars')
+					last_close = float(ctx.get('last_close') or 0.0)
+					first_close = None
+					try:
+						if bars is not None and not bars.empty:
+							first_close = float(bars.iloc[0].get('close') or 0.0)
+					except Exception:
+						first_close = None
+					change_pct = 0.0
+					if first_close:
+						change_pct = ((last_close - first_close) / first_close) * 100
+					fallback_results.append({
+						'symbol': clean_symbol,
+						'change_pct': round(change_pct, 2),
+						'rvol': round(float(ctx.get('rvol') or 0.0), 2),
+						'patterns': _normalize_patterns(ctx.get('patterns') or []),
+						'score': round(_score_from_ctx(ctx), 4),
 						'source': 'watchlist',
-					}
-					for symbol in watch.symbols
-					if str(symbol).strip()
-				]
-		return Response({'results': results}, status=200)
+					})
+				results = fallback_results
+		if results:
+			for item in results:
+				item['patterns'] = _normalize_patterns(item.get('patterns') or [])
+		return Response(_clean_json({'results': results}), status=200)
 
 
 class PortfolioDashboardView(APIView):
@@ -3336,20 +3712,44 @@ class AccountDashboardView(APIView):
 		cached = cache.get(cache_key)
 		if cached is not None:
 			return cached
+		fallback_key = "macro_snapshot_last"
 		try:
-			dxy = yf.Ticker('DX-Y.NYB').history(period='5d', interval='1d')
-			oil = yf.Ticker('CL=F').history(period='5d', interval='1d')
-			gold = yf.Ticker('GC=F').history(period='5d', interval='1d')
-			def _latest_change(frame):
-				if frame is None or frame.empty or 'Close' not in frame:
+			frame = yf.download(['DX-Y.NYB', 'CL=F', 'GC=F'], period='7d', interval='1d', group_by='ticker')
+			def _latest_change(symbol: str):
+				data = None
+				if frame is None or frame.empty:
 					return None, None
-				closes = frame['Close'].dropna()
+				if isinstance(frame.columns, pd.MultiIndex):
+					level0 = frame.columns.get_level_values(0)
+					if symbol in level0:
+						data = frame[symbol]
+					elif symbol in frame.columns.get_level_values(-1):
+						try:
+							data = frame.xs(symbol, axis=1, level=-1)
+						except Exception:
+							data = None
+				else:
+					data = frame
+				if data is None or data.empty:
+					return None, None
+				if 'Close' in data:
+					closes = data['Close'].dropna()
+				elif 'close' in data:
+					closes = data['close'].dropna()
+				else:
+					return None, None
+				if closes.empty:
+					return None, None
 				if len(closes) < 2:
 					return float(closes.iloc[-1]), None
 				return float(closes.iloc[-1]), float((closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2] * 100)
-			dxy_price, dxy_change = _latest_change(dxy)
-			oil_price, oil_change = _latest_change(oil)
-			gold_price, gold_change = _latest_change(gold)
+			dxy_price, dxy_change = _latest_change('DX-Y.NYB')
+			oil_price, oil_change = _latest_change('CL=F')
+			gold_price, gold_change = _latest_change('GC=F')
+			if oil_price is None:
+				last_macro = MacroIndicator.objects.order_by('-date').first()
+				if last_macro and last_macro.oil_price is not None:
+					oil_price = float(last_macro.oil_price)
 			tech_risk = bool(dxy_change is not None and dxy_change > 0.5) or bool(gold_change is not None and gold_change > 0.5)
 			result = {
 				'dxy': dxy_price,
@@ -3361,9 +3761,11 @@ class AccountDashboardView(APIView):
 				'tech_risk': tech_risk,
 			}
 			cache.set(cache_key, result, 60 * 10)
+			cache.set(fallback_key, result, 60 * 60)
 			return result
 		except Exception:
-			return {}
+			fallback = cache.get(fallback_key)
+			return fallback or {}
 
 	def _pyramid_steps(self, symbol: str, price: float, avg_cost: float, volume_z: float | None, rsi: float | None, ma20: float | None) -> dict[str, Any]:
 		ai_score, _ = self._ai_score(symbol)
@@ -4858,12 +5260,52 @@ class AIBacktesterView(APIView):
 
 
 class PortfolioOptimizerView(APIView):
+	def _fallback_optimizer_review(
+		self,
+		actions: list[dict[str, Any]],
+		suggestions: list[dict[str, Any]],
+	) -> dict[str, Any]:
+		def _normalize_score(value: Any) -> float:
+			try:
+				val = float(value)
+			except (TypeError, ValueError):
+				return 0.0
+			if val <= 1:
+				val *= 100
+			return max(0.0, min(100.0, val))
+
+		scores = [_normalize_score(item.get('ai_score') or item.get('confidence')) for item in actions]
+		score = round(sum(scores) / len(scores), 1) if scores else 50.0
+		low_conf = sum(1 for item in actions if _normalize_score(item.get('ai_score') or item.get('confidence')) < 40)
+		speculative = sum(1 for item in actions if item.get('speculative'))
+		advice = []
+		risks = []
+		if low_conf:
+			advice.append("Plusieurs positions affichent une confiance faible: surveille le risque.")
+		if speculative:
+			risks.append("Exposition spéculative détectée: privilégie une gestion stricte des stops.")
+		if not advice:
+			advice.append("Contexte stable: conserve une approche prudente et diversifiée.")
+		if not risks:
+			risks.append("Analyse rapide (sans backtest complet).")
+		summary = (
+			f"Score global {score:.0f}%. {len(actions)} positions analysées"
+			f" et {len(suggestions)} suggestions surveillées."
+		)
+		return {
+			'score': score,
+			'summary': summary,
+			'advice': advice,
+			'risks': risks,
+			'text': summary,
+		}
+
 	def _gemini_optimizer_report(
 		self,
 		portfolio: dict[str, Any] | None,
 		actions: list[dict[str, Any]],
 		suggestions: list[dict[str, Any]],
-	) -> str | None:
+	) -> str | dict[str, Any] | None:
 		api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
 		if not api_key:
 			return None
@@ -4899,17 +5341,79 @@ class PortfolioOptimizerView(APIView):
 			prompt = (
 				"Tu es un conseiller stratégique en portefeuille. Analyse ce portefeuille et propose un audit clair. "
 				"Tu reçois le P/L actuel, les prix d'entrée, et les prédictions du modèle. "
-				"Réponds en français, concis, avec des actions recommandées.\n\n"
+				"Réponds en français, clair et actionnable.\n\n"
+				"Réponds en JSON strict: "
+				"{\"score\":0-100,\"summary\":\"...\",\"advice\":[\"...\"],\"risks\":[\"...\"],"
+				"\"audit\":[\"...\"],\"exposure\":\"...\"}.\n"
 				f"Portfolio: {portfolio_name}\n"
 				f"Exposition: Penny {penny_count} vs Stable {blue_count}\n"
 				f"Positions: {json.dumps(positions, ensure_ascii=False)}\n"
 				f"Suggestions modèle: {json.dumps(suggestions_brief, ensure_ascii=False)}\n"
-				"Donne un diagnostic: sur-exposition, titres à alléger, titres à renforcer. "
-				"Utilise des phrases du type: 'Attention, tu es trop exposé aux Penny Stocks...'"
+				"Donne un diagnostic détaillé: sur-exposition, titres à alléger, titres à renforcer, et 2-4 actions concrètes."
 			)
 			model_name = getattr(settings, 'GEMINI_AI_MODEL', 'models/gemini-2.5-flash')
 			response = client.models.generate_content(model=model_name, contents=prompt)
-			return (getattr(response, 'text', None) or '').strip() or None
+			text = (getattr(response, 'text', None) or '').strip()
+			if not text:
+				return None
+			try:
+				parsed = json.loads(text)
+			except Exception:
+				json_start = text.find('{')
+				json_end = text.rfind('}')
+				if json_start >= 0 and json_end > json_start:
+					parsed = json.loads(text[json_start:json_end + 1])
+				else:
+					return text
+			return {
+				'score': parsed.get('score'),
+				'summary': parsed.get('summary') or '',
+				'advice': parsed.get('advice') or [],
+				'risks': parsed.get('risks') or [],
+				'audit': parsed.get('audit') or parsed.get('recommendations') or [],
+				'exposure': parsed.get('exposure') or '',
+				'text': text,
+			}
+		except Exception:
+			return None
+
+	def _gemini_confirm_action(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+		api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
+		if not api_key:
+			return None
+		try:
+			from google import genai
+			client = genai.Client(api_key=api_key)
+			model_name = getattr(settings, 'GEMINI_AI_MODEL', 'models/gemini-2.5-flash')
+			prompt = (
+				"Tu es un auditeur de signaux trading."
+				"Analyse les métriques et réponds en JSON strict: "
+				"{\"verdict\":\"CONFIRME\"|\"PRUDENCE\",\"confidence\":0-100,\"note\":\"...\"}.\n"
+				f"Ticker: {payload.get('ticker')}\n"
+				f"Signal: {payload.get('signal_pct')}%\n"
+				f"Win rate: {payload.get('win_rate')}%\n"
+				f"Sharpe: {payload.get('sharpe')}\n"
+				f"Volume Z: {payload.get('volume_z')}\n"
+				f"RSI: {payload.get('rsi')}\n"
+				f"Distance MA20: {payload.get('ma20_distance')}%\n"
+				"Règle: si win rate < 45% ou Volume Z < -0.5, verdict PRUDENCE."
+			)
+			response = client.models.generate_content(model=model_name, contents=prompt)
+			text = (getattr(response, 'text', None) or '').strip()
+			if not text:
+				return None
+			try:
+				parsed = json.loads(text)
+			except Exception:
+				parsed = {'verdict': None, 'confidence': None, 'note': text}
+			verdict = parsed.get('verdict')
+			confidence = parsed.get('confidence')
+			note = parsed.get('note')
+			return {
+				'gemini_verdict': verdict,
+				'gemini_confidence': confidence,
+				'gemini_note': note,
+			}
 		except Exception:
 			return None
 	def _clamp(self, value: float, low: float, high: float) -> float:
@@ -4964,7 +5468,7 @@ class PortfolioOptimizerView(APIView):
 				'total_return_12y': None,
 				'altman_z': None,
 			}
-			cache.set(cache_key, result, 60 * 60 * 6)
+			cache.set(cache_key, result, 60 * 60 * 24)
 			return result
 		info = {}
 		try:
@@ -5065,7 +5569,7 @@ class PortfolioOptimizerView(APIView):
 			'total_return_12y': total_return_12y,
 			'altman_z': altman_z,
 		}
-		cache.set(cache_key, result, 60 * 60 * 6)
+		cache.set(cache_key, result, 60 * 60 * 24)
 		return result
 
 	def _model_bundle(self, symbol: str, universe: str) -> tuple[pd.DataFrame, dict] | tuple[None, None]:
@@ -5306,7 +5810,10 @@ class PortfolioOptimizerView(APIView):
 		buy_threshold: float,
 		sell_threshold: float,
 		fast_mode: bool = False,
+		allow_gemini: bool = False,
 	) -> dict[str, Any] | None:
+		if fast_mode:
+			return self._build_action_fast(holding, universe, allow_gemini=allow_gemini)
 		symbol = (holding.stock.symbol or '').strip().upper()
 		if not symbol:
 			return None
@@ -5484,6 +5991,21 @@ class PortfolioOptimizerView(APIView):
 		except Exception:
 			pass
 
+		gemini_confirm = None
+		if allow_gemini:
+			distance_ma20 = None
+			if ma20 is not None and ma20:
+				distance_ma20 = ((price_value - ma20) / ma20) * 100
+			gemini_confirm = self._gemini_confirm_action({
+				'ticker': symbol,
+				'signal_pct': round(signal * 100, 2),
+				'win_rate': round(float(win_rate), 2) if win_rate is not None else None,
+				'sharpe': round(float(sharpe), 2) if sharpe is not None else None,
+				'volume_z': round(volume_z, 2),
+				'rsi': round(rsi_value, 2) if rsi_value is not None else None,
+				'ma20_distance': round(float(distance_ma20), 2) if distance_ma20 is not None else None,
+			})
+
 		return {
 			'ticker': symbol,
 			'name': holding.stock.name or symbol,
@@ -5510,6 +6032,75 @@ class PortfolioOptimizerView(APIView):
 			'market_cap': market_cap,
 			'dividend_yield': dividend_yield,
 			'type': 'Bluechip' if universe == 'BLUECHIP' else 'Watchlist',
+			'gemini_verdict': gemini_confirm.get('gemini_verdict') if gemini_confirm else None,
+			'gemini_confidence': gemini_confirm.get('gemini_confidence') if gemini_confirm else None,
+			'gemini_note': gemini_confirm.get('gemini_note') if gemini_confirm else None,
+		}
+
+	def _build_action_fast(self, holding: PortfolioHolding, universe: str, allow_gemini: bool = False) -> dict[str, Any] | None:
+		symbol = (holding.stock.symbol or '').strip().upper()
+		if not symbol:
+			return None
+		price_value = self._to_float(getattr(holding.stock, 'latest_price', None)) or 0.0
+		dividend_yield = self._to_float(getattr(holding.stock, 'dividend_yield', None))
+		name = holding.stock.name or symbol
+		ai_score = 50.0
+		volume_z = None
+		rsi_value = None
+		ma20 = None
+		gemini_confirm = None
+		if allow_gemini:
+			try:
+				data, payload = self._model_bundle(symbol, universe)
+				if data is not None and payload is not None:
+					signal, row = self._latest_signal(data, payload, symbol)
+					ai_score = round(signal * 100, 2)
+					volume_z = float(row.get('VolumeZ', 0.0) or 0.0)
+					rsi_value = float(row.get('RSI14', 0.0) or 0.0)
+					ma20 = self._sma(data.get('Close') if data is not None else None, 20)
+					ma20_distance = None
+					if ma20 is not None and ma20:
+						ma20_distance = ((price_value - ma20) / ma20) * 100
+					gemini_confirm = self._gemini_confirm_action({
+						'ticker': symbol,
+						'signal_pct': ai_score,
+						'win_rate': None,
+						'sharpe': None,
+						'volume_z': round(volume_z, 2),
+						'rsi': round(rsi_value, 2),
+						'ma20_distance': round(float(ma20_distance), 2) if ma20_distance is not None else None,
+					})
+			except Exception:
+				gemini_confirm = None
+		return {
+			'ticker': symbol,
+			'name': name,
+			'signal': 'KEEP',
+			'confidence': 50,
+			'ai_score': ai_score,
+			'reason': 'Mode rapide: position détectée (analyse légère).',
+			'drivers': ['Mode rapide activé', 'Analyse complète disponible hors mode rapide'],
+			'metrics': ([{'label': 'Prix', 'value': f"${price_value:.2f}"}] if price_value else []),
+			'risks': ['Analyse rapide (sans backtest)'],
+			'advice': ['✋ HOLD / NEUTRAL (mode rapide).'],
+			'advice_color': 'Yellow',
+			'alerts': [],
+			'speculative': False,
+			'altman_z': None,
+			'volume_z': round(volume_z, 2) if volume_z is not None else None,
+			'rsi': round(rsi_value, 2) if rsi_value is not None else None,
+			'unrealized_pnl_pct': None,
+			'avg_cost': None,
+			'shares': float(holding.shares or 0) if hasattr(holding, 'shares') else None,
+			'win_rate': None,
+			'sharpe': None,
+			'price': round(price_value, 4),
+			'market_cap': None,
+			'dividend_yield': dividend_yield,
+			'type': 'Bluechip' if universe == 'BLUECHIP' else 'Watchlist',
+			'gemini_verdict': gemini_confirm.get('gemini_verdict') if gemini_confirm else None,
+			'gemini_confidence': gemini_confirm.get('gemini_confidence') if gemini_confirm else None,
+			'gemini_note': gemini_confirm.get('gemini_note') if gemini_confirm else None,
 		}
 
 	def _candidate_symbols(self, env_key: str, fallback: str) -> list[str]:
@@ -5578,18 +6169,58 @@ class PortfolioOptimizerView(APIView):
 
 	def get(self, request):
 		try:
+			hover_flag = str(request.query_params.get('hover', '')).strip().lower() in {'1', 'true', 'yes'}
+			hover_symbol = (request.query_params.get('ticker') or '').strip().upper()
+			if hover_flag and hover_symbol:
+				cache_key = f"optimizer:hover:{hover_symbol}"
+				cached = cache.get(cache_key)
+				if cached is not None:
+					return Response(cached, status=200)
+				stock = Stock.objects.filter(symbol__iexact=hover_symbol).first()
+				if not stock:
+					stock = Stock(symbol=hover_symbol, name=hover_symbol)
+				holding = SimpleNamespace(stock=stock)
+				latest_price = float(getattr(stock, 'latest_price', 0) or 0)
+				dividend_yield = float(getattr(stock, 'dividend_yield', 0) or 0)
+				is_stable = latest_price >= 5 or dividend_yield >= 0.02
+				universe = 'BLUECHIP' if is_stable else 'PENNY'
+				action = self._build_action_fast(holding, universe, allow_gemini=True)
+				payload = {
+					'ticker': hover_symbol,
+					'gemini_verdict': action.get('gemini_verdict') if action else None,
+					'gemini_confidence': action.get('gemini_confidence') if action else None,
+					'gemini_note': action.get('gemini_note') if action else None,
+					'ai_score': action.get('ai_score') if action else None,
+					'volume_z': action.get('volume_z') if action else None,
+					'rsi': action.get('rsi') if action else None,
+					'price': action.get('price') if action else None,
+					'as_of': timezone.now().isoformat(),
+				}
+				cache.set(cache_key, payload, timeout=60 * 5)
+				return Response(payload, status=200)
 			portfolio_id = request.query_params.get('portfolio_id')
 			lookback_days = int(os.getenv('OPTIMIZER_LOOKBACK_DAYS', '90'))
 			buy_threshold = float(os.getenv('OPTIMIZER_BUY_THRESHOLD', '0.64'))
 			sell_threshold = float(os.getenv('OPTIMIZER_SELL_THRESHOLD', '0.35'))
 			min_win_rate = float(os.getenv('OPTIMIZER_MIN_WIN_RATE', '0.52'))
-			fast_mode = str(request.query_params.get('fast', '')).lower() in {'1', 'true', 'yes'}
+			fast_param = str(request.query_params.get('fast', '')).strip().lower()
+			default_fast = str(os.getenv('OPTIMIZER_DEFAULT_FAST', '1')).strip().lower() in {'1', 'true', 'yes', 'y'}
+			fast_mode = fast_param in {'1', 'true', 'yes'} or (not fast_param and default_fast)
+			slow_max_holdings = int(os.getenv('OPTIMIZER_SLOW_MAX_HOLDINGS', '8'))
+			slow_lookback_days = int(os.getenv('OPTIMIZER_SLOW_LOOKBACK_DAYS', '60'))
+			gemini_confirm_on = str(os.getenv('OPTIMIZER_GEMINI_CONFIRM', '1')).lower() in {'1', 'true', 'yes'}
+			gemini_confirm_limit = int(os.getenv('OPTIMIZER_GEMINI_CONFIRM_LIMIT', '3'))
 			portfolio = None
 			if portfolio_id:
 				portfolio = Portfolio.objects.filter(id=portfolio_id).first()
 			if not portfolio:
 				portfolio = Portfolio.objects.first()
 			portfolio_payload = {'id': portfolio.id, 'name': portfolio.name} if portfolio else None
+
+			optimizer_cache_key = f"optimizer:payload:{portfolio_payload.get('id') if portfolio_payload else 'default'}:{'fast' if fast_mode else 'slow'}"
+			cached_payload = cache.get(optimizer_cache_key)
+			if cached_payload:
+				return Response(cached_payload, status=200)
 
 			holdings = list(PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)) if portfolio else []
 			stocks_by_symbol: dict[str, Stock] = {}
@@ -5625,9 +6256,14 @@ class PortfolioOptimizerView(APIView):
 				max_holdings = int(os.getenv('OPTIMIZER_MAX_HOLDINGS', '20'))
 				if len(holdings) > max_holdings:
 					holdings = holdings[:max_holdings]
+			else:
+				lookback_days = min(lookback_days, slow_lookback_days)
+				if len(holdings) > slow_max_holdings:
+					holdings = holdings[:slow_max_holdings]
 
 			actions: list[dict[str, Any]] = []
 			existing = set()
+			gemini_used = 0
 			for holding in holdings:
 				symbol = (holding.stock.symbol or '').strip().upper()
 				if not symbol:
@@ -5636,10 +6272,21 @@ class PortfolioOptimizerView(APIView):
 				is_stable = float(holding.stock.latest_price or 0) >= 5 or float(holding.stock.dividend_yield or 0) >= 0.02
 				universe = 'BLUECHIP' if is_stable else 'PENNY'
 				try:
-					action = self._build_action(holding, universe, lookback_days, buy_threshold, sell_threshold, fast_mode=fast_mode)
+					allow_gemini = gemini_confirm_on and (gemini_used < gemini_confirm_limit) and (not fast_mode)
+					action = self._build_action(
+						holding,
+						universe,
+						lookback_days,
+						buy_threshold,
+						sell_threshold,
+						fast_mode=fast_mode,
+						allow_gemini=allow_gemini,
+					)
 				except Exception:
 					action = None
 				if action:
+					if action.get('gemini_verdict') is not None:
+						gemini_used += 1
 					actions.append(action)
 
 			bluechip_candidates = self._candidate_symbols(
@@ -5647,39 +6294,36 @@ class PortfolioOptimizerView(APIView):
 				'SPY,AAPL,MSFT,NVDA,AMZN,GOOGL,TSLA,AVGO,LLY',
 			)
 			penny_candidates = self._candidate_symbols('OPTIMIZER_UNIVERSE_PENNY', '')
-			if fast_mode:
-				max_candidates = int(os.getenv('OPTIMIZER_MAX_CANDIDATES', '20'))
-				bluechip_candidates = bluechip_candidates[:max_candidates]
-				penny_candidates = penny_candidates[:max_candidates]
 			suggestions: list[dict[str, Any]] = []
-			for symbol in bluechip_candidates:
-				if symbol in existing:
-					continue
-				suggestion = self._build_suggestion(
-					symbol,
-					'BLUECHIP',
-					lookback_days,
-					buy_threshold,
-					sell_threshold,
-					min_win_rate,
-					fast_mode=fast_mode,
-				)
-				if suggestion:
-					suggestions.append(suggestion)
-			for symbol in penny_candidates:
-				if symbol in existing:
-					continue
-				suggestion = self._build_suggestion(
-					symbol,
-					'PENNY',
-					lookback_days,
-					buy_threshold,
-					sell_threshold,
-					min_win_rate,
-					fast_mode=fast_mode,
-				)
-				if suggestion:
-					suggestions.append(suggestion)
+			if not fast_mode:
+				for symbol in bluechip_candidates:
+					if symbol in existing:
+						continue
+					suggestion = self._build_suggestion(
+						symbol,
+						'BLUECHIP',
+						lookback_days,
+						buy_threshold,
+						sell_threshold,
+						min_win_rate,
+						fast_mode=fast_mode,
+					)
+					if suggestion:
+						suggestions.append(suggestion)
+				for symbol in penny_candidates:
+					if symbol in existing:
+						continue
+					suggestion = self._build_suggestion(
+						symbol,
+						'PENNY',
+						lookback_days,
+						buy_threshold,
+						sell_threshold,
+						min_win_rate,
+						fast_mode=fast_mode,
+					)
+					if suggestion:
+						suggestions.append(suggestion)
 
 			def _priority(item: dict[str, Any]) -> tuple[int, float, float]:
 				altman_z = item.get('altman_z')
@@ -5707,13 +6351,23 @@ class PortfolioOptimizerView(APIView):
 						break
 				suggestions = suggestions or fallback
 
-			gemini_cache_key = f"optimizer:gemini:{portfolio_payload.get('id') if portfolio_payload else 'default'}"
-			gemini_report = cache.get(gemini_cache_key)
-			if gemini_report is None:
-				gemini_report = self._gemini_optimizer_report(portfolio_payload, actions, suggestions)
-				cache.set(gemini_cache_key, gemini_report, timeout=60 * 15)
+			gemini_review = None
+			gemini_report = None
+			if not fast_mode:
+				gemini_cache_key = f"optimizer:gemini:{portfolio_payload.get('id') if portfolio_payload else 'default'}"
+				gemini_payload = cache.get(gemini_cache_key)
+				if gemini_payload is None:
+					gemini_payload = self._gemini_optimizer_report(portfolio_payload, actions, suggestions)
+					cache.set(gemini_cache_key, gemini_payload, timeout=60 * 15)
+				gemini_review = gemini_payload if isinstance(gemini_payload, dict) else None
+				gemini_report = gemini_payload if isinstance(gemini_payload, str) else None
+				if gemini_review and not gemini_report:
+					gemini_report = (gemini_review.get('summary') or '').strip() or None
+				if not gemini_review and not gemini_report:
+					gemini_review = self._fallback_optimizer_review(actions, suggestions)
+					gemini_report = (gemini_review.get('summary') or '').strip() or None
 
-			return Response({
+			response_payload = {
 				'portfolio': portfolio_payload,
 				'as_of': timezone.now().isoformat(),
 				'actions': actions,
@@ -5726,7 +6380,10 @@ class PortfolioOptimizerView(APIView):
 				},
 				'fast_mode': fast_mode,
 				'gemini_report': gemini_report,
-			})
+				'gemini_review': gemini_review,
+			}
+			cache.set(optimizer_cache_key, response_payload, timeout=60 * 2)
+			return Response(response_payload, status=200)
 		except Exception as exc:
 			return Response({
 				'portfolio': None,
