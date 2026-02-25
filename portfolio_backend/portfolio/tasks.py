@@ -1281,6 +1281,73 @@ def _build_tsx_manual_trade_alert(
     return "\n".join(lines)
 
 
+def _watchlist_symbols(sandboxes: list[str] | None = None, limit: int | None = None) -> list[str]:
+    sandboxes = sandboxes or ['WATCHLIST']
+    symbols: list[str] = []
+    for sandbox in sandboxes:
+        stored = SandboxWatchlist.objects.filter(sandbox=sandbox).first()
+        if stored and stored.symbols:
+            symbols.extend([str(s).strip().upper() for s in stored.symbols if str(s).strip()])
+    symbols = sorted(set([s for s in symbols if s]))
+    if limit:
+        return symbols[:limit]
+    return symbols
+
+
+def _percent_change(symbol: str) -> float | None:
+    try:
+        hist = yf.Ticker(symbol).history(period='2d', interval='1d', timeout=10)
+        if hist is None or hist.empty or 'Close' not in hist or len(hist) < 2:
+            return None
+        prev = _safe_float(hist['Close'].iloc[-2])
+        last = _safe_float(hist['Close'].iloc[-1])
+        if not prev or not last:
+            return None
+        return ((last - prev) / prev) * 100
+    except Exception:
+        return None
+
+
+def _overnight_window(now_ny: datetime) -> tuple[datetime, datetime]:
+    morning = now_ny.replace(hour=8, minute=0, second=0, microsecond=0)
+    evening = now_ny.replace(hour=20, minute=0, second=0, microsecond=0)
+    if now_ny.time() < dt_time(8, 0):
+        end = morning
+        start = (morning - timedelta(days=1)).replace(hour=20, minute=0, second=0, microsecond=0)
+    else:
+        end = morning
+        start = (morning - timedelta(days=1)).replace(hour=20, minute=0, second=0, microsecond=0)
+        if now_ny >= evening:
+            end = now_ny
+    return start, end
+
+
+def _overnight_positive_news(limit: int = 3) -> list[dict[str, Any]]:
+    now_ny = _ny_time_now()
+    start, end = _overnight_window(now_ny)
+    qs = StockNews.objects.filter(published_at__gte=start, published_at__lt=end)
+    if not qs.exists():
+        return []
+    grouped = (
+        qs.values('stock__symbol')
+        .annotate(avg_sent=models.Avg('sentiment'), count=models.Count('id'))
+        .order_by('-avg_sent', '-count')
+    )
+    results: list[dict[str, Any]] = []
+    for row in grouped[:limit]:
+        symbol = row.get('stock__symbol')
+        if not symbol:
+            continue
+        headline = qs.filter(stock__symbol=symbol).exclude(headline__isnull=True).order_by('-published_at').first()
+        results.append({
+            'symbol': symbol,
+            'avg_sent': float(row.get('avg_sent') or 0.0),
+            'count': int(row.get('count') or 0),
+            'headline': headline.headline if headline else None,
+        })
+    return results
+
+
 def _guardian_score(
     pattern_signal: float | None,
     rvol: float | None,
@@ -7460,6 +7527,208 @@ def _format_diag_price(value: float | None) -> str:
     if price >= 0.1:
         return f"{price:.3f}$"
     return f"{price:.4f}$"
+
+
+@shared_task
+def nightly_intraday_retrain() -> dict[str, Any]:
+    log = _task_log_start('nightly_intraday_retrain')
+    try:
+        enabled = os.getenv('INTRADAY_TRAINING_ENABLED', 'true').lower() in {'1', 'true', 'yes', 'y'}
+        if not enabled:
+            result = {'status': 'disabled'}
+            _task_log_finish(log, 'SUCCESS', result)
+            return result
+
+        from .ml_engine.intraday_training import (
+            train_voting_ensemble,
+            train_xgboost_model,
+            save_intraday_model,
+            build_dataset,
+        )
+
+        bluechip = _watchlist_symbols(['AI_BLUECHIP', 'WATCHLIST'], limit=50)
+        penny = _watchlist_symbols(['AI_PENNY'], limit=50)
+        days = int(os.getenv('INTRADAY_TRAINING_DAYS', '180'))
+
+        if bluechip and penny:
+            result = train_voting_ensemble(bluechip, penny, market_symbol='QQQ', days=days)
+            path = save_intraday_model(result, 'ensemble')
+        else:
+            dataset, labels, features = build_dataset(bluechip or penny, market_symbol='QQQ', days=days)
+            result = train_xgboost_model(dataset, labels, features)
+            path = save_intraday_model(result, 'single')
+
+        payload = {
+            'status': 'ok',
+            'model_path': path,
+            'scores': result.scores,
+            'features': result.features,
+        }
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+@shared_task
+def nightly_summary_report() -> dict[str, Any]:
+    log = _task_log_start('nightly_summary_report')
+    try:
+        top_news = _overnight_positive_news(limit=3)
+        spy_change = _percent_change('SPY')
+        gold_change = _percent_change('GC=F')
+        oil_change = _percent_change('CL=F')
+        sentiment, meta = get_market_sentiment()
+        vix = meta.get('vix')
+
+        rec = 'Reste sur la touche'
+        if sentiment == 'BULLISH' and (vix is None or float(vix) < float(os.getenv('VIX_STRESS_THRESHOLD', '30'))):
+            rec = "Aujourd'hui, sois agressif"
+
+        lines = [
+            "🌙 *Nightly Summary*",
+            f"SPY: {spy_change:+.2f}%" if spy_change is not None else "SPY: n/a",
+            f"Or (GC=F): {gold_change:+.2f}%" if gold_change is not None else "Or (GC=F): n/a",
+            f"Pétrole (CL=F): {oil_change:+.2f}%" if oil_change is not None else "Pétrole (CL=F): n/a",
+            f"Régime: {sentiment}",
+            "",
+            "Top 3 news positives overnight:",
+        ]
+        if top_news:
+            for item in top_news:
+                headline = f" — {item['headline']}" if item.get('headline') else ''
+                lines.append(f"• {item['symbol']}: {item['avg_sent']:+.2f} ({item['count']} news){headline}")
+        else:
+            lines.append('— Aucune news marquante')
+        lines.append("")
+        lines.append(f"🧭 Recommandation: {rec}")
+
+        message = "\n".join(lines).strip()
+        _send_telegram_alert(message, allow_during_blackout=True, category='report')
+        payload = {'status': 'sent', 'top_news': top_news, 'sentiment': sentiment, 'vix': vix}
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+@shared_task
+def send_telegram_report(mode: str = 'premarket') -> dict[str, Any]:
+    log = _task_log_start(f'send_telegram_report:{mode}')
+    try:
+        mode = (mode or 'premarket').lower().strip()
+        watchlist = _watchlist_symbols(['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'], limit=15)
+        min_conf = float(os.getenv('MIN_CONFIDENCE', '0.7'))
+        min_rvol = float(os.getenv('REPORT_MIN_RVOL', '1.5'))
+
+        if mode == 'premarket':
+            spy_change = _percent_change('SPY')
+            gold_change = _percent_change('GC=F')
+            oil_change = _percent_change('CL=F')
+            news_scores = []
+            for symbol in watchlist:
+                sent, _ = _news_sentiment_score(symbol, days=1)
+                news_scores.append((symbol, sent))
+            news_scores = sorted(news_scores, key=lambda x: x[1], reverse=True)[:5]
+
+            gap_watch: list[tuple[str, float]] = []
+            for symbol in watchlist:
+                try:
+                    hist = yf.Ticker(symbol).history(period='2d', interval='1d', timeout=10)
+                    if hist is None or hist.empty or 'Close' not in hist or len(hist) < 2:
+                        continue
+                    prev_close = float(hist['Close'].iloc[-2])
+                    last_price = _latest_price_snapshot(symbol)
+                    if not _is_valid_price(last_price) or prev_close <= 0:
+                        continue
+                    gap_pct = ((last_price - prev_close) / prev_close) * 100
+                    gap_watch.append((symbol, gap_pct))
+                except Exception:
+                    continue
+            gap_watch = sorted(gap_watch, key=lambda x: abs(x[1]), reverse=True)[:5]
+
+            lines = [
+                "☀️ *Réveil Stratégique (Pré-Market)*",
+                f"SPY: {spy_change:+.2f}%" if spy_change is not None else "SPY: n/a",
+                f"Or (GC=F): {gold_change:+.2f}%" if gold_change is not None else "Or (GC=F): n/a",
+                f"Pétrole (CL=F): {oil_change:+.2f}%" if oil_change is not None else "Pétrole (CL=F): n/a",
+                "",
+                "Watchlist — sentiment overnight:",
+            ]
+            if news_scores:
+                for symbol, sent in news_scores:
+                    lines.append(f"• {symbol}: {sent:+.2f}")
+            else:
+                lines.append('— n/a')
+
+            lines.append("")
+            lines.append("Gap Watch (pré-ouverture):")
+            if gap_watch:
+                for symbol, gap in gap_watch:
+                    lines.append(f"• {symbol}: {gap:+.2f}%")
+            else:
+                lines.append('— n/a')
+
+        elif mode == 'validation':
+            lines = ["✅ *Validation de Tendance (09:45)*", "Bougie 15m confirmée:"]
+            picks: list[str] = []
+            for symbol in watchlist:
+                ctx_15m = _intraday_context_for_timeframe(
+                    symbol,
+                    minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
+                    timeframe=15,
+                    rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
+                )
+                if not ctx_15m:
+                    continue
+                rvol = float(ctx_15m.get('rvol') or 0.0)
+                if rvol < min_rvol:
+                    continue
+                signal_payload = _model_signal(symbol, 'BLUECHIP', get_model_path('BLUECHIP'), use_alpaca=False)
+                conf = float(signal_payload.get('signal') or 0.0) if signal_payload else 0.0
+                if conf < min_conf:
+                    continue
+                picks.append(f"• {symbol}: Conf {conf:.2f}, RVOL {rvol:.2f}")
+                if len(picks) >= 3:
+                    break
+            if not picks:
+                lines.append('— Aucun signal high conviction')
+            else:
+                lines.extend(picks)
+
+        else:
+            lines = ["🏦 *Institutional Flow (10:30)*"]
+            flow: list[str] = []
+            for symbol in watchlist:
+                ctx_5m = _intraday_context_for_timeframe(
+                    symbol,
+                    minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
+                    timeframe=5,
+                    rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
+                )
+                if not ctx_5m:
+                    continue
+                rvol = float(ctx_5m.get('rvol') or 0.0)
+                if rvol < min_rvol:
+                    continue
+                flow.append(f"• {symbol}: RVOL {rvol:.2f}")
+                if len(flow) >= 3:
+                    break
+            if not flow:
+                lines.append('— Flux institutionnel faible ou absent')
+            else:
+                lines.extend(flow)
+
+        message = "\n".join(lines).strip()
+        _send_telegram_alert(message, allow_during_blackout=True, category='report')
+        payload = {'status': 'sent', 'mode': mode}
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
 
 
 def _penny_diagnostic_item(symbol: str) -> dict[str, Any] | None:

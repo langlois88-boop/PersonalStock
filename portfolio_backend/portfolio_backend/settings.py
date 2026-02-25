@@ -377,6 +377,29 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.morning_status_check',
         'schedule': crontab(minute=20, hour=9, day_of_week='mon-fri'),
     },
+    'nightly-intraday-retrain': {
+        'task': 'portfolio.tasks.nightly_intraday_retrain',
+        'schedule': crontab(minute=30, hour=0),
+    },
+    'nightly-summary-report': {
+        'task': 'portfolio.tasks.nightly_summary_report',
+        'schedule': crontab(minute=0, hour=8),
+    },
+    'premarket-report-0845': {
+        'task': 'portfolio.tasks.send_telegram_report',
+        'schedule': crontab(minute=45, hour=8, day_of_week='mon-fri'),
+        'args': ('premarket',),
+    },
+    'validation-report-0945': {
+        'task': 'portfolio.tasks.send_telegram_report',
+        'schedule': crontab(minute=45, hour=9, day_of_week='mon-fri'),
+        'args': ('validation',),
+    },
+    'institutional-flow-1030': {
+        'task': 'portfolio.tasks.send_telegram_report',
+        'schedule': crontab(minute=30, hour=10, day_of_week='mon-fri'),
+        'args': ('institutional',),
+    },
     'daily-profit-tracker': {
         'task': 'portfolio.tasks.daily_profit_tracker',
         'schedule': crontab(minute=30, hour=16, day_of_week='mon-fri'),
