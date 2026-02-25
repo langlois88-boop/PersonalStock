@@ -171,6 +171,92 @@ def _gemini_trade_reason(symbol: str, signal_payload: dict[str, Any] | None) -> 
         return None
 
 
+def _compute_adx(frame: pd.DataFrame, length: int = 14) -> tuple[float | None, float | None]:
+    if frame is None or frame.empty or not {'High', 'Low', 'Close'}.issubset(frame.columns):
+        return None, None
+    try:
+        import pandas_ta as ta
+
+        adx = ta.adx(frame['High'], frame['Low'], frame['Close'], length=length)
+        if adx is None or adx.empty:
+            return None, None
+        col = [c for c in adx.columns if c.upper().startswith('ADX')]
+        if not col:
+            return None, None
+        series = adx[col[0]].dropna()
+        if len(series) < 2:
+            return float(series.iloc[-1]) if len(series) else None, None
+        return float(series.iloc[-1]), float(series.iloc[-1] - series.iloc[-2])
+    except Exception:
+        return None, None
+
+
+def _atr_from_frame(frame: pd.DataFrame, length: int = 14) -> float | None:
+    if frame is None or frame.empty or not {'High', 'Low', 'Close'}.issubset(frame.columns):
+        return None
+    try:
+        high = frame['High']
+        low = frame['Low']
+        close = frame['Close']
+        tr = pd.concat([
+            (high - low).abs(),
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(length).mean().iloc[-1]
+        return float(atr) if atr is not None else None
+    except Exception:
+        return None
+
+
+def _classify_tier(
+    frame: pd.DataFrame,
+    signal_payload: dict[str, Any],
+) -> tuple[str, list[str]]:
+    reasons: list[str] = []
+    if frame is None or frame.empty:
+        return 'T2', ['fallback']
+    last = frame.tail(1).iloc[0]
+    volume_z = float(last.get('VolumeZ') or 0.0)
+    rvol10 = float(last.get('RVOL10') or 0.0)
+    sentiment = float(last.get('sentiment_score') or 0.0)
+    news_count = float(last.get('news_count') or 0.0)
+    close = float(last.get('Close') or 0.0)
+    ma20 = float(last.get('MA20') or 0.0)
+    ma200 = float(last.get('MA200') or 0.0)
+    rsi14 = float(last.get('RSI14') or 0.0)
+    volatility = float(last.get('Volatility') or 0.0)
+
+    vol_spike = volume_z >= float(os.getenv('TIER1_VOLUMEZ_MIN', '2.5')) or rvol10 >= float(os.getenv('TIER1_RVOL_MIN', '5'))
+    if vol_spike:
+        reasons.append('volume_spike')
+    news_impact = news_count >= float(os.getenv('TIER1_NEWS_MIN', '1')) and sentiment >= float(os.getenv('TIER1_SENTIMENT_MIN', '0.6'))
+    if news_impact:
+        reasons.append('news_impact')
+
+    breakout = False
+    try:
+        if 'Close' in frame.columns and len(frame) >= 60:
+            recent_high = float(frame['Close'].rolling(252, min_periods=60).max().iloc[-1])
+            breakout = recent_high > 0 and close >= recent_high * float(os.getenv('TIER1_BREAKOUT_PCT', '0.995'))
+    except Exception:
+        breakout = False
+    if breakout:
+        reasons.append('breakout')
+
+    if vol_spike and news_impact and breakout:
+        return 'T1', reasons
+
+    tier2_ok = close > ma20 and close > ma200 and 40 <= rsi14 <= 70
+    if tier2_ok:
+        reasons.append('swing_setup')
+        return 'T2', reasons
+
+    if volatility >= float(os.getenv('TIER3_VOLATILITY_MIN', '0.03')):
+        reasons.append('intraday_volatility')
+    return 'T3', reasons
+
+
 def _parse_driver_map(raw: str | None) -> dict[str, str]:
     mapping: dict[str, str] = {}
     raw = (raw or '').strip()
@@ -3721,6 +3807,9 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
     regime = get_market_regime_context()
     risk_off = bool(regime.get('risk_off')) if isinstance(regime, dict) else False
     regime_risk_factor = float(os.getenv('MARKET_RISK_OFF_POSITION_FACTOR', '0.5')) if risk_off else 1.0
+    tier1_size_mult = float(os.getenv('TIER1_SIZE_MULT', '1.5'))
+    tier3_size_mult = float(os.getenv('TIER3_SIZE_MULT', '0.5'))
+    tier1_atr_mult = float(os.getenv('TIER1_TRAIL_ATR_MULT', '2.0'))
 
     created = 0
     closed = 0
@@ -3737,6 +3826,49 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
         except Exception:
             return None
         return None
+
+        def _alpaca_fusion(symbol: str) -> pd.DataFrame:
+            fusion = DataFusionEngine(symbol, use_alpaca=True)
+            return fusion.fuse_all() or pd.DataFrame()
+
+        def _update_open_trade(trade: PaperTrade, price: float, signal: float | None) -> bool:
+            frame = _alpaca_fusion(trade.ticker)
+            tier, tier_reasons = _classify_tier(frame, {'signal': signal})
+            entry_features = dict(trade.entry_features or {})
+            entry_features['tier'] = tier
+            entry_features['tier_reasons'] = tier_reasons
+
+            adx_val, adx_slope = _compute_adx(frame)
+            atr_val = _atr_from_frame(frame) or 0.0
+            high_water = float(entry_features.get('alpaca_high_water') or trade.entry_price or 0.0)
+            if price > high_water:
+                high_water = price
+            entry_features['alpaca_high_water'] = high_water
+
+            should_sell = False
+            if tier == 'T1':
+                trail_stop = high_water - (tier1_atr_mult * atr_val) if atr_val else None
+                if trail_stop is not None and price <= trail_stop:
+                    should_sell = True
+                if adx_val is not None and adx_val < 20:
+                    should_sell = True
+            elif tier == 'T2':
+                age_days = (timezone.now() - trade.entry_date).days if trade.entry_date else 0
+                if age_days >= int(os.getenv('TIER2_MAX_DAYS', '3')):
+                    if adx_val is None or adx_val < 25 or (adx_slope is not None and adx_slope <= 0):
+                        should_sell = True
+                if signal is not None and signal < sell_threshold:
+                    should_sell = True
+            else:
+                now_ny = _ny_time_now()
+                if now_ny.time() >= dt_time(15, 45) or (trade.entry_date and trade.entry_date.date() < timezone.localdate()):
+                    should_sell = True
+                if signal is not None and signal < sell_threshold:
+                    should_sell = True
+
+            trade.entry_features = entry_features
+            trade.save(update_fields=['entry_features'])
+            return should_sell
 
     for symbol in watchlist:
         symbol = (symbol or '').strip().upper()
@@ -3772,6 +3904,23 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
         existing_pos = positions.get(symbol)
         open_trade = PaperTrade.objects.filter(broker='ALPACA', status='OPEN', ticker__iexact=symbol).first()
 
+        if existing_pos and open_trade:
+            should_sell = _update_open_trade(open_trade, price, signal)
+            if should_sell:
+                qty = int(abs(_alpaca_position_qty(existing_pos)))
+                if qty <= 0:
+                    continue
+                order = submit_market_order(symbol, qty, 'sell')
+                if order is None:
+                    continue
+                open_trade.broker_order_id = str(getattr(order, 'id', '') or '')
+                open_trade.broker_status = str(getattr(order, 'status', '') or '')
+                open_trade.broker_side = 'SELL'
+                open_trade.broker_updated_at = timezone.now()
+                open_trade.save(update_fields=['broker_order_id', 'broker_status', 'broker_side', 'broker_updated_at'])
+                closed += 1
+            continue
+
         if existing_pos and signal < sell_threshold:
             qty = int(abs(_alpaca_position_qty(existing_pos)))
             if qty <= 0:
@@ -3793,10 +3942,17 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
         if signal < buy_threshold:
             continue
 
+        frame = _alpaca_fusion(symbol)
+        tier, tier_reasons = _classify_tier(frame, signal_payload or {})
+
         position_cap = buying_power * position_cap_pct
         risk_budget = buying_power * risk_pct
         allocation = _risk_manager_allocation(float(signal) * 100, None, price, None)
         position_value = min(position_cap, risk_budget, allocation) * regime_risk_factor
+        if tier == 'T1':
+            position_value *= tier1_size_mult
+        elif tier == 'T3':
+            position_value *= tier3_size_mult
         qty = int(position_value / price) if price else 0
         if qty <= 0:
             continue
@@ -3812,7 +3968,12 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
             entry_price=round(price, 2),
             quantity=qty,
             entry_signal=signal,
-            entry_features=(signal_payload or {}).get('features'),
+            entry_features={
+                **((signal_payload or {}).get('features') or {}),
+                'tier': tier,
+                'tier_reasons': tier_reasons,
+                'alpaca_high_water': price,
+            },
             entry_explanations=(signal_payload or {}).get('explanations'),
             model_name=(signal_payload or {}).get('model_name', universe),
             model_version=(signal_payload or {}).get('model_version', ''),
@@ -3824,7 +3985,7 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
             stop_loss=round(price * 0.96, 2),
             status='OPEN',
             pnl=0,
-            notes=notes or '',
+            notes=(notes or '') + f" | tier {tier}",
         )
         created += 1
 
