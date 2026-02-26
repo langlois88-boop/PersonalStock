@@ -682,6 +682,8 @@ def _journal_task_logs(as_of_date: date, limit: int = 6) -> list[str]:
 
 def _journal_scanner_sections() -> tuple[str, list[str]]:
     results = cache.get('market_scanner_results') or []
+    if not results:
+        results = cache.get('market_scanner_afterhours_results') or []
     total = len(results)
     intro = (
         f"Le bot a scanné {total} tickers aujourd'hui via ses deux pipelines."
@@ -773,6 +775,118 @@ def _journal_portfolio_summary() -> tuple[str, str, str]:
     positions_text = f"{holdings_count} position(s)" if holdings_count else "Aucune"
     status_text = "Prêt pour l'ouverture de demain." if holdings_count == 0 else "Surveillance active."
     return capital_text, positions_text, status_text
+
+
+def _afterhours_scanner_symbols() -> list[str]:
+    scr_ids = [
+        s.strip()
+        for s in os.getenv('AFTERHOURS_SCREENERS', 'day_gainers,most_actives').split(',')
+        if s.strip()
+    ]
+    limit = int(os.getenv('AFTERHOURS_SYMBOL_LIMIT', '120'))
+    symbols: list[str] = []
+    try:
+        quotes = _fetch_yfinance_screeners(scr_ids, count=limit)
+        symbols = [
+            str(item.get('symbol') or '').strip().upper()
+            for item in quotes
+            if item.get('symbol')
+        ]
+    except Exception:
+        symbols = []
+    if not symbols:
+        symbols = _default_scanner_symbols()
+    symbols = [s for s in dict.fromkeys(symbols) if s]
+    return symbols[:limit]
+
+
+def _afterhours_market_scan(symbols: list[str] | None = None) -> dict[str, Any]:
+    min_price = float(os.getenv('SCANNER_MIN_PRICE', '0.5'))
+    max_price = float(os.getenv('SCANNER_MAX_PRICE', '10'))
+    min_volume = float(os.getenv('SCANNER_MIN_VOLUME', '500000'))
+    min_change = float(os.getenv('SCANNER_MIN_CHANGE_PCT', '2'))
+    min_rvol = float(os.getenv('AFTERHOURS_DAILY_RVOL_MIN', '1.5'))
+    min_confidence = float(os.getenv('SCANNER_MIN_CONFIDENCE', '65'))
+    update_watchlist = os.getenv('AI_SCANNER_UPDATE_WATCHLIST', 'true').lower() in {'1', 'true', 'yes', 'y'}
+    notify = os.getenv('AI_SCANNER_TELEGRAM', 'false').lower() in {'1', 'true', 'yes', 'y'}
+
+    if not symbols:
+        symbols = _afterhours_scanner_symbols()
+    if not symbols:
+        return {'status': 'empty', 'count': 0, 'results': [], 'mode': 'afterhours'}
+
+    results: list[dict[str, Any]] = []
+    for symbol in symbols:
+        try:
+            hist = yf.Ticker(symbol).history(period='20d', interval='1d', timeout=10)
+            if hist is None or hist.empty or 'Close' not in hist:
+                continue
+            close = hist['Close']
+            volume = hist['Volume'] if 'Volume' in hist else None
+            if close is None or close.empty or len(close) < 2:
+                continue
+            last_close = float(close.iloc[-1])
+            prev_close = float(close.iloc[-2])
+            if last_close <= 0 or prev_close <= 0:
+                continue
+            if not (min_price <= last_close <= max_price):
+                continue
+            change_pct = ((last_close - prev_close) / prev_close) * 100
+            if change_pct < min_change:
+                continue
+            if volume is None or volume.empty:
+                continue
+            last_vol = float(volume.iloc[-1])
+            avg_vol = float(volume.tail(20).mean()) if len(volume) >= 5 else float(volume.mean())
+            if last_vol < min_volume or avg_vol <= 0:
+                continue
+            rvol = last_vol / avg_vol
+            if rvol < min_rvol:
+                continue
+
+            base_score = 0.5 + (min(10.0, abs(change_pct)) / 100) + (min(5.0, rvol) / 50)
+            confidence_pct = max(0.0, min(95.0, base_score * 100))
+            if confidence_pct < min_confidence:
+                continue
+
+            results.append({
+                'symbol': symbol,
+                'price': round(last_close, 4),
+                'change_pct': round(change_pct, 2),
+                'volume': int(last_vol),
+                'rvol': round(rvol, 2),
+                'score': round(confidence_pct / 100, 4),
+                'confidence_pct': round(confidence_pct, 2),
+            })
+        except Exception:
+            continue
+
+    results = sorted(results, key=lambda x: x['score'], reverse=True)
+    if results:
+        cache.set('market_scanner_afterhours_results', results, timeout=60 * 60 * 24)
+
+    if update_watchlist and results:
+        SandboxWatchlist.objects.update_or_create(
+            sandbox='AI_PENNY',
+            defaults={'symbols': [entry['symbol'] for entry in results[:25]]},
+        )
+        if os.getenv('AI_SCANNER_UPDATE_WATCHLIST_MAIN', 'false').lower() in {'1', 'true', 'yes', 'y'}:
+            main_limit = int(os.getenv('AI_SCANNER_MAIN_LIMIT', '15'))
+            SandboxWatchlist.objects.update_or_create(
+                sandbox='WATCHLIST',
+                defaults={'symbols': [entry['symbol'] for entry in results[:max(1, main_limit)]]},
+            )
+
+    if notify and results:
+        top = results[0]
+        _send_telegram_alert(
+            f"📌 Pré-sélection fermeture: {top['symbol']} score {top['score']:.2f} "
+            f"RVOL {top['rvol']} Δ {top['change_pct']:+.2f}%",
+            allow_during_blackout=True,
+            category='report',
+        )
+
+    return {'status': 'ok', 'count': len(results), 'results': results, 'mode': 'afterhours'}
 
 
 def _ny_time_now() -> datetime:
@@ -4706,6 +4820,8 @@ def auto_discover_top_movers(min_score: float | None = None) -> dict[str, Any]:
 @shared_task
 def market_scanner_task(symbols: list[str] | None = None) -> dict[str, Any]:
     """Scan market for high-momentum candidates and cache results."""
+    if _market_closed_now():
+        return _afterhours_market_scan(symbols)
     min_price = float(os.getenv('SCANNER_MIN_PRICE', '0.5'))
     max_price = float(os.getenv('SCANNER_MAX_PRICE', '10'))
     min_volume = float(os.getenv('SCANNER_MIN_VOLUME', '500000'))
