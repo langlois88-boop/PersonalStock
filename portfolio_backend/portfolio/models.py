@@ -144,6 +144,31 @@ class SandboxWatchlist(models.Model):
 		return f"{self.sandbox} ({len(self.symbols or [])} symbols)"
 
 
+class MasterWatchlistEntry(models.Model):
+	CATEGORY_CHOICES = (
+		('HIGH_VOL', 'High Volatility'),
+		('WEAK_SHORT', 'Weak Stocks'),
+		('SWING', 'Swing Pipeline'),
+	)
+
+	symbol = models.CharField(max_length=12, unique=True, db_index=True)
+	category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, db_index=True)
+	stop_loss_pct = models.FloatField(null=True, blank=True)
+	high_risk = models.BooleanField(default=False)
+	block_if_market_sentiment_lt = models.FloatField(null=True, blank=True)
+	volume_scan_enabled = models.BooleanField(default=False)
+	source = models.CharField(max_length=120, blank=True, default='')
+	notes = models.TextField(blank=True, default='')
+	created_at = models.DateTimeField(auto_now_add=True)
+	updated_at = models.DateTimeField(auto_now=True)
+
+	class Meta:
+		ordering = ['category', 'symbol']
+
+	def __str__(self) -> str:
+		return f"{self.symbol} ({self.category})"
+
+
 class ModelEvaluationDaily(models.Model):
 	MODEL_CHOICES = (
 		('BLUECHIP', 'BLUECHIP'),

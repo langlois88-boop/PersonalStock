@@ -69,6 +69,7 @@ from .models import (
     Prediction,
     PaperTrade,
     SandboxWatchlist,
+    MasterWatchlistEntry,
     Stock,
     StockNews,
     TaskRunLog,
@@ -643,6 +644,20 @@ def _send_telegram_alert(message: str, allow_during_blackout: bool = False, cate
         pass
 
 
+def _market_sentiment_score() -> float | None:
+    sentiment, meta = get_market_sentiment()
+    spy_change = meta.get('spy_change')
+    tsx_change = meta.get('tsx_change')
+    values = [v for v in [spy_change, tsx_change] if v is not None]
+    if values:
+        return float(sum(values) / len(values))
+    if sentiment == 'BEARISH':
+        return -1.0
+    if sentiment == 'BULLISH':
+        return 1.0
+    return None
+
+
 _MONTHS_FR = {
     1: 'JANVIER',
     2: 'FÉVRIER',
@@ -796,6 +811,9 @@ def _afterhours_scanner_symbols() -> list[str]:
         symbols = []
     if not symbols:
         symbols = _default_scanner_symbols()
+    swing = list(MasterWatchlistEntry.objects.filter(category='SWING').values_list('symbol', flat=True))
+    if swing:
+        symbols.extend([str(s).strip().upper() for s in swing if str(s).strip()])
     symbols = [s for s in dict.fromkeys(symbols) if s]
     return symbols[:limit]
 
@@ -4145,6 +4163,11 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     closed = 0
 
     market_sentiment, market_meta = get_market_sentiment()
+    market_score = _market_sentiment_score()
+    master_entries = {
+        row.symbol: row
+        for row in MasterWatchlistEntry.objects.all()
+    }
 
     for symbol, trades in open_trades_by_symbol.items():
         price = _latest_price(symbol)
@@ -4225,6 +4248,13 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
 
     for symbol in watchlist:
         existing_trades = open_trades_by_symbol.get(symbol, [])
+        master_entry = master_entries.get(symbol)
+        if master_entry and master_entry.category == 'WEAK_SHORT':
+            threshold = master_entry.block_if_market_sentiment_lt
+            if threshold is None:
+                threshold = 0.0
+            if market_score is not None and market_score < float(threshold):
+                continue
         intraday_ctx = None
         pattern_signal = None
         rvol = None
@@ -4426,6 +4456,11 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
 
     positions = {getattr(p, 'symbol', '').strip().upper(): p for p in get_open_positions() if getattr(p, 'symbol', None)}
     market_sentiment, market_meta = get_market_sentiment()
+    market_score = _market_sentiment_score()
+    master_entries = {
+        row.symbol: row
+        for row in MasterWatchlistEntry.objects.all()
+    }
     regime = get_market_regime_context()
     risk_off = bool(regime.get('risk_off')) if isinstance(regime, dict) else False
     regime_risk_factor = float(os.getenv('MARKET_RISK_OFF_POSITION_FACTOR', '0.5')) if risk_off else 1.0
@@ -4496,6 +4531,13 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
         symbol = (symbol or '').strip().upper()
         if not symbol:
             continue
+        master_entry = master_entries.get(symbol)
+        if master_entry and master_entry.category == 'WEAK_SHORT':
+            threshold = master_entry.block_if_market_sentiment_lt
+            if threshold is None:
+                threshold = 0.0
+            if market_score is not None and market_score < float(threshold):
+                continue
         if _symbol_currency(symbol) == 'CAD':
             notify_key = f"alpaca_cad_alert:{symbol}:{_ny_time_now().strftime('%Y%m%d')}"
             if not cache.get(notify_key):
@@ -4962,7 +5004,11 @@ def market_scanner_task(symbols: list[str] | None = None) -> dict[str, Any]:
         if float(top.get('rvol') or 0) > 3:
             target_pct = max(target_pct, swing_min_rvol_target_pct)
         target_price = buy_limit * (1 + target_pct)
-        stop_price = buy_limit * (1 - swing_stop_pct)
+        stop_pct = swing_stop_pct
+        master_entry = MasterWatchlistEntry.objects.filter(symbol__iexact=top['symbol']).first()
+        if master_entry and master_entry.category == 'HIGH_VOL' and master_entry.stop_loss_pct:
+            stop_pct = float(master_entry.stop_loss_pct)
+        stop_price = buy_limit * (1 - stop_pct)
         title = (top.get('news_titles') or [''])[0] or None
         if _symbol_currency(top['symbol']) == 'CAD':
             ctx_5m = _intraday_context_for_timeframe(
