@@ -643,6 +643,138 @@ def _send_telegram_alert(message: str, allow_during_blackout: bool = False, cate
         pass
 
 
+_MONTHS_FR = {
+    1: 'JANVIER',
+    2: 'FÉVRIER',
+    3: 'MARS',
+    4: 'AVRIL',
+    5: 'MAI',
+    6: 'JUIN',
+    7: 'JUILLET',
+    8: 'AOÛT',
+    9: 'SEPTEMBRE',
+    10: 'OCTOBRE',
+    11: 'NOVEMBRE',
+    12: 'DÉCEMBRE',
+}
+
+
+def _format_french_date(date_value: date) -> str:
+    month = _MONTHS_FR.get(date_value.month, str(date_value.month))
+    return f"{date_value.day} {month} {date_value.year}"
+
+
+def _journal_task_logs(as_of_date: date, limit: int = 6) -> list[str]:
+    logs = list(
+        TaskRunLog.objects.filter(started_at__date=as_of_date)
+        .order_by('started_at')[:limit]
+    )
+    if not logs:
+        return ["— Aucun log notable"]
+    lines: list[str] = []
+    for entry in logs:
+        ts = timezone.localtime(entry.started_at).strftime('%H:%M')
+        status_icon = '✅' if entry.status == 'SUCCESS' else '⚠️'
+        name = entry.task_name.replace('_', ' ').replace(':', ' ').strip()
+        lines.append(f"{ts} | {status_icon} {name}")
+    return lines
+
+
+def _journal_scanner_sections() -> tuple[str, list[str]]:
+    results = cache.get('market_scanner_results') or []
+    total = len(results)
+    intro = (
+        f"Le bot a scanné {total} tickers aujourd'hui via ses deux pipelines."
+        if total else
+        "Le bot n'a pas trouvé de candidats aujourd'hui."
+    )
+    penny_max = float(os.getenv('AI_PENNY_MAX_PRICE', '15'))
+    penny = [r for r in results if float(r.get('price') or 0) <= penny_max]
+    bluechip = [r for r in results if float(r.get('price') or 0) > penny_max]
+
+    def _format_target(item: dict[str, Any]) -> list[str]:
+        symbol = item.get('symbol') or ''
+        score = float(item.get('score') or 0.0)
+        rvol = float(item.get('rvol') or 0.0)
+        patterns = ', '.join(item.get('patterns') or []) or 'Pattern technique'
+        lines = [f"Target Détectée : ${symbol}"]
+        lines.append(f"Score IA : {score:.2f} (RVOL {rvol:.2f} · {patterns})")
+        lines.append("Action : Signal envoyé au Paper Trading.")
+        return lines
+
+    output: list[str] = []
+    output.append("1. Pipeline Penny (Stocks $1-$15)")
+    if penny:
+        output.extend(_format_target(penny[0]))
+    else:
+        output.append("Aucune target détectée.")
+
+    output.append("")
+    output.append("2. Pipeline Bluechip (Grosses Caps)")
+    if bluechip:
+        output.extend(_format_target(bluechip[0]))
+    else:
+        output.append("Aucune target détectée.")
+
+    return intro, output
+
+
+def _journal_paper_trades(as_of_date: date) -> tuple[list[str], list[str], float]:
+    closed = list(
+        PaperTrade.objects.filter(
+            broker='ALPACA',
+            status='CLOSED',
+            exit_date__date=as_of_date,
+        ).order_by('exit_date')
+    )
+    open_trades = list(
+        PaperTrade.objects.filter(
+            broker='ALPACA',
+            status='OPEN',
+        ).order_by('entry_date')
+    )
+
+    closed_lines: list[str] = []
+    closed_pnl = 0.0
+    for trade in closed:
+        entry_price = float(trade.entry_price or 0)
+        exit_price = float(trade.exit_price or 0)
+        pnl = float(trade.pnl or 0)
+        closed_pnl += pnl
+        closed_lines.append(
+            f"{trade.ticker} : Entrée ${entry_price:.2f} ➔ Sortie ${exit_price:.2f} ({pnl:+.2f})"
+        )
+
+    open_lines: list[str] = []
+    open_pnl = 0.0
+    for trade in open_trades:
+        entry_price = float(trade.entry_price or 0)
+        current_price = get_latest_trade_price(trade.ticker)
+        if current_price is not None:
+            current_price = float(current_price)
+        else:
+            current_price = entry_price
+        qty = float(trade.quantity or 0)
+        pnl = (current_price - entry_price) * qty
+        open_pnl += pnl
+        pct = ((current_price - entry_price) / entry_price * 100) if entry_price else 0.0
+        status_icon = '🟢' if pct > 0.5 else '🔴' if pct < -0.5 else '⚪'
+        open_lines.append(
+            f"{trade.ticker} : ${current_price:.2f} ({pct:+.1f}%) {status_icon}"
+        )
+
+    return closed_lines, open_lines, (closed_pnl + open_pnl)
+
+
+def _journal_portfolio_summary() -> tuple[str, str, str]:
+    total_capital = Portfolio.objects.aggregate(total=models.Sum('capital')).get('total')
+    holdings_count = PortfolioHolding.objects.count()
+    capital_text = f"{float(total_capital):.2f}$ CAD" if total_capital else "n/a"
+    positions_text = f"{holdings_count} position(s)" if holdings_count else "Aucune"
+    status_text = "Prêt pour l'ouverture de demain." if holdings_count == 0 else "Surveillance active."
+    return capital_text, positions_text, status_text
+
+
 def _ny_time_now() -> datetime:
     try:
         return timezone.now().astimezone(ZoneInfo('America/New_York'))
@@ -7661,6 +7793,72 @@ def nightly_summary_report() -> dict[str, Any]:
         message = "\n".join(lines).strip()
         _send_telegram_alert(message, allow_during_blackout=True, category='report')
         payload = {'status': 'sent', 'top_news': top_news, 'sentiment': sentiment, 'vix': vix}
+        _task_log_finish(log, 'SUCCESS', payload)
+        return payload
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+@shared_task
+def send_daily_bot_journal() -> dict[str, Any]:
+    log = _task_log_start('send_daily_bot_journal')
+    try:
+        as_of_date = timezone.localdate()
+        date_label = _format_french_date(as_of_date)
+
+        lines = [
+            f"📜 JOURNAL DE BORD DU BOT | {date_label}",
+            "🕒 EXÉCUTION DES TÂCHES (LOGS)",
+        ]
+        lines.extend(_journal_task_logs(as_of_date))
+
+        lines.append("")
+        lines.append("🕵️ CHASSE AUX DEALS (AUTO SCANNER)")
+        intro, details = _journal_scanner_sections()
+        lines.append(intro)
+        lines.extend(details)
+
+        lines.append("")
+        lines.append("🧪 PERFORMANCE PAPER TRADE (ALPACA)")
+        closed_lines, open_lines, theoretical_pnl = _journal_paper_trades(as_of_date)
+
+        lines.append("Positions Closes :")
+        if closed_lines:
+            lines.extend(closed_lines)
+        else:
+            lines.append("— Aucune position clôturée.")
+
+        lines.append("")
+        lines.append("Positions Actives :")
+        if open_lines:
+            lines.extend(open_lines)
+        else:
+            lines.append("— Aucune position active.")
+
+        lines.append("")
+        lines.append(f"Profit Théorique du jour : {theoretical_pnl:+.2f}$")
+
+        lines.append("")
+        lines.append("💰 RÉSUMÉ DU PORTFOLIO RÉEL")
+        capital_text, positions_text, status_text = _journal_portfolio_summary()
+        lines.append(f"Capital Total : {capital_text}")
+        lines.append(f"Positions Ouvertes : {positions_text}")
+        lines.append(f"Statut : {status_text}")
+
+        lines.append("")
+        lines.append("🛠️ CONFIGURATION "
+                     "PATTERN REPLICATION" )
+        enabled = os.getenv('PATTERN_REPLICATOR_ENABLED', 'true').lower() in {'1', 'true', 'yes', 'y'}
+        volumez = os.getenv('PATTERN_REPLICATOR_VOLUMEZ_MIN', '2.0')
+        rule = os.getenv('PATTERN_REPLICATOR_RULE', 'Price_Crossing_MA20')
+        lines.append(f"Statut : {'Activé' if enabled else 'Désactivé'}")
+        lines.append(f"Cible : Stocks avec VolumeZ > {volumez} et {rule}.")
+        lines.append("Alerte : Priorité maximale sur Telegram si un clone est détecté.")
+
+        message = "\n".join(lines).strip()
+        _send_telegram_alert(message, allow_during_blackout=True, category='report')
+        payload = {'status': 'sent', 'as_of': as_of_date.isoformat()}
         _task_log_finish(log, 'SUCCESS', payload)
         return payload
     except Exception as exc:

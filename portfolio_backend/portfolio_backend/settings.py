@@ -361,6 +361,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.generate_trading_journal_daily',
         'schedule': crontab(minute=30, hour=20),
     },
+    'daily-bot-journal-2005': {
+        'task': 'portfolio.tasks.send_daily_bot_journal',
+        'schedule': crontab(minute=5, hour=20),
+    },
     'weekend-deep-research-sat': {
         'task': 'portfolio.tasks.weekend_deep_research',
         'schedule': crontab(minute=0, hour=6, day_of_week='sat'),
