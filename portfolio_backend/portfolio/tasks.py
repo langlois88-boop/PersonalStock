@@ -4699,6 +4699,12 @@ def market_scanner_task(symbols: list[str] | None = None) -> dict[str, Any]:
             sandbox='AI_PENNY',
             defaults={'symbols': [entry['symbol'] for entry in results[:25]]},
         )
+        if os.getenv('AI_SCANNER_UPDATE_WATCHLIST_MAIN', 'false').lower() in {'1', 'true', 'yes', 'y'}:
+            main_limit = int(os.getenv('AI_SCANNER_MAIN_LIMIT', '15'))
+            SandboxWatchlist.objects.update_or_create(
+                sandbox='WATCHLIST',
+                defaults={'symbols': [entry['symbol'] for entry in results[:max(1, main_limit)]]},
+            )
 
     if notify and results:
         top = results[0]
