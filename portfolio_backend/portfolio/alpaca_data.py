@@ -13,7 +13,7 @@ try:
     from alpaca.data.timeframe import TimeFrame
     from alpaca.data.enums import DataFeed  # <--- Crucial pour le plan gratuit
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import GetAssetsRequest, MarketOrderRequest
+    from alpaca.trading.requests import GetAssetsRequest, MarketOrderRequest, LimitOrderRequest
     from alpaca.trading.enums import AssetClass, OrderSide, TimeInForce
 except Exception:  # pragma: no cover
     StockHistoricalDataClient = None
@@ -25,6 +25,7 @@ except Exception:  # pragma: no cover
     TradingClient = None
     GetAssetsRequest = None
     MarketOrderRequest = None
+    LimitOrderRequest = None
     AssetClass = None
     OrderSide = None
     TimeInForce = None
@@ -100,6 +101,27 @@ def submit_market_order(symbol: str, qty: int, side: str) -> Any | None:
             qty=qty,
             side=side_enum,
             time_in_force=TimeInForce.DAY,
+        )
+        return client.submit_order(request)
+    except Exception:
+        return None
+
+
+def submit_limit_order(symbol: str, qty: int, side: str, limit_price: float) -> Any | None:
+    client = _alpaca_trading_client()
+    if client is None or LimitOrderRequest is None or OrderSide is None or TimeInForce is None:
+        return None
+    symbol = (symbol or '').strip().upper()
+    if not symbol or qty <= 0 or limit_price <= 0:
+        return None
+    try:
+        side_enum = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
+        request = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=side_enum,
+            time_in_force=TimeInForce.DAY,
+            limit_price=round(float(limit_price), 4),
         )
         return client.submit_order(request)
     except Exception:
@@ -442,6 +464,8 @@ def get_intraday_context(symbol: str, minutes: int = 390, rvol_window: int = 20)
         'rsi14': float(last.get('rsi14') or 0.0),
         'ema20': float(last.get('ema20') or 0.0),
         'ema50': float(last.get('ema50') or 0.0),
+        'vwap': float(last.get('vwap') or 0.0),
+        'price_to_vwap': float(last.get('price_to_vwap') or 0.0),
         'last_close': float(last.get('close') or 0.0),
         'bid_ask_spread_pct': float(spread_pct or 0.0),
     }

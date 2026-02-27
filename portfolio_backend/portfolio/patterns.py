@@ -76,6 +76,23 @@ def enrich_bars_with_patterns(frame: pd.DataFrame, rvol_window: int = 20) -> pd.
     rs = gain / loss.replace(0, pd.NA)
     rsi = 100 - (100 / (1 + rs))
 
+    vwap_series = pd.Series([pd.NA] * len(df), index=df.index)
+    try:
+        if 'timestamp' in df.columns:
+            ts = pd.to_datetime(df['timestamp'], errors='coerce')
+        elif isinstance(df.index, pd.DatetimeIndex):
+            ts = pd.to_datetime(df.index, errors='coerce')
+        else:
+            ts = pd.Series([pd.NaT] * len(df), index=df.index)
+        session_key = ts.dt.date
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        tp_vol = typical_price * df['volume']
+        cum_tp_vol = tp_vol.groupby(session_key).cumsum()
+        cum_vol = df['volume'].groupby(session_key).cumsum()
+        vwap_series = (cum_tp_vol / cum_vol).fillna(pd.NA)
+    except Exception:
+        vwap_series = pd.Series([pd.NA] * len(df), index=df.index)
+
     for idx in range(len(df)):
         row = df.iloc[idx]
         prev_row = df.iloc[idx - 1] if idx > 0 else None
@@ -118,6 +135,11 @@ def enrich_bars_with_patterns(frame: pd.DataFrame, rvol_window: int = 20) -> pd.
     df['ema20'] = ema20
     df['ema50'] = ema50
     df['rsi14'] = rsi.fillna(0.0)
+    df['vwap'] = vwap_series
+    try:
+        df['price_to_vwap'] = (df['close'] - df['vwap']) / df['vwap']
+    except Exception:
+        df['price_to_vwap'] = 0.0
     return df
 
 

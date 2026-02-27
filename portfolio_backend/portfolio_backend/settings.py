@@ -243,6 +243,18 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.send_morning_scout_report',
         'schedule': crontab(minute=0, hour=9),
     },
+    'premarket-deep-scan-0830': {
+        'task': 'portfolio.tasks.premarket_deep_scan',
+        'schedule': crontab(minute=30, hour=8, day_of_week='mon-fri'),
+    },
+    'premarket-ai-prediction-0900': {
+        'task': 'portfolio.tasks.premarket_ai_prediction',
+        'schedule': crontab(minute=0, hour=9, day_of_week='mon-fri'),
+    },
+    'match-plan-0945': {
+        'task': 'portfolio.tasks.send_match_plan_report',
+        'schedule': crontab(minute=45, hour=9, day_of_week='mon-fri'),
+    },
     'update-user-preferences-daily': {
         'task': 'portfolio.tasks.update_user_preferences',
         'schedule': crontab(minute=30, hour=9),
@@ -295,6 +307,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.sync_alpaca_paper_trades',
         'schedule': crontab(minute='*/5', hour='*'),
     },
+    'crypto-scan-15min': {
+        'task': 'portfolio.tasks.task_crypto_scan',
+        'schedule': crontab(minute='*/15', hour='*'),
+    },
     'market-scanner-5min': {
         'task': 'portfolio.tasks.market_scanner_task',
         'schedule': crontab(minute='*/5', hour='9-16', day_of_week='mon-fri'),
@@ -314,6 +330,10 @@ CELERY_BEAT_SCHEDULE = {
     'model-evaluation-daily': {
         'task': 'portfolio.tasks.compute_model_evaluation_daily',
         'schedule': crontab(minute=50, hour=7),
+    },
+    'cleanup-system-logs-weekly': {
+        'task': 'portfolio.tasks.cleanup_system_logs',
+        'schedule': crontab(minute=0, hour=3, day_of_week='sun'),
     },
     'data-pipeline-daily': {
         'task': 'portfolio.tasks.ensure_data_pipeline_daily',

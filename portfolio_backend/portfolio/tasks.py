@@ -73,6 +73,7 @@ from .models import (
     Stock,
     StockNews,
     TaskRunLog,
+    SystemLog,
     UserPreference,
 )
 from .ai_module import run_predictions
@@ -87,6 +88,7 @@ from .alpaca_data import (
     get_account,
     get_open_positions,
     submit_market_order,
+    submit_limit_order,
     get_order_by_id,
     close_position,
     get_stock_snapshots,
@@ -94,6 +96,7 @@ from .alpaca_data import (
     get_tradable_symbols,
 )
 from .patterns import enrich_bars_with_patterns
+from .crypto_processor import scan_crypto_drip
 from .ml_engine.engine.data_fusion import DataFusionEngine
 from .ml_engine.backtester import (
     AIBacktester,
@@ -644,6 +647,23 @@ def _send_telegram_alert(message: str, allow_during_blackout: bool = False, cate
         pass
 
 
+def _send_telegram_message(message: str, chat_id: str | None = None) -> None:
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    chat_id = chat_id or os.getenv('TELEGRAM_CHAT_ID')
+    if not token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        'chat_id': chat_id,
+        'text': message,
+        'parse_mode': 'Markdown',
+    }
+    try:
+        requests.post(url, json=payload, timeout=8)
+    except Exception:
+        pass
+
+
 def _market_sentiment_score() -> float | None:
     sentiment, meta = get_market_sentiment()
     spy_change = meta.get('spy_change')
@@ -918,7 +938,10 @@ def _entry_time_features(symbol: str, now: datetime | None = None) -> dict[str, 
     now = now or _ny_time_now()
     hour = now.hour
     weekday = now.weekday()
+    minutes_since_open = max(0, (now.hour * 60 + now.minute) - (9 * 60 + 30))
     minutes_to_close = max(0, (16 * 60) - (now.hour * 60 + now.minute))
+    is_power_hour = 1 if now.hour == 15 else 0
+    is_lunch = 1 if (now.hour == 11 and now.minute >= 30) or (now.hour == 12) or (now.hour == 13 and now.minute < 30) else 0
     earnings_in_days = None
     try:
         ticker = yf.Ticker(symbol)
@@ -930,7 +953,10 @@ def _entry_time_features(symbol: str, now: datetime | None = None) -> dict[str, 
     return {
         'entry_hour': hour,
         'entry_weekday': weekday,
+        'minutes_since_open': minutes_since_open,
         'minutes_to_close': minutes_to_close,
+        'is_power_hour': is_power_hour,
+        'is_lunch': is_lunch,
         'earnings_in_days': earnings_in_days if earnings_in_days is not None else 0,
     }
 
@@ -3628,6 +3654,461 @@ def _is_blacklisted(symbol: str) -> tuple[bool, str]:
     return False, ''
 
 
+def _earnings_blackout(symbol: str, days: int = 2) -> tuple[bool, date | None]:
+    try:
+        ticker = yf.Ticker(symbol)
+    except Exception:
+        return False, None
+    try:
+        earnings_date = _get_earnings_date(ticker)
+        if not earnings_date:
+            return False, None
+        cutoff = (timezone.now() + timedelta(days=days)).date()
+        return earnings_date <= cutoff, earnings_date
+    except Exception:
+        return False, None
+
+
+def _daily_trend_ok(symbol: str, use_alpaca: bool = False) -> bool:
+    try:
+        if use_alpaca:
+            hist = get_daily_bars(symbol, days=200)
+            if hist is None or hist.empty or 'close' not in hist:
+                return True
+            close = hist['close']
+        else:
+            hist = yf.Ticker(symbol).history(period='1y', interval='1d', timeout=10)
+            if hist is None or hist.empty or 'Close' not in hist:
+                return True
+            close = hist['Close']
+        ema20 = close.ewm(span=20, adjust=False).mean()
+        ema50 = close.ewm(span=50, adjust=False).mean()
+        ema200 = close.ewm(span=200, adjust=False).mean()
+        last = float(close.iloc[-1]) if len(close) else 0.0
+        e20 = float(ema20.iloc[-1]) if len(ema20) else 0.0
+        e50 = float(ema50.iloc[-1]) if len(ema50) else 0.0
+        e200 = float(ema200.iloc[-1]) if len(ema200) else 0.0
+        e200_prev = float(ema200.iloc[-6]) if len(ema200) >= 6 else e200
+        if last <= 0 or e20 <= 0 or e50 <= 0:
+            return True
+        slope_ok = e200_prev <= 0 or e200 >= e200_prev
+        return last >= e20 and e20 >= e50 and (e200 <= 0 or e50 >= e200) and slope_ok
+    except Exception:
+        return True
+
+
+def _weak_list_health() -> dict[str, Any]:
+    cache_key = 'weak_list_health'
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    symbols = list(MasterWatchlistEntry.objects.filter(category='WEAK_SHORT').values_list('symbol', flat=True))
+    symbols = [str(s).strip().upper() for s in symbols if str(s).strip()]
+    if not symbols:
+        payload = {'status': 'empty', 'ratio_down': 0.0, 'count': 0, 'defensive': False}
+        cache.set(cache_key, payload, timeout=60 * 30)
+        return payload
+    down = 0
+    seen = 0
+    for symbol in symbols[:200]:
+        try:
+            hist = yf.Ticker(symbol).history(period='2d', interval='1d', timeout=10)
+            if hist is None or hist.empty or 'Close' not in hist or len(hist) < 2:
+                continue
+            prev = _safe_float(hist['Close'].iloc[-2])
+            last = _safe_float(hist['Close'].iloc[-1])
+            if not prev or not last:
+                continue
+            seen += 1
+            if last < prev:
+                down += 1
+        except Exception:
+            continue
+    ratio_down = (down / seen) if seen else 0.0
+    threshold = float(os.getenv('WEAK_LIST_DEFENSIVE_THRESHOLD', '0.8'))
+    payload = {
+        'status': 'ok',
+        'ratio_down': round(ratio_down, 3),
+        'count': seen,
+        'defensive': bool(seen >= 10 and ratio_down >= threshold),
+    }
+    cache.set(cache_key, payload, timeout=60 * 30)
+    return payload
+
+
+@lru_cache(maxsize=512)
+def _correlation_group(symbol: str) -> str | None:
+    overrides = _parse_driver_map(os.getenv('CORRELATION_GROUP_OVERRIDES'))
+    sym = (symbol or '').strip().upper()
+    if sym in overrides:
+        return overrides[sym]
+    try:
+        info = yf.Ticker(sym).info or {}
+    except Exception:
+        info = {}
+    haystack = ' '.join([
+        str(info.get('sector') or ''),
+        str(info.get('industry') or ''),
+        str(info.get('longName') or ''),
+        str(info.get('shortName') or ''),
+    ]).lower()
+    if any(k in haystack for k in ['gold', 'silver', 'mining']):
+        return 'GOLD'
+    if any(k in haystack for k in ['oil', 'gas', 'energy']):
+        return 'ENERGY'
+    if any(k in haystack for k in ['bank', 'financial', 'insurance']):
+        return 'FINANCIAL'
+    if any(k in haystack for k in ['software', 'semiconductor', 'tech']):
+        return 'TECH'
+    return None
+
+
+def _correlation_blocked(symbol: str, open_symbols: list[str]) -> bool:
+    group = _correlation_group(symbol)
+    if not group:
+        return False
+    max_per_group = int(os.getenv('CORRELATION_MAX_PER_GROUP', '2'))
+    count = 0
+    for sym in open_symbols:
+        if _correlation_group(sym) == group:
+            count += 1
+    return count >= max_per_group
+
+
+def _spread_too_wide(symbol: str, max_pct: float) -> bool:
+    spread_pct = get_latest_bid_ask_spread_pct(symbol)
+    if spread_pct is None:
+        bid, ask = _latest_bid_ask(symbol)
+        if bid and ask and ask > 0:
+            spread_pct = float((ask - bid) / ((ask + bid) / 2))
+    if spread_pct is None:
+        return False
+    return spread_pct > max_pct
+
+
+def _pump_dump_risk(intraday_ctx: dict[str, Any] | None, sentiment: float | None) -> bool:
+    if not intraday_ctx:
+        return False
+    rvol = float(intraday_ctx.get('rvol') or 0.0)
+    if rvol <= 0:
+        return False
+    pump_rvol = float(os.getenv('PENNY_PUMP_DUMP_RVOL', '10'))
+    euphoric = float(os.getenv('PENNY_PUMP_DUMP_SENTIMENT', '0.7'))
+    if rvol < pump_rvol:
+        return False
+    if sentiment is None:
+        return False
+    return sentiment >= euphoric
+
+
+def _vwap_filter_block(intraday_ctx: dict[str, Any] | None) -> bool:
+    if not intraday_ctx:
+        return False
+    if os.getenv('VWAP_FILTER_ENABLED', 'true').lower() not in {'1', 'true', 'yes', 'y'}:
+        return False
+    return float(intraday_ctx.get('price_to_vwap') or 0.0) < 0.0
+
+
+def _time_of_day_penalty(now: datetime | None = None) -> float:
+    now = now or _ny_time_now()
+    if os.getenv('MIDDAY_SIGNAL_PENALTY_ENABLED', 'true').lower() not in {'1', 'true', 'yes', 'y'}:
+        return 1.0
+    if (now.hour == 11 and now.minute >= 30) or (now.hour == 12) or (now.hour == 13 and now.minute < 30):
+        return float(os.getenv('MIDDAY_SIGNAL_PENALTY', '0.9'))
+    return 1.0
+
+
+def _atr_spike(symbol: str, use_alpaca: bool = False) -> bool:
+    spike_mult = float(os.getenv('ATR_SPIKE_MULT', '2.0'))
+    try:
+        if use_alpaca:
+            hist = get_daily_bars(symbol, days=40)
+            if hist is None or hist.empty or not {'high', 'low', 'close'}.issubset(hist.columns):
+                return False
+            high = hist['high']
+            low = hist['low']
+            close = hist['close']
+        else:
+            hist = yf.Ticker(symbol).history(period='3mo', interval='1d', timeout=10)
+            if hist is None or hist.empty or not {'High', 'Low', 'Close'}.issubset(hist.columns):
+                return False
+            high = hist['High']
+            low = hist['Low']
+            close = hist['Close']
+        tr = pd.concat([
+            (high - low).abs(),
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(14).mean()
+        latest = float(atr.iloc[-1]) if len(atr) else 0.0
+        avg = float(atr.tail(10).mean()) if len(atr) >= 10 else float(atr.mean())
+        return avg > 0 and latest >= avg * spike_mult
+    except Exception:
+        return False
+
+
+def _is_halted(intraday_ctx: dict[str, Any] | None) -> bool:
+    if not intraday_ctx:
+        return False
+    bars = intraday_ctx.get('bars')
+    if bars is None or bars.empty or 'volume' not in bars:
+        return False
+    tail = bars.tail(2)
+    if tail.empty:
+        return False
+    return float(tail['volume'].iloc[-1]) == 0.0 and float(tail['volume'].iloc[-2]) == 0.0
+
+
+def _flash_crash(intraday_ctx: dict[str, Any] | None) -> bool:
+    if not intraday_ctx:
+        return False
+    bars = intraday_ctx.get('bars')
+    if bars is None or bars.empty or 'close' not in bars:
+        return False
+    tail = bars.tail(3)
+    if len(tail) < 3:
+        return False
+    first = float(tail['close'].iloc[0] or 0.0)
+    last = float(tail['close'].iloc[-1] or 0.0)
+    if first <= 0:
+        return False
+    drop = (last - first) / first
+    return drop <= float(os.getenv('FLASH_CRASH_PCT', '-0.10'))
+
+
+def _btc_trend_ok(symbol: str) -> bool:
+    symbols = [s.strip().upper() for s in os.getenv('BTC_CORR_SYMBOLS', 'HIVE,HUT,RIOT,MARA,BITF,CLSK,MSTR,HIVE.V,BITF.TO').split(',') if s.strip()]
+    sym = (symbol or '').strip().upper()
+    if not symbols or sym not in symbols:
+        return True
+    try:
+        btc = get_intraday_bars('BTC-USD', minutes=240)
+        if btc is None or btc.empty or 'close' not in btc:
+            return True
+        close = btc['close']
+        ema20 = close.ewm(span=20, adjust=False).mean()
+        ema50 = close.ewm(span=50, adjust=False).mean()
+        return float(ema20.iloc[-1]) >= float(ema50.iloc[-1])
+    except Exception:
+        return True
+
+
+def _midday_blackout() -> bool:
+    if os.getenv('MIDDAY_NO_TRADE_ENABLED', 'true').lower() not in {'1', 'true', 'yes', 'y'}:
+        return False
+    now_ny = _ny_time_now()
+    start_raw = os.getenv('MIDDAY_START', '11:45').strip()
+    end_raw = os.getenv('MIDDAY_END', '13:15').strip()
+    try:
+        start_h, start_m = [int(x) for x in start_raw.split(':', 1)]
+        end_h, end_m = [int(x) for x in end_raw.split(':', 1)]
+        start = dt_time(start_h, start_m)
+        end = dt_time(end_h, end_m)
+    except Exception:
+        start = dt_time(11, 45)
+        end = dt_time(13, 15)
+    return start <= now_ny.time() <= end
+
+
+def _price_velocity_drop(intraday_ctx: dict[str, Any] | None, bars_back: int = 5) -> bool:
+    if not intraday_ctx:
+        return False
+    bars = intraday_ctx.get('bars')
+    if bars is None or bars.empty or 'close' not in bars:
+        return False
+    if len(bars) <= bars_back:
+        return False
+    start = float(bars['close'].iloc[-1 - bars_back] or 0.0)
+    last = float(bars['close'].iloc[-1] or 0.0)
+    if start <= 0:
+        return False
+    drop = (last - start) / start
+    threshold = float(os.getenv('PRICE_VELOCITY_DROP_PCT', '-0.03'))
+    return drop <= threshold
+
+
+def _daily_equity_circuit_breaker(sandbox: str, equity_now: float) -> bool:
+    threshold = float(os.getenv('DAILY_EQUITY_DRAWDOWN_PCT', '0.03'))
+    if equity_now <= 0:
+        return False
+    key = f"daily_equity_base:{sandbox}:{_ny_time_now().strftime('%Y%m%d')}"
+    trigger_key = f"daily_equity_trip:{sandbox}:{_ny_time_now().strftime('%Y%m%d')}"
+    if cache.get(trigger_key):
+        return True
+    baseline = cache.get(key)
+    if baseline is None:
+        cache.set(key, float(equity_now), timeout=60 * 60 * 24)
+        return False
+    baseline = float(baseline)
+    if baseline <= 0:
+        return False
+    drawdown = (equity_now - baseline) / baseline
+    if drawdown <= -abs(threshold):
+        cache.set(trigger_key, True, timeout=60 * 60 * 24)
+        return True
+    return False
+
+
+def _reentry_cache_key(symbol: str, sandbox: str) -> str:
+    day_key = _ny_time_now().strftime('%Y%m%d')
+    return f"reentry_watch:{sandbox}:{symbol}:{day_key}"
+
+
+def _mark_reentry(symbol: str, sandbox: str) -> None:
+    cache.set(_reentry_cache_key(symbol, sandbox), True, timeout=60 * 60 * 6)
+
+
+def _is_reentry_candidate(symbol: str, sandbox: str) -> bool:
+    return bool(cache.get(_reentry_cache_key(symbol, sandbox)))
+
+
+def _reentry_confirmed(intraday_ctx: dict[str, Any] | None) -> bool:
+    if not intraday_ctx:
+        return False
+    confirm_pct = float(os.getenv('REENTRY_CONFIRMATION_PCT', '0.005'))
+    price_to_vwap = float(intraday_ctx.get('price_to_vwap') or 0.0)
+    return price_to_vwap >= confirm_pct
+
+
+def _decision_log(symbol: str, sandbox: str, status: str, reason: str, signal: float | None = None) -> None:
+    if os.getenv('DECISION_LOG_ENABLED', 'false').lower() not in {'1', 'true', 'yes', 'y'}:
+        return
+    path = os.getenv('DECISION_LOG_PATH', 'logs/decision_log.csv')
+    try:
+        dir_name = os.path.dirname(path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        line = f"{timezone.now().isoformat()},{sandbox},{symbol},{status},{signal if signal is not None else ''},{reason}\n"
+        with open(path, 'a', encoding='utf-8') as handle:
+            handle.write(line)
+    except Exception:
+        return
+
+
+def _system_log(
+    category: str,
+    level: str,
+    message: str,
+    symbol: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    try:
+        SystemLog.objects.create(
+            category=category,
+            level=level,
+            symbol=(symbol or None),
+            message=message,
+            metadata=metadata or {},
+        )
+    except Exception:
+        return
+
+
+def _prediction_log(symbol: str, universe: str, score: float) -> None:
+    path = os.getenv('PREDICTIONS_LOG_PATH', 'logs/predictions.csv')
+    try:
+        dir_name = os.path.dirname(path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        line = f"{timezone.now().isoformat()},{universe},{symbol},{score:.4f}\n"
+        with open(path, 'a', encoding='utf-8') as handle:
+            handle.write(line)
+    except Exception:
+        return
+
+
+def _kelly_fraction(sandbox: str, lookback_days: int = 120) -> float:
+    if os.getenv('KELLY_ENABLED', 'false').lower() not in {'1', 'true', 'yes', 'y'}:
+        return 0.0
+    min_trades = int(os.getenv('KELLY_MIN_TRADES', '20'))
+    max_frac = float(os.getenv('KELLY_MAX_FRACTION', '0.1'))
+    cutoff = timezone.now() - timedelta(days=lookback_days)
+    trades = PaperTrade.objects.filter(sandbox=sandbox, status='CLOSED', exit_date__gte=cutoff)
+    if trades.count() < min_trades:
+        return 0.0
+    wins = trades.filter(outcome='WIN')
+    losses = trades.filter(outcome='LOSS')
+    win_rate = wins.count() / trades.count() if trades.count() else 0.0
+    avg_win = float(wins.aggregate(avg=models.Avg('pnl')).get('avg') or 0.0)
+    avg_loss = abs(float(losses.aggregate(avg=models.Avg('pnl')).get('avg') or 0.0))
+    if avg_loss <= 0:
+        return 0.0
+    b = avg_win / avg_loss if avg_loss else 0.0
+    f = win_rate - ((1 - win_rate) / b) if b > 0 else 0.0
+    return max(0.0, min(max_frac, f))
+
+
+def _loss_blacklist(symbol: str, sandbox: str) -> bool:
+    if os.getenv('LOSS_BLACKLIST_ENABLED', 'true').lower() not in {'1', 'true', 'yes', 'y'}:
+        return False
+    days = int(os.getenv('LOSS_BLACKLIST_DAYS', '7'))
+    max_losses = int(os.getenv('LOSS_BLACKLIST_TRADES', '3'))
+    cutoff = timezone.now() - timedelta(days=days)
+    losses = PaperTrade.objects.filter(
+        ticker__iexact=symbol,
+        sandbox=sandbox,
+        status='CLOSED',
+        outcome='LOSS',
+        exit_date__gte=cutoff,
+    ).count()
+    return losses >= max_losses
+
+
+def _sector_trend_ok(symbol: str) -> bool:
+    if os.getenv('SECTOR_TREND_FILTER_ENABLED', 'false').lower() not in {'1', 'true', 'yes', 'y'}:
+        return True
+    mapping = {
+        'TECH': 'XLK',
+        'ENERGY': 'XLE',
+        'FINANCIAL': 'XLF',
+        'GOLD': 'GLD',
+    }
+    group = _correlation_group(symbol)
+    etf = mapping.get(group)
+    if not etf:
+        return True
+    try:
+        hist = yfin.Ticker(etf).history(period='2d', interval='1d', timeout=10)
+        if hist is None or hist.empty or 'Close' not in hist or len(hist) < 2:
+            return True
+        prev = float(hist['Close'].iloc[-2])
+        last = float(hist['Close'].iloc[-1])
+        if prev <= 0:
+            return True
+        change_pct = ((last - prev) / prev) * 100
+        min_pct = float(os.getenv('SECTOR_TREND_MIN_PCT', '-1.0'))
+        return change_pct >= min_pct
+    except Exception:
+        return True
+
+
+def _multi_model_boost(symbol: str, current_signal: float, universe: str, use_alpaca: bool) -> float:
+    if os.getenv('MULTI_MODEL_BOOST_ENABLED', 'false').lower() not in {'1', 'true', 'yes', 'y'}:
+        return 1.0
+    other_universe = 'BLUECHIP' if universe == 'PENNY' else 'PENNY'
+    try:
+        other_payload = _model_signal(symbol, other_universe, get_model_path(other_universe), use_alpaca=use_alpaca)
+        other_signal = float(other_payload.get('signal') or 0.0) if other_payload else 0.0
+        threshold = float(os.getenv('MULTI_MODEL_BOOST_MIN', '0.8'))
+        if current_signal >= threshold and other_signal >= threshold:
+            return float(os.getenv('MULTI_MODEL_BOOST_FACTOR', '1.2'))
+    except Exception:
+        return 1.0
+    return 1.0
+
+
+def _reddit_hype_risk(symbol: str) -> bool:
+    if os.getenv('PENNY_REDDIT_HYPE_FILTER', 'false').lower() not in {'1', 'true', 'yes', 'y'}:
+        return False
+    latest = PennySignal.objects.filter(symbol__iexact=symbol).order_by('-as_of').first()
+    if not latest:
+        return False
+    hype = float(latest.hype_score or 0.0)
+    max_hype = float(os.getenv('PENNY_REDDIT_HYPE_MAX', '0.9'))
+    return hype >= max_hype
+
+
 def _get_vix_level() -> float | None:
     try:
         hist = yf.Ticker('^VIX').history(period='5d', interval='1d', timeout=10)
@@ -3976,6 +4457,10 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     min_volume_z = _env_float(prefix, 'VOLUME_ZSCORE_MIN', '0.5')
     break_even_pct = _env_float(prefix, 'BREAK_EVEN_PCT', '0.015')
     break_even_fee_pct = _env_float(prefix, 'BREAK_EVEN_FEE_PCT', '0.0')
+    lock_profit_trigger_pct = _env_float(prefix, 'LOCK_PROFIT_TRIGGER_PCT', '0.05')
+    lock_profit_stop_pct = _env_float(prefix, 'LOCK_PROFIT_STOP_PCT', '0.03')
+    max_spread_pct = _env_float(prefix, 'MAX_SPREAD_PCT', '0.01')
+    hard_position_cap_pct = _env_float(prefix, 'HARD_POSITION_CAP_PCT', '0.10')
     reinforce_min_score = _env_float(prefix, 'REINFORCE_MIN_SCORE', '0.85')
     min_altman_z = _env_float(prefix, 'MIN_ALTMAN_Z', '2.0')
     min_win_rate = _env_float(prefix, 'MIN_WIN_RATE', '0.40')
@@ -4009,6 +4494,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
 
     if max_position_cap_pct is not None:
         position_cap_pct = min(position_cap_pct, max_position_cap_pct)
+    position_cap_pct = min(position_cap_pct, hard_position_cap_pct)
 
     if sandbox == 'AI_BLUECHIP':
         buy_threshold = 0.85
@@ -4023,6 +4509,32 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     available = max(0.0, capital - open_value)
     min_available_capital = _env_float(prefix, 'MIN_AVAILABLE_CAPITAL', '0.0')
     block_new_entries = sandbox == 'AI_PENNY' and min_available_capital > 0 and available < min_available_capital
+    if _daily_equity_circuit_breaker(sandbox, capital):
+        for trade in open_trades_list:
+            price = _latest_price(trade.ticker) or float(trade.entry_price)
+            trade.status = 'CLOSED'
+            trade.exit_price = price
+            trade.exit_date = timezone.now()
+            trade.pnl = float(price - float(trade.entry_price)) * float(trade.quantity)
+            trade.outcome = 'WIN' if float(trade.pnl or 0) > 0 else 'LOSS'
+            trade.notes = (trade.notes or '') + ' | Circuit breaker daily equity.'
+            trade.save(update_fields=['status', 'exit_price', 'exit_date', 'pnl', 'outcome', 'notes'])
+        _system_log('SYSTEM', 'ERROR', f'Circuit breaker triggered for {sandbox}', metadata={'capital': capital})
+        _send_telegram_alert(
+            f"⛔ Circuit breaker: fermeture des positions {sandbox} (drawdown quotidien).",
+            allow_during_blackout=True,
+            category='risk',
+        )
+        return {
+            'created': 0,
+            'closed': len(open_trades_list),
+            'available': round(available, 2),
+            'entries_blocked_low_capital': True,
+            'market_regime': regime,
+        }
+    weak_health = _weak_list_health()
+    if weak_health.get('defensive'):
+        block_new_entries = True
     regime = get_market_regime_context()
     risk_off = bool(regime.get('risk_off')) if isinstance(regime, dict) else False
     regime_risk_factor = float(os.getenv('MARKET_RISK_OFF_POSITION_FACTOR', '0.5')) if risk_off else 1.0
@@ -4189,6 +4701,32 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         for trade in trades:
             entry_price = float(trade.entry_price or 0)
             profit_pct = (price - entry_price) / entry_price if entry_price else 0.0
+            entry_features = dict(trade.entry_features or {})
+            partial_taken = bool(entry_features.get('partial_taken'))
+            partial_tp_pct = float(os.getenv('PARTIAL_TAKE_PROFIT_PCT', '0.03'))
+            partial_qty_pct = float(os.getenv('PARTIAL_TAKE_PROFIT_QTY_PCT', '0.5'))
+            if profit_pct >= partial_tp_pct and not partial_taken:
+                sell_qty = max(1, int(float(trade.quantity) * partial_qty_pct))
+                if sell_qty < trade.quantity:
+                    trade.quantity = int(trade.quantity - sell_qty)
+                    trade.pnl = float(trade.pnl or 0) + float(price - entry_price) * float(sell_qty)
+                    entry_features['partial_taken'] = True
+                    trade.entry_features = entry_features
+                    trade.notes = (trade.notes or '') + ' | Partial TP exécuté.'
+                    trade.save(update_fields=['quantity', 'pnl', 'entry_features', 'notes'])
+            time_exit_min = int(os.getenv('TIME_BASED_EXIT_MINUTES', '120'))
+            if trade.entry_date and time_exit_min > 0:
+                age_min = (timezone.now() - trade.entry_date).total_seconds() / 60
+                if age_min >= time_exit_min and profit_pct > 0:
+                    trade.status = 'CLOSED'
+                    trade.exit_price = price
+                    trade.exit_date = timezone.now()
+                    trade.pnl = float(price - float(trade.entry_price)) * float(trade.quantity) + float(trade.pnl or 0)
+                    trade.outcome = 'WIN' if float(trade.pnl or 0) > 0 else 'LOSS'
+                    trade.notes = (trade.notes or '') + ' | Sortie temps (profit positif).'
+                    trade.save(update_fields=['status', 'exit_price', 'exit_date', 'pnl', 'outcome', 'notes'])
+                    closed += 1
+                    continue
             if profit_pct > 0 and take_profit_volume_days > 0:
                 negative_streak, latest_volume_z = _volume_z_negative_streak(symbol, take_profit_volume_days)
                 if negative_streak:
@@ -4213,6 +4751,11 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             dynamic_atr_stop = 0.0
             if profit_pct >= trail_profit_trigger and atr > 0:
                 dynamic_atr_stop = price - (trail_atr_mult * atr)
+            profit_trail_pct = None
+            if profit_pct >= 0.06:
+                profit_trail_pct = 0.005
+            elif profit_pct >= 0.03:
+                profit_trail_pct = 0.01
             stop_mult = _stop_loss_multiplier(trade.entry_explanations)
             adjusted_trail = max(0.005, min(0.25, trail_pct * stop_mult))
             new_stop = max(
@@ -4221,6 +4764,10 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 break_even_stop,
                 dynamic_atr_stop,
             )
+            if profit_trail_pct is not None:
+                new_stop = max(new_stop, price * (1 - profit_trail_pct))
+            if entry_price and price >= entry_price * (1 + lock_profit_trigger_pct):
+                new_stop = max(new_stop, entry_price * (1 + lock_profit_stop_pct))
             if intraday_ctx:
                 pattern_signal = float(intraday_ctx.get('pattern_signal') or 0)
                 rvol = float(intraday_ctx.get('rvol') or 0)
@@ -4230,7 +4777,8 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             trade.stop_loss = new_stop
             stop_hit = price <= new_stop
             signal_exit = signal is not None and signal < sell_threshold
-            should_close = stop_hit or signal_exit
+            velocity_exit = _price_velocity_drop(intraday_ctx)
+            should_close = stop_hit or signal_exit or velocity_exit
             if should_close:
                 trade.status = 'CLOSED'
                 trade.exit_price = price
@@ -4238,7 +4786,12 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 trade.pnl = float(price - float(trade.entry_price)) * float(trade.quantity)
                 trade.outcome = 'WIN' if float(trade.pnl or 0) > 0 else 'LOSS'
                 volume_z = _safe_float((signal_payload or {}).get('features', {}).get('VolumeZ'))
-                exit_reason = 'Stop Loss' if stop_hit else 'Signal IA'
+                if stop_hit:
+                    _mark_reentry(symbol, sandbox)
+                if velocity_exit:
+                    exit_reason = 'Vitesse baisse'
+                else:
+                    exit_reason = 'Stop Loss' if stop_hit else 'Signal IA'
                 volume_note = f" VolumeZ {volume_z:.2f}." if volume_z is not None else ''
                 trade.notes = (
                     f"Trade fermé à cause de {exit_reason}. Cause probable : Volume trop faible lors de l'entrée." + volume_note
@@ -4248,6 +4801,10 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
 
     for symbol in watchlist:
         existing_trades = open_trades_by_symbol.get(symbol, [])
+        if _midday_blackout():
+            _decision_log(symbol, sandbox, 'SKIP', 'midday_blackout')
+            continue
+        reentry_candidate = _is_reentry_candidate(symbol, sandbox)
         master_entry = master_entries.get(symbol)
         if master_entry and master_entry.category == 'WEAK_SHORT':
             threshold = master_entry.block_if_market_sentiment_lt
@@ -4267,8 +4824,26 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             if intraday_ctx:
                 pattern_signal = float(intraday_ctx.get('pattern_signal') or 0)
                 rvol = float(intraday_ctx.get('rvol') or 0)
+                if _is_halted(intraday_ctx) or _flash_crash(intraday_ctx):
+                    _decision_log(symbol, sandbox, 'SKIP', 'halt_or_flash')
+                    continue
+                min_intraday_rvol = float(os.getenv('MIN_INTRADAY_RVOL', '1.0'))
+                if rvol < min_intraday_rvol:
+                    _decision_log(symbol, sandbox, 'SKIP', f'rvol<{min_intraday_rvol}')
+                    continue
+                if _vwap_filter_block(intraday_ctx):
+                    _decision_log(symbol, sandbox, 'SKIP', 'below_vwap')
+                    continue
+                spread_pct = float(intraday_ctx.get('bid_ask_spread_pct') or 0.0)
+                penny_max_spread = float(os.getenv('PENNY_MAX_SPREAD_PCT', '0.02'))
+                spread_limit = penny_max_spread if sandbox == 'AI_PENNY' else max_spread_pct
+                if spread_pct > 0 and spread_pct > spread_limit:
+                    _decision_log(symbol, sandbox, 'SKIP', f'spread>{spread_limit}')
+                    continue
         signal_payload = _signal(symbol, intraday_ctx=intraday_ctx)
         signal = signal_payload['signal'] if signal_payload else None
+        if signal is not None:
+            signal = float(signal) * _time_of_day_penalty()
         if pattern_signal is not None and rvol is not None:
             if pattern_signal < 0 and rvol >= 2:
                 continue
@@ -4302,6 +4877,62 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             continue
         if block_new_entries:
             continue
+        if _atr_spike(symbol, use_alpaca=use_alpaca):
+            _decision_log(symbol, sandbox, 'SKIP', 'atr_spike')
+            continue
+        if not _btc_trend_ok(symbol):
+            _decision_log(symbol, sandbox, 'SKIP', 'btc_trend_down')
+            continue
+        earnings_blocked, _ = _earnings_blackout(symbol, days=2)
+        if earnings_blocked:
+            continue
+        if os.getenv('MULTI_TIMEFRAME_DAILY_ENABLED', 'true').lower() in {'1', 'true', 'yes', 'y'}:
+            if not _daily_trend_ok(symbol, use_alpaca=use_alpaca):
+                continue
+        if _correlation_blocked(symbol, list(open_trades_by_symbol.keys())):
+            continue
+        if _spread_too_wide(symbol, max_spread_pct):
+            continue
+        if reentry_candidate:
+            if not _reentry_confirmed(intraday_ctx):
+                _decision_log(symbol, sandbox, 'SKIP', 'reentry_no_vwap')
+                continue
+        reentry_window = int(os.getenv('REENTRY_WINDOW_MINUTES', '30'))
+        reentry_bonus = float(os.getenv('REENTRY_MIN_SIGNAL_BONUS', '0.05'))
+        reentry_size_factor = 1.0
+        if reentry_window > 0:
+            cutoff = timezone.now() - timedelta(minutes=reentry_window)
+            recent_loss = PaperTrade.objects.filter(
+                ticker__iexact=symbol,
+                sandbox=sandbox,
+                status='CLOSED',
+                outcome='LOSS',
+                exit_date__gte=cutoff,
+            ).exists()
+            if recent_loss and (signal is None or signal < (buy_threshold + reentry_bonus)):
+                continue
+        reentry_stop_minutes = int(os.getenv('REENTRY_STOPLOSS_WINDOW_MINUTES', '120'))
+        reentry_stop_min_signal = float(os.getenv('REENTRY_STOPLOSS_MIN_SIGNAL', '0.8'))
+        if reentry_stop_minutes > 0:
+            cutoff = timezone.now() - timedelta(minutes=reentry_stop_minutes)
+            recent_stop = PaperTrade.objects.filter(
+                ticker__iexact=symbol,
+                sandbox=sandbox,
+                status='CLOSED',
+                outcome='LOSS',
+                exit_date__gte=cutoff,
+                notes__icontains='Stop Loss',
+            ).exists()
+            if recent_stop and signal is not None and signal >= reentry_stop_min_signal:
+                reentry_size_factor = float(os.getenv('REENTRY_STOPLOSS_SIZE_FACTOR', '0.75'))
+        if reentry_candidate:
+            reentry_size_factor = float(os.getenv('REENTRY_STOPLOSS_SIZE_FACTOR', '0.75'))
+        if _loss_blacklist(symbol, sandbox):
+            _decision_log(symbol, sandbox, 'SKIP', 'loss_blacklist')
+            continue
+        if not _sector_trend_ok(symbol):
+            _decision_log(symbol, sandbox, 'SKIP', 'sector_trend')
+            continue
         if existing_trades and signal < reinforce_min_score:
             continue
         if sandbox == 'AI_PENNY' and _penny_blocked():
@@ -4323,6 +4954,11 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             breakout_flag = float((signal_payload or {}).get('features', {}).get('breakout_1m') or 0.0)
             if intraday_rvol < min_rvol or breakout_flag <= 0:
                 continue
+            if _reddit_hype_risk(symbol):
+                continue
+            sentiment_raw = float((signal_payload or {}).get('features', {}).get('finbert_sentiment') or 0.0)
+            if _pump_dump_risk(intraday_ctx, sentiment_raw):
+                continue
             if os.getenv('ORDER_BOOK_IMBALANCE_ENABLED', 'false').lower() in {'1', 'true', 'yes', 'y'}:
                 imbalance = get_order_book_imbalance(symbol)
                 min_imbalance = float(os.getenv('ORDER_BOOK_IMBALANCE_MIN', '1.0'))
@@ -4334,7 +4970,11 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         atr = _atr(symbol)
         stop_mult = _stop_loss_multiplier((signal_payload or {}).get('explanations'))
         adjusted_trail = max(0.005, min(0.25, trail_pct * stop_mult))
-        stop_distance = max(price * adjusted_trail, atr_mult * atr, price * 0.01)
+        reentry_atr_mult = float(os.getenv('REENTRY_STOPLOSS_ATR_MULTI', str(atr_mult)))
+        if reentry_candidate:
+            stop_distance = max(price * adjusted_trail, reentry_atr_mult * atr, price * 0.01)
+        else:
+            stop_distance = max(price * adjusted_trail, atr_mult * atr, price * 0.01)
         if intraday_ctx:
             vol = float(intraday_ctx.get('volatility') or 0)
             if vol > 0:
@@ -4355,8 +4995,13 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         if allocation <= 0:
             continue
         position_value = min(position_value, allocation)
+        kelly_frac = _kelly_fraction(sandbox)
+        if kelly_frac > 0:
+            position_value = min(position_value, capital * kelly_frac)
+        position_value *= _multi_model_boost(symbol, float(signal or 0), universe, use_alpaca)
         position_value *= regime_risk_factor
         position_value *= confidence_factor
+        position_value *= reentry_size_factor
         quantity = int(position_value / price) if price else 0
         if quantity <= 0:
             continue
@@ -4370,6 +5015,8 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 'intraday_rsi14': float(intraday_ctx.get('rsi14') or 0),
                 'intraday_ema20': float(intraday_ctx.get('ema20') or 0),
                 'intraday_ema50': float(intraday_ctx.get('ema50') or 0),
+                'intraday_vwap': float(intraday_ctx.get('vwap') or 0),
+                'intraday_price_to_vwap': float(intraday_ctx.get('price_to_vwap') or 0),
             })
         entry_features.update(_entry_time_features(symbol))
         PaperTrade.objects.create(
@@ -4391,6 +5038,14 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 f"(Confiance {float(signal or 0) * 100:.1f}%)"
             ),
         )
+        if os.getenv('TRADE_REASON_ALERTS', 'false').lower() in {'1', 'true', 'yes', 'y'}:
+            reason = (signal_payload or {}).get('explanations') or []
+            AlertEvent.objects.create(
+                category='TRADE_REASON',
+                message=f"{symbol} entry: {reason}",
+                stock=Stock.objects.filter(symbol__iexact=symbol).first(),
+            )
+        _decision_log(symbol, sandbox, 'BUY', 'paper_trade_created', signal)
         created += 1
         available = max(0.0, available - (quantity * price))
 
@@ -4449,11 +5104,16 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
     min_volume_z = _env_float(prefix, 'VOLUME_ZSCORE_MIN', '0.5')
     max_cost_pct = _env_float(prefix, 'ALPACA_MAX_COST_PCT', '0.01')
     commission_pct = _env_float(prefix, 'ALPACA_COMMISSION_PCT', '0.0')
+    max_spread_pct = _env_float(prefix, 'MAX_SPREAD_PCT', '0.01')
+    hard_position_cap_pct = _env_float(prefix, 'HARD_POSITION_CAP_PCT', '0.10')
+    lock_profit_trigger_pct = _env_float(prefix, 'LOCK_PROFIT_TRIGGER_PCT', '0.05')
+    lock_profit_stop_pct = _env_float(prefix, 'LOCK_PROFIT_STOP_PCT', '0.03')
     allow_gemini = os.getenv('ALPACA_GEMINI_REASON', 'true').lower() in {'1', 'true', 'yes', 'y'}
     min_confidence = _env_float(prefix, 'ALPACA_MIN_CONFIDENCE', '0.7')
     min_sentiment = _env_float(prefix, 'ALPACA_MIN_SENTIMENT', '0.0')
     min_imbalance = _env_float(prefix, 'ALPACA_MIN_IMBALANCE', '1.0')
 
+    shadow_mode = os.getenv('ALPACA_SHADOW_TRADING', 'false').lower() in {'1', 'true', 'yes', 'y'}
     positions = {getattr(p, 'symbol', '').strip().upper(): p for p in get_open_positions() if getattr(p, 'symbol', None)}
     market_sentiment, market_meta = get_market_sentiment()
     market_score = _market_sentiment_score()
@@ -4467,10 +5127,47 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
     tier1_size_mult = float(os.getenv('TIER1_SIZE_MULT', '1.5'))
     tier3_size_mult = float(os.getenv('TIER3_SIZE_MULT', '0.5'))
     tier1_atr_mult = float(os.getenv('TIER1_TRAIL_ATR_MULT', '2.0'))
+    use_limit_orders = os.getenv('ALPACA_USE_LIMIT_ORDERS', 'true').lower() in {'1', 'true', 'yes', 'y'}
+    limit_offset = float(os.getenv('ALPACA_LIMIT_OFFSET', '0.01'))
 
     created = 0
     closed = 0
     buying_power = _alpaca_buying_power()
+    account = get_account()
+    equity_now = None
+    try:
+        equity_now = float(getattr(account, 'equity', None)) if account is not None else None
+    except Exception:
+        equity_now = None
+    equity_now = equity_now if equity_now is not None else buying_power
+    if _daily_equity_circuit_breaker(sandbox, float(equity_now or 0)):
+        for symbol, pos in positions.items():
+            try:
+                close_position(symbol)
+            except Exception:
+                continue
+        _system_log('SYSTEM', 'ERROR', f'Circuit breaker triggered for {sandbox}', metadata={'equity': equity_now})
+        _send_telegram_alert(
+            f"⛔ Circuit breaker: fermeture positions Alpaca {sandbox} (drawdown quotidien).",
+            allow_during_blackout=True,
+            category='risk',
+        )
+        return {
+            'created': 0,
+            'closed': len(positions),
+            'buying_power': round(buying_power, 2),
+            'market_regime': regime,
+            'market_meta': market_meta,
+        }
+    if shadow_mode:
+        positions = {}
+    shadow_trades = []
+    shadow_by_symbol: dict[str, PaperTrade] = {}
+    if shadow_mode:
+        shadow_trades = list(PaperTrade.objects.filter(broker='SHADOW', status='OPEN', sandbox=sandbox))
+        shadow_by_symbol = {str(t.ticker or '').strip().upper(): t for t in shadow_trades}
+    position_cap_pct = min(position_cap_pct, hard_position_cap_pct)
+    weak_health = _weak_list_health()
 
     def _alpaca_latest_price(symbol: str) -> float | None:
         price = get_latest_trade_price(symbol)
@@ -4484,52 +5181,79 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
             return None
         return None
 
-        def _alpaca_fusion(symbol: str) -> pd.DataFrame:
-            fusion = DataFusionEngine(symbol, use_alpaca=True)
-            return fusion.fuse_all() or pd.DataFrame()
+    def _alpaca_fusion(symbol: str) -> pd.DataFrame:
+        fusion = DataFusionEngine(symbol, use_alpaca=True)
+        return fusion.fuse_all() or pd.DataFrame()
 
-        def _update_open_trade(trade: PaperTrade, price: float, signal: float | None) -> bool:
-            frame = _alpaca_fusion(trade.ticker)
-            tier, tier_reasons = _classify_tier(frame, {'signal': signal})
-            entry_features = dict(trade.entry_features or {})
-            entry_features['tier'] = tier
-            entry_features['tier_reasons'] = tier_reasons
+    def _update_open_trade(trade: PaperTrade, price: float, signal: float | None) -> bool:
+        frame = _alpaca_fusion(trade.ticker)
+        tier, tier_reasons = _classify_tier(frame, {'signal': signal})
+        entry_features = dict(trade.entry_features or {})
+        entry_features['tier'] = tier
+        entry_features['tier_reasons'] = tier_reasons
 
-            adx_val, adx_slope = _compute_adx(frame)
-            atr_val = _atr_from_frame(frame) or 0.0
-            high_water = float(entry_features.get('alpaca_high_water') or trade.entry_price or 0.0)
-            if price > high_water:
-                high_water = price
-            entry_features['alpaca_high_water'] = high_water
+        adx_val, adx_slope = _compute_adx(frame)
+        atr_val = _atr_from_frame(frame) or 0.0
+        high_water = float(entry_features.get('alpaca_high_water') or trade.entry_price or 0.0)
+        if price > high_water:
+            high_water = price
+        entry_features['alpaca_high_water'] = high_water
 
-            should_sell = False
-            if tier == 'T1':
-                trail_stop = high_water - (tier1_atr_mult * atr_val) if atr_val else None
-                if trail_stop is not None and price <= trail_stop:
+        should_sell = False
+        entry_price = float(trade.entry_price or 0.0)
+        profit_pct = (price - entry_price) / entry_price if entry_price else 0.0
+        profit_trail_pct = None
+        if profit_pct >= 0.06:
+            profit_trail_pct = 0.005
+        elif profit_pct >= 0.03:
+            profit_trail_pct = 0.01
+        if entry_price and price >= entry_price * (1 + lock_profit_trigger_pct):
+            trade.stop_loss = max(float(trade.stop_loss or 0.0), entry_price * (1 + lock_profit_stop_pct))
+        if profit_trail_pct is not None:
+            trade.stop_loss = max(float(trade.stop_loss or 0.0), price * (1 - profit_trail_pct))
+        intraday_ctx = get_intraday_context(
+            trade.ticker,
+            minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
+            rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
+        )
+        if _price_velocity_drop(intraday_ctx):
+            should_sell = True
+        if trade.stop_loss and price <= float(trade.stop_loss):
+            _mark_reentry(trade.ticker, sandbox)
+            should_sell = True
+        if tier == 'T1':
+            trail_stop = high_water - (tier1_atr_mult * atr_val) if atr_val else None
+            if trail_stop is not None and price <= trail_stop:
+                should_sell = True
+            if adx_val is not None and adx_val < 20:
+                should_sell = True
+        elif tier == 'T2':
+            age_days = (timezone.now() - trade.entry_date).days if trade.entry_date else 0
+            if age_days >= int(os.getenv('TIER2_MAX_DAYS', '3')):
+                if adx_val is None or adx_val < 25 or (adx_slope is not None and adx_slope <= 0):
                     should_sell = True
-                if adx_val is not None and adx_val < 20:
-                    should_sell = True
-            elif tier == 'T2':
-                age_days = (timezone.now() - trade.entry_date).days if trade.entry_date else 0
-                if age_days >= int(os.getenv('TIER2_MAX_DAYS', '3')):
-                    if adx_val is None or adx_val < 25 or (adx_slope is not None and adx_slope <= 0):
-                        should_sell = True
-                if signal is not None and signal < sell_threshold:
-                    should_sell = True
-            else:
-                now_ny = _ny_time_now()
-                if now_ny.time() >= dt_time(15, 45) or (trade.entry_date and trade.entry_date.date() < timezone.localdate()):
-                    should_sell = True
-                if signal is not None and signal < sell_threshold:
-                    should_sell = True
+            if signal is not None and signal < sell_threshold:
+                should_sell = True
+        else:
+            now_ny = _ny_time_now()
+            if now_ny.time() >= dt_time(15, 45) or (trade.entry_date and trade.entry_date.date() < timezone.localdate()):
+                should_sell = True
+            if signal is not None and signal < sell_threshold:
+                should_sell = True
 
-            trade.entry_features = entry_features
-            trade.save(update_fields=['entry_features'])
-            return should_sell
+        trade.entry_features = entry_features
+        trade.save(update_fields=['entry_features'])
+        return should_sell
 
     for symbol in watchlist:
         symbol = (symbol or '').strip().upper()
         if not symbol:
+            continue
+        if _midday_blackout():
+            _decision_log(symbol, sandbox, 'SKIP', 'midday_blackout')
+            continue
+        reentry_candidate = _is_reentry_candidate(symbol, sandbox)
+        if weak_health.get('defensive'):
             continue
         master_entry = master_entries.get(symbol)
         if master_entry and master_entry.category == 'WEAK_SHORT':
@@ -4538,6 +5262,14 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
                 threshold = 0.0
             if market_score is not None and market_score < float(threshold):
                 continue
+        earnings_blocked, _ = _earnings_blackout(symbol, days=2)
+        if earnings_blocked:
+            continue
+        if os.getenv('MULTI_TIMEFRAME_DAILY_ENABLED', 'true').lower() in {'1', 'true', 'yes', 'y'}:
+            if not _daily_trend_ok(symbol, use_alpaca=True):
+                continue
+        if _correlation_blocked(symbol, list(positions.keys())):
+            continue
         if _symbol_currency(symbol) == 'CAD':
             notify_key = f"alpaca_cad_alert:{symbol}:{_ny_time_now().strftime('%Y%m%d')}"
             if not cache.get(notify_key):
@@ -4592,12 +5324,52 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
         signal = signal_payload.get('signal') if signal_payload else None
         if signal is None:
             continue
+        intraday_ctx = get_intraday_context(
+            symbol,
+            minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
+            rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
+        )
+        if intraday_ctx:
+            if _is_halted(intraday_ctx) or _flash_crash(intraday_ctx):
+                _decision_log(symbol, sandbox, 'SKIP', 'halt_or_flash')
+                continue
+            min_intraday_rvol = float(os.getenv('MIN_INTRADAY_RVOL', '1.0'))
+            if float(intraday_ctx.get('rvol') or 0.0) < min_intraday_rvol:
+                _decision_log(symbol, sandbox, 'SKIP', f'rvol<{min_intraday_rvol}')
+                continue
+            if _vwap_filter_block(intraday_ctx):
+                _decision_log(symbol, sandbox, 'SKIP', 'below_vwap')
+                continue
+            spread_pct = float(intraday_ctx.get('bid_ask_spread_pct') or 0.0)
+            penny_max_spread = float(os.getenv('PENNY_MAX_SPREAD_PCT', '0.02'))
+            spread_limit = penny_max_spread if sandbox == 'AI_PENNY' else max_spread_pct
+            if spread_pct > 0 and spread_pct > spread_limit:
+                _decision_log(symbol, sandbox, 'SKIP', f'spread>{spread_limit}')
+                continue
+        if reentry_candidate and not _reentry_confirmed(intraday_ctx):
+            _decision_log(symbol, sandbox, 'SKIP', 'reentry_no_vwap')
+            continue
+        signal = float(signal) * _time_of_day_penalty()
         if signal < min_confidence:
             continue
 
         feature_snapshot = (signal_payload or {}).get('features') or {}
         sentiment_score = float(feature_snapshot.get('sentiment_score') or 0.0)
         if sentiment_score < min_sentiment:
+            continue
+
+        if _loss_blacklist(symbol, sandbox):
+            _decision_log(symbol, sandbox, 'SKIP', 'loss_blacklist')
+            continue
+        if not _sector_trend_ok(symbol):
+            _decision_log(symbol, sandbox, 'SKIP', 'sector_trend')
+            continue
+
+        if _atr_spike(symbol, use_alpaca=True):
+            _decision_log(symbol, sandbox, 'SKIP', 'atr_spike')
+            continue
+        if not _btc_trend_ok(symbol):
+            _decision_log(symbol, sandbox, 'SKIP', 'btc_trend_down')
             continue
 
         if sandbox != 'AI_PENNY':
@@ -4612,6 +5384,8 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
                 spread_pct = float((ask - bid) / ((ask + bid) / 2))
         if spread_pct is None:
             spread_pct = 0.0
+        if spread_pct > max_spread_pct:
+            continue
         if (spread_pct + commission_pct) > max_cost_pct:
             continue
 
@@ -4622,9 +5396,33 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
         price = _alpaca_latest_price(symbol)
         if price is None:
             continue
+        if sandbox == 'AI_PENNY':
+            intraday_ctx = get_intraday_context(
+                symbol,
+                minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
+                rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
+            )
+            finbert_sentiment = float((signal_payload or {}).get('features', {}).get('finbert_sentiment') or 0.0)
+            if _pump_dump_risk(intraday_ctx, finbert_sentiment):
+                continue
+            if _reddit_hype_risk(symbol):
+                continue
 
         existing_pos = positions.get(symbol)
         open_trade = PaperTrade.objects.filter(broker='ALPACA', status='OPEN', ticker__iexact=symbol).first()
+        shadow_trade = shadow_by_symbol.get(symbol) if shadow_mode else None
+
+        if shadow_mode and shadow_trade:
+            should_sell = _update_open_trade(shadow_trade, price, signal)
+            if should_sell:
+                shadow_trade.status = 'CLOSED'
+                shadow_trade.exit_price = price
+                shadow_trade.exit_date = timezone.now()
+                shadow_trade.pnl = float(price - float(shadow_trade.entry_price)) * float(shadow_trade.quantity)
+                shadow_trade.outcome = 'WIN' if float(shadow_trade.pnl or 0) > 0 else 'LOSS'
+                shadow_trade.save(update_fields=['status', 'exit_price', 'exit_date', 'pnl', 'outcome'])
+                closed += 1
+            continue
 
         if existing_pos and open_trade:
             should_sell = _update_open_trade(open_trade, price, signal)
@@ -4632,8 +5430,16 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
                 qty = int(abs(_alpaca_position_qty(existing_pos)))
                 if qty <= 0:
                     continue
-                order = submit_market_order(symbol, qty, 'sell')
+                if use_limit_orders and price:
+                    order = submit_limit_order(symbol, qty, 'sell', max(0.01, price - limit_offset))
+                else:
+                    order = submit_market_order(symbol, qty, 'sell')
                 if order is None:
+                    _send_telegram_alert(
+                        f"⚠️ Order sell failed {symbol} qty {qty} (Alpaca)",
+                        allow_during_blackout=True,
+                        category='order_error',
+                    )
                     continue
                 open_trade.broker_order_id = str(getattr(order, 'id', '') or '')
                 open_trade.broker_status = str(getattr(order, 'status', '') or '')
@@ -4647,8 +5453,16 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
             qty = int(abs(_alpaca_position_qty(existing_pos)))
             if qty <= 0:
                 continue
-            order = submit_market_order(symbol, qty, 'sell')
+            if use_limit_orders and price:
+                order = submit_limit_order(symbol, qty, 'sell', max(0.01, price - limit_offset))
+            else:
+                order = submit_market_order(symbol, qty, 'sell')
             if order is None:
+                _send_telegram_alert(
+                    f"⚠️ Order sell failed {symbol} qty {qty} (Alpaca)",
+                    allow_during_blackout=True,
+                    category='order_error',
+                )
                 continue
             if open_trade:
                 open_trade.broker_order_id = str(getattr(order, 'id', '') or '')
@@ -4667,20 +5481,84 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
         frame = _alpaca_fusion(symbol)
         tier, tier_reasons = _classify_tier(frame, signal_payload or {})
 
+        reentry_size_factor = 1.0
+        reentry_stop_minutes = int(os.getenv('REENTRY_STOPLOSS_WINDOW_MINUTES', '120'))
+        reentry_stop_min_signal = float(os.getenv('REENTRY_STOPLOSS_MIN_SIGNAL', '0.8'))
+        if reentry_stop_minutes > 0:
+            cutoff = timezone.now() - timedelta(minutes=reentry_stop_minutes)
+            recent_stop = PaperTrade.objects.filter(
+                ticker__iexact=symbol,
+                sandbox=sandbox,
+                status='CLOSED',
+                outcome='LOSS',
+                exit_date__gte=cutoff,
+                notes__icontains='Stop Loss',
+            ).exists()
+            if recent_stop and signal >= reentry_stop_min_signal:
+                reentry_size_factor = float(os.getenv('REENTRY_STOPLOSS_SIZE_FACTOR', '0.75'))
+        if reentry_candidate:
+            reentry_size_factor = float(os.getenv('REENTRY_STOPLOSS_SIZE_FACTOR', '0.75'))
+
         position_cap = buying_power * position_cap_pct
         risk_budget = buying_power * risk_pct
         allocation = _risk_manager_allocation(float(signal) * 100, None, price, None)
         position_value = min(position_cap, risk_budget, allocation) * regime_risk_factor
+        kelly_frac = _kelly_fraction(sandbox)
+        if kelly_frac > 0:
+            position_value = min(position_value, buying_power * kelly_frac)
+        position_value *= _multi_model_boost(symbol, float(signal or 0), universe, True)
+        position_value *= reentry_size_factor
         if tier == 'T1':
             position_value *= tier1_size_mult
         elif tier == 'T3':
             position_value *= tier3_size_mult
         qty = int(position_value / price) if price else 0
         if qty <= 0:
+            _send_telegram_alert(
+                f"⚠️ Qty=0 {symbol} (buying power insuffisant)",
+                allow_during_blackout=True,
+                category='order_error',
+            )
             continue
 
-        order = submit_market_order(symbol, qty, 'buy')
+        if shadow_mode:
+            PaperTrade.objects.create(
+                ticker=symbol,
+                sandbox=sandbox,
+                entry_price=round(price, 2),
+                quantity=qty,
+                entry_signal=signal,
+                entry_features={
+                    **((signal_payload or {}).get('features') or {}),
+                    'tier': tier,
+                    'tier_reasons': tier_reasons,
+                    'alpaca_high_water': price,
+                },
+                entry_explanations=(signal_payload or {}).get('explanations'),
+                model_name=(signal_payload or {}).get('model_name', universe),
+                model_version=(signal_payload or {}).get('model_version', ''),
+                broker='SHADOW',
+                broker_status='SHADOW',
+                broker_side='BUY',
+                broker_updated_at=timezone.now(),
+                stop_loss=round(price * 0.96, 2),
+                status='OPEN',
+                pnl=0,
+                notes=f"shadow | tier {tier}",
+            )
+            created += 1
+            continue
+
+        if use_limit_orders:
+            order = submit_limit_order(symbol, qty, 'buy', price + limit_offset)
+        else:
+            order = submit_market_order(symbol, qty, 'buy')
         if order is None:
+            _send_telegram_alert(
+                f"⚠️ Order buy failed {symbol} qty {qty} (Alpaca)",
+                allow_during_blackout=True,
+                category='order_error',
+            )
             continue
 
         notes = _gemini_trade_reason(symbol, signal_payload) if allow_gemini else None
@@ -4709,6 +5587,14 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
             pnl=0,
             notes=(notes or '') + f" | tier {tier}",
         )
+        if os.getenv('TRADE_REASON_ALERTS', 'false').lower() in {'1', 'true', 'yes', 'y'}:
+            reason = (signal_payload or {}).get('explanations') or []
+            AlertEvent.objects.create(
+                category='TRADE_REASON',
+                message=f"{symbol} entry: {reason}",
+                stock=Stock.objects.filter(symbol__iexact=symbol).first(),
+            )
+        _decision_log(symbol, sandbox, 'BUY', 'alpaca_order', float(signal))
         created += 1
 
     return {
@@ -5103,6 +5989,212 @@ def scan_market_for_opportunities(min_score: float | None = None) -> dict[str, A
         return payload
     except Exception:
         return payload
+
+
+@shared_task
+def premarket_deep_scan() -> dict[str, Any]:
+    screener_ids = [
+        s.strip()
+        for s in os.getenv('PREMARKET_SCREENERS', 'day_gainers,day_losers,most_actives').split(',')
+        if s.strip()
+    ]
+    min_price = float(os.getenv('PREMARKET_MIN_PRICE', '0.5'))
+    max_price = float(os.getenv('PREMARKET_MAX_PRICE', '250'))
+    min_volume = float(os.getenv('PREMARKET_MIN_VOLUME', '250000'))
+    spread_limit = float(os.getenv('PREMARKET_MAX_SPREAD_PCT', '0.015'))
+    limit = int(os.getenv('PREMARKET_LIMIT', '200'))
+
+    quotes = _fetch_yfinance_screeners(screener_ids, count=limit)
+    candidates: list[dict[str, Any]] = []
+    for item in quotes:
+        symbol = (item.get('symbol') or '').strip().upper()
+        if not symbol:
+            continue
+        price = item.get('regularMarketPrice') or item.get('price') or item.get('lastPrice')
+        volume = item.get('regularMarketVolume') or item.get('volume') or 0
+        try:
+            price = float(price)
+        except Exception:
+            price = None
+        try:
+            volume = float(volume)
+        except Exception:
+            volume = 0
+        if price is None or price <= 0:
+            continue
+        if not (min_price <= price <= max_price):
+            continue
+        if volume < min_volume:
+            continue
+        spread_pct = _bid_ask_spread_pct(symbol)
+        if spread_pct is not None and spread_pct > spread_limit:
+            continue
+        candidates.append({
+            'symbol': symbol,
+            'price': price,
+            'volume': int(volume),
+        })
+
+    cache.set('premarket_candidates', candidates, timeout=60 * 60 * 3)
+    _system_log('SYSTEM', 'SUCCESS', f'Premarket scan: {len(candidates)} candidates', metadata={'count': len(candidates)})
+    return {'count': len(candidates), 'candidates': candidates}
+
+
+@shared_task
+def premarket_ai_prediction() -> dict[str, Any]:
+    candidates = cache.get('premarket_candidates') or []
+    if not candidates:
+        return {'status': 'empty', 'count': 0}
+
+    min_score = float(os.getenv('PREMARKET_MIN_SCORE', '0.65'))
+    penny_max = float(os.getenv('AI_PENNY_MAX_PRICE', '15'))
+    predictions: list[dict[str, Any]] = []
+
+    for item in candidates:
+        symbol = (item.get('symbol') or '').strip().upper()
+        price = item.get('price')
+        if not symbol:
+            continue
+        universe = 'PENNY' if price is not None and float(price) <= penny_max else 'BLUECHIP'
+        payload = _model_signal(symbol, universe, get_model_path(universe), use_alpaca=False)
+        score = float(payload.get('signal') or 0.0) if payload else 0.0
+        if score < min_score:
+            continue
+        entry = {
+            'symbol': symbol,
+            'score': round(score, 4),
+            'price': price,
+            'universe': universe,
+            'features': (payload or {}).get('features') or {},
+        }
+        predictions.append(entry)
+        _system_log(
+            'AI_PENNY' if universe == 'PENNY' else 'AI_BLUECHIP',
+            'INFO',
+            f'{symbol} score {score:.4f}',
+            symbol=symbol,
+            metadata={'score': score, 'universe': universe},
+        )
+        _prediction_log(symbol, universe, score)
+
+    predictions.sort(key=lambda x: x.get('score', 0), reverse=True)
+    cache.set('premarket_predictions', predictions, timeout=60 * 60 * 3)
+    return {'count': len(predictions), 'predictions': predictions[:25]}
+
+
+@shared_task
+def send_match_plan_report() -> dict[str, Any]:
+    today_key = _ny_time_now().strftime('%Y%m%d')
+    sent_key = f'match_plan_sent:{today_key}'
+    if cache.get(sent_key):
+        return {'status': 'skipped', 'reason': 'already_sent'}
+
+    predictions = cache.get('premarket_predictions') or []
+    if not predictions:
+        _system_log('SYSTEM', 'WARNING', 'Match plan skipped: no predictions')
+        return {'status': 'empty'}
+
+    min_score = float(os.getenv('PLAN_MIN_SCORE', '0.75'))
+    limit = int(os.getenv('PLAN_MAX_TICKERS', '5'))
+    atr_mult = float(os.getenv('PLAN_ATR_MULT', '1.5'))
+    stop_pct = float(os.getenv('PLAN_STOP_PCT', '0.03'))
+
+    selected = [p for p in predictions if float(p.get('score') or 0) >= min_score][:limit]
+    if not selected:
+        _system_log('SYSTEM', 'WARNING', 'Match plan skipped: no candidates above threshold')
+        return {'status': 'empty'}
+
+    lines = [f"🚀 **PLAN DE MATCH - {timezone.now().strftime('%Y-%m-%d')}**"]
+    plan_payload: list[dict[str, Any]] = []
+    for item in selected:
+        symbol = item['symbol']
+        universe = item.get('universe') or 'BLUECHIP'
+        score = float(item.get('score') or 0)
+        price = _latest_price_snapshot(symbol) or item.get('price')
+        if price is None:
+            continue
+        atr = _atr(symbol)
+        stop_distance = max((atr_mult * atr) if atr else 0.0, price * stop_pct)
+        stop_loss = max(0.01, price - stop_distance)
+        targets = [round(price * 1.05, 4), round(price * 1.10, 4), round(price * 1.20, 4)]
+        trade_type = 'SWING/LONG' if universe == 'BLUECHIP' else 'DAY TRADE'
+
+        plan_payload.append({
+            'symbol': symbol,
+            'trade_type': trade_type,
+            'score': score,
+            'entry_price': round(price, 4),
+            'targets': targets,
+            'stop_loss': round(stop_loss, 4),
+        })
+        lines.append(
+            "\n━━━━━━━━━━━━━━━\n"
+            f"📈 **SYMBOLE : {symbol}**\n"
+            f"🎯 Type : {trade_type} (IA: {score:.2f})\n"
+            f"💰 Entrée : {price:.4f}$\n"
+            f"✅ Objectifs : {targets[0]:.4f} / {targets[1]:.4f} / {targets[2]:.4f}\n"
+            f"🛡️ Stop Loss : {stop_loss:.4f}$"
+        )
+
+    message = "\n".join(lines) + "\n\n⚠️ *Gérez votre risque. Ordres Bracket recommandés.*"
+    _send_telegram_message(message)
+    cache.set(sent_key, True, timeout=60 * 60 * 24)
+    _system_log('TELEGRAM', 'SUCCESS', f'Match plan sent ({len(plan_payload)} items)', metadata={'count': len(plan_payload)})
+    return {'status': 'sent', 'count': len(plan_payload), 'plan': plan_payload}
+
+
+@shared_task
+def cleanup_system_logs() -> dict[str, Any]:
+    days = int(os.getenv('SYSTEM_LOG_RETENTION_DAYS', '30'))
+    cutoff = timezone.now() - timedelta(days=days)
+    deleted, _ = SystemLog.objects.filter(timestamp__lt=cutoff).delete()
+    return {'deleted': deleted}
+
+
+@shared_task
+def task_crypto_scan() -> dict[str, Any]:
+    enabled = os.getenv('CRYPTO_SCAN_ENABLED', 'true').lower() in {'1', 'true', 'yes', 'y'}
+    if not enabled:
+        return {'status': 'disabled'}
+
+    results = scan_crypto_drip()
+    min_score = float(os.getenv('CRYPTO_MIN_SCORE_ALERT', '0.8'))
+    target_pct = float(os.getenv('CRYPTO_TARGET_PCT', '0.025'))
+    oversold_threshold = float(os.getenv('CRYPTO_RSI_OVERSOLD', '25'))
+    chat_id = os.getenv('TELEGRAM_CRYPTO_CHAT_ID') or os.getenv('TELEGRAM_CHAT_ID')
+
+    alerts = []
+    for item in results:
+        symbol = item.get('symbol')
+        if not symbol:
+            continue
+        score = item.get('score')
+        rsi_val = float(item.get('rsi') or 0.0)
+        if item.get('blocked'):
+            _system_log('AI_CRYPTO', 'WARNING', f'{symbol} blocked (BTC panic)', symbol=symbol)
+            continue
+        if not item.get('drip'):
+            continue
+        if rsi_val > oversold_threshold:
+            continue
+        if score is None or float(score) < min_score:
+            _system_log('AI_CRYPTO', 'INFO', f'{symbol} drip but score low', symbol=symbol, metadata={'score': score})
+            continue
+        price = float(item.get('price') or 0.0)
+        target = price * (1 + target_pct)
+        stop = price * (1 - max(0.005, target_pct / 2))
+        message = (
+            f"⚡ **CRYPTO DRIP** {symbol}\n"
+            f"Score: {float(score):.2f} | RSI: {rsi_val:.1f}\n"
+            f"Entrée: {price:.4f}$\n"
+            f"Target: {target:.4f}$ (+{target_pct * 100:.1f}%)\n"
+            f"Stop: {stop:.4f}$"
+        )
+        _send_telegram_message(message, chat_id=chat_id)
+        _system_log('AI_CRYPTO', 'SUCCESS', f'{symbol} alert sent', symbol=symbol, metadata={'score': score})
+        alerts.append({'symbol': symbol, 'score': score, 'price': price})
+
+    return {'status': 'ok', 'alerts': alerts, 'count': len(alerts)}
 
 
 @shared_task
@@ -6027,6 +7119,8 @@ def retrain_from_paper_trades_daily(sandbox_override: str | None = None) -> dict
             .exclude(exit_date__isnull=True)
             .order_by('entry_date')
         )
+        if os.getenv('PAPER_TRADE_ONLY_WINNERS', 'false').lower() in {'1', 'true', 'yes', 'y'}:
+            trades = trades.filter(outcome='WIN')
         if not trades.exists():
             return {'sandbox': selected_sandbox, 'status': 'no_trades', 'samples': 0}
 
@@ -9280,3 +10374,63 @@ def generate_penny_signals(days: int = 7) -> dict[str, int]:
             created += 1
 
     return {'created': created, 'seen': seen}
+
+
+@shared_task
+def scan_long_goal_candidates(limit: int = 15) -> dict[str, Any]:
+    """Scan bluechips for long-goal discounts (weekly RSI < 30 + earnings growth + below MA200)."""
+    log = _task_log_start('scan_long_goal_candidates')
+    symbols = [
+        s.strip().upper()
+        for s in os.getenv('LONG_GOAL_SYMBOLS', 'AAPL,AMZN,MSFT,NVDA,TD.TO,CNQ.TO,RY.TO,ENB.TO').split(',')
+        if s.strip()
+    ]
+    results: list[dict[str, Any]] = []
+    for symbol in symbols:
+        try:
+            weekly = yf.Ticker(symbol).history(period='2y', interval='1wk', timeout=10)
+            if weekly is None or weekly.empty or 'Close' not in weekly:
+                continue
+            close = weekly['Close']
+            delta = close.diff().fillna(0.0)
+            gain = delta.clip(lower=0).rolling(14).mean()
+            loss = (-delta.clip(upper=0)).rolling(14).mean()
+            rs = gain / loss.replace(0, pd.NA)
+            rsi = 100 - (100 / (1 + rs))
+            rsi_val = float(rsi.iloc[-1]) if len(rsi) else 0.0
+            if rsi_val >= 30:
+                continue
+
+            daily = yf.Ticker(symbol).history(period='1y', interval='1d', timeout=10)
+            if daily is None or daily.empty or 'Close' not in daily:
+                continue
+            ma200 = daily['Close'].ewm(span=200, adjust=False).mean().iloc[-1]
+            last = float(daily['Close'].iloc[-1])
+            if not (last < ma200):
+                continue
+
+            info = yf.Ticker(symbol).info or {}
+            earnings_growth = info.get('earningsGrowth')
+            if earnings_growth is None or float(earnings_growth) <= 0:
+                continue
+
+            results.append({
+                'symbol': symbol,
+                'weekly_rsi': round(rsi_val, 2),
+                'price': round(last, 2),
+                'ma200': round(float(ma200), 2),
+                'earnings_growth': float(earnings_growth),
+            })
+        except Exception:
+            continue
+    results = sorted(results, key=lambda x: x['weekly_rsi'])[:limit]
+    if results and os.getenv('LONG_GOAL_NOTIFY', 'false').lower() in {'1', 'true', 'yes', 'y'}:
+        lines = ["🏁 Long Goal Candidates", ""]
+        for row in results:
+            lines.append(
+                f"{row['symbol']}: RSIw {row['weekly_rsi']}, Price {row['price']} < MA200 {row['ma200']}"
+            )
+        _send_telegram_alert("\n".join(lines), allow_during_blackout=True, category='report')
+    payload = {'status': 'ok', 'count': len(results), 'results': results}
+    _task_log_finish(log, 'SUCCESS', payload)
+    return payload

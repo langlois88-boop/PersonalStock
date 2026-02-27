@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 import joblib
 import numpy as np
@@ -69,6 +70,25 @@ def _compute_intraday_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns={'timestamp': 'timestamp'})
     df['log_return'] = np.log(df['close'] / df['close'].shift(1)).replace([np.inf, -np.inf], 0).fillna(0)
     df['price_z'] = _zscore(df['close'])
+    try:
+        ts = pd.to_datetime(df['timestamp'], errors='coerce', utc=True)
+        ts_local = ts.dt.tz_convert(ZoneInfo('America/New_York'))
+        open_start = ts_local.dt.normalize() + pd.Timedelta(hours=9, minutes=30)
+        open_end = ts_local.dt.normalize() + pd.Timedelta(hours=9, minutes=45)
+        opening_mask = (ts_local >= open_start) & (ts_local < open_end)
+        minutes_since_open = ((ts_local - open_start).dt.total_seconds() / 60).clip(lower=0)
+        is_power_hour = ((ts_local.dt.hour == 15) & (ts_local.dt.minute >= 0)).astype(float)
+        df['minutes_since_open'] = minutes_since_open.fillna(0.0)
+        df['is_power_hour'] = is_power_hour.fillna(0.0)
+    except Exception:
+        opening_mask = pd.Series([False] * len(df), index=df.index)
+        df['minutes_since_open'] = 0.0
+        df['is_power_hour'] = 0.0
+    opening_boost = float(os.getenv('OPENING_VOLUME_BOOST', '1.5'))
+    volume_boosted = df['volume'].where(~opening_mask, df['volume'] * opening_boost)
+    vol_mean = volume_boosted.rolling(20, min_periods=5).mean()
+    vol_std = volume_boosted.rolling(20, min_periods=5).std(ddof=0).replace(0, np.nan)
+    df['volume_z'] = ((volume_boosted - vol_mean) / vol_std).fillna(0.0)
     return df
 
 
@@ -123,6 +143,10 @@ def build_dataset(symbols: Iterable[str], market_symbol: str = 'QQQ', days: int 
         'rvol',
         'pattern_signal',
         'volatility',
+        'volume_z',
+        'price_to_vwap',
+        'minutes_since_open',
+        'is_power_hour',
         'market_trend',
     ]
     dataset = dataset.dropna(subset=feature_cols + ['label'])
@@ -202,13 +226,21 @@ def train_voting_ensemble(
             random_state=42,
         )
 
+    weights_raw = os.getenv('INTRADAY_ENSEMBLE_WEIGHTS', '1,2')
+    try:
+        weights = [float(x.strip()) for x in weights_raw.split(',') if x.strip()]
+        if len(weights) != 2:
+            weights = [1, 2]
+    except Exception:
+        weights = [1, 2]
+
     ensemble = VotingClassifier(
         estimators=[
             ('bluechip_expert', blue_model),
             ('penny_expert', penny_model),
         ],
         voting='soft',
-        weights=[1, 2],
+        weights=weights,
     )
 
     X_blue = blue_df[feature_cols]
@@ -248,6 +280,22 @@ def save_intraday_model(result: IntradayModelResult, name: str) -> str:
             'features': result.features,
             'scores': result.scores,
             'importances': result.importances,
+        },
+        path,
+    )
+    return path
+
+
+def export_production_model(pipeline: object, feature_cols: list[str]) -> str:
+    base = os.path.join(os.path.dirname(__file__), 'models')
+    os.makedirs(base, exist_ok=True)
+    path = os.path.join(base, 'production_model.pkl')
+    joblib.dump(
+        {
+            'model': pipeline,
+            'features': feature_cols,
+            'trained_at': datetime.now(timezone.utc).isoformat(),
+            'scaler_type': 'RobustScaler',
         },
         path,
     )

@@ -1,3 +1,4 @@
+import os
 from typing import Dict, List
 
 import numpy as np
@@ -16,16 +17,28 @@ def generate_recommendations(symbols: List[str], model_path: str) -> List[Dict[s
     payload = load_model_payload(model_path)
     model = payload.get("model")
     feature_list = payload.get("features") or FEATURE_COLUMNS
+    debug = os.getenv('RECOMMENDER_DEBUG', 'true').lower() in {'1', 'true', 'yes', 'y'}
 
     results = []
+    if debug:
+        print(f"\n--- SCANNER START ({len(symbols)} tickers) ---")
     for symbol in symbols:
         features = merger.merge(symbol)
         if not features:
+            if debug:
+                print(f"❌ {symbol}: Aucune donnée (Merger vide)")
             continue
         vector = build_feature_vector(features, feature_list)
+        if np.all(vector == 0):
+            if debug:
+                print(f"⚠️ {symbol}: Vecteur nul (Problème de données techniques)")
+            continue
         if hasattr(model, "predict_proba"):
             score = float(model.predict_proba([vector])[0][1])
             recommendation = "BUY" if score >= 0.7 else "HOLD"
+            if debug:
+                status_icon = "✅" if recommendation == "BUY" else "⏳"
+                print(f"{status_icon} {symbol}: Score={score:.4f} | Recommandation: {recommendation}")
             results.append({
                 "symbol": symbol,
                 "prob_up_15d": round(score, 4),
@@ -35,6 +48,8 @@ def generate_recommendations(symbols: List[str], model_path: str) -> List[Dict[s
         else:
             pred = float(model.predict([vector])[0])
             recommendation = "BUY" if pred >= 0.02 else "HOLD"
+            if debug:
+                print(f"📊 {symbol}: Prédiction retour={pred:.2%}")
             results.append({
                 "symbol": symbol,
                 "predicted_20d_return": round(pred, 4),

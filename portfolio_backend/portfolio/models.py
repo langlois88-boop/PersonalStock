@@ -83,6 +83,7 @@ class PaperTrade(models.Model):
 	BROKER_CHOICES = (
 		('SIM', 'SIM'),
 		('ALPACA', 'ALPACA'),
+		('SHADOW', 'SHADOW'),
 	)
 	SANDBOX_CHOICES = (
 		('WATCHLIST', 'WATCHLIST'),
@@ -249,6 +250,40 @@ class TaskRunLog(models.Model):
 
 	def __str__(self) -> str:
 		return f"{self.task_name} {self.status}"
+
+
+class SystemLog(models.Model):
+	CATEGORY_CHOICES = (
+		('AI_PENNY', 'IA Penny'),
+		('AI_BLUECHIP', 'IA Bluechip'),
+		('AI_CRYPTO', 'IA Crypto'),
+		('PAPER_TRADE', 'Paper Trade'),
+		('SYSTEM', 'System'),
+		('TELEGRAM', 'Telegram'),
+	)
+	LEVEL_CHOICES = (
+		('INFO', 'INFO'),
+		('SUCCESS', 'SUCCESS'),
+		('WARNING', 'WARNING'),
+		('ERROR', 'ERROR'),
+	)
+
+	timestamp = models.DateTimeField(auto_now_add=True, db_index=True)
+	category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, db_index=True)
+	level = models.CharField(max_length=10, choices=LEVEL_CHOICES, db_index=True)
+	symbol = models.CharField(max_length=20, null=True, blank=True, db_index=True)
+	message = models.TextField()
+	metadata = models.JSONField(null=True, blank=True)
+
+	class Meta:
+		ordering = ['-timestamp']
+		indexes = [
+			models.Index(fields=['category', 'timestamp'], name='systemlog_cat_ts'),
+			models.Index(fields=['level', 'timestamp'], name='systemlog_lvl_ts'),
+		]
+
+	def __str__(self) -> str:
+		return f"{self.category} {self.level} {self.symbol or ''}".strip()
 
 
 class DataQADaily(models.Model):

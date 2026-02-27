@@ -16,6 +16,7 @@ from django.conf import settings
 from django.db.utils import OperationalError
 from django.db.models import Prefetch
 from django.utils import timezone
+from django.shortcuts import render
 import finnhub
 from . import market_data as yf
 import numpy as np
@@ -65,6 +66,7 @@ from .models import (
 	ModelEvaluationDaily,
 	ModelRegistry,
 	TaskRunLog,
+	SystemLog,
 	DataQADaily,
 	ModelCalibrationDaily,
 	ModelDriftDaily,
@@ -7641,3 +7643,46 @@ class PortfolioCsvImportView(APIView):
 			'skipped_rows': skipped_rows,
 			'errors': errors,
 		})
+
+
+class SystemLogPageView(APIView):
+	def get(self, request):
+		return render(request, 'portfolio/logs.html')
+
+
+class SystemLogDataView(APIView):
+	def get(self, request):
+		category = (request.query_params.get('category') or '').strip().upper()
+		level = (request.query_params.get('level') or '').strip().upper()
+		symbol = (request.query_params.get('symbol') or '').strip().upper()
+		errors_only = (request.query_params.get('errors_only') or '').strip().lower() in {'1', 'true', 'yes', 'y'}
+		limit = int(request.query_params.get('limit') or 200)
+
+		qs = SystemLog.objects.all()
+		if category:
+			qs = qs.filter(category=category)
+			if category not in dict(SystemLog.CATEGORY_CHOICES):
+				qs = SystemLog.objects.all()
+		if level:
+			qs = qs.filter(level=level)
+			if level not in dict(SystemLog.LEVEL_CHOICES):
+				qs = SystemLog.objects.all()
+		if symbol:
+			qs = qs.filter(symbol__icontains=symbol)
+		if errors_only:
+			qs = qs.filter(level='ERROR')
+
+		logs = qs.order_by('-timestamp')[:max(1, min(limit, 1000))]
+		data = [
+			{
+				'id': item.id,
+				'timestamp': item.timestamp.isoformat(),
+				'category': item.category,
+				'level': item.level,
+				'symbol': item.symbol,
+				'message': item.message,
+				'metadata': item.metadata or {},
+			}
+			for item in logs
+		]
+		return Response({'count': len(data), 'results': data})

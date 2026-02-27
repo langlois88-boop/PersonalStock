@@ -19,6 +19,7 @@ from sklearn.pipeline import make_pipeline
 MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_v1.pkl"
 BLUECHIP_MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_bluechip_v1.pkl"
 PENNY_MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_penny_v1.pkl"
+CRYPTO_MODEL_PATH = Path(__file__).resolve().parent / "crypto_brain_v1.pkl"
 FEATURE_COLUMNS = [
     "MA20",
     "MA50",
@@ -54,6 +55,14 @@ FEATURE_COLUMNS = [
     "tsx_corr_60",
     "bid_ask_spread_pct",
 ]
+CRYPTO_FEATURE_COLUMNS = [
+    "return_1",
+    "rsi_14",
+    "rubber_band_index",
+    "price_to_vwap",
+    "volatility_spike",
+    "btc_correlation",
+]
 
 TRIPLE_BARRIER_UP_PCT = float(os.getenv("TRIPLE_BARRIER_UP_PCT", "0.05"))
 TRIPLE_BARRIER_DOWN_PCT = float(os.getenv("TRIPLE_BARRIER_DOWN_PCT", "0.03"))
@@ -67,6 +76,7 @@ PENNY_TRIPLE_BARRIER_MAX_DAYS = int(os.getenv("PENNY_TRIPLE_BARRIER_MAX_DAYS", "
 TIME_SERIES_SPLITS = int(os.getenv("TIME_SERIES_SPLITS", "4"))
 TX_COST_PCT = float(os.getenv("BACKTEST_TX_COST_PCT", "0.002"))
 SLIPPAGE_PCT = float(os.getenv("BACKTEST_SLIPPAGE_PCT", "0.001"))
+FIXED_COST_PER_SHARE = float(os.getenv("BACKTEST_FIXED_COST_PER_SHARE", "0.01"))
 MONTE_CARLO_RUNS = int(os.getenv("BACKTEST_MONTE_CARLO_RUNS", "1000"))
 RUIN_THRESHOLD_PCT = float(os.getenv("BACKTEST_RUIN_THRESHOLD_PCT", "0.6"))
 
@@ -77,7 +87,16 @@ def get_model_path(universe: str | None = None) -> Path:
         return Path(os.getenv('PENNY_MODEL_PATH', str(PENNY_MODEL_PATH)))
     if universe_key in {'AI_BLUECHIP', 'BLUECHIP', 'BLUE_CHIP', 'BLUE'}:
         return Path(os.getenv('BLUECHIP_MODEL_PATH', str(BLUECHIP_MODEL_PATH)))
+    if universe_key in {'AI_CRYPTO', 'CRYPTO', 'CRYPTO_ASSET', 'CRYPTO_ASSETS'}:
+        return Path(os.getenv('CRYPTO_MODEL_PATH', str(CRYPTO_MODEL_PATH)))
     return Path(os.getenv('BLUECHIP_MODEL_PATH', str(BLUECHIP_MODEL_PATH)))
+
+
+def get_feature_columns(universe: str | None = None) -> list[str]:
+    universe_key = (universe or '').strip().upper()
+    if universe_key in {'AI_CRYPTO', 'CRYPTO', 'CRYPTO_ASSET', 'CRYPTO_ASSETS'}:
+        return CRYPTO_FEATURE_COLUMNS
+    return FEATURE_COLUMNS
 
 
 def _new_model_version() -> str:
@@ -195,9 +214,10 @@ def apply_feature_weighting_to_signal(
     return _apply_feature_weighting(signal, row, weights, stats)
 
 
-def _ensure_features(df: pd.DataFrame) -> pd.DataFrame:
+def _ensure_features(df: pd.DataFrame, feature_columns: list[str] | None = None) -> pd.DataFrame:
     data = df.copy()
-    for col in FEATURE_COLUMNS:
+    feature_columns = feature_columns or FEATURE_COLUMNS
+    for col in feature_columns:
         if col not in data.columns:
             data[col] = 0.0
     if "VolumeZ" in data.columns:
@@ -316,10 +336,13 @@ def _infer_universe(model_path: Path | None = None) -> str | None:
         resolved = model_path
     penny_path = Path(os.getenv('PENNY_MODEL_PATH', str(PENNY_MODEL_PATH)))
     blue_path = Path(os.getenv('BLUECHIP_MODEL_PATH', str(BLUECHIP_MODEL_PATH)))
+    crypto_path = Path(os.getenv('CRYPTO_MODEL_PATH', str(CRYPTO_MODEL_PATH)))
     if resolved == penny_path:
         return 'PENNY'
     if resolved == blue_path:
         return 'BLUECHIP'
+    if resolved == crypto_path:
+        return 'CRYPTO'
     return None
 
 
@@ -346,12 +369,13 @@ def _select_features(X_df: pd.DataFrame, y: np.ndarray) -> list[str]:
 
 
 def _build_training_set(df: pd.DataFrame, universe: str | None = None) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    data = _ensure_features(df)
+    feature_cols = get_feature_columns(universe)
+    data = _ensure_features(df, feature_columns=feature_cols)
     data = data.dropna(subset=["Returns"])
     if data.empty:
         return np.array([]), np.array([]), []
 
-    X_df = data[FEATURE_COLUMNS].fillna(0)
+    X_df = data[feature_cols].fillna(0)
     atr_pct = None
     if "Close" in data.columns and "High" in data.columns and "Low" in data.columns:
         atr_pct = _atr_pct_series(data["Close"], data.get("High"), data.get("Low"))
@@ -567,11 +591,13 @@ class AIBacktester:
         entry_price = None
         highest_price = None
         position_weight = 0.0
+        position_shares = 0.0
         capital = self.initial_balance
         equity_curve = [1.0]
         cost_pct = (tx_cost_pct if tx_cost_pct is not None else TX_COST_PCT) + (
             slippage_pct if slippage_pct is not None else SLIPPAGE_PCT
         )
+        fixed_cost = FIXED_COST_PER_SHARE
 
         for idx in range(1, len(df)):
             row = df.iloc[idx]
@@ -605,8 +631,9 @@ class AIBacktester:
                 position_cap = capital * position_cap_pct
                 position_value = min(capital, position_cap, risk_budget / (stop_distance / entry_price))
                 position_weight = position_value / capital if capital else 0.0
+                position_shares = position_value / entry_price if entry_price else 0.0
                 if position_value > 0:
-                    capital -= position_value * cost_pct
+                    capital -= (position_value * cost_pct) + (position_shares * fixed_cost)
             elif prev_pos == 1:
                 if price is not None and highest_price is not None:
                     highest_price = max(highest_price, price)
@@ -618,7 +645,8 @@ class AIBacktester:
                     entry_price = None
                     highest_price = None
                     position_weight = 0.0
-                    capital -= capital * cost_pct
+                    capital -= (capital * cost_pct) + (position_shares * fixed_cost)
+                    position_shares = 0.0
 
             df.iloc[idx, df.columns.get_loc("position")] = pos
 
