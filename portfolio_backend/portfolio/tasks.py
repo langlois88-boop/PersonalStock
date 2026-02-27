@@ -10231,7 +10231,8 @@ def monitor_hive_trade() -> dict[str, Any]:
         close_15m = _extract_close_series(intraday)
         rsi_15m = _compute_rsi(close_15m, 14) if close_15m is not None and not close_15m.empty else None
         rsi_key = _cache_key(symbol, 'rsi')
-        if filled and rsi_15m is not None and rsi_15m >= rsi_sell and not cache.get(rsi_key, False):
+        rsi_alerts_enabled = os.getenv('HIVE_RSI_ALERTS', 'false').lower() in {'1', 'true', 'yes', 'y'}
+        if rsi_alerts_enabled and filled and rsi_15m is not None and rsi_15m >= rsi_sell and not cache.get(rsi_key, False):
             cache.set(rsi_key, True, timeout=60 * 60 * 8)
             _send_hive_alert(
                 'HIVE_RSI_HOT',
