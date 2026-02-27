@@ -1056,9 +1056,6 @@ def _afterhours_market_scan(symbols: list[str] | None = None) -> dict[str, Any]:
                 continue
             last_close = float(close.iloc[-1])
             prev_close = float(close.iloc[-2])
-        from uuid import uuid4
-
-
             if last_close <= 0 or prev_close <= 0:
                 continue
             if not (min_price <= last_close <= max_price):
@@ -1070,7 +1067,6 @@ def _afterhours_market_scan(symbols: list[str] | None = None) -> dict[str, Any]:
                 continue
             last_vol = float(volume.iloc[-1])
             avg_vol = float(volume.tail(20).mean()) if len(volume) >= 5 else float(volume.mean())
-            'reply_markup': reply_markup,
             if last_vol < min_volume or avg_vol <= 0:
                 continue
             rvol = last_vol / avg_vol
