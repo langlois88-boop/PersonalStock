@@ -28,17 +28,20 @@ const api = axios.create({ baseURL: apiBaseUrl, timeout: 30000 });
 api.interceptors.response.use(
 	(response) => response,
 	(error) => {
+		const suppress = error?.config?.meta?.suppressErrorReport;
 		const status = error?.response?.status;
 		const url = error?.config?.url;
 		const method = error?.config?.method;
 		const message = error?.response?.data?.error || error?.message || 'Request failed';
-		pushApiError({
-			status,
-			url,
-			method,
-			message,
-			timestamp: new Date().toISOString(),
-		});
+		if (!suppress) {
+			pushApiError({
+				status,
+				url,
+				method,
+				message,
+				timestamp: new Date().toISOString(),
+			});
+		}
 		return Promise.reject(error);
 	}
 );

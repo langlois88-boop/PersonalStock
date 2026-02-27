@@ -67,6 +67,7 @@ from .views import (
     TradingDiagnosticView,
     SystemLogPageView,
     SystemLogDataView,
+    TelegramWebhookView,
 )
 
 router = routers.DefaultRouter()
@@ -132,6 +133,7 @@ urlpatterns = [
     path('sector-compare/', SectorTrendCompareView.as_view()),
     path('forecast/', ForecastView.as_view()),
     path('health/', HealthCheckView.as_view()),
+    path('telegram/webhook/', TelegramWebhookView.as_view()),
     path('trading/diagnostics/', TradingDiagnosticView.as_view()),
     path('logs/', SystemLogPageView.as_view()),
     path('logs/data/', SystemLogDataView.as_view()),

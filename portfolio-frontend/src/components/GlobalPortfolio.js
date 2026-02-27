@@ -32,6 +32,7 @@ const StatCard = ({ title, value, subtitle, accent }) => (
 );
 
 const CHART_RANGES = [
+  { key: '1D', label: '1D', days: 1 },
   { key: '1M', label: '1M', days: 30 },
   { key: '3M', label: '3M', days: 90 },
   { key: '6M', label: '6M', days: 180 },
@@ -92,18 +93,42 @@ function GlobalPortfolio() {
     saveWatchlist(watchlistItems.filter((item) => item !== symbol));
   };
 
-  useEffect(() => {
+  const loadNews = (overrideSymbol) => {
+    const symbol = overrideSymbol || newsSymbol;
+    setNewsLoading(true);
+    const params = symbol !== 'ALL'
+      ? { symbol, limit: 12, sector_limit: 12, sentiment_limit: 12 }
+      : { limit: 12, sector_limit: 12, sentiment_limit: 12 };
+    api
+      .get('dashboard/news/', { params })
+      .then((res) => setNews(res.data || { holdings: [], sectors_news: [], sentiment: { positive: [], negative: [] } }))
+      .catch(() => setNews({ holdings: [], sectors_news: [], sentiment: { positive: [], negative: [] } }))
+      .finally(() => setNewsLoading(false));
+  };
+
+  const loadPortfolio = (intraday) => {
     setLoading(true);
     setError('');
     api
-      .get('dashboard/portfolio/')
+      .get('dashboard/portfolio/', { params: intraday ? { intraday: 1 } : {} })
       .then((res) => setData(res.data))
       .catch(() => {
         setError("Impossible de charger le portefeuille.");
         setData(emptyState);
       })
       .finally(() => setLoading(false));
-  }, []);
+  };
+
+  useEffect(() => {
+    loadPortfolio(chartRange === '1D');
+    let interval;
+    if (chartRange === '1D') {
+      interval = setInterval(() => loadPortfolio(true), 60000);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [chartRange]);
 
   useEffect(() => {
     let isMounted = true;
@@ -183,16 +208,13 @@ function GlobalPortfolio() {
   }, []);
 
   useEffect(() => {
-    setNewsLoading(true);
-    const params = newsSymbol !== 'ALL'
-      ? { symbol: newsSymbol, limit: 12, sector_limit: 12, sentiment_limit: 12 }
-      : { limit: 12, sector_limit: 12, sentiment_limit: 12 };
-    api
-      .get('dashboard/news/', { params })
-      .then((res) => setNews(res.data || { holdings: [], sectors_news: [], sentiment: { positive: [], negative: [] } }))
-      .catch(() => setNews({ holdings: [], sectors_news: [], sentiment: { positive: [], negative: [] } }))
-      .finally(() => setNewsLoading(false));
+    loadNews();
   }, [newsSymbol, data.holdings?.length]);
+
+  useEffect(() => {
+    const interval = setInterval(() => loadNews(), 900000);
+    return () => clearInterval(interval);
+  }, [newsSymbol]);
 
   useEffect(() => {
     setNewsVisible({ holdings: 6, sectors: 6, positive: 6, negative: 6 });
@@ -227,6 +249,9 @@ function GlobalPortfolio() {
     if (!value) return '—';
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return '—';
+    if (chartRange === '1D') {
+      return date.toLocaleTimeString('fr-CA', { hour: '2-digit', minute: '2-digit' });
+    }
     return date.toLocaleDateString('fr-CA', { month: 'short', day: 'numeric' });
   };
 
@@ -246,20 +271,22 @@ function GlobalPortfolio() {
   );
 
   const filteredChart = useMemo(() => {
-    const chart = Array.isArray(data.chart) ? data.chart : [];
-    if (!chart.length || chartRange === 'ALL') return chart;
+    const baseChart = chartRange === '1D'
+      ? (Array.isArray(data.intraday_chart) ? data.intraday_chart : [])
+      : (Array.isArray(data.chart) ? data.chart : []);
+    if (!baseChart.length || chartRange === 'ALL' || chartRange === '1D') return baseChart;
     const range = CHART_RANGES.find((item) => item.key === chartRange);
-    if (!range?.days) return chart;
-    const lastDate = new Date(chart[chart.length - 1]?.date);
-    if (Number.isNaN(lastDate.getTime())) return chart;
+    if (!range?.days) return baseChart;
+    const lastDate = new Date(baseChart[baseChart.length - 1]?.date);
+    if (Number.isNaN(lastDate.getTime())) return baseChart;
     const startDate = new Date(lastDate);
     startDate.setDate(startDate.getDate() - range.days);
-    return chart.filter((point) => {
+    return baseChart.filter((point) => {
       const date = new Date(point.date);
       if (Number.isNaN(date.getTime())) return true;
       return date >= startDate;
     });
-  }, [data.chart, chartRange]);
+  }, [data.chart, data.intraday_chart, chartRange]);
 
   const performanceSeries = useMemo(() => {
     const chart = Array.isArray(filteredChart) ? filteredChart : [];
@@ -286,20 +313,68 @@ function GlobalPortfolio() {
     return { value: diff, pct };
   }, [performanceSeries]);
 
+  const holdingsList = useMemo(() => (Array.isArray(data.holdings) ? data.holdings : []), [data.holdings]);
+
+  const zombieHoldings = useMemo(() => {
+    return holdingsList.filter((row) => Number(row.unrealized_pnl_pct ?? 0) <= -90);
+  }, [holdingsList]);
+
+  const displayHoldings = useMemo(() => {
+    const zombieSet = new Set(zombieHoldings.map((row) => row.ticker));
+    return holdingsList.filter((row) => !zombieSet.has(row.ticker));
+  }, [holdingsList, zombieHoldings]);
+
   const portfolioDividendYield = useMemo(() => {
-    const list = Array.isArray(data.holdings) ? data.holdings : [];
-    let total = 0;
-    let weighted = 0;
-    list.forEach((row) => {
-      const value = Number(row.value ?? (Number(row.price || 0) * Number(row.shares || 0)));
-      if (!Number.isFinite(value) || value <= 0) return;
-      const yieldValue = Number(row.dividend_yield || 0);
-      total += value;
-      weighted += value * (Number.isFinite(yieldValue) ? yieldValue : 0);
+    const stable = displayHoldings.filter((row) => row.category === 'Stable');
+    const compute = (rows) => {
+      let total = 0;
+      let weighted = 0;
+      rows.forEach((row) => {
+        const value = Number(row.value ?? (Number(row.price || 0) * Number(row.shares || 0)));
+        if (!Number.isFinite(value) || value <= 0) return;
+        const yieldValue = Number(row.dividend_yield || 0);
+        total += value;
+        weighted += value * (Number.isFinite(yieldValue) ? yieldValue : 0);
+      });
+      if (!total) return null;
+      return weighted / total;
+    };
+    return compute(stable) ?? compute(displayHoldings);
+  }, [displayHoldings]);
+
+  const actionRequired = useMemo(() => {
+    const items = [];
+    displayHoldings.forEach((row) => {
+      const rsi = Number(row.rsi ?? 0);
+      const unrealizedPct = Number(row.unrealized_pnl_pct ?? 0);
+      if (row.exit_strategy) {
+        items.push({
+          ticker: row.ticker,
+          title: row.exit_strategy.action || 'Action requise',
+          message: row.exit_strategy.instructions || row.exit_strategy.reason || 'Réduction recommandée.',
+          level: 'critical',
+        });
+        return;
+      }
+      if (rsi >= 70 && unrealizedPct > 0) {
+        items.push({
+          ticker: row.ticker,
+          title: 'Sécuriser profits',
+          message: `RSI ${rsi.toFixed(1)} — surchauffe.`,
+          level: 'warning',
+        });
+      }
+      if (unrealizedPct <= -20) {
+        items.push({
+          ticker: row.ticker,
+          title: 'Surveillance',
+          message: `P/L ${unrealizedPct.toFixed(2)}% — surveiller le risque.`,
+          level: 'warning',
+        });
+      }
     });
-    if (!total) return null;
-    return weighted / total;
-  }, [data.holdings]);
+    return items.slice(0, 6);
+  }, [displayHoldings]);
 
   const PerformanceTooltip = ({ active, payload, label, chartMode: mode }) => {
     if (!active || !payload || !payload.length) return null;
@@ -323,7 +398,7 @@ function GlobalPortfolio() {
   };
 
   const topHoldings = useMemo(() => {
-    const list = Array.isArray(data.holdings) ? [...data.holdings] : [];
+    const list = [...displayHoldings];
     const withValue = list.map((row) => {
       const livePrice = livePrices?.[row.ticker];
       const price = Number(livePrice ?? row.price ?? 0);
@@ -333,7 +408,7 @@ function GlobalPortfolio() {
     });
     withValue.sort((a, b) => (b._positionValue || 0) - (a._positionValue || 0));
     return withValue.slice(0, 4);
-  }, [data.holdings, livePrices]);
+  }, [displayHoldings, livePrices]);
 
   const toggleSort = (key) => {
     setSortConfig((prev) => {
@@ -511,6 +586,47 @@ function GlobalPortfolio() {
 
   return (
     <div className="space-y-6">
+      {actionRequired.length > 0 ? (
+        <div className="bg-slate-900 border-l-4 border-red-500 p-4 mb-2 rounded-r-lg shadow-xl animate-pulse">
+          <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+            <div className="flex items-center">
+              <div className="text-red-500 mr-4 text-3xl">⚠️</div>
+              <div>
+                <h3 className="text-white font-bold text-lg">ACTIONS PRIORITAIRES ({actionRequired.length})</h3>
+                <p className="text-slate-400 text-sm">Signaux critiques détectés par l'IA</p>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-3">
+              {actionRequired.map((item) => (
+                <div
+                  key={`${item.ticker}-${item.title}`}
+                  className={`border p-3 rounded-md flex flex-col items-center min-w-[180px] ${
+                    item.level === 'critical'
+                      ? 'bg-red-500/10 border-red-500'
+                      : 'bg-amber-500/10 border-amber-500'
+                  }`}
+                >
+                  <span className={`font-bold text-xs uppercase ${item.level === 'critical' ? 'text-red-500' : 'text-amber-400'}`}>
+                    {item.title}
+                  </span>
+                  <span className="text-white font-bold">{item.ticker}</span>
+                  <span className={`text-xs ${item.level === 'critical' ? 'text-red-300' : 'text-amber-300'}`}>
+                    {item.message}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/10 p-5">
+          <div className="flex items-center justify-between">
+            <p className="text-white font-semibold">✅ Repos</p>
+            <span className="text-xs text-emerald-200 uppercase tracking-[0.2em]">Aucune action urgente</span>
+          </div>
+        </div>
+      )}
+
       <UnifiedAlerts />
 
       <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
@@ -636,7 +752,7 @@ function GlobalPortfolio() {
                   <p className="text-xs text-slate-400">Depuis le sommet</p>
                 </div>
                 <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
-                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Dividend yield</p>
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Dividend yield (stable)</p>
                   <p className="text-lg font-semibold text-slate-100">
                     {portfolioDividendYield === null ? '—' : formatPct(portfolioDividendYield * 100)}
                   </p>
@@ -761,6 +877,27 @@ function GlobalPortfolio() {
           </div>
         </div>
       </div>
+
+      {zombieHoldings.length > 0 ? (
+        <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
+          <div className="flex items-center justify-between">
+            <h3 className="text-lg font-semibold text-white">🧟 Zombie / Recovery</h3>
+            <span className="text-xs text-slate-400">Tax Loss Harvesting</span>
+          </div>
+          <p className="text-xs text-slate-400 mt-2">Positions fortement négatives à isoler.</p>
+          <div className="mt-4 space-y-2">
+            {zombieHoldings.map((row) => (
+              <div key={`zombie-${row.ticker}`} className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-semibold text-slate-200">{row.ticker}</span>
+                  <span className="text-xs text-rose-300">{formatPctSigned(row.unrealized_pnl_pct)}</span>
+                </div>
+                <p className="text-xs text-slate-400">Valeur {formatMoney(row.value)} · Coût {formatMoney(row.cost_value)}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       {data.archives && data.archives.length > 0 ? (
         <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6">
@@ -1185,12 +1322,24 @@ function GlobalPortfolio() {
               className="bg-slate-950/60 border border-slate-800 text-slate-200 text-xs rounded-lg px-2 py-1"
             >
               <option value="ALL">Tous les titres</option>
-              {(data.holdings || []).map((row) => (
+              {displayHoldings.map((row) => (
                 <option key={row.ticker} value={row.ticker}>
                   {row.ticker}
                 </option>
               ))}
             </select>
+            <button
+              type="button"
+              onClick={() => loadNews()}
+              disabled={newsLoading}
+              className={`text-xs px-3 py-1 rounded-lg border ${
+                newsLoading
+                  ? 'border-slate-800 text-slate-500'
+                  : 'border-slate-700 text-slate-200 hover:border-indigo-500/50'
+              }`}
+            >
+              {newsLoading ? 'Refresh…' : 'Rafraîchir'}
+            </button>
           </div>
         </div>
 

@@ -457,6 +457,14 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.hive_opening_rebound_alert',
         'schedule': crontab(minute=35, hour=9, day_of_week='mon-fri'),
     },
+    'value-hunter-hourly': {
+        'task': 'portfolio.tasks.value_hunter_scan',
+        'schedule': crontab(minute=0, hour='9-16', day_of_week='mon-fri'),
+    },
+    'value-hunter-report-1015': {
+        'task': 'portfolio.tasks.send_value_hunter_report',
+        'schedule': crontab(minute=15, hour=10, day_of_week='mon-fri'),
+    },
     'penny-rebound-diagnostic': {
         'task': 'portfolio.tasks.send_penny_rebound_diagnostic',
         'schedule': crontab(minute=35, hour=9, day_of_week='mon-fri'),

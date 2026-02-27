@@ -71,6 +71,14 @@ from .models import (
 	ModelCalibrationDaily,
 	ModelDriftDaily,
 )
+from .tasks import (
+	reset_daily_equity_breaker,
+	_send_telegram_message,
+	_decision_journal_tail,
+	process_alpaca_trade_approval,
+	telegram_answer_callback,
+	_decision_log,
+)
 from .serializers import (
 	AccountSerializer,
 	AccountTransactionSerializer,
@@ -2254,9 +2262,49 @@ class PortfolioDashboardView(APIView):
 		except Exception:
 			return {'symbol': symbol, 'status': 'unavailable'}
 
-	def _stop_price(self, price: float) -> float | None:
+	def _atr_value(self, symbol: str, window: int = 14) -> float | None:
 		try:
-			return round(float(price) * 0.95, 4) if price else None
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				return None
+			def _col(*names: str) -> str | None:
+				for name in names:
+					if name in frame.columns:
+						return name
+				return None
+			high_col = _col('high', 'High')
+			low_col = _col('low', 'Low')
+			close_col = _col('close', 'Close')
+			if not high_col or not low_col or not close_col:
+				return None
+			high = pd.Series(frame[high_col]).astype(float)
+			low = pd.Series(frame[low_col]).astype(float)
+			close = pd.Series(frame[close_col]).astype(float)
+			prev_close = close.shift(1)
+			tr = pd.concat([
+				(high - low).abs(),
+				(high - prev_close).abs(),
+				(low - prev_close).abs(),
+			], axis=1).max(axis=1)
+			atr = tr.rolling(window=window, min_periods=max(2, window // 2)).mean()
+			latest = atr.iloc[-1]
+			if pd.isna(latest):
+				return None
+			return float(latest)
+		except Exception:
+			return None
+
+	def _stop_price(self, symbol: str, price: float) -> float | None:
+		try:
+			if not price:
+				return None
+			atr = self._atr_value(symbol) if symbol else None
+			if atr:
+				atr_mult = float(os.getenv('DASHBOARD_ATR_MULT', os.getenv('ALPACA_ATR_MULT', '1.5')))
+				stop_distance = max(atr_mult * atr, float(price) * 0.02)
+				return round(float(price) - stop_distance, 4)
+			return round(float(price) * 0.95, 4)
 		except Exception:
 			return None
 
@@ -2637,7 +2685,7 @@ class PortfolioDashboardView(APIView):
 				'rsi': round(rsi, 2) if rsi is not None else None,
 				'rsi_history': [round(val, 2) for val in rsi_history] if rsi_history else [],
 				'ma20': round(ma20, 4) if ma20 is not None else None,
-				'stop_price': self._stop_price(effective_price),
+				'stop_price': self._stop_price(symbol, effective_price),
 				'exit_strategy': exit_strategy,
 				'model_win_rate': round(float(stats.get('win_rate') or 0), 2) if stats.get('win_rate') is not None else None,
 				'model_sharpe': round(float(stats.get('sharpe') or 0), 2) if stats.get('sharpe') is not None else None,
@@ -2926,9 +2974,49 @@ def _gemini_macro_ok(symbol: str, sector: str, news_titles: list[str]) -> bool:
 		except Exception:
 			return None, None
 
-	def _stop_price(self, price: float) -> float | None:
+	def _atr_value(self, symbol: str, window: int = 14) -> float | None:
 		try:
-			return round(float(price) * 0.95, 4) if price else None
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				return None
+			def _col(*names: str) -> str | None:
+				for name in names:
+					if name in frame.columns:
+						return name
+				return None
+			high_col = _col('high', 'High')
+			low_col = _col('low', 'Low')
+			close_col = _col('close', 'Close')
+			if not high_col or not low_col or not close_col:
+				return None
+			high = pd.Series(frame[high_col]).astype(float)
+			low = pd.Series(frame[low_col]).astype(float)
+			close = pd.Series(frame[close_col]).astype(float)
+			prev_close = close.shift(1)
+			tr = pd.concat([
+				(high - low).abs(),
+				(high - prev_close).abs(),
+				(low - prev_close).abs(),
+			], axis=1).max(axis=1)
+			atr = tr.rolling(window=window, min_periods=max(2, window // 2)).mean()
+			latest = atr.iloc[-1]
+			if pd.isna(latest):
+				return None
+			return float(latest)
+		except Exception:
+			return None
+
+	def _stop_price(self, symbol: str, price: float) -> float | None:
+		try:
+			if not price:
+				return None
+			atr = self._atr_value(symbol) if symbol else None
+			if atr:
+				atr_mult = float(os.getenv('DASHBOARD_ATR_MULT', os.getenv('ALPACA_ATR_MULT', '1.5')))
+				stop_distance = max(atr_mult * atr, float(price) * 0.02)
+				return round(float(price) - stop_distance, 4)
+			return round(float(price) * 0.95, 4)
 		except Exception:
 			return None
 
@@ -3255,7 +3343,7 @@ def _gemini_macro_ok(symbol: str, sector: str, news_titles: list[str]) -> bool:
 				'rsi': round(rsi, 2) if rsi is not None else None,
 				'rsi_history': [round(val, 2) for val in rsi_history] if rsi_history else [],
 				'ma20': round(ma20, 4) if ma20 is not None else None,
-				'stop_price': self._stop_price(effective_price),
+				'stop_price': self._stop_price(symbol, effective_price),
 				'exit_strategy': exit_strategy,
 				'model_win_rate': round(float(stats.get('win_rate') or 0), 2) if stats.get('win_rate') is not None else None,
 				'model_sharpe': round(float(stats.get('sharpe') or 0), 2) if stats.get('sharpe') is not None else None,
@@ -3277,8 +3365,49 @@ def _gemini_macro_ok(symbol: str, sector: str, news_titles: list[str]) -> bool:
 
 
 def _portfolio_dashboard_get(self, request):
+	def _build_intraday_chart(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+		max_symbols = int(os.getenv('INTRADAY_CHART_MAX_SYMBOLS', '15'))
+		minutes = int(os.getenv('INTRADAY_CHART_MINUTES', '390'))
+		if not entries:
+			return []
+		limited = entries[:max_symbols]
+		frame = None
+		for entry in limited:
+			symbol = (entry.get('symbol') or '').strip().upper()
+			shares = float(entry.get('shares') or 0)
+			if not symbol or shares <= 0:
+				continue
+			df = get_intraday_bars(symbol, minutes=minutes)
+			if df is None or df.empty:
+				continue
+			close_col = 'close' if 'close' in df.columns else 'Close' if 'Close' in df.columns else None
+			if close_col is None:
+				continue
+			if 'timestamp' in df.columns:
+				ts = pd.to_datetime(df['timestamp'], errors='coerce')
+				series = pd.Series(df[close_col].values, index=ts)
+			else:
+				series = pd.Series(df[close_col].values, index=pd.to_datetime(df.index, errors='coerce'))
+			series = series.dropna()
+			if series.empty:
+				continue
+			series = (series * shares).to_frame(symbol)
+			frame = series if frame is None else frame.join(series, how='outer')
+
+		if frame is None or frame.empty:
+			return []
+		frame = frame.sort_index().ffill()
+		frame = frame.dropna(how='all')
+		values = frame.sum(axis=1)
+		return [
+			{'date': ts.isoformat(), 'value': round(float(val), 2)}
+			for ts, val in values.items()
+			if val is not None and not pd.isna(val)
+		]
+
 		portfolio_id = request.query_params.get('portfolio_id')
 		enrich = self._should_enrich(request)
+		intraday_enabled = str(request.query_params.get('intraday', '')).strip().lower() in {'1', 'true', 'yes', 'y'}
 		portfolio = None
 		if portfolio_id:
 			portfolio = Portfolio.objects.filter(id=portfolio_id).first()
@@ -3307,6 +3436,7 @@ def _portfolio_dashboard_get(self, request):
 					'holdings': [],
 					'archives': [],
 					'chart': [],
+					'intraday_chart': [],
 					'confidence_meter': self._build_confidence_meter(),
 				}, status=200)
 
@@ -3325,6 +3455,10 @@ def _portfolio_dashboard_get(self, request):
 			change_1d_pct = (change_1d / (total_value - change_1d) * 100) if total_value else 0
 			change_7d_pct = (change_7d / (total_value - change_7d) * 100) if total_value else 0
 
+			intraday_chart = _build_intraday_chart([
+				{**item, 'symbol': (item.get('ticker') or '').strip().upper(), 'shares': item.get('shares')}
+				for item in items
+			]) if intraday_enabled else []
 			return Response({
 				'portfolio': None,
 				'total_balance': round(total_value, 2),
@@ -3344,6 +3478,7 @@ def _portfolio_dashboard_get(self, request):
 				'holdings': items,
 				'archives': [],
 				'chart': [],
+				'intraday_chart': intraday_chart,
 				'confidence_meter': self._build_confidence_meter(),
 			}, status=200)
 
@@ -3506,7 +3641,7 @@ def _portfolio_dashboard_get(self, request):
 				'rsi': round(rsi, 2) if rsi is not None else None,
 				'rsi_history': [round(val, 2) for val in rsi_history] if rsi_history else [],
 				'ma20': round(ma20, 4) if ma20 is not None else None,
-				'stop_price': self._stop_price(effective_price),
+				'stop_price': self._stop_price(symbol, effective_price),
 				'model_win_rate': round(float(stats.get('win_rate') or 0), 2) if stats.get('win_rate') is not None else None,
 				'model_sharpe': round(float(stats.get('sharpe') or 0), 2) if stats.get('sharpe') is not None else None,
 				'relative_strength': rel_strength,
@@ -3565,6 +3700,7 @@ def _portfolio_dashboard_get(self, request):
 				for i in range(12)
 			]
 
+		intraday_chart = _build_intraday_chart(pre_entries) if intraday_enabled else []
 		chart_values = [float(point.get('value') or 0) for point in chart if point.get('value') is not None]
 		current_drawdown = self._current_drawdown(chart_values)
 
@@ -3587,6 +3723,7 @@ def _portfolio_dashboard_get(self, request):
 			'holdings': items,
 			'archives': archived,
 			'chart': chart,
+			'intraday_chart': intraday_chart,
 			'confidence_meter': self._build_confidence_meter(),
 		})
 
@@ -3719,9 +3856,49 @@ class AccountDashboardView(APIView):
 		except Exception:
 			return None, None
 
-	def _stop_price(self, price: float) -> float | None:
+	def _atr_value(self, symbol: str, window: int = 14) -> float | None:
 		try:
-			return round(float(price) * 0.95, 4) if price else None
+			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
+			frame = fusion.fuse_all()
+			if frame is None or frame.empty:
+				return None
+			def _col(*names: str) -> str | None:
+				for name in names:
+					if name in frame.columns:
+						return name
+				return None
+			high_col = _col('high', 'High')
+			low_col = _col('low', 'Low')
+			close_col = _col('close', 'Close')
+			if not high_col or not low_col or not close_col:
+				return None
+			high = pd.Series(frame[high_col]).astype(float)
+			low = pd.Series(frame[low_col]).astype(float)
+			close = pd.Series(frame[close_col]).astype(float)
+			prev_close = close.shift(1)
+			tr = pd.concat([
+				(high - low).abs(),
+				(high - prev_close).abs(),
+				(low - prev_close).abs(),
+			], axis=1).max(axis=1)
+			atr = tr.rolling(window=window, min_periods=max(2, window // 2)).mean()
+			latest = atr.iloc[-1]
+			if pd.isna(latest):
+				return None
+			return float(latest)
+		except Exception:
+			return None
+
+	def _stop_price(self, symbol: str, price: float) -> float | None:
+		try:
+			if not price:
+				return None
+			atr = self._atr_value(symbol) if symbol else None
+			if atr:
+				atr_mult = float(os.getenv('DASHBOARD_ATR_MULT', os.getenv('ALPACA_ATR_MULT', '1.5')))
+				stop_distance = max(atr_mult * atr, float(price) * 0.02)
+				return round(float(price) - stop_distance, 4)
+			return round(float(price) * 0.95, 4)
 		except Exception:
 			return None
 
@@ -4064,7 +4241,7 @@ class AccountDashboardView(APIView):
 					'rsi': round(rsi, 2) if rsi is not None else None,
 					'ma20': round(ma20, 4) if ma20 is not None else None,
 					'volume_z': round(volume_z, 2) if volume_z is not None else None,
-					'stop_price': self._stop_price(current),
+					'stop_price': self._stop_price(symbol, current),
 					'pyramid': pyramid,
 					'insider': insider,
 					'institutional': institutional,
@@ -5412,16 +5589,55 @@ class PortfolioOptimizerView(APIView):
 		score = round(sum(scores) / len(scores), 1) if scores else 50.0
 		low_conf = sum(1 for item in actions if _normalize_score(item.get('ai_score') or item.get('confidence')) < 40)
 		speculative = sum(1 for item in actions if item.get('speculative'))
+		sector_counts: dict[str, int] = {}
+		dividend_count = 0
+		growth_count = 0
+		for item in actions:
+			sector = (item.get('sector') or 'Autre').strip() or 'Autre'
+			sector_counts[sector] = sector_counts.get(sector, 0) + 1
+			dividend_yield = item.get('dividend_yield')
+			try:
+				dividend_yield = float(dividend_yield) if dividend_yield is not None else None
+			except (TypeError, ValueError):
+				dividend_yield = None
+			if dividend_yield is not None and dividend_yield >= 3:
+				dividend_count += 1
+			revenue_growth = item.get('revenue_growth')
+			try:
+				revenue_growth = float(revenue_growth) if revenue_growth is not None else None
+			except (TypeError, ValueError):
+				revenue_growth = None
+			if revenue_growth is not None and revenue_growth >= 10:
+				growth_count += 1
+
+		sector_top = None
+		sector_pct = 0.0
+		if sector_counts:
+			sector_top, sector_count = max(sector_counts.items(), key=lambda x: x[1])
+			sector_pct = round((sector_count / max(1, len(actions))) * 100, 1)
+		dividend_pct = round((dividend_count / max(1, len(actions))) * 100, 1)
+		growth_pct = round((growth_count / max(1, len(actions))) * 100, 1)
 		advice = []
 		risks = []
+		audit = []
 		if low_conf:
 			advice.append("Plusieurs positions affichent une confiance faible: surveille le risque.")
 		if speculative:
 			risks.append("Exposition spéculative détectée: privilégie une gestion stricte des stops.")
+		if sector_top and sector_pct >= 45:
+			audit.append(f"Concentration sectorielle élevée: {sector_top} ({sector_pct}%).")
+			advice.append("Réduis la concentration en ajoutant des secteurs non corrélés.")
+		if dividend_pct >= 55:
+			audit.append(f"Orientation dividendes élevée ({dividend_pct}%).")
+			advice.append("Pour un TFSA, privilégie un mix croissance + qualité plutôt qu'un biais dividende.")
+		if growth_pct <= 25:
+			audit.append(f"Faible exposition à la croissance ({growth_pct}%).")
+			advice.append("Ajoute des titres/ETF axés croissance pour équilibrer le rendement total.")
 		if not advice:
 			advice.append("Contexte stable: conserve une approche prudente et diversifiée.")
 		if not risks:
 			risks.append("Analyse rapide (sans backtest complet).")
+		exposure = f"Exposition: {sector_top or '—'} {sector_pct:.0f}% · Dividendes {dividend_pct:.0f}% · Croissance {growth_pct:.0f}%"
 		summary = (
 			f"Score global {score:.0f}%. {len(actions)} positions analysées"
 			f" et {len(suggestions)} suggestions surveillées."
@@ -5431,6 +5647,8 @@ class PortfolioOptimizerView(APIView):
 			'summary': summary,
 			'advice': advice,
 			'risks': risks,
+			'audit': audit,
+			'exposure': exposure,
 			'text': summary,
 		}
 
@@ -5474,6 +5692,7 @@ class PortfolioOptimizerView(APIView):
 			]
 			prompt = (
 				"Tu es un conseiller stratégique en portefeuille. Analyse ce portefeuille et propose un audit clair. "
+				"Ce contenu est informatif et n'est pas un conseil financier. "
 				"Tu reçois le P/L actuel, les prix d'entrée, et les prédictions du modèle. "
 				"Réponds en français, clair et actionnable.\n\n"
 				"Réponds en JSON strict: "
@@ -5483,7 +5702,9 @@ class PortfolioOptimizerView(APIView):
 				f"Exposition: Penny {penny_count} vs Stable {blue_count}\n"
 				f"Positions: {json.dumps(positions, ensure_ascii=False)}\n"
 				f"Suggestions modèle: {json.dumps(suggestions_brief, ensure_ascii=False)}\n"
-				"Donne un diagnostic détaillé: sur-exposition, titres à alléger, titres à renforcer, et 2-4 actions concrètes."
+				"Donne un diagnostic détaillé: sur-exposition sectorielle, équilibre croissance/dividendes, "
+				"et 2-4 actions concrètes (ex: diversifier par secteur/poids). "
+				"Si compte TFSA, privilégie la croissance et l'efficacité fiscale dans l'analyse."
 			)
 			model_name = getattr(settings, 'GEMINI_AI_MODEL', 'models/gemini-2.5-flash')
 			response = client.models.generate_content(model=model_name, contents=prompt)
@@ -5875,6 +6096,7 @@ class PortfolioOptimizerView(APIView):
 		fundamentals: dict[str, Any] | None = None,
 		fast_mode: bool = False,
 	) -> list[dict[str, str]]:
+		result_ready = bool(result and getattr(result, 'dates', None))
 		metrics = [
 			{'label': 'Signal', 'value': f"{signal * 100:.1f}%"},
 		]
@@ -5897,10 +6119,12 @@ class PortfolioOptimizerView(APIView):
 		volume_z = row.get('VolumeZ')
 		if volume_z is not None:
 			metrics.append({'label': 'Volume Z', 'value': f"{float(volume_z or 0):.2f}"})
-		if result:
+		if result_ready:
 			metrics.append({'label': 'Win rate', 'value': f"{result.win_rate:.1f}%"})
 			metrics.append({'label': 'Sharpe', 'value': f"{result.sharpe_ratio:.2f}"})
 			metrics.append({'label': 'Max DD', 'value': f"{result.max_drawdown * 100:.1f}%"})
+		elif result is not None:
+			metrics.append({'label': 'Win rate', 'value': 'N/A - New Ticker'})
 		if fundamentals:
 			altman_z = fundamentals.get('altman_z')
 			if altman_z is not None:
@@ -5929,7 +6153,7 @@ class PortfolioOptimizerView(APIView):
 		min_volume_z = float(os.getenv('VOLUME_ZSCORE_MIN', '0.5'))
 		if volume_z < min_volume_z:
 			risks.append('Volume insuffisant pour confirmer le signal')
-		if result:
+		if result and getattr(result, 'dates', None):
 			if result.win_rate < 0.5:
 				risks.append('Win rate historique faible')
 			if result.max_drawdown <= -0.2:
@@ -5968,9 +6192,10 @@ class PortfolioOptimizerView(APIView):
 
 		signal, row = self._latest_signal(data, payload, symbol)
 		result = None if fast_mode else self._backtest(data, payload, symbol, lookback_days, buy_threshold, sell_threshold)
-		confidence = self._confidence(signal, result.win_rate if result else None)
-		win_rate = result.win_rate if result else None
-		sharpe = result.sharpe_ratio if result else None
+		result_ready = bool(result and getattr(result, 'dates', None))
+		confidence = self._confidence(signal, result.win_rate if result_ready else None)
+		win_rate = result.win_rate if result_ready else None
+		sharpe = result.sharpe_ratio if result_ready else None
 		volume_z = float(row.get('VolumeZ', 0.0) or 0.0)
 		min_volume_z = float(os.getenv('VOLUME_ZSCORE_MIN', '0.5'))
 		rsi_value = float(row.get('RSI14', 0.0) or 0.0)
@@ -5979,7 +6204,7 @@ class PortfolioOptimizerView(APIView):
 		sma200 = self._sma(data.get('Close') if data is not None else None, 200)
 		etf_symbols = [s.strip().upper() for s in os.getenv('ETF_SYMBOLS', 'TEC.TO').split(',') if s.strip()]
 		is_etf = symbol.upper() in etf_symbols
-		is_speculative = False if fast_mode else bool(result and (result.win_rate < 50 or result.sharpe_ratio < 1.0))
+		is_speculative = False if fast_mode else bool(result_ready and (result.win_rate < 50 or result.sharpe_ratio < 1.0))
 		fundamentals = self._fundamentals_snapshot(symbol, fast_mode=fast_mode)
 		sector = (fundamentals.get('sector') or holding.stock.sector or '')
 		revenue_growth = fundamentals.get('revenue_growth')
@@ -6014,7 +6239,7 @@ class PortfolioOptimizerView(APIView):
 		advice = []
 		advice_color = 'Red'
 		ai_score = float(signal or 0.0)
-		performance_shield = bool(result and (result.sharpe_ratio < 0 or result.win_rate < 45))
+		performance_shield = bool(result_ready and (result.sharpe_ratio < 0 or result.win_rate < 45))
 		if performance_shield:
 			advice = ['❌ AVOID (Risque élevé)', 'Le modèle manque de précision historique sur ce ticker.']
 			advice_color = 'Red'
@@ -6164,6 +6389,8 @@ class PortfolioOptimizerView(APIView):
 			'sharpe': round(float(sharpe), 2) if sharpe is not None else None,
 			'price': round(price_value, 4),
 			'market_cap': market_cap,
+			'sector': sector,
+			'revenue_growth': revenue_growth,
 			'dividend_yield': dividend_yield,
 			'type': 'Bluechip' if universe == 'BLUECHIP' else 'Watchlist',
 			'gemini_verdict': gemini_confirm.get('gemini_verdict') if gemini_confirm else None,
@@ -6258,7 +6485,8 @@ class PortfolioOptimizerView(APIView):
 		if signal < buy_threshold:
 			return None
 		result = None if fast_mode else self._backtest(data, payload, symbol, lookback_days, buy_threshold, sell_threshold)
-		if result and result.win_rate < min_win_rate:
+		result_ready = bool(result and getattr(result, 'dates', None))
+		if result_ready and result.win_rate < min_win_rate:
 			return None
 		fundamentals = self._fundamentals_snapshot(symbol, fast_mode=fast_mode)
 		sector = fundamentals.get('sector') or ''
@@ -6268,8 +6496,8 @@ class PortfolioOptimizerView(APIView):
 		is_healthcare = 'health' in str(sector).lower()
 		if universe == 'PENNY' and is_healthcare and revenue_growth is not None and revenue_growth < 0:
 			return None
-		is_speculative = False if fast_mode else bool(result and (result.win_rate < 50 or result.sharpe_ratio < 1.0))
-		confidence = self._confidence(signal, result.win_rate if result else None)
+		is_speculative = False if fast_mode else bool(result_ready and (result.win_rate < 50 or result.sharpe_ratio < 1.0))
+		confidence = self._confidence(signal, result.win_rate if result_ready else None)
 		if is_speculative:
 			return None
 		name = symbol
@@ -6297,6 +6525,8 @@ class PortfolioOptimizerView(APIView):
 			'sharpe': round(float(result.sharpe_ratio), 2) if result else None,
 			'price': round(float(row.get('Close', 0.0) or 0.0), 4),
 			'market_cap': market_cap,
+			'sector': sector,
+			'revenue_growth': revenue_growth,
 			'dividend_yield': fundamentals.get('dividend_yield'),
 			'type': 'Bluechip' if universe == 'BLUECHIP' else 'Penny',
 		}
@@ -6586,6 +6816,92 @@ class HealthCheckView(APIView):
 			'last_news_fetched_at': last_news.fetched_at if last_news else None,
 			'tasks': tasks,
 		})
+
+
+class TelegramWebhookView(APIView):
+	authentication_classes = []
+	permission_classes = []
+
+	def post(self, request):
+		secret = os.getenv('TELEGRAM_WEBHOOK_SECRET', '').strip()
+		if secret:
+			received = request.headers.get('X-Telegram-Bot-Api-Secret-Token', '')
+			if received != secret:
+				return Response({'status': 'forbidden'}, status=403)
+		payload = request.data or {}
+		callback = payload.get('callback_query') or {}
+		if callback:
+			data = (callback.get('data') or '').strip()
+			callback_id = callback.get('id')
+			chat_id = (callback.get('message') or {}).get('chat', {}).get('id')
+			if data.startswith('approve:') or data.startswith('reject:'):
+				parts = data.split(':', 1)
+				token = parts[1] if len(parts) > 1 else ''
+				approved = data.startswith('approve:')
+				result = process_alpaca_trade_approval(token, approved=approved)
+				telegram_answer_callback(str(callback_id) if callback_id else '')
+				status = result.get('status')
+				if chat_id:
+					if status == 'approved':
+						message = f"✅ Ordre approuvé: {result.get('symbol')} qty {result.get('qty')}"
+					elif status == 'rejected':
+						message = f"❌ Ordre refusé: {result.get('symbol')}"
+					elif status == 'order_failed':
+						message = f"⚠️ Échec d'ordre: {result.get('symbol')}"
+					elif status == 'expired':
+						message = "⏱️ Validation expirée."
+					else:
+						message = "⚠️ Validation non traitée."
+					_send_telegram_message(message, chat_id=str(chat_id))
+				return Response({'status': 'ok', 'result': result})
+			if data.startswith('approve_test_') or data.startswith('reject_test_'):
+				approved = data.startswith('approve_test_')
+				symbol = data.split('_', 2)[-1] if '_' in data else 'TEST'
+				telegram_answer_callback(str(callback_id) if callback_id else '')
+				_decision_log(symbol, 'TEST', 'APPROVE' if approved else 'REJECT', 'telegram_test')
+				if chat_id:
+					message = (
+						f"✅ Test approuvé: {symbol}"
+						if approved
+						else f"❌ Test rejeté: {symbol}"
+					)
+					_send_telegram_message(message, chat_id=str(chat_id))
+				return Response({'status': 'ok', 'result': {'status': 'test', 'symbol': symbol, 'approved': approved}})
+			return Response({'status': 'ignored'})
+		message = payload.get('message') or {}
+		text = (message.get('text') or '').strip()
+		chat_id = (message.get('chat') or {}).get('id')
+		if not text or not chat_id:
+			return Response({'status': 'ignored'})
+		if text.lower().startswith('/reset_breaker'):
+			parts = text.split()
+			sandbox = parts[1].strip().upper() if len(parts) > 1 else None
+			result = reset_daily_equity_breaker(sandbox=sandbox)
+			cleared = ', '.join(result.get('cleared') or []) or 'aucun'
+			_send_telegram_message(
+				f"✅ Circuit breaker réinitialisé: {cleared}",
+				chat_id=str(chat_id),
+			)
+			return Response({'status': 'ok', 'result': result})
+		if text.lower().startswith('/journal'):
+			entries = _decision_journal_tail(limit=5)
+			if not entries:
+				_send_telegram_message("📓 Journal IA: aucune entrée récente.", chat_id=str(chat_id))
+				return Response({'status': 'ok', 'result': []})
+			lines = ["📓 Journal IA — 5 dernières décisions"]
+			for entry in entries:
+				signal = entry.get('signal') or ''
+				if signal:
+					try:
+						signal = f"{float(signal) * 100:.1f}%" if float(signal) <= 1 else f"{float(signal):.1f}%"
+					except Exception:
+						signal = str(signal)
+				lines.append(
+					f"• {entry.get('symbol')} [{entry.get('sandbox')}] {entry.get('status')} ({signal}) — {entry.get('reason')}"
+				)
+			_send_telegram_message("\n".join(lines), chat_id=str(chat_id))
+			return Response({'status': 'ok', 'result': entries})
+		return Response({'status': 'ignored'})
 
 
 class DataQADailyView(APIView):

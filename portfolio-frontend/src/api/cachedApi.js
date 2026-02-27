@@ -4,7 +4,7 @@ const cache = new Map();
 
 const buildKey = (url, params) => `${url}::${JSON.stringify(params || {})}`;
 
-export const cachedGet = async (url, params = {}, ttlMs = 60000) => {
+export const cachedGet = async (url, params = {}, ttlMs = 60000, options = {}) => {
   const key = buildKey(url, params);
   const now = Date.now();
   const cached = cache.get(key);
@@ -12,7 +12,7 @@ export const cachedGet = async (url, params = {}, ttlMs = 60000) => {
     return cached.data;
   }
 
-  const response = await api.get(url, { params });
+  const response = await api.get(url, { params, ...(options || {}) });
   cache.set(key, { data: response.data, timestamp: now });
   return response.data;
 };

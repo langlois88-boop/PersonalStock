@@ -22,27 +22,49 @@ function UnifiedAlerts() {
   const [monitoring, setMonitoring] = useState([]);
   const [alerts, setAlerts] = useState([]);
   const [apiErrors, setApiErrors] = useState([]);
+  const [pollError, setPollError] = useState(null);
 
   useEffect(() => {
     let active = true;
 
     const load = async () => {
       try {
-        const [healthData, monitoringData, alertsData] = await Promise.all([
-          cachedGet('health/', {}, 30000),
-          cachedGet('models/monitoring/', {}, 60000),
-          cachedGet('alerts/', { page_size: 6 }, 20000),
+        const results = await Promise.allSettled([
+          cachedGet('health/', {}, 30000, { meta: { suppressErrorReport: true } }),
+          cachedGet('models/monitoring/', {}, 60000, { meta: { suppressErrorReport: true } }),
+          cachedGet('alerts/', { page_size: 6 }, 20000, { meta: { suppressErrorReport: true } }),
         ]);
         if (!active) return;
-        setHealth(healthData || null);
-        setMonitoring(monitoringData?.results || []);
-        const list = Array.isArray(alertsData?.results) ? alertsData.results : alertsData || [];
-        setAlerts(list.slice(0, 6));
+        const [healthResult, monitoringResult, alertsResult] = results;
+        const hasError = results.some((item) => item.status === 'rejected');
+        setPollError(hasError ? new Date().toISOString() : null);
+
+        if (healthResult.status === 'fulfilled') {
+          setHealth(healthResult.value || null);
+        } else {
+          setHealth(null);
+        }
+
+        if (monitoringResult.status === 'fulfilled') {
+          setMonitoring(monitoringResult.value?.results || []);
+        } else {
+          setMonitoring([]);
+        }
+
+        if (alertsResult.status === 'fulfilled') {
+          const list = Array.isArray(alertsResult.value?.results)
+            ? alertsResult.value.results
+            : alertsResult.value || [];
+          setAlerts(list.slice(0, 6));
+        } else {
+          setAlerts([]);
+        }
       } catch (err) {
         if (!active) return;
         setHealth(null);
         setMonitoring([]);
         setAlerts([]);
+        setPollError(new Date().toISOString());
       }
     };
 
@@ -100,6 +122,16 @@ function UnifiedAlerts() {
     }));
   }, [apiErrors]);
 
+  const pollAlert = pollError
+    ? [{
+        id: `poll-${pollError}`,
+        title: 'API indisponible',
+        message: 'Impossible de joindre health/monitoring/alerts. Nouvelle tentative en cours.',
+        level: 'critical',
+        timestamp: pollError,
+      }]
+    : [];
+
   const alertEvents = (alerts || []).map((entry) => ({
     id: `alert-${entry.id}`,
     title: entry.category || 'Alert',
@@ -108,7 +140,7 @@ function UnifiedAlerts() {
     timestamp: entry.created_at,
   }));
 
-  const merged = [...apiAlertItems, ...taskAlerts, ...driftAlerts, ...alertEvents];
+  const merged = [...pollAlert, ...apiAlertItems, ...taskAlerts, ...driftAlerts, ...alertEvents];
 
   return (
     <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-4">

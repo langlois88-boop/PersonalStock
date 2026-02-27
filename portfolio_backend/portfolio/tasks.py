@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from uuid import uuid4
 from pathlib import Path
 from functools import lru_cache
 from datetime import date, datetime, timedelta, time as dt_time, timezone as dt_timezone
@@ -664,6 +665,196 @@ def _send_telegram_message(message: str, chat_id: str | None = None) -> None:
         pass
 
 
+def _send_telegram_inline_message(message: str, reply_markup: dict[str, Any], chat_id: str | None = None) -> None:
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    chat_id = chat_id or os.getenv('TELEGRAM_CHAT_ID')
+    if not token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        'chat_id': chat_id,
+        'text': message,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': True,
+        'reply_markup': reply_markup,
+    }
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception:
+        pass
+
+
+def telegram_answer_callback(callback_id: str) -> None:
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    if not token or not callback_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/answerCallbackQuery"
+    payload = {
+        'callback_query_id': callback_id,
+    }
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception:
+        pass
+
+
+def _alpaca_approval_cache_key(token: str) -> str:
+    return f"alpaca_approval:{token}"
+
+
+def _alpaca_approval_pending_key(sandbox: str, symbol: str) -> str:
+    return f"alpaca_approval_pending:{sandbox}:{symbol}"
+
+
+def _format_pct(value: float | None) -> str:
+    if value is None:
+        return '—'
+    try:
+        return f"{float(value) * 100:.1f}%" if float(value) <= 1 else f"{float(value):.1f}%"
+    except Exception:
+        return '—'
+
+
+def _queue_alpaca_trade_approval(
+    *,
+    symbol: str,
+    sandbox: str,
+    qty: int,
+    price: float,
+    limit_price: float | None,
+    stop_loss: float,
+    signal_payload: dict[str, Any] | None,
+    tier: str,
+    tier_reasons: list[str] | None,
+    use_limit_orders: bool,
+    notes: str | None,
+) -> bool:
+    if not symbol or qty <= 0 or price <= 0:
+        return False
+    pending_key = _alpaca_approval_pending_key(sandbox, symbol)
+    if cache.get(pending_key):
+        return True
+    ttl_min = int(os.getenv('ALPACA_APPROVAL_TTL_MIN', '30'))
+    token = uuid4().hex[:8]
+    payload = {
+        'symbol': symbol,
+        'sandbox': sandbox,
+        'qty': qty,
+        'price': price,
+        'limit_price': limit_price,
+        'stop_loss': stop_loss,
+        'signal_payload': signal_payload or {},
+        'tier': tier,
+        'tier_reasons': tier_reasons or [],
+        'use_limit_orders': use_limit_orders,
+        'notes': notes or '',
+        'pending_key': pending_key,
+    }
+    cache.set(_alpaca_approval_cache_key(token), payload, timeout=ttl_min * 60)
+    cache.set(pending_key, token, timeout=ttl_min * 60)
+    confidence = None
+    try:
+        confidence = float((signal_payload or {}).get('signal') or 0.0)
+    except Exception:
+        confidence = None
+    order_label = 'LIMIT' if use_limit_orders and limit_price else 'MARKET'
+    message_lines = [
+        "📝 Validation requise (Alpaca)",
+        f"Ticker: {symbol} [{sandbox}]",
+        f"Signal: {_format_pct(confidence)}",
+        f"Prix: ${price:.2f}",
+        f"Quantité: {qty}",
+        f"Stop ATR: ${stop_loss:.2f}",
+        f"Ordre: {order_label}{f' @ ${limit_price:.2f}' if limit_price else ''}",
+        f"Tier: {tier}",
+    ]
+    reply_markup = {
+        'inline_keyboard': [
+            [
+                {'text': '✅ Approuver', 'callback_data': f"approve:{token}"},
+                {'text': '❌ Refuser', 'callback_data': f"reject:{token}"},
+            ]
+        ]
+    }
+    _send_telegram_inline_message("\n".join(message_lines), reply_markup)
+    return True
+
+
+def process_alpaca_trade_approval(token: str, approved: bool) -> dict[str, Any]:
+    key = _alpaca_approval_cache_key(token)
+    payload = cache.get(key)
+    if not payload:
+        return {'status': 'expired'}
+    if payload.get('status') in {'approved', 'rejected'}:
+        return {'status': payload.get('status')}
+    symbol = payload.get('symbol')
+    sandbox = payload.get('sandbox')
+    pending_key = payload.get('pending_key')
+    if not approved:
+        payload['status'] = 'rejected'
+        cache.set(key, payload, timeout=60 * 30)
+        if pending_key:
+            cache.delete(pending_key)
+        _decision_log(symbol, sandbox, 'SKIP', 'manual_reject')
+        return {'status': 'rejected', 'symbol': symbol}
+
+    qty = int(payload.get('qty') or 0)
+    price = float(payload.get('price') or 0)
+    limit_price = payload.get('limit_price')
+    use_limit_orders = bool(payload.get('use_limit_orders'))
+    if qty <= 0 or price <= 0:
+        if pending_key:
+            cache.delete(pending_key)
+        return {'status': 'invalid'}
+    if use_limit_orders and limit_price:
+        order = submit_limit_order(symbol, qty, 'buy', float(limit_price))
+    else:
+        order = submit_market_order(symbol, qty, 'buy')
+    if order is None:
+        if pending_key:
+            cache.delete(pending_key)
+        payload['status'] = 'order_failed'
+        cache.set(key, payload, timeout=60 * 10)
+        return {'status': 'order_failed', 'symbol': symbol}
+
+    tier = payload.get('tier') or 'T2'
+    tier_reasons = payload.get('tier_reasons') or []
+    signal_payload = payload.get('signal_payload') or {}
+    stop_loss = float(payload.get('stop_loss') or 0.0)
+    notes = payload.get('notes') or ''
+    PaperTrade.objects.create(
+        ticker=symbol,
+        sandbox=sandbox,
+        entry_price=round(price, 2),
+        quantity=qty,
+        entry_signal=signal_payload.get('signal'),
+        entry_features={
+            **(signal_payload.get('features') or {}),
+            'tier': tier,
+            'tier_reasons': tier_reasons,
+            'alpaca_high_water': price,
+        },
+        entry_explanations=signal_payload.get('explanations'),
+        model_name=signal_payload.get('model_name', 'BLUECHIP'),
+        model_version=signal_payload.get('model_version', ''),
+        broker='ALPACA',
+        broker_order_id=str(getattr(order, 'id', '') or ''),
+        broker_status=str(getattr(order, 'status', '') or ''),
+        broker_side='BUY',
+        broker_updated_at=timezone.now(),
+        stop_loss=round(stop_loss, 2) if stop_loss > 0 else None,
+        status='OPEN',
+        pnl=0,
+        notes=f"manual approval | {notes}".strip(),
+    )
+    payload['status'] = 'approved'
+    cache.set(key, payload, timeout=60 * 60)
+    if pending_key:
+        cache.delete(pending_key)
+    _decision_log(symbol, sandbox, 'BUY', 'manual_approval')
+    return {'status': 'approved', 'symbol': symbol, 'qty': qty}
+
+
 def _market_sentiment_score() -> float | None:
     sentiment, meta = get_market_sentiment()
     spy_change = meta.get('spy_change')
@@ -865,6 +1056,9 @@ def _afterhours_market_scan(symbols: list[str] | None = None) -> dict[str, Any]:
                 continue
             last_close = float(close.iloc[-1])
             prev_close = float(close.iloc[-2])
+        from uuid import uuid4
+
+
             if last_close <= 0 or prev_close <= 0:
                 continue
             if not (min_price <= last_close <= max_price):
@@ -876,11 +1070,14 @@ def _afterhours_market_scan(symbols: list[str] | None = None) -> dict[str, Any]:
                 continue
             last_vol = float(volume.iloc[-1])
             avg_vol = float(volume.tail(20).mean()) if len(volume) >= 5 else float(volume.mean())
+            'reply_markup': reply_markup,
             if last_vol < min_volume or avg_vol <= 0:
                 continue
             rvol = last_vol / avg_vol
             if rvol < min_rvol:
                 continue
+
+
 
             base_score = 0.5 + (min(10.0, abs(change_pct)) / 100) + (min(5.0, rvol) / 50)
             confidence_pct = max(0.0, min(95.0, base_score * 100))
@@ -899,6 +1096,8 @@ def _afterhours_market_scan(symbols: list[str] | None = None) -> dict[str, Any]:
         except Exception:
             continue
 
+
+
     results = sorted(results, key=lambda x: x['score'], reverse=True)
     if results:
         cache.set('market_scanner_afterhours_results', results, timeout=60 * 60 * 24)
@@ -910,10 +1109,16 @@ def _afterhours_market_scan(symbols: list[str] | None = None) -> dict[str, Any]:
         )
         if os.getenv('AI_SCANNER_UPDATE_WATCHLIST_MAIN', 'false').lower() in {'1', 'true', 'yes', 'y'}:
             main_limit = int(os.getenv('AI_SCANNER_MAIN_LIMIT', '15'))
+
+
             SandboxWatchlist.objects.update_or_create(
                 sandbox='WATCHLIST',
+
+
                 defaults={'symbols': [entry['symbol'] for entry in results[:max(1, main_limit)]]},
             )
+
+
 
     if notify and results:
         top = results[0]
@@ -921,6 +1126,8 @@ def _afterhours_market_scan(symbols: list[str] | None = None) -> dict[str, Any]:
             f"📌 Pré-sélection fermeture: {top['symbol']} score {top['score']:.2f} "
             f"RVOL {top['rvol']} Δ {top['change_pct']:+.2f}%",
             allow_during_blackout=True,
+
+
             category='report',
         )
 
@@ -984,6 +1191,8 @@ def _price_move_after_entry(symbol: str, entry_time: datetime, hours: int) -> tu
     return max_move, min_move
 
 
+
+
 def _risk_manager_allocation(
     confidence_score: float,
     sentiment_score: float | None,
@@ -1001,6 +1210,8 @@ def _risk_manager_allocation(
 
     if sentiment_score is not None:
         sentiment_score = max(0.0, min(1.0, sentiment_score))
+
+
         allocation *= max(0.6, min(1.2, 1 + ((sentiment_score - 0.5) * 0.4)))
 
     if price and atr:
@@ -1013,6 +1224,8 @@ def _risk_manager_allocation(
 
 def _time_hhmm(dt_value: datetime | None = None) -> str:
     dt_value = dt_value or _ny_time_now()
+
+
     return dt_value.strftime('%H:%M')
 
 
@@ -3883,15 +4096,154 @@ def _btc_trend_ok(symbol: str) -> bool:
     if not symbols or sym not in symbols:
         return True
     try:
-        btc = get_intraday_bars('BTC-USD', minutes=240)
+        minutes = int(os.getenv('BTC_TREND_MINUTES', '60'))
+        btc = get_intraday_bars('BTC-USD', minutes=minutes)
         if btc is None or btc.empty or 'close' not in btc:
             return True
         close = btc['close']
-        ema20 = close.ewm(span=20, adjust=False).mean()
-        ema50 = close.ewm(span=50, adjust=False).mean()
+        ema_fast = int(os.getenv('BTC_TREND_EMA_FAST', '20'))
+        ema_slow = int(os.getenv('BTC_TREND_EMA_SLOW', '50'))
+        ema20 = close.ewm(span=ema_fast, adjust=False).mean()
+        ema50 = close.ewm(span=ema_slow, adjust=False).mean()
         return float(ema20.iloc[-1]) >= float(ema50.iloc[-1])
     except Exception:
         return True
+
+
+def _value_hunter_watchlist() -> list[str]:
+    raw = os.getenv(
+        'VALUE_HUNTER_WATCHLIST',
+        'ATD.TO,DOL.TO,L.TO,RY.TO,TD.TO,BNS.TO,BMO.TO,CNR.TO,CP.TO,TFII.TO,ENB.TO,TRP.TO,FTS.TO,CSU.TO,BN.TO,GIB-A.TO,T.TO,BCE.TO,SAP.TO,MRU.TO',
+    )
+    return [s.strip().upper() for s in raw.split(',') if s.strip()]
+
+
+def _check_bluechip_health(symbol: str) -> tuple[bool, dict[str, Any]]:
+    try:
+        info = yfin.Ticker(symbol).info or {}
+    except Exception:
+        info = {}
+    fcf = info.get('freeCashflow') or 0
+    debt_to_equity = (info.get('debtToEquity') or 0) / 100
+    profit_margins = info.get('profitMargins') or 0
+    min_fcf = float(os.getenv('VALUE_HUNTER_MIN_FCF', '0'))
+    max_de = float(os.getenv('VALUE_HUNTER_MAX_DEBT_TO_EQUITY', '1.5'))
+    min_margin = float(os.getenv('VALUE_HUNTER_MIN_PROFIT_MARGINS', '0.05'))
+    ok = bool(fcf and fcf > min_fcf and debt_to_equity < max_de and profit_margins > min_margin)
+    return ok, {
+        'free_cashflow': float(fcf or 0),
+        'debt_to_equity': float(debt_to_equity or 0),
+        'profit_margins': float(profit_margins or 0),
+    }
+
+
+def _value_hunter_candidate(symbol: str) -> dict[str, Any] | None:
+    symbol = (symbol or '').strip().upper()
+    if not symbol:
+        return None
+    try:
+        info = yfin.Ticker(symbol).info or {}
+    except Exception:
+        info = {}
+    market_cap = info.get('marketCap') or 0
+    try:
+        market_cap = float(market_cap)
+    except Exception:
+        market_cap = 0
+    if market_cap < float(os.getenv('VALUE_HUNTER_MIN_MARKET_CAP', '10000000000')):
+        return None
+
+    try:
+        hist = yfin.Ticker(symbol).history(period='1y', interval='1d')
+    except Exception:
+        hist = None
+    close = _extract_close_series(hist) if hist is not None else None
+    if close is None or close.empty:
+        return None
+    price = float(close.iloc[-1])
+    prev_close = float(close.iloc[-2]) if len(close) > 1 else price
+    drop_pct = ((price - prev_close) / prev_close) * 100 if prev_close else 0.0
+    rsi = _compute_rsi(close, 14)
+    if rsi is None:
+        return None
+    ma200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else None
+    if not ma200 or ma200 <= 0:
+        return None
+    distance = ((ma200 - price) / ma200) * 100
+    if distance < float(os.getenv('VALUE_HUNTER_MIN_DISTANCE_MA200_PCT', '10')):
+        return None
+    rsi_trigger = float(os.getenv('VALUE_HUNTER_MAX_RSI', '35'))
+    alert_drop = float(os.getenv('VALUE_HUNTER_DROP_ALERT_PCT', '-3'))
+    if drop_pct > alert_drop and rsi > float(os.getenv('VALUE_HUNTER_RSI_ALERT', '30')):
+        return None
+    if rsi > rsi_trigger:
+        return None
+    sentiment, _ = _news_sentiment_score(symbol, days=3)
+    if sentiment < float(os.getenv('VALUE_HUNTER_MIN_SENTIMENT', '-0.2')):
+        return None
+    health_ok, health_meta = _check_bluechip_health(symbol)
+    if not health_ok:
+        return None
+
+    return {
+        'symbol': symbol,
+        'price': round(price, 4),
+        'rsi': round(float(rsi), 2),
+        'distance_ma200': round(float(distance), 2),
+        'market_cap': market_cap,
+        'sentiment': round(float(sentiment), 3),
+        'drop_pct': round(float(drop_pct), 2),
+        **health_meta,
+    }
+
+
+@shared_task
+def value_hunter_scan(send_alerts: bool = True) -> dict[str, Any]:
+    watchlist = _value_hunter_watchlist()
+    if not watchlist:
+        return {'status': 'empty', 'count': 0}
+    results: list[dict[str, Any]] = []
+    for symbol in watchlist:
+        candidate = _value_hunter_candidate(symbol)
+        if candidate:
+            results.append(candidate)
+
+    results.sort(key=lambda x: (x.get('rsi', 100), -x.get('distance_ma200', 0)))
+    cache.set('value_hunter_candidates', results, timeout=60 * 60)
+
+    if send_alerts and results:
+        lines = ["💎 MODE VALUE — AUBAINES BLUECHIP"]
+        for item in results[:5]:
+            lines.append(
+                f"🚨 {item['symbol']} RSI {item['rsi']} | -{item['distance_ma200']}% MA200"
+            )
+        _send_telegram_alert("\n".join(lines), allow_during_blackout=True, category='report')
+
+    return {'status': 'ok', 'count': len(results), 'results': results[:10]}
+
+
+@shared_task
+def send_value_hunter_report() -> dict[str, Any]:
+    aggressive = cache.get('market_scanner_results') or []
+    value_candidates = cache.get('value_hunter_candidates') or []
+
+    lines = ["📊 *Rapport Opportunités*", "", "🔥 MODE AGRESSIF"]
+    if aggressive:
+        for item in aggressive[:5]:
+            lines.append(f"• {item.get('symbol')}: score {float(item.get('score') or 0):.2f} RVOL {item.get('rvol')}")
+    else:
+        lines.append('— Aucun signal momentum')
+
+    lines.append("")
+    lines.append("💎 MODE VALUE")
+    if value_candidates:
+        for item in value_candidates[:5]:
+            lines.append(f"• {item.get('symbol')}: RSI {item.get('rsi')} | -{item.get('distance_ma200')}% MA200")
+    else:
+        lines.append('— Aucun rabais solide')
+
+    _send_telegram_alert("\n".join(lines), allow_during_blackout=True, category='report')
+    return {'status': 'sent', 'aggressive': len(aggressive), 'value': len(value_candidates)}
 
 
 def _midday_blackout() -> bool:
@@ -3928,26 +4280,52 @@ def _price_velocity_drop(intraday_ctx: dict[str, Any] | None, bars_back: int = 5
     return drop <= threshold
 
 
-def _daily_equity_circuit_breaker(sandbox: str, equity_now: float) -> bool:
+def _daily_equity_circuit_breaker(sandbox: str, equity_now: float) -> dict[str, Any]:
     threshold = float(os.getenv('DAILY_EQUITY_DRAWDOWN_PCT', '0.03'))
+    result = {
+        'triggered': False,
+        'first_trigger': False,
+        'baseline': None,
+        'drawdown': 0.0,
+        'threshold': threshold,
+    }
     if equity_now <= 0:
-        return False
+        return result
     key = f"daily_equity_base:{sandbox}:{_ny_time_now().strftime('%Y%m%d')}"
     trigger_key = f"daily_equity_trip:{sandbox}:{_ny_time_now().strftime('%Y%m%d')}"
-    if cache.get(trigger_key):
-        return True
     baseline = cache.get(key)
     if baseline is None:
         cache.set(key, float(equity_now), timeout=60 * 60 * 24)
-        return False
+        result['baseline'] = float(equity_now)
+        return result
     baseline = float(baseline)
+    result['baseline'] = baseline
     if baseline <= 0:
-        return False
+        return result
     drawdown = (equity_now - baseline) / baseline
+    result['drawdown'] = drawdown
+    if cache.get(trigger_key):
+        result['triggered'] = True
+        return result
     if drawdown <= -abs(threshold):
         cache.set(trigger_key, True, timeout=60 * 60 * 24)
-        return True
-    return False
+        result['triggered'] = True
+        result['first_trigger'] = True
+    return result
+
+
+def reset_daily_equity_breaker(sandbox: str | None = None, day: date | None = None) -> dict[str, Any]:
+    day_key = (day or _ny_time_now().date()).strftime('%Y%m%d')
+    sandboxes = [sandbox] if sandbox else ['AI_PENNY', 'AI_BLUECHIP', 'WATCHLIST']
+    cleared = []
+    for box in sandboxes:
+        if not box:
+            continue
+        trigger_key = f"daily_equity_trip:{box}:{day_key}"
+        if cache.get(trigger_key):
+            cache.delete(trigger_key)
+            cleared.append(box)
+    return {'cleared': cleared, 'date': day_key}
 
 
 def _reentry_cache_key(symbol: str, sandbox: str) -> str:
@@ -3984,6 +4362,89 @@ def _decision_log(symbol: str, sandbox: str, status: str, reason: str, signal: f
             handle.write(line)
     except Exception:
         return
+
+
+def _decision_journal_tail(limit: int = 5) -> list[dict[str, Any]]:
+    path = os.getenv('DECISION_LOG_PATH', 'logs/decision_log.csv')
+    try:
+        if not os.path.exists(path):
+            return []
+        with open(path, 'r', encoding='utf-8') as handle:
+            lines = handle.readlines()
+        lines = [line.strip() for line in lines if line.strip()]
+        tail = lines[-limit:]
+        entries = []
+        for line in tail:
+            parts = line.split(',', 5)
+            if len(parts) < 6:
+                continue
+            entries.append({
+                'ts': parts[0],
+                'sandbox': parts[1],
+                'symbol': parts[2],
+                'status': parts[3],
+                'signal': parts[4],
+                'reason': parts[5],
+            })
+        return entries
+    except Exception:
+        return []
+
+
+def _ai_scan_cache_key(day: date | None = None) -> str:
+    day_key = (day or _ny_time_now().date()).strftime('%Y%m%d')
+    return f"ai_scan_summary:{day_key}"
+
+
+def _record_ai_scan(symbol: str, confidence: float | None, source: str) -> None:
+    symbol = (symbol or '').strip().upper()
+    if not symbol:
+        return
+    normalized = None
+    try:
+        if confidence is not None:
+            normalized = float(confidence)
+            if normalized <= 1:
+                normalized *= 100
+    except Exception:
+        normalized = None
+    entry = {
+        'symbol': symbol,
+        'confidence': normalized,
+        'source': (source or '').strip() or 'unknown',
+        'ts': timezone.now().isoformat(),
+    }
+    key = _ai_scan_cache_key()
+    existing = cache.get(key)
+    if not isinstance(existing, list):
+        existing = []
+    existing.append(entry)
+    cache.set(key, existing[-250:], timeout=60 * 60 * 24)
+
+
+def _get_ai_scan_summary(day: date | None = None) -> list[dict[str, Any]]:
+    key = _ai_scan_cache_key(day)
+    entries = cache.get(key)
+    if not isinstance(entries, list):
+        return []
+    cleaned: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        symbol = (entry.get('symbol') or '').strip().upper()
+        if not symbol:
+            continue
+        confidence = entry.get('confidence')
+        try:
+            confidence = float(confidence) if confidence is not None else None
+        except Exception:
+            confidence = None
+        current = cleaned.get(symbol)
+        if current is None or (confidence is not None and (current.get('confidence') is None or confidence > current.get('confidence'))):
+            cleaned[symbol] = {
+                'symbol': symbol,
+                'confidence': confidence,
+                'source': entry.get('source') or 'unknown',
+            }
+    return list(cleaned.values())
 
 
 def _system_log(
@@ -4519,33 +4980,45 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     available = max(0.0, capital - open_value)
     min_available_capital = _env_float(prefix, 'MIN_AVAILABLE_CAPITAL', '0.0')
     block_new_entries = sandbox == 'AI_PENNY' and min_available_capital > 0 and available < min_available_capital
-    if _daily_equity_circuit_breaker(sandbox, capital):
-        for trade in open_trades_list:
-            price = _latest_price(trade.ticker) or float(trade.entry_price)
-            trade.status = 'CLOSED'
-            trade.exit_price = price
-            trade.exit_date = timezone.now()
-            trade.pnl = float(price - float(trade.entry_price)) * float(trade.quantity)
-            trade.outcome = 'WIN' if float(trade.pnl or 0) > 0 else 'LOSS'
-            trade.notes = (trade.notes or '') + ' | Circuit breaker daily equity.'
-            trade.save(update_fields=['status', 'exit_price', 'exit_date', 'pnl', 'outcome', 'notes'])
-        _system_log('SYSTEM', 'ERROR', f'Circuit breaker triggered for {sandbox}', metadata={'capital': capital})
-        _send_telegram_alert(
-            f"⛔ Circuit breaker: fermeture des positions {sandbox} (drawdown quotidien).",
-            allow_during_blackout=True,
-            category='risk',
-        )
+    regime = get_market_regime_context()
+    breaker = _daily_equity_circuit_breaker(sandbox, capital)
+    if breaker.get('triggered'):
+        if breaker.get('first_trigger'):
+            for trade in open_trades_list:
+                price = _latest_price(trade.ticker) or float(trade.entry_price)
+                trade.status = 'CLOSED'
+                trade.exit_price = price
+                trade.exit_date = timezone.now()
+                trade.pnl = float(price - float(trade.entry_price)) * float(trade.quantity)
+                trade.outcome = 'WIN' if float(trade.pnl or 0) > 0 else 'LOSS'
+                trade.notes = (trade.notes or '') + ' | Circuit breaker daily equity.'
+                trade.save(update_fields=['status', 'exit_price', 'exit_date', 'pnl', 'outcome', 'notes'])
+            baseline = float(breaker.get('baseline') or capital)
+            loss_amount = max(0.0, baseline - capital)
+            threshold_amount = abs(float(breaker.get('threshold') or 0)) * baseline
+            drawdown_pct = abs(float(breaker.get('drawdown') or 0)) * 100
+            now_str = _ny_time_now().strftime('%H:%M')
+            _system_log('SYSTEM', 'ERROR', f'Circuit breaker triggered for {sandbox}', metadata={'capital': capital})
+            _send_telegram_alert(
+                "\n".join([
+                    f"⛔ Circuit breaker {sandbox} (arrêt journée)",
+                    f"📉 Perte: ${loss_amount:.2f} / seuil ${threshold_amount:.2f} ({drawdown_pct:.2f}%)",
+                    f"🕒 Heure: {now_str}",
+                ]),
+                allow_during_blackout=True,
+                category='risk',
+            )
         return {
             'created': 0,
             'closed': len(open_trades_list),
             'available': round(available, 2),
             'entries_blocked_low_capital': True,
             'market_regime': regime,
+            'circuit_breaker': True,
         }
     weak_health = _weak_list_health()
     if weak_health.get('defensive'):
         block_new_entries = True
-    regime = get_market_regime_context()
     risk_off = bool(regime.get('risk_off')) if isinstance(regime, dict) else False
     regime_risk_factor = float(os.getenv('MARKET_RISK_OFF_POSITION_FACTOR', '0.5')) if risk_off else 1.0
     pattern_boost = float(os.getenv('PATTERN_SIGNAL_BOOST', '2.0'))
@@ -5109,6 +5582,8 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
     model_path = get_model_path(universe)
     buy_threshold = _env_float(prefix, 'BUY_THRESHOLD', '0.82')
     sell_threshold = _env_float(prefix, 'SELL_THRESHOLD', '0.4')
+    trail_pct = _env_float(prefix, 'TRAIL_PCT', '0.04')
+    atr_mult = _env_float(prefix, 'ATR_MULT', '1.5')
     risk_pct = _env_float(prefix, 'RISK_PCT', '0.015')
     position_cap_pct = _env_float(prefix, 'POSITION_CAP_PCT', '0.10')
     min_volume_z = _env_float(prefix, 'VOLUME_ZSCORE_MIN', '0.5')
@@ -5122,6 +5597,7 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
     min_confidence = _env_float(prefix, 'ALPACA_MIN_CONFIDENCE', '0.7')
     min_sentiment = _env_float(prefix, 'ALPACA_MIN_SENTIMENT', '0.0')
     min_imbalance = _env_float(prefix, 'ALPACA_MIN_IMBALANCE', '1.0')
+    manual_approval = os.getenv('ALPACA_MANUAL_APPROVAL', 'false').lower() in {'1', 'true', 'yes', 'y'}
 
     shadow_mode = os.getenv('ALPACA_SHADOW_TRADING', 'false').lower() in {'1', 'true', 'yes', 'y'}
     positions = {getattr(p, 'symbol', '').strip().upper(): p for p in get_open_positions() if getattr(p, 'symbol', None)}
@@ -5150,24 +5626,36 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
     except Exception:
         equity_now = None
     equity_now = equity_now if equity_now is not None else buying_power
-    if _daily_equity_circuit_breaker(sandbox, float(equity_now or 0)):
-        for symbol, pos in positions.items():
-            try:
-                close_position(symbol)
-            except Exception:
-                continue
-        _system_log('SYSTEM', 'ERROR', f'Circuit breaker triggered for {sandbox}', metadata={'equity': equity_now})
-        _send_telegram_alert(
-            f"⛔ Circuit breaker: fermeture positions Alpaca {sandbox} (drawdown quotidien).",
-            allow_during_blackout=True,
-            category='risk',
-        )
+    breaker = _daily_equity_circuit_breaker(sandbox, float(equity_now or 0))
+    if breaker.get('triggered'):
+        if breaker.get('first_trigger'):
+            for symbol, pos in positions.items():
+                try:
+                    close_position(symbol)
+                except Exception:
+                    continue
+            baseline = float(breaker.get('baseline') or equity_now or 0)
+            loss_amount = max(0.0, baseline - float(equity_now or 0))
+            threshold_amount = abs(float(breaker.get('threshold') or 0)) * baseline
+            drawdown_pct = abs(float(breaker.get('drawdown') or 0)) * 100
+            now_str = _ny_time_now().strftime('%H:%M')
+            _system_log('SYSTEM', 'ERROR', f'Circuit breaker triggered for {sandbox}', metadata={'equity': equity_now})
+            _send_telegram_alert(
+                "\n".join([
+                    f"⛔ Circuit breaker Alpaca {sandbox} (arrêt journée)",
+                    f"📉 Perte: ${loss_amount:.2f} / seuil ${threshold_amount:.2f} ({drawdown_pct:.2f}%)",
+                    f"🕒 Heure: {now_str}",
+                ]),
+                allow_during_blackout=True,
+                category='risk',
+            )
         return {
             'created': 0,
             'closed': len(positions),
             'buying_power': round(buying_power, 2),
             'market_regime': regime,
             'market_meta': market_meta,
+            'circuit_breaker': True,
         }
     if shadow_mode:
         positions = {}
@@ -5490,6 +5978,7 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
 
         frame = _alpaca_fusion(symbol)
         tier, tier_reasons = _classify_tier(frame, signal_payload or {})
+        atr_val = _atr_from_frame(frame) or 0.0
 
         reentry_size_factor = 1.0
         reentry_stop_minutes = int(os.getenv('REENTRY_STOPLOSS_WINDOW_MINUTES', '120'))
@@ -5531,6 +6020,9 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
             )
             continue
 
+        stop_distance = max(price * trail_pct, atr_mult * atr_val, price * 0.01)
+        stop_loss = max(0.01, price - stop_distance)
+
         if shadow_mode:
             PaperTrade.objects.create(
                 ticker=symbol,
@@ -5551,13 +6043,32 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
                 broker_status='SHADOW',
                 broker_side='BUY',
                 broker_updated_at=timezone.now(),
-                stop_loss=round(price * 0.96, 2),
+                stop_loss=round(stop_loss, 2),
                 status='OPEN',
                 pnl=0,
                 notes=f"shadow | tier {tier}",
             )
             created += 1
             continue
+
+        if manual_approval:
+            limit_price = (price + limit_offset) if use_limit_orders else None
+            queued = _queue_alpaca_trade_approval(
+                symbol=symbol,
+                sandbox=sandbox,
+                qty=qty,
+                price=price,
+                limit_price=limit_price,
+                stop_loss=stop_loss,
+                signal_payload=signal_payload,
+                tier=tier,
+                tier_reasons=tier_reasons,
+                use_limit_orders=use_limit_orders,
+                notes=None,
+            )
+            if queued:
+                _decision_log(symbol, sandbox, 'PENDING', 'manual_approval')
+                continue
 
         if use_limit_orders:
             order = submit_limit_order(symbol, qty, 'buy', price + limit_offset)
@@ -5592,7 +6103,7 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
             broker_status=str(getattr(order, 'status', '') or ''),
             broker_side='BUY',
             broker_updated_at=timezone.now(),
-            stop_loss=round(price * 0.96, 2),
+            stop_loss=round(stop_loss, 2),
             status='OPEN',
             pnl=0,
             notes=(notes or '') + f" | tier {tier}",
@@ -6190,6 +6701,7 @@ def premarket_ai_prediction() -> dict[str, Any]:
             'universe': universe,
             'features': (payload or {}).get('features') or {},
         }
+        _record_ai_scan(symbol, score, 'premarket_ai_prediction')
         predictions.append(entry)
         _system_log(
             'AI_PENNY' if universe == 'PENNY' else 'AI_BLUECHIP',
@@ -6715,7 +7227,8 @@ def generate_daily_performance_report() -> dict[str, Any]:
     try:
         today = _ny_time_now().date()
         signals = ActiveSignal.objects.filter(opened_at__date=today)
-        if not signals.exists():
+        scan_summary = _get_ai_scan_summary(today)
+        if not signals.exists() and not scan_summary:
             message = (
                 f"📋 **BILAN DE JOURNÉE IA** ({today})\n"
                 "---\n"
@@ -6726,8 +7239,11 @@ def generate_daily_performance_report() -> dict[str, Any]:
             _task_log_finish(log, 'SUCCESS', payload)
             return payload
 
-        total_signals = signals.count()
-        avg_confidence = signals.aggregate(avg=models.Avg('confidence')).get('avg')
+        total_signals = signals.count() if signals.exists() else len(scan_summary)
+        avg_confidence = signals.aggregate(avg=models.Avg('confidence')).get('avg') if signals.exists() else None
+        if avg_confidence is None and scan_summary:
+            valid = [row.get('confidence') for row in scan_summary if row.get('confidence') is not None]
+            avg_confidence = (sum(valid) / len(valid)) if valid else None
 
         def _fmt_conf(value: float | None) -> str:
             if value is None:
@@ -6737,8 +7253,16 @@ def generate_daily_performance_report() -> dict[str, Any]:
                 conf *= 100
             return f"{conf:.1f}%"
 
-        top_picks = signals.order_by('-confidence', '-opened_at')[:3]
-        picks_lines = [f"• {signal.ticker}: {_fmt_conf(signal.confidence)}" for signal in top_picks]
+        if signals.exists():
+            top_picks = signals.order_by('-confidence', '-opened_at')[:3]
+            picks_lines = [f"• {signal.ticker}: {_fmt_conf(signal.confidence)}" for signal in top_picks]
+        else:
+            ranked = sorted(
+                [row for row in scan_summary if row.get('confidence') is not None],
+                key=lambda x: x.get('confidence') or 0,
+                reverse=True,
+            )
+            picks_lines = [f"• {row['symbol']}: {_fmt_conf(row.get('confidence'))}" for row in ranked[:3]]
         picks_str = "\n".join(picks_lines) if picks_lines else "—"
 
         report = (
@@ -6887,6 +7411,7 @@ def send_morning_scout_report() -> dict[str, Any]:
             if not rows:
                 return ['— Aucun titre']
             table_lines = _format_table(headers, rows)
+                    _record_ai_scan(symbol, confidence_pct, 'market_scanner')
             return ['```', *table_lines, '```']
 
         def _send_telegram_chunks(message: str) -> None:
