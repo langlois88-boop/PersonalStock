@@ -4005,6 +4005,16 @@ def _system_log(
         return
 
 
+def _canadian_boost(score: float, symbol: str) -> float:
+    if os.getenv('PREFER_CANADIAN_SYMBOLS', 'false').lower() not in {'1', 'true', 'yes', 'y'}:
+        return score
+    boost = float(os.getenv('CANADIAN_SCORE_BOOST', '0.03'))
+    symbol = (symbol or '').strip().upper()
+    if symbol.endswith(('.TO', '.V', '.CN')):
+        return min(1.0, score + boost)
+    return score
+
+
 def _prediction_log(symbol: str, universe: str, score: float) -> None:
     path = os.getenv('PREDICTIONS_LOG_PATH', 'logs/predictions.csv')
     try:
@@ -5746,6 +5756,118 @@ def auto_discover_top_movers(min_score: float | None = None) -> dict[str, Any]:
 
 
 @shared_task
+def bluechip_dip_scanner() -> dict[str, Any]:
+    """Find bluechips that dipped unjustly and may rebound."""
+    if os.getenv('BLUECHIP_DIP_ENABLED', 'true').lower() not in {'1', 'true', 'yes', 'y'}:
+        return {'status': 'disabled'}
+
+    screener_ids = [
+        s.strip()
+        for s in os.getenv('BLUECHIP_DIP_SCREENERS', 'day_losers,most_actives').split(',')
+        if s.strip()
+    ]
+    min_price = float(os.getenv('BLUECHIP_DIP_MIN_PRICE', '10'))
+    max_price = float(os.getenv('BLUECHIP_DIP_MAX_PRICE', '500'))
+    min_score = float(os.getenv('BLUECHIP_DIP_MIN_SCORE', '0.65'))
+    limit = int(os.getenv('BLUECHIP_DIP_LIMIT', '40'))
+
+    quotes = _fetch_yfinance_screeners(screener_ids, count=limit)
+    candidates: list[dict[str, Any]] = []
+    for item in quotes:
+        symbol = (item.get('symbol') or '').strip().upper()
+        price = item.get('regularMarketPrice') or item.get('price') or item.get('lastPrice')
+        try:
+            price = float(price)
+        except Exception:
+            price = None
+        if not symbol or price is None:
+            continue
+        if not (min_price <= price <= max_price):
+            continue
+
+        score, rsi, lower = _mean_reversion_score(symbol)
+        score = _canadian_boost(score, symbol)
+        if score < min_score:
+            continue
+        candidates.append({
+            'symbol': symbol,
+            'price': round(price, 2),
+            'score': round(score, 4),
+            'rsi': None if rsi is None else round(float(rsi), 2),
+            'lower_band': None if lower is None else round(float(lower), 2),
+        })
+
+    candidates.sort(key=lambda x: x.get('score', 0), reverse=True)
+    if candidates:
+        SandboxWatchlist.objects.update_or_create(
+            sandbox='AI_BLUECHIP',
+            defaults={'symbols': [row['symbol'] for row in candidates[:25]], 'source': 'bluechip_dip_scanner'},
+        )
+    _system_log('AI_BLUECHIP', 'SUCCESS', f'Dip scanner: {len(candidates)} candidates', metadata={'count': len(candidates)})
+    return {'status': 'ok', 'count': len(candidates), 'results': candidates[:10]}
+
+
+@shared_task
+def penny_opportunity_scanner() -> dict[str, Any]:
+    """Find penny stocks with unusual dips or momentum and refresh AI_PENNY watchlist."""
+    if os.getenv('PENNY_SCANNER_ENABLED', 'true').lower() not in {'1', 'true', 'yes', 'y'}:
+        return {'status': 'disabled'}
+
+    screener_ids = [
+        s.strip()
+        for s in os.getenv('PENNY_SCAN_SCREENERS', 'small_cap_gainers,day_gainers,most_actives').split(',')
+        if s.strip()
+    ]
+    min_price = float(os.getenv('PENNY_MIN_PRICE', '0.00001'))
+    max_price = float(os.getenv('PENNY_MAX_PRICE', '2.0'))
+    min_volume = float(os.getenv('PENNY_MIN_VOLUME', '100000'))
+    min_score = float(os.getenv('PENNY_SCAN_MIN_SCORE', '0.7'))
+    limit = int(os.getenv('PENNY_SCAN_LIMIT', '80'))
+
+    quotes = _fetch_yfinance_screeners(screener_ids, count=limit)
+    candidates: list[dict[str, Any]] = []
+    for item in quotes:
+        symbol = (item.get('symbol') or '').strip().upper()
+        price = item.get('regularMarketPrice') or item.get('price') or item.get('lastPrice')
+        volume = item.get('regularMarketVolume') or item.get('volume') or 0
+        try:
+            price = float(price)
+        except Exception:
+            price = None
+        try:
+            volume = float(volume)
+        except Exception:
+            volume = 0.0
+        if not symbol or price is None:
+            continue
+        if not (min_price <= price <= max_price):
+            continue
+        if volume < min_volume:
+            continue
+
+        score, rsi, lower = _mean_reversion_score(symbol)
+        score = _canadian_boost(score, symbol)
+        if score < min_score:
+            continue
+        candidates.append({
+            'symbol': symbol,
+            'price': round(price, 4),
+            'score': round(score, 4),
+            'rsi': None if rsi is None else round(float(rsi), 2),
+            'lower_band': None if lower is None else round(float(lower), 4),
+        })
+
+    candidates.sort(key=lambda x: x.get('score', 0), reverse=True)
+    if candidates:
+        SandboxWatchlist.objects.update_or_create(
+            sandbox='AI_PENNY',
+            defaults={'symbols': [row['symbol'] for row in candidates[:25]], 'source': 'penny_opportunity_scanner'},
+        )
+    _system_log('AI_PENNY', 'SUCCESS', f'Penny scanner: {len(candidates)} candidates', metadata={'count': len(candidates)})
+    return {'status': 'ok', 'count': len(candidates), 'results': candidates[:10]}
+
+
+@shared_task
 def market_scanner_task(symbols: list[str] | None = None) -> dict[str, Any]:
     """Scan market for high-momentum candidates and cache results."""
     if _market_closed_now():
@@ -6058,6 +6180,7 @@ def premarket_ai_prediction() -> dict[str, Any]:
         universe = 'PENNY' if price is not None and float(price) <= penny_max else 'BLUECHIP'
         payload = _model_signal(symbol, universe, get_model_path(universe), use_alpaca=False)
         score = float(payload.get('signal') or 0.0) if payload else 0.0
+        score = _canadian_boost(score, symbol)
         if score < min_score:
             continue
         entry = {

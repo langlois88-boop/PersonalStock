@@ -279,9 +279,17 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.refresh_ai_bluechip_watchlist',
         'schedule': crontab(minute=5, hour='8-16', day_of_week='mon-fri'),
     },
+    'bluechip-dip-scanner-0900': {
+        'task': 'portfolio.tasks.bluechip_dip_scanner',
+        'schedule': crontab(minute=0, hour='9,13', day_of_week='mon-fri'),
+    },
     'refresh-ai-penny-watchlist-hourly': {
         'task': 'portfolio.tasks.refresh_ai_penny_watchlist',
         'schedule': crontab(minute=10, hour='8-16', day_of_week='mon-fri'),
+    },
+    'penny-opportunity-scanner-0930': {
+        'task': 'portfolio.tasks.penny_opportunity_scanner',
+        'schedule': crontab(minute=30, hour='9,13', day_of_week='mon-fri'),
     },
     'paper-trades-ai-bluechip-15min': {
         'task': 'portfolio.tasks.execute_paper_trades_ai_bluechip',
