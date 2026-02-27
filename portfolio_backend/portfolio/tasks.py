@@ -7407,7 +7407,6 @@ def send_morning_scout_report() -> dict[str, Any]:
             if not rows:
                 return ['— Aucun titre']
             table_lines = _format_table(headers, rows)
-                    _record_ai_scan(symbol, confidence_pct, 'market_scanner')
             return ['```', *table_lines, '```']
 
         def _send_telegram_chunks(message: str) -> None:
