@@ -2178,7 +2178,31 @@ class PortfolioDashboardView(APIView):
 		return str(os.getenv('DASHBOARD_FAST_MODE', '1')).strip().lower() in {'1', 'true', 'yes', 'y'}
 
 	def get(self, request):
-		return _portfolio_dashboard_get(self, request)
+		response = _portfolio_dashboard_get(self, request)
+		if response is None:
+			return Response({
+				'portfolio': None,
+				'total_balance': 0,
+				'total_return': 0,
+				'total_return_pct': 0,
+				'change_24h': 0,
+				'change_24h_pct': 0,
+				'change_7d': 0,
+				'change_7d_pct': 0,
+				'current_drawdown': 0,
+				'allocation': {
+					'stable_pct': 0,
+					'risky_pct': 0,
+					'stable_value': 0,
+					'risky_value': 0,
+				},
+				'holdings': [],
+				'archives': [],
+				'chart': [],
+				'intraday_chart': [],
+				'confidence_meter': self._build_confidence_meter(),
+			}, status=200)
+		return response
 
 	def _should_enrich(self, request) -> bool:
 		flag = request.query_params.get('enrich')
