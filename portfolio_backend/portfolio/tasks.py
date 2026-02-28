@@ -6164,6 +6164,15 @@ def sync_alpaca_paper_trades() -> dict[str, Any]:
         orders = get_recent_orders(lookback_days=lookback_days)
         if not orders:
             return {'created': created, 'closed': closed}
+        def _order_time(order: Any) -> datetime:
+            dt = _parse_dt(getattr(order, 'filled_at', None))
+            if dt is None:
+                dt = _parse_dt(getattr(order, 'created_at', None))
+            if dt is None:
+                dt = _parse_dt(getattr(order, 'updated_at', None))
+            return dt or datetime.min.replace(tzinfo=timezone.utc)
+
+        orders = sorted(list(orders), key=_order_time)
         cutoff = timezone.now() - timedelta(days=lookback_days)
         for order in orders:
             symbol = str(getattr(order, 'symbol', '') or '').strip().upper()
