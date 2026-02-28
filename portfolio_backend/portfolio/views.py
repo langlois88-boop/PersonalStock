@@ -6117,7 +6117,10 @@ class PortfolioOptimizerView(APIView):
 			fusion = DataFusionEngine(symbol)
 			fusion_df = fusion.fuse_all()
 			if fusion_df is None or fusion_df.empty:
-				return None, None
+				fusion = DataFusionEngine(symbol, fast_mode=True)
+				fusion_df = fusion.fuse_all()
+				if fusion_df is None or fusion_df.empty:
+					return None, None
 			payload = load_or_train_model(fusion_df, model_path=get_model_path(universe))
 			if not payload or not payload.get('model'):
 				return None, None
