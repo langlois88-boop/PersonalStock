@@ -224,23 +224,20 @@ function OptimizerPage() {
     loadTrackedSignals();
   }, [loadTrackedSignals]);
 
-  const coreActions = useMemo(
-    () =>
-      actions.filter((item) => {
-        const price = Number(item.price ?? 0);
-        const marketCap = Number(item.market_cap ?? 0);
-        return price > 5 && marketCap > 2_000_000_000;
-      }),
-    [actions],
+  const isCoreCandidate = useCallback(
+    (item) => {
+      const price = Number(item.price ?? 0);
+      const marketCap = Number(item.market_cap ?? 0);
+      if (marketCap >= 100_000_000_000) return true;
+      if (isCore12y(item)) return true;
+      return price > 5 && marketCap > 2_000_000_000;
+    },
+    [isCore12y],
   );
+  const coreActions = useMemo(() => actions.filter(isCoreCandidate), [actions, isCoreCandidate]);
   const moonshotActions = useMemo(
-    () =>
-      actions.filter((item) => {
-        const price = Number(item.price ?? 0);
-        const marketCap = Number(item.market_cap ?? 0);
-        return price <= 5 || marketCap <= 2_000_000_000;
-      }),
-    [actions],
+    () => actions.filter((item) => !isCoreCandidate(item)),
+    [actions, isCoreCandidate],
   );
   const hasActions = useMemo(() => actions.length > 0, [actions.length]);
   const visibleActions = activeTab === 'core' ? coreActions : moonshotActions;

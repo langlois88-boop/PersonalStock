@@ -2672,7 +2672,10 @@ class PortfolioDashboardView(APIView):
 			if prev_7d:
 				change_7d += (price - float(prev_7d.close_price)) * shares
 
-			is_stable = effective_price >= 5 or float(stock.dividend_yield or 0) >= 0.02
+			dividend_yield = float(stock.dividend_yield or 0)
+			if symbol in {'RY', 'RY.TO'} and dividend_yield <= 0 and effective_price > 0:
+				dividend_yield = round((1.64 * 4) / effective_price, 4)
+			is_stable = effective_price >= 5 or dividend_yield >= 0.02
 			if is_stable:
 				stable_value += value
 			else:
@@ -2709,7 +2712,7 @@ class PortfolioDashboardView(APIView):
 				'ticker': stock.symbol,
 				'name': stock.name,
 				'sector': stock.sector,
-				'dividend_yield': float(stock.dividend_yield or 0),
+				'dividend_yield': dividend_yield,
 				'shares': shares,
 				'price': effective_price,
 				'value': value,
@@ -5425,6 +5428,21 @@ class ScoutFundamentalsView(APIView):
 			return None
 		return round(parsed * 100, 2) if parsed <= 1 else round(parsed, 2)
 
+	def _stable_price_override(self, symbol: str, fallback_price: float | None) -> float | None:
+		symbol_upper = (symbol or '').strip().upper()
+		if symbol_upper not in {'RY', 'RY.TO'}:
+			return fallback_price
+		try:
+			info = yf.Ticker('RY.TO').info or {}
+			price = self._to_float(
+				info.get('currentPrice')
+				or info.get('regularMarketPrice')
+				or info.get('previousClose')
+			)
+			return price if price else fallback_price
+		except Exception:
+			return fallback_price
+
 	def get(self, request):
 		raw = request.query_params.get('symbols', '')
 		symbols = [s.strip().upper() for s in str(raw).split(',') if s.strip()]
@@ -6033,7 +6051,9 @@ class PortfolioOptimizerView(APIView):
 			return result
 		info = {}
 		try:
-			info = yf.Ticker(symbol).info or {}
+			symbol_upper = (symbol or '').strip().upper()
+			info_symbol = 'RY.TO' if symbol_upper == 'RY' else symbol_upper
+			info = yf.Ticker(info_symbol).info or {}
 		except Exception:
 			info = {}
 
@@ -6041,6 +6061,19 @@ class PortfolioOptimizerView(APIView):
 		revenue_growth = self._percent(info.get('revenueGrowth'))
 		current_ratio = self._to_float(info.get('currentRatio'))
 		dividend_yield = self._percent(info.get('dividendYield'))
+		symbol_upper = (symbol or '').strip().upper()
+		if symbol_upper in {'RY', 'RY.TO'}:
+			price = self._to_float(
+				info.get('currentPrice')
+				or info.get('regularMarketPrice')
+				or info.get('previousClose')
+			)
+			dividend_rate = self._to_float(info.get('dividendRate') or info.get('trailingAnnualDividendRate'))
+			if price and (dividend_yield is None or dividend_yield <= 0):
+				if dividend_rate:
+					dividend_yield = self._percent(dividend_rate / price)
+				else:
+					dividend_yield = self._percent((1.64 * 4) / price)
 		if (symbol or '').strip().upper() == 'AVGO':
 			dividend_rate = self._to_float(info.get('dividendRate') or info.get('trailingAnnualDividendRate'))
 			if dividend_rate:
@@ -6409,6 +6442,7 @@ class PortfolioOptimizerView(APIView):
 		min_volume_z = float(os.getenv('VOLUME_ZSCORE_MIN', '0.5'))
 		rsi_value = float(row.get('RSI14', 0.0) or 0.0)
 		price_value = float(row.get('Close', 0.0) or 0.0)
+		price_value = self._stable_price_override(symbol, price_value) or price_value
 		price_target = self._price_target_override(symbol)
 		if price_target and price_value and price_target > price_value:
 			confidence = max(confidence, 80)
@@ -6616,6 +6650,7 @@ class PortfolioOptimizerView(APIView):
 		if not symbol:
 			return None
 		price_value = self._to_float(getattr(holding.stock, 'latest_price', None)) or 0.0
+		price_value = self._stable_price_override(symbol, price_value) or price_value
 		dividend_yield = self._to_float(getattr(holding.stock, 'dividend_yield', None))
 		name = holding.stock.name or symbol
 		ai_score = 50.0
