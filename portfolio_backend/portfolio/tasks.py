@@ -2337,6 +2337,51 @@ def fetch_fundamentals_daily() -> dict[str, int]:
 
 
 @shared_task
+def refresh_dividend_yield(symbols: list[str] | None = None) -> dict[str, Any]:
+    log = _task_log_start('refresh_dividend_yield')
+    updated = 0
+    skipped = 0
+    payload_symbols = symbols or []
+    if not payload_symbols:
+        env_list = os.getenv('DIVIDEND_REFRESH_SYMBOLS', '')
+        payload_symbols = [s.strip().upper() for s in env_list.split(',') if s.strip()]
+    try:
+        for symbol in payload_symbols:
+            stock = Stock.objects.filter(symbol__iexact=symbol).first()
+            if not stock:
+                skipped += 1
+                continue
+            try:
+                info = yf.Ticker(stock.symbol).info or {}
+            except Exception:
+                info = {}
+            div_yield = info.get('dividendYield')
+            if div_yield is None:
+                div_yield = info.get('trailingAnnualDividendYield')
+            div_yield = float(div_yield) if div_yield is not None else None
+            price_hint = info.get('regularMarketPrice') or info.get('currentPrice') or stock.latest_price
+            if div_yield is None:
+                dividend_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate')
+                if dividend_rate is not None and price_hint:
+                    try:
+                        div_yield = float(dividend_rate) / float(price_hint)
+                    except Exception:
+                        div_yield = None
+            if div_yield is None:
+                skipped += 1
+                continue
+            stock.dividend_yield = div_yield
+            stock.save(update_fields=['dividend_yield'])
+            updated += 1
+        _task_log_finish(log, 'SUCCESS', {'updated': updated, 'skipped': skipped})
+        return {'updated': updated, 'skipped': skipped}
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        _send_alert('Task failed: refresh_dividend_yield', str(exc))
+        raise
+
+
+@shared_task
 def fetch_news_daily(days: int = 1, page_size: int = 10, language: str = 'en') -> dict[str, int]:
     log = _task_log_start('fetch_news_daily')
     api_key = os.getenv('NEWSAPI_KEY')
@@ -4798,10 +4843,10 @@ def _normalize_score(value: float | None, low: float, high: float) -> float:
     return max(0.0, min(1.0, (float(value) - low) / (high - low)))
 
 
-def _bluechip_fundamental_score(symbol: str) -> float:
-    fundamentals = _yahoo_fundamentals(symbol)
+def _bluechip_fundamental_score(symbol: str) -> tuple[float, dict[str, Any]]:
+    fundamentals = _yahoo_fundamentals(symbol) or {}
     if not fundamentals:
-        return 0.0
+        return 0.0, {}
     current_ratio = fundamentals.get('current_ratio')
     revenue_growth = fundamentals.get('revenue_growth')
     profit_margins = fundamentals.get('profit_margins')
@@ -4815,7 +4860,7 @@ def _bluechip_fundamental_score(symbol: str) -> float:
     pe_score = 1.0 - _normalize_score(trailing_pe, 8.0, 35.0)
     scores = [current_score, growth_score, margin_score, debt_score, pe_score]
     valid = [s for s in scores if s is not None]
-    return float(sum(valid) / len(valid)) if valid else 0.0
+    return (float(sum(valid) / len(valid)) if valid else 0.0), fundamentals
 
 
 def _index_correlation_score(symbol: str, days: int = 90) -> float:
@@ -5114,15 +5159,33 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             return payload
 
         if sandbox == 'AI_BLUECHIP':
-            fundamentals_score = _bluechip_fundamental_score(symbol)
+            fundamentals_score, fundamentals = _bluechip_fundamental_score(symbol)
             corr_score = _index_correlation_score(symbol)
             composite = (0.2 * base_signal) + (0.4 * fundamentals_score) + (0.4 * corr_score)
+
+            growth_min = float(os.getenv('BLUECHIP_GROWTH_PRIORITY_MIN', '0.10'))
+            growth_boost = float(os.getenv('BLUECHIP_GROWTH_PRIORITY_BOOST', '0.10'))
+            revenue_growth = fundamentals.get('revenue_growth')
+            growth_bonus = 0.0
+            if revenue_growth is not None:
+                try:
+                    growth_value = float(revenue_growth)
+                    if growth_value >= growth_min:
+                        growth_bonus = growth_boost
+                except Exception:
+                    growth_value = None
+            else:
+                growth_value = None
+
+            composite = min(1.0, composite + growth_bonus)
             payload['signal'] = float(composite)
             payload['model_name'] = 'BLUECHIP_FUNDAMENTAL'
             payload['features'] = dict(payload.get('features') or {})
             payload['features'].update({
                 'fundamental_score': float(fundamentals_score),
                 'index_correlation_score': float(corr_score),
+                'revenue_growth': growth_value,
+                'growth_priority_boost': float(growth_bonus),
             })
             return payload
 
