@@ -97,7 +97,8 @@ class DataFusionEngine:
             except Exception:
                 df = pd.DataFrame()
         if df is None or df.empty:
-            return pd.DataFrame()
+            db_df = self._get_market_data_from_db()
+            return db_df if db_df is not None and not db_df.empty else pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
             level_0 = df.columns.get_level_values(0)
             level_last = df.columns.get_level_values(-1)
@@ -120,7 +121,8 @@ class DataFusionEngine:
         df = df.rename(columns={"Adj Close": "Adj_Close"})
         df = _normalize_ohlc_columns(df)
         if "Close" not in df.columns:
-            return pd.DataFrame()
+            db_df = self._get_market_data_from_db()
+            return db_df if db_df is not None and not db_df.empty else pd.DataFrame()
         df["Returns"] = df["Close"].pct_change()
         return df
 
