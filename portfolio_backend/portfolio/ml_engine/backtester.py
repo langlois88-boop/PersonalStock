@@ -642,7 +642,7 @@ class AIBacktester:
             min_volume_z = float(os.getenv("VOLUME_ZSCORE_MIN", "0.5"))
 
             trend_ok = ma20 > ma50 if (ma20 and ma50) else True
-            market_ok = price is not None and (not ma200 or price > ma200)
+            market_ok = price is not None and (not ma200 or price > ma200 or ai_signal >= buy_threshold)
             sentiment_ok = sentiment > 0.1 or sentiment_constant
             volume_ok = volume_z >= min_volume_z
             buy_ok = (ai_signal >= buy_threshold) and sentiment_ok and trend_ok and volume_ok
