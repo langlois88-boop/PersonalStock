@@ -2368,6 +2368,19 @@ def refresh_dividend_yield(symbols: list[str] | None = None) -> dict[str, Any]:
                     except Exception:
                         div_yield = None
             if div_yield is None:
+                try:
+                    dividends = yf.Ticker(stock.symbol).dividends
+                except Exception:
+                    dividends = None
+                if dividends is not None and not dividends.empty:
+                    try:
+                        recent = dividends.tail(12)
+                        annualized = float(recent.sum())
+                        if price_hint:
+                            div_yield = annualized / float(price_hint)
+                    except Exception:
+                        div_yield = None
+            if div_yield is None:
                 skipped += 1
                 continue
             stock.dividend_yield = div_yield
@@ -4344,11 +4357,16 @@ def _daily_equity_circuit_breaker(sandbox: str, equity_now: float) -> dict[str, 
     result['baseline'] = baseline
     if baseline <= 0:
         return result
-    drawdown = (equity_now - baseline) / baseline
-    result['drawdown'] = drawdown
     if cache.get(trigger_key):
         result['triggered'] = True
         return result
+    if equity_now >= baseline:
+        cache.set(key, float(equity_now), timeout=60 * 60 * 24)
+        result['baseline'] = float(equity_now)
+        result['drawdown'] = 0.0
+        return result
+    drawdown = (equity_now - baseline) / baseline
+    result['drawdown'] = drawdown
     if drawdown <= -abs(threshold):
         cache.set(trigger_key, True, timeout=60 * 60 * 24)
         result['triggered'] = True
@@ -4364,9 +4382,12 @@ def reset_daily_equity_breaker(sandbox: str | None = None, day: date | None = No
         if not box:
             continue
         trigger_key = f"daily_equity_trip:{box}:{day_key}"
+        baseline_key = f"daily_equity_base:{box}:{day_key}"
         if cache.get(trigger_key):
             cache.delete(trigger_key)
             cleared.append(box)
+        if cache.get(baseline_key):
+            cache.delete(baseline_key)
     return {'cleared': cleared, 'date': day_key}
 
 
