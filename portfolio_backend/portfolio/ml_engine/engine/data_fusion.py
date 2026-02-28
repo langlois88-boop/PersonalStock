@@ -118,8 +118,14 @@ class DataFusionEngine:
         df.index = pd.to_datetime(df.index, errors="coerce")
         df = df[~df.index.isna()]
         df = _normalize_datetime_index(df)
+        if df is None or df.empty:
+            db_df = self._get_market_data_from_db()
+            return db_df if db_df is not None and not db_df.empty else pd.DataFrame()
         df = df.rename(columns={"Adj Close": "Adj_Close"})
         df = _normalize_ohlc_columns(df)
+        if df is None or df.empty:
+            db_df = self._get_market_data_from_db()
+            return db_df if db_df is not None and not db_df.empty else pd.DataFrame()
         if "Close" not in df.columns:
             db_df = self._get_market_data_from_db()
             return db_df if db_df is not None and not db_df.empty else pd.DataFrame()
