@@ -6719,6 +6719,59 @@ class PortfolioOptimizerView(APIView):
 			'type': 'Bluechip' if universe == 'BLUECHIP' else 'Penny',
 		}
 
+	def _parse_symbol_set(self, value):
+		if not value:
+			return set()
+		return {item.strip().upper() for item in value.split(',') if item.strip()}
+
+	def _override_tags_for_symbol(self, symbol):
+		if not symbol:
+			return {}
+		symbol = symbol.strip().upper()
+		return {
+			'growth': symbol in self._parse_symbol_set(os.getenv('OPTIMIZER_GROWTH_SYMBOLS', '')),
+			'bluechip': symbol in self._parse_symbol_set(os.getenv('OPTIMIZER_BLUECHIP_SYMBOLS', '')),
+			'speculative': symbol in self._parse_symbol_set(os.getenv('OPTIMIZER_SPEC_SYMBOLS', '')),
+			'zombie': symbol in self._parse_symbol_set(os.getenv('OPTIMIZER_ZOMBIE_SYMBOLS', '')),
+		}
+
+	def _apply_manual_category_overrides(self, action):
+		if not action or not action.get('ticker'):
+			return action
+		overrides = self._override_tags_for_symbol(action.get('ticker'))
+		if not overrides:
+			return action
+		applied = [key for key, flag in overrides.items() if flag]
+		if applied:
+			try:
+				SystemLog.objects.create(
+					category='SYSTEM',
+					level='INFO',
+					symbol=action.get('ticker'),
+					message=f"[OPTIMIZER] Applied override for {action.get('ticker')} as {', '.join(applied)}.",
+					metadata={'overrides': applied},
+				)
+			except Exception:
+				pass
+		for key, flag in overrides.items():
+			if flag is not None:
+				action[key] = bool(flag)
+		if overrides.get('bluechip'):
+			action['type'] = 'Bluechip'
+			if action.get('confidence') is not None:
+				try:
+					boosted = float(action['confidence']) * 1.2
+					action['confidence'] = int(round(self._clamp(boosted, 45, 95)))
+				except Exception:
+					pass
+		elif overrides.get('speculative'):
+			action['type'] = 'Penny'
+		if applied:
+			action['category_override_label'] = f"Category: {', '.join(applied)} (Tag Overridden)"
+		else:
+			action['category_override_label'] = None
+		return action
+
 	def get(self, request):
 		try:
 			hover_flag = str(request.query_params.get('hover', '')).strip().lower() in {'1', 'true', 'yes'}
@@ -6737,6 +6790,7 @@ class PortfolioOptimizerView(APIView):
 				is_stable = latest_price >= 5 or dividend_yield >= 0.02
 				universe = 'BLUECHIP' if is_stable else 'PENNY'
 				action = self._build_action_fast(holding, universe, allow_gemini=True)
+				action = self._apply_manual_category_overrides(action)
 				payload = {
 					'ticker': hover_symbol,
 					'gemini_verdict': action.get('gemini_verdict') if action else None,
@@ -6746,6 +6800,7 @@ class PortfolioOptimizerView(APIView):
 					'volume_z': action.get('volume_z') if action else None,
 					'rsi': action.get('rsi') if action else None,
 					'price': action.get('price') if action else None,
+					'category_override_label': action.get('category_override_label') if action else None,
 					'as_of': timezone.now().isoformat(),
 				}
 				cache.set(cache_key, payload, timeout=60 * 5)
@@ -6837,6 +6892,7 @@ class PortfolioOptimizerView(APIView):
 				except Exception:
 					action = None
 				if action:
+					action = self._apply_manual_category_overrides(action)
 					if action.get('gemini_verdict') is not None:
 						gemini_used += 1
 					actions.append(action)
@@ -6861,7 +6917,7 @@ class PortfolioOptimizerView(APIView):
 						fast_mode=fast_mode,
 					)
 					if suggestion:
-						suggestions.append(suggestion)
+						suggestions.append(self._apply_manual_category_overrides(suggestion))
 				for symbol in penny_candidates:
 					if symbol in existing:
 						continue
@@ -6875,7 +6931,7 @@ class PortfolioOptimizerView(APIView):
 						fast_mode=fast_mode,
 					)
 					if suggestion:
-						suggestions.append(suggestion)
+						suggestions.append(self._apply_manual_category_overrides(suggestion))
 
 			def _priority(item: dict[str, Any]) -> tuple[int, float, float]:
 				altman_z = item.get('altman_z')

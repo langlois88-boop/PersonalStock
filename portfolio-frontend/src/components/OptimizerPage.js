@@ -368,6 +368,22 @@ function OptimizerPage() {
                   <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-700 text-slate-300 border border-slate-600">
                     {item.type}
                   </span>
+                  {(() => {
+                    const tags = [];
+                    if (item.growth) tags.push({ key: 'GRW', className: 'bg-emerald-500/15 text-emerald-200 border-emerald-500/40' });
+                    if (item.bluechip) tags.push({ key: 'BLU', className: 'bg-sky-500/15 text-sky-200 border-sky-500/40' });
+                    if (item.speculative) tags.push({ key: 'SPC', className: 'bg-amber-500/15 text-amber-200 border-amber-500/40' });
+                    if (item.zombie) tags.push({ key: 'ZOM', className: 'bg-rose-500/15 text-rose-200 border-rose-500/40' });
+                    if (!tags.length) return null;
+                    return tags.map((tag) => (
+                      <span
+                        key={`${item.ticker}-${tag.key}`}
+                        className={`text-[10px] px-2 py-0.5 rounded-full border ${tag.className}`}
+                      >
+                        [{tag.key}]
+                      </span>
+                    ));
+                  })()}
                 </div>
                 <p className="text-xs text-slate-400">{item.name}</p>
                 <p className="text-xs text-slate-400">{item.reason}</p>
@@ -481,6 +497,9 @@ function OptimizerPage() {
                       <p className="mt-1 text-xs text-rose-300">Checkup indisponible.</p>
                     ) : hoverGemini[item.ticker] ? (
                       <div className="mt-1 text-xs text-slate-200 space-y-1">
+                        {hoverGemini[item.ticker]?.category_override_label ? (
+                          <p className="text-amber-200">{hoverGemini[item.ticker].category_override_label}</p>
+                        ) : null}
                         {hoverGemini[item.ticker]?.gemini_confidence != null ? (
                           <p>Confiance: {Number(hoverGemini[item.ticker].gemini_confidence).toFixed(0)}%</p>
                         ) : null}

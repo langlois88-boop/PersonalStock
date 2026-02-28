@@ -129,6 +129,9 @@ class DataFusionEngine:
         if "Close" not in df.columns:
             db_df = self._get_market_data_from_db()
             return db_df if db_df is not None and not db_df.empty else pd.DataFrame()
+        if df["Close"].dropna().empty:
+            db_df = self._get_market_data_from_db()
+            return db_df if db_df is not None and not db_df.empty else pd.DataFrame()
         df["Returns"] = df["Close"].pct_change()
         return df
 
