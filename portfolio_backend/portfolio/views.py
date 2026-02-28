@@ -3513,6 +3513,91 @@ def _portfolio_dashboard_get(self, request):
 		portfolio = Portfolio.objects.filter(id=portfolio_id).first()
 	if not portfolio:
 		portfolio = Portfolio.objects.first()
+	if portfolio:
+		try:
+			account_transactions = AccountTransaction.objects.select_related('stock').all()
+		except OperationalError:
+			account_transactions = []
+		if account_transactions:
+			fallback = self._build_holdings_from_account_transactions(list(account_transactions), enrich)
+			items = fallback['items']
+			total_value = fallback['total_value']
+			stable_value = fallback['stable_value']
+			risky_value = fallback['risky_value']
+			change_1d = fallback['change_1d']
+			change_7d = fallback['change_7d']
+			total_cost_value = float(fallback.get('total_cost_value') or 0)
+			total_return = total_value - total_cost_value
+			total_return_pct = (total_return / total_cost_value * 100) if total_cost_value else 0.0
+
+			allocation_pct = (stable_value / total_value * 100) if total_value else 0
+			change_1d_pct = (change_1d / (total_value - change_1d) * 100) if total_value else 0
+			change_7d_pct = (change_7d / (total_value - change_7d) * 100) if total_value else 0
+
+			snapshots = DripSnapshot.objects.filter(portfolio=portfolio).order_by('-as_of')[:365]
+			if snapshots:
+				chart = [
+					{
+						'date': s.as_of.isoformat(),
+						'value': float(s.capital or 0),
+					}
+					for s in reversed(list(snapshots))
+				]
+			else:
+				chart = [
+					{'date': f'D-{i}', 'value': round(total_value * (0.98 + i * 0.002), 2)}
+					for i in range(12)
+				]
+			intraday_chart = _build_intraday_chart([
+				{**item, 'symbol': (item.get('ticker') or '').strip().upper(), 'shares': item.get('shares')}
+				for item in items
+			]) if intraday_enabled else []
+			chart_values = [float(point.get('value') or 0) for point in chart if point.get('value') is not None]
+			current_drawdown = self._current_drawdown(chart_values)
+			return Response({
+				'portfolio': {'id': portfolio.id, 'name': portfolio.name},
+				'total_balance': round(total_value, 2),
+				'total_return': round(total_return, 2),
+				'total_return_pct': round(total_return_pct, 2),
+				'change_24h': round(change_1d, 2),
+				'change_24h_pct': round(change_1d_pct, 2),
+				'change_7d': round(change_7d, 2),
+				'change_7d_pct': round(change_7d_pct, 2),
+				'current_drawdown': round(float(current_drawdown) * 100, 2),
+				'allocation': {
+					'stable_pct': round(allocation_pct, 2),
+					'risky_pct': round(100 - allocation_pct, 2),
+					'stable_value': round(stable_value, 2),
+					'risky_value': round(risky_value, 2),
+				},
+				'holdings': items,
+				'archives': [],
+				'chart': chart,
+				'intraday_chart': intraday_chart,
+				'confidence_meter': self._build_confidence_meter(),
+			}, status=200)
+		return Response({
+			'portfolio': {'id': portfolio.id, 'name': portfolio.name},
+			'total_balance': 0,
+			'total_return': 0,
+			'total_return_pct': 0,
+			'change_24h': 0,
+			'change_24h_pct': 0,
+			'change_7d': 0,
+			'change_7d_pct': 0,
+			'current_drawdown': 0,
+			'allocation': {
+				'stable_pct': 0,
+				'risky_pct': 0,
+				'stable_value': 0,
+				'risky_value': 0,
+			},
+			'holdings': [],
+			'archives': [],
+			'chart': [],
+			'intraday_chart': [],
+			'confidence_meter': self._build_confidence_meter(),
+		}, status=200)
 	if not portfolio:
 		try:
 			transactions = AccountTransaction.objects.select_related('stock').all()
