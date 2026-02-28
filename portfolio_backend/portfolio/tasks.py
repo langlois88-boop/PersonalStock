@@ -88,6 +88,7 @@ from .alpaca_data import (
     get_order_book_imbalance,
     get_account,
     get_open_positions,
+    get_recent_orders,
     submit_market_order,
     submit_limit_order,
     get_order_by_id,
@@ -6153,12 +6154,8 @@ def sync_alpaca_paper_trades() -> dict[str, Any]:
     def _sync_recent_orders(lookback_days: int = 7) -> dict[str, int]:
         created = 0
         closed = 0
-        client = get_trading_client()
-        if not client:
-            return {'created': created, 'closed': closed}
-        try:
-            orders = client.get_orders() or []
-        except Exception:
+        orders = get_recent_orders(lookback_days=lookback_days)
+        if not orders:
             return {'created': created, 'closed': closed}
         cutoff = timezone.now() - timedelta(days=lookback_days)
         for order in orders:

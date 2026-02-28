@@ -13,8 +13,8 @@ try:
     from alpaca.data.timeframe import TimeFrame
     from alpaca.data.enums import DataFeed  # <--- Crucial pour le plan gratuit
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import GetAssetsRequest, MarketOrderRequest, LimitOrderRequest
-    from alpaca.trading.enums import AssetClass, OrderSide, TimeInForce
+    from alpaca.trading.requests import GetAssetsRequest, MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
+    from alpaca.trading.enums import AssetClass, OrderSide, TimeInForce, OrderStatus
 except Exception:  # pragma: no cover
     StockHistoricalDataClient = None
     StockBarsRequest = None
@@ -26,9 +26,11 @@ except Exception:  # pragma: no cover
     GetAssetsRequest = None
     MarketOrderRequest = None
     LimitOrderRequest = None
+    GetOrdersRequest = None
     AssetClass = None
     OrderSide = None
     TimeInForce = None
+    OrderStatus = None
 
 from .patterns import enrich_bars_with_patterns
 
@@ -157,6 +159,21 @@ def get_tradable_symbols(limit: int = 500) -> list[str]:
         assets = client.get_all_assets(request)
         symbols = [a.symbol for a in assets if getattr(a, 'tradable', False)]
         return symbols[:limit]
+    except Exception:
+        return []
+
+
+def get_recent_orders(lookback_days: int = 7) -> list[Any]:
+    client = _alpaca_trading_client()
+    if client is None:
+        return []
+    try:
+        if GetOrdersRequest is not None and OrderStatus is not None:
+            after = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            closed = client.get_orders(GetOrdersRequest(status=OrderStatus.CLOSED, after=after)) or []
+            open_orders = client.get_orders(GetOrdersRequest(status=OrderStatus.OPEN, after=after)) or []
+            return list(closed) + list(open_orders)
+        return client.get_orders() or []
     except Exception:
         return []
 
