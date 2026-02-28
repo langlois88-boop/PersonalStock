@@ -14,7 +14,7 @@ try:
     from alpaca.data.enums import DataFeed  # <--- Crucial pour le plan gratuit
     from alpaca.trading.client import TradingClient
     from alpaca.trading.requests import GetAssetsRequest, MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
-    from alpaca.trading.enums import AssetClass, OrderSide, TimeInForce, OrderStatus
+    from alpaca.trading.enums import AssetClass, OrderSide, TimeInForce
 except Exception:  # pragma: no cover
     StockHistoricalDataClient = None
     StockBarsRequest = None
@@ -168,11 +168,9 @@ def get_recent_orders(lookback_days: int = 7) -> list[Any]:
     if client is None:
         return []
     try:
-        if GetOrdersRequest is not None and OrderStatus is not None:
+        if GetOrdersRequest is not None:
             after = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-            closed = client.get_orders(GetOrdersRequest(status=OrderStatus.CLOSED, after=after)) or []
-            open_orders = client.get_orders(GetOrdersRequest(status=OrderStatus.OPEN, after=after)) or []
-            return list(closed) + list(open_orders)
+            return list(client.get_orders(GetOrdersRequest(status='all', after=after)) or [])
         return client.get_orders() or []
     except Exception:
         return []
