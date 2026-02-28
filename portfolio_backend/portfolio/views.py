@@ -3430,8 +3430,84 @@ def _portfolio_dashboard_get(self, request):
 		]
 
 	portfolio_id = request.query_params.get('portfolio_id')
+	account_id = request.query_params.get('account_id')
 	enrich = self._should_enrich(request)
 	intraday_enabled = str(request.query_params.get('intraday', '')).strip().lower() in {'1', 'true', 'yes', 'y'}
+	if account_id and str(account_id).strip().upper() != 'ALL':
+		account = Account.objects.filter(id=account_id).first()
+		try:
+			transactions = AccountTransaction.objects.select_related('stock').filter(account_id=account_id)
+		except OperationalError:
+			transactions = []
+		if not transactions:
+			return Response({
+				'portfolio': {'id': account.id, 'name': account.name, 'type': account.account_type} if account else None,
+				'total_balance': 0,
+				'total_return': 0,
+				'total_return_pct': 0,
+				'change_24h': 0,
+				'change_24h_pct': 0,
+				'change_7d': 0,
+				'change_7d_pct': 0,
+				'current_drawdown': 0,
+				'allocation': {
+					'stable_pct': 0,
+					'risky_pct': 0,
+					'stable_value': 0,
+					'risky_value': 0,
+				},
+				'holdings': [],
+				'archives': [],
+				'chart': [],
+				'intraday_chart': [],
+				'confidence_meter': self._build_confidence_meter(),
+			}, status=200)
+
+		fallback = self._build_holdings_from_account_transactions(list(transactions), enrich)
+		items = fallback['items']
+		total_value = fallback['total_value']
+		stable_value = fallback['stable_value']
+		risky_value = fallback['risky_value']
+		change_1d = fallback['change_1d']
+		change_7d = fallback['change_7d']
+		total_cost_value = float(fallback.get('total_cost_value') or 0)
+		total_return = total_value - total_cost_value
+		total_return_pct = (total_return / total_cost_value * 100) if total_cost_value else 0.0
+
+		allocation_pct = (stable_value / total_value * 100) if total_value else 0
+		change_1d_pct = (change_1d / (total_value - change_1d) * 100) if total_value else 0
+		change_7d_pct = (change_7d / (total_value - change_7d) * 100) if total_value else 0
+
+		chart = [
+			{'date': f'D-{i}', 'value': round(total_value * (0.98 + i * 0.002), 2)}
+			for i in range(12)
+		]
+		intraday_chart = _build_intraday_chart([
+			{**item, 'symbol': (item.get('ticker') or '').strip().upper(), 'shares': item.get('shares')}
+			for item in items
+		]) if intraday_enabled else []
+		return Response({
+			'portfolio': {'id': account.id, 'name': account.name, 'type': account.account_type} if account else None,
+			'total_balance': round(total_value, 2),
+			'total_return': round(total_return, 2),
+			'total_return_pct': round(total_return_pct, 2),
+			'change_24h': round(change_1d, 2),
+			'change_24h_pct': round(change_1d_pct, 2),
+			'change_7d': round(change_7d, 2),
+			'change_7d_pct': round(change_7d_pct, 2),
+			'current_drawdown': 0,
+			'allocation': {
+				'stable_pct': round(allocation_pct, 2),
+				'risky_pct': round(100 - allocation_pct, 2),
+				'stable_value': round(stable_value, 2),
+				'risky_value': round(risky_value, 2),
+			},
+			'holdings': items,
+			'archives': [],
+			'chart': chart,
+			'intraday_chart': intraday_chart,
+			'confidence_meter': self._build_confidence_meter(),
+		}, status=200)
 	portfolio = None
 	if portfolio_id:
 		portfolio = Portfolio.objects.filter(id=portfolio_id).first()

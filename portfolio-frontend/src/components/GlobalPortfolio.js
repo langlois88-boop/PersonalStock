@@ -109,8 +109,15 @@ function GlobalPortfolio() {
   const loadPortfolio = (intraday) => {
     setLoading(true);
     setError('');
+    const params = {};
+    if (intraday) {
+      params.intraday = 1;
+    }
+    if (selectedAccountId && selectedAccountId !== 'ALL') {
+      params.account_id = selectedAccountId;
+    }
     api
-      .get('dashboard/portfolio/', { params: intraday ? { intraday: 1 } : {} })
+      .get('dashboard/portfolio/', { params })
       .then((res) => setData(res.data))
       .catch(() => {
         setError("Impossible de charger le portefeuille.");
@@ -128,7 +135,7 @@ function GlobalPortfolio() {
     return () => {
       if (interval) clearInterval(interval);
     };
-  }, [chartRange]);
+  }, [chartRange, selectedAccountId]);
 
   useEffect(() => {
     let isMounted = true;
