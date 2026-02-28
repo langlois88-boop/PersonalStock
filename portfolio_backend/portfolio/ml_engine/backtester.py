@@ -201,6 +201,20 @@ def _feature_weighting_enabled() -> bool:
     return os.getenv('FEATURE_WEIGHTING_ENABLED', 'false').lower() in {'1', 'true', 'yes', 'y'}
 
 
+def _fallback_signal(df: pd.DataFrame) -> pd.Series:
+    ma20 = df.get('MA20') if 'MA20' in df.columns else pd.Series(index=df.index, data=np.nan)
+    ma50 = df.get('MA50') if 'MA50' in df.columns else pd.Series(index=df.index, data=np.nan)
+    rsi = df.get('RSI14') if 'RSI14' in df.columns else pd.Series(index=df.index, data=50.0)
+
+    trend = (ma20 > ma50).fillna(False)
+    base = np.where(trend, 0.7, 0.3)
+
+    rsi = pd.to_numeric(rsi, errors='coerce').fillna(50.0)
+    rsi_adj = (rsi - 50.0) / 100.0
+    signal = np.clip(base + rsi_adj, 0.0, 1.0)
+    return pd.Series(signal, index=df.index)
+
+
 def apply_feature_weighting_to_signal(
     signal: float,
     row: pd.Series,
@@ -567,6 +581,9 @@ class AIBacktester:
                 lambda row: _apply_feature_weighting(float(row["ai_signal"]), row, weight_profile, stats),
                 axis=1,
             )
+
+        if df["ai_signal"].nunique(dropna=False) <= 1:
+            df["ai_signal"] = _fallback_signal(df)
 
         if {"High", "Low", "Close"}.issubset(df.columns):
             high = df["High"]
