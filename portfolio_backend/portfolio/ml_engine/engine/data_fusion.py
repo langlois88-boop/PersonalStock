@@ -102,10 +102,19 @@ class DataFusionEngine:
         if isinstance(df.columns, pd.MultiIndex):
             level_0 = df.columns.get_level_values(0)
             level_last = df.columns.get_level_values(-1)
-            if self.ticker in level_0:
-                df = df.xs(self.ticker, level=0, axis=1)
-            elif self.ticker in level_last:
-                df = df.xs(self.ticker, level=-1, axis=1)
+            mapped_ticker = getattr(yf, "_map_symbol", None)
+            mapped_ticker = mapped_ticker(self.ticker) if callable(mapped_ticker) else self.ticker
+            candidates = [self.ticker, mapped_ticker]
+            selected = None
+            for candidate in candidates:
+                if candidate in level_0:
+                    selected = (candidate, 0)
+                    break
+                if candidate in level_last:
+                    selected = (candidate, -1)
+                    break
+            if selected is not None:
+                df = df.xs(selected[0], level=selected[1], axis=1)
             else:
                 df.columns = [
                     "_".join([str(part) for part in col if part not in (None, "")])
