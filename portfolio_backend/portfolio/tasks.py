@@ -2290,6 +2290,33 @@ def fetch_prices_hourly() -> dict[str, float]:
         raise
 
 
+def _is_generic_news_item(headline: str | None, source: str | None) -> bool:
+    text = f"{headline or ''} {source or ''}".strip().lower()
+    if not text:
+        return True
+    patterns = (
+        'stock traders daily',
+        'strategic equity report',
+        'investment strategy',
+        'equity report',
+        'edition - stock traders daily',
+    )
+    return any(pattern in text for pattern in patterns)
+
+
+def _is_duplicate_news_item(stock: Stock, headline: str | None, published_at: datetime | None) -> bool:
+    if not headline:
+        return False
+    if published_at is None:
+        published_at = timezone.now()
+    window_start = published_at - timedelta(days=2)
+    return StockNews.objects.filter(
+        stock=stock,
+        headline__iexact=headline,
+        published_at__gte=window_start,
+    ).exists()
+
+
 @shared_task
 def fetch_fundamentals_daily() -> dict[str, int]:
     log = _task_log_start('fetch_fundamentals_daily')
@@ -2424,7 +2451,10 @@ def fetch_news_daily(days: int = 1, page_size: int = 10, language: str = 'en') -
 
     created = 0
     seen = 0
+    skipped = 0
+    skipped = 0
     updated = 0
+    skipped = 0
 
     try:
         for stock in Stock.objects.all().order_by('symbol'):
@@ -2456,13 +2486,20 @@ def fetch_news_daily(days: int = 1, page_size: int = 10, language: str = 'en') -
                 description = (a.get('description') or '').strip()
                 text_for_sentiment = f"{headline}. {description}".strip()
                 sentiment = analyzer.polarity_scores(text_for_sentiment).get('compound')
+                source = ((a.get('source') or {}).get('name') or '').strip()[:100]
+                if _is_generic_news_item(headline, source):
+                    skipped += 1
+                    continue
+                if _is_duplicate_news_item(stock, headline, published_at):
+                    skipped += 1
+                    continue
 
                 _, was_created = StockNews.objects.get_or_create(
                     url=url,
                     defaults={
                         'stock': stock,
                         'headline': headline,
-                        'source': ((a.get('source') or {}).get('name') or '').strip()[:100],
+                        'source': source,
                         'published_at': published_at,
                         'sentiment': sentiment,
                         'raw': a,
@@ -2473,8 +2510,8 @@ def fetch_news_daily(days: int = 1, page_size: int = 10, language: str = 'en') -
                 else:
                     updated += 1
 
-        _task_log_finish(log, 'SUCCESS', {'created': created, 'updated': updated})
-        return {'created': created, 'updated': updated}
+        _task_log_finish(log, 'SUCCESS', {'created': created, 'updated': updated, 'skipped': skipped})
+        return {'created': created, 'updated': updated, 'skipped': skipped}
     except Exception as exc:
         _task_log_finish(log, 'FAILED', error=str(exc))
         _send_alert('Task failed: fetch_news_daily', str(exc))
@@ -2522,6 +2559,13 @@ def fetch_finnhub_news_daily(days: int = 1) -> dict[str, int]:
                 if item.get('datetime'):
                     published_at = datetime.fromtimestamp(item['datetime'], tz=timezone.UTC)
 
+                if _is_generic_news_item(headline, 'Finnhub'):
+                    skipped += 1
+                    continue
+                if _is_duplicate_news_item(stock, headline, published_at):
+                    skipped += 1
+                    continue
+
                 _, was_created = StockNews.objects.get_or_create(
                     url=url,
                     defaults={
@@ -2536,8 +2580,8 @@ def fetch_finnhub_news_daily(days: int = 1) -> dict[str, int]:
                 if was_created:
                     created += 1
 
-        _task_log_finish(log, 'SUCCESS', {'created': created, 'seen': seen})
-        return {'created': created, 'seen': seen}
+        _task_log_finish(log, 'SUCCESS', {'created': created, 'seen': seen, 'skipped': skipped})
+        return {'created': created, 'seen': seen, 'skipped': skipped}
     except Exception as exc:
         error_text = str(exc)
         if 'status_code: 403' in error_text or '403' in error_text:
@@ -2588,6 +2632,12 @@ def fetch_google_news_daily(days: int = 1) -> dict[str, int]:
 
                 if published_at and published_at < cutoff:
                     continue
+                if _is_generic_news_item(headline, 'Google News'):
+                    skipped += 1
+                    continue
+                if _is_duplicate_news_item(stock, headline, published_at):
+                    skipped += 1
+                    continue
 
                 _, was_created = StockNews.objects.get_or_create(
                     url=link,
@@ -2603,8 +2653,8 @@ def fetch_google_news_daily(days: int = 1) -> dict[str, int]:
                 if was_created:
                     created += 1
 
-        _task_log_finish(log, 'SUCCESS', {'created': created, 'seen': seen})
-        return {'created': created, 'seen': seen}
+        _task_log_finish(log, 'SUCCESS', {'created': created, 'seen': seen, 'skipped': skipped})
+        return {'created': created, 'seen': seen, 'skipped': skipped}
     except Exception as exc:
         _task_log_finish(log, 'FAILED', error=str(exc))
         _send_alert('Task failed: fetch_google_news_daily', str(exc))
