@@ -5777,6 +5777,7 @@ class PortfolioOptimizerView(APIView):
 		sector_counts: dict[str, int] = {}
 		dividend_count = 0
 		growth_count = 0
+		growth_symbols = self._parse_symbol_set(os.getenv('OPTIMIZER_GROWTH_SYMBOLS', ''))
 		for item in actions:
 			sector = (item.get('sector') or 'Autre').strip() or 'Autre'
 			sector_counts[sector] = sector_counts.get(sector, 0) + 1
@@ -5792,7 +5793,11 @@ class PortfolioOptimizerView(APIView):
 				revenue_growth = float(revenue_growth) if revenue_growth is not None else None
 			except (TypeError, ValueError):
 				revenue_growth = None
-			if revenue_growth is not None and revenue_growth >= 10:
+			growth_override = bool(item.get('growth'))
+			symbol = (item.get('ticker') or '').strip().upper()
+			if not growth_override and symbol in growth_symbols:
+				growth_override = True
+			if growth_override or (revenue_growth is not None and revenue_growth >= 10):
 				growth_count += 1
 
 		sector_top = None
@@ -6758,14 +6763,15 @@ class PortfolioOptimizerView(APIView):
 				action[key] = bool(flag)
 		if overrides.get('bluechip'):
 			action['type'] = 'Bluechip'
+		elif overrides.get('speculative'):
+			action['type'] = 'Penny'
+		if overrides.get('growth') or overrides.get('bluechip'):
 			if action.get('confidence') is not None:
 				try:
-					boosted = float(action['confidence']) * 1.2
+					boosted = float(action['confidence']) + 40
 					action['confidence'] = int(round(self._clamp(boosted, 45, 95)))
 				except Exception:
 					pass
-		elif overrides.get('speculative'):
-			action['type'] = 'Penny'
 		if applied:
 			action['category_override_label'] = f"Category: {', '.join(applied)} (Tag Overridden)"
 		else:
