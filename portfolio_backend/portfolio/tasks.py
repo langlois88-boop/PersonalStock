@@ -1219,6 +1219,21 @@ def _risk_manager_allocation(
     return round(float(allocation), 2)
 
 
+def _dynamic_position_target(equity: float) -> float:
+    try:
+        pct = float(os.getenv('DYNAMIC_POSITION_PCT', '0.015'))
+        min_value = float(os.getenv('DYNAMIC_POSITION_MIN', '50'))
+        max_value = float(os.getenv('DYNAMIC_POSITION_MAX', '3000'))
+    except Exception:
+        pct = 0.015
+        min_value = 50.0
+        max_value = 3000.0
+    if equity <= 0:
+        return 0.0
+    target = equity * pct
+    return max(min_value, min(max_value, float(target)))
+
+
 def _time_hhmm(dt_value: datetime | None = None) -> str:
     dt_value = dt_value or _ny_time_now()
 
@@ -5552,16 +5567,8 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         confidence_factor = max(0.0, min(1.0, (float(signal) - 0.65) / 0.35)) if signal is not None else 0.0
         if confidence_factor <= 0:
             continue
-        position_value = min(available, position_cap, risk_budget / (stop_distance / price)) if price else 0.0
-        sentiment_raw, _ = _news_sentiment_score(symbol, days=1)
-        sentiment_score = max(0.0, min(1.0, (float(sentiment_raw) + 1.0) / 2.0))
-        allocation = _risk_manager_allocation(float(signal or 0.0) * 100, sentiment_score, price, atr)
-        if allocation <= 0:
-            continue
-        position_value = min(position_value, allocation)
-        kelly_frac = _kelly_fraction(sandbox)
-        if kelly_frac > 0:
-            position_value = min(position_value, capital * kelly_frac)
+        position_value = _dynamic_position_target(capital)
+        position_value = min(position_value, available, position_cap, risk_budget)
         position_value *= _multi_model_boost(symbol, float(signal or 0), universe, use_alpaca)
         position_value *= regime_risk_factor
         position_value *= confidence_factor
@@ -5569,6 +5576,17 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         quantity = int(position_value / price) if price else 0
         if quantity <= 0:
             continue
+        _system_log(
+            'SYSTEM',
+            'INFO',
+            f"💰 Dynamic Sizing: Equity {capital:.2f} | Risk 1.5% | Target {position_value:.2f}$ | Qty {quantity}",
+            symbol=symbol,
+            metadata={
+                'equity': round(capital, 2),
+                'target_value': round(position_value, 2),
+                'qty': quantity,
+            },
+        )
         stop_loss = price - stop_distance
         entry_features = dict((signal_payload or {}).get('features') or {})
         if intraday_ctx:
@@ -6081,11 +6099,8 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
 
         position_cap = buying_power * position_cap_pct
         risk_budget = buying_power * risk_pct
-        allocation = _risk_manager_allocation(float(signal) * 100, None, price, None)
-        position_value = min(position_cap, risk_budget, allocation) * regime_risk_factor
-        kelly_frac = _kelly_fraction(sandbox)
-        if kelly_frac > 0:
-            position_value = min(position_value, buying_power * kelly_frac)
+        position_value = _dynamic_position_target(float(equity_now or buying_power or 0))
+        position_value = min(position_value, position_cap, risk_budget, buying_power)
         position_value *= _multi_model_boost(symbol, float(signal or 0), universe, True)
         position_value *= reentry_size_factor
         if tier == 'T1':
@@ -6100,6 +6115,17 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
                 category='order_error',
             )
             continue
+        _system_log(
+            'SYSTEM',
+            'INFO',
+            f"💰 Dynamic Sizing: Equity {float(equity_now or buying_power or 0):.2f} | Risk 1.5% | Target {position_value:.2f}$ | Qty {qty}",
+            symbol=symbol,
+            metadata={
+                'equity': round(float(equity_now or buying_power or 0), 2),
+                'target_value': round(position_value, 2),
+                'qty': qty,
+            },
+        )
 
         stop_distance = max(price * trail_pct, atr_mult * atr_val, price * 0.01)
         stop_loss = max(0.01, price - stop_distance)
