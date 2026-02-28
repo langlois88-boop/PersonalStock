@@ -545,8 +545,8 @@ class AIBacktester:
     def run_simulation(
         self,
         lookback_days: int | None = None,
-        buy_threshold: float = 0.64,
-        sell_threshold: float = 0.35,
+        buy_threshold: float | None = None,
+        sell_threshold: float | None = None,
         stop_loss_pct: float = 0.04,
         atr_multiplier: float = 1.5,
         risk_per_trade_pct: float = 0.015,
@@ -554,6 +554,10 @@ class AIBacktester:
         tx_cost_pct: float | None = None,
         slippage_pct: float | None = None,
     ) -> BacktestResult:
+        if buy_threshold is None:
+            buy_threshold = float(os.getenv("BACKTEST_BUY_THRESHOLD", "0.64"))
+        if sell_threshold is None:
+            sell_threshold = float(os.getenv("BACKTEST_SELL_THRESHOLD", "0.35"))
         df = self.data.copy().sort_index()
         if lookback_days:
             df = df.tail(lookback_days)
