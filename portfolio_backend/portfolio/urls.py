@@ -67,6 +67,7 @@ from .views import (
     TradingDiagnosticView,
     SystemLogPageView,
     SystemLogDataView,
+    TaskRunLogDataView,
     TelegramWebhookView,
 )
 
@@ -137,5 +138,6 @@ urlpatterns = [
     path('trading/diagnostics/', TradingDiagnosticView.as_view()),
     path('logs/', SystemLogPageView.as_view()),
     path('logs/data/', SystemLogDataView.as_view()),
+    path('logs/tasks/', TaskRunLogDataView.as_view()),
     path('', include(router.urls)),
 ]

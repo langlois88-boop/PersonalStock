@@ -10,6 +10,7 @@ import ManagePortfolioPage from './components/ManagePortfolioPage';
 import IntradayAI from './components/IntradayAI';
 import QuickSearchBar from './components/QuickSearchBar';
 import RiskControlCenter from './components/RiskControlCenter';
+import LogsCenterPage from './components/LogsCenterPage';
 
 function App() {
   const [page, setPage] = useState('home');
@@ -29,6 +30,7 @@ function App() {
         {page === 'paper' && <LivePaperTrading />}
         {page === 'intraday' && <IntradayAI />}
         {page === 'risk' && <RiskControlCenter />}
+        {page === 'logs' && <LogsCenterPage />}
       </main>
     </div>
   );

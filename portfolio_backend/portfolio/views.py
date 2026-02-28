@@ -8026,3 +8026,37 @@ class SystemLogDataView(APIView):
 			for item in logs
 		]
 		return Response({'count': len(data), 'results': data})
+
+
+class TaskRunLogDataView(APIView):
+	def get(self, request):
+		task = (request.query_params.get('task') or '').strip()
+		status = (request.query_params.get('status') or '').strip().upper()
+		errors_only = (request.query_params.get('errors_only') or '').strip().lower() in {'1', 'true', 'yes', 'y'}
+		limit = int(request.query_params.get('limit') or 200)
+
+		qs = TaskRunLog.objects.all()
+		if task:
+			qs = qs.filter(task_name__icontains=task)
+		if status:
+			qs = qs.filter(status=status)
+			if status not in dict(TaskRunLog.STATUS_CHOICES):
+				qs = TaskRunLog.objects.all()
+		if errors_only:
+			qs = qs.filter(status='FAILED')
+
+		logs = qs.order_by('-started_at')[:max(1, min(limit, 1000))]
+		data = [
+			{
+				'id': item.id,
+				'task_name': item.task_name,
+				'status': item.status,
+				'started_at': item.started_at.isoformat() if item.started_at else None,
+				'finished_at': item.finished_at.isoformat() if item.finished_at else None,
+				'duration_ms': item.duration_ms,
+				'error': item.error,
+				'payload': item.payload or {},
+			}
+			for item in logs
+		]
+		return Response({'count': len(data), 'results': data})
