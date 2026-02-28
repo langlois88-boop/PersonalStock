@@ -6126,6 +6126,118 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
 @shared_task
 def sync_alpaca_paper_trades() -> dict[str, Any]:
     """Sync Alpaca order status and update PaperTrade rows."""
+    def _infer_sandbox(symbol: str) -> str:
+        sym = (symbol or '').strip().upper()
+        if not sym:
+            return 'WATCHLIST'
+        for sandbox in ['AI_PENNY', 'AI_BLUECHIP', 'WATCHLIST']:
+            watch = SandboxWatchlist.objects.filter(sandbox=sandbox).first()
+            if not watch:
+                continue
+            symbols = [str(s).strip().upper() for s in (watch.symbols or [])]
+            if sym in symbols:
+                return sandbox
+        return 'WATCHLIST'
+
+    def _parse_dt(value: Any) -> datetime | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        try:
+            text = str(value).replace('Z', '+00:00')
+            return datetime.fromisoformat(text)
+        except Exception:
+            return None
+
+    def _sync_recent_orders(lookback_days: int = 7) -> dict[str, int]:
+        created = 0
+        closed = 0
+        client = get_trading_client()
+        if not client:
+            return {'created': created, 'closed': closed}
+        try:
+            orders = client.get_orders() or []
+        except Exception:
+            return {'created': created, 'closed': closed}
+        cutoff = timezone.now() - timedelta(days=lookback_days)
+        for order in orders:
+            symbol = str(getattr(order, 'symbol', '') or '').strip().upper()
+            if not symbol:
+                continue
+            status = str(getattr(order, 'status', '') or '').lower()
+            filled_qty = getattr(order, 'filled_qty', None)
+            filled_avg_price = getattr(order, 'filled_avg_price', None)
+            try:
+                filled_qty = float(filled_qty) if filled_qty is not None else 0.0
+            except Exception:
+                filled_qty = 0.0
+            try:
+                filled_avg_price = float(filled_avg_price) if filled_avg_price is not None else 0.0
+            except Exception:
+                filled_avg_price = 0.0
+            if filled_qty <= 0 or filled_avg_price <= 0:
+                continue
+            filled_at = _parse_dt(getattr(order, 'filled_at', None)) or _parse_dt(getattr(order, 'updated_at', None))
+            if filled_at and filled_at < cutoff:
+                continue
+            side = str(getattr(order, 'side', '') or '').lower()
+            order_id = str(getattr(order, 'id', '') or '')
+            if side == 'buy':
+                existing = PaperTrade.objects.filter(broker='ALPACA', broker_order_id=order_id).first()
+                if existing:
+                    continue
+                sandbox = _infer_sandbox(symbol)
+                PaperTrade.objects.create(
+                    ticker=symbol,
+                    sandbox=sandbox,
+                    entry_price=round(float(filled_avg_price), 2),
+                    quantity=int(filled_qty),
+                    entry_signal=None,
+                    broker='ALPACA',
+                    broker_order_id=order_id,
+                    broker_status=status,
+                    broker_side='BUY',
+                    broker_updated_at=timezone.now(),
+                    broker_filled_qty=filled_qty,
+                    broker_avg_price=filled_avg_price,
+                    stop_loss=round(float(filled_avg_price) * 0.96, 2),
+                    status='OPEN',
+                    pnl=0,
+                    notes='imported from alpaca orders',
+                )
+                created += 1
+            elif side == 'sell':
+                open_trade = PaperTrade.objects.filter(
+                    broker='ALPACA',
+                    status='OPEN',
+                    ticker__iexact=symbol,
+                ).order_by('entry_date').first()
+                if not open_trade:
+                    continue
+                open_trade.exit_price = round(float(filled_avg_price), 2)
+                open_trade.exit_date = timezone.now()
+                open_trade.status = 'CLOSED'
+                open_trade.pnl = float(open_trade.exit_price - float(open_trade.entry_price)) * float(open_trade.quantity)
+                open_trade.outcome = 'WIN' if float(open_trade.pnl or 0) > 0 else 'LOSS'
+                open_trade.broker_status = status
+                open_trade.broker_side = 'SELL'
+                open_trade.broker_updated_at = timezone.now()
+                open_trade.save(update_fields=[
+                    'exit_price',
+                    'exit_date',
+                    'status',
+                    'pnl',
+                    'outcome',
+                    'broker_status',
+                    'broker_side',
+                    'broker_updated_at',
+                ])
+                closed += 1
+        return {'created': created, 'closed': closed}
+
+    lookback_days = int(os.getenv('ALPACA_SYNC_LOOKBACK_DAYS', '7'))
+    _sync_recent_orders(lookback_days=lookback_days)
     updated = 0
     trades = PaperTrade.objects.filter(broker='ALPACA', status='OPEN')
     for trade in trades:
