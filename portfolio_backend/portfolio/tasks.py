@@ -6151,6 +6151,13 @@ def sync_alpaca_paper_trades() -> dict[str, Any]:
         except Exception:
             return None
 
+    def _enum_value(value: Any) -> str:
+        if value is None:
+            return ''
+        if hasattr(value, 'value'):
+            return str(getattr(value, 'value'))
+        return str(value)
+
     def _sync_recent_orders(lookback_days: int = 7) -> dict[str, int]:
         created = 0
         closed = 0
@@ -6162,7 +6169,7 @@ def sync_alpaca_paper_trades() -> dict[str, Any]:
             symbol = str(getattr(order, 'symbol', '') or '').strip().upper()
             if not symbol:
                 continue
-            status = str(getattr(order, 'status', '') or '').lower()
+            status = _enum_value(getattr(order, 'status', '')).lower()
             filled_qty = getattr(order, 'filled_qty', None)
             filled_avg_price = getattr(order, 'filled_avg_price', None)
             try:
@@ -6178,7 +6185,7 @@ def sync_alpaca_paper_trades() -> dict[str, Any]:
             filled_at = _parse_dt(getattr(order, 'filled_at', None)) or _parse_dt(getattr(order, 'updated_at', None))
             if filled_at and filled_at < cutoff:
                 continue
-            side = str(getattr(order, 'side', '') or '').lower()
+            side = _enum_value(getattr(order, 'side', '')).lower()
             order_id = str(getattr(order, 'id', '') or '')
             if side == 'buy':
                 existing = PaperTrade.objects.filter(broker='ALPACA', broker_order_id=order_id).first()
