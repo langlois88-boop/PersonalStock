@@ -234,6 +234,19 @@ def _ensure_features(df: pd.DataFrame, feature_columns: list[str] | None = None)
     for col in feature_columns:
         if col not in data.columns:
             data[col] = 0.0
+    if "Close" in data.columns:
+        close = pd.to_numeric(data["Close"], errors="coerce")
+        if close.notna().any():
+            if "MA20" in data.columns and data["MA20"].replace(0, np.nan).isna().all():
+                data["MA20"] = close.rolling(20).mean()
+            if "MA50" in data.columns and data["MA50"].replace(0, np.nan).isna().all():
+                data["MA50"] = close.rolling(50).mean()
+            if "RSI14" in data.columns and data["RSI14"].replace(0, np.nan).isna().all():
+                delta = close.diff()
+                gain = delta.where(delta > 0, 0.0).rolling(14).mean()
+                loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
+                rs = gain / loss.replace(0, np.nan)
+                data["RSI14"] = 100 - (100 / (1 + rs))
     if "VolumeZ" in data.columns:
         data["VolumeZ"] = pd.to_numeric(data["VolumeZ"], errors="coerce").fillna(0.0)
     if "sector_code" in data.columns:
