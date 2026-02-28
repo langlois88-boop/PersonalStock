@@ -2255,7 +2255,8 @@ class PortfolioDashboardView(APIView):
 			stats = None
 			try:
 				backtester = AIBacktester(fusion_df, payload, symbol=symbol)
-				result = backtester.run_simulation(lookback_days=90)
+				lookback_days = int(os.getenv('GEMINI_BACKTEST_LOOKBACK_DAYS', '365'))
+				result = backtester.run_simulation(lookback_days=lookback_days)
 				stats = {'win_rate': float(result.win_rate), 'sharpe': float(result.sharpe_ratio)}
 			except Exception:
 				stats = {'win_rate': None, 'sharpe': None}
@@ -2495,7 +2496,8 @@ class PortfolioDashboardView(APIView):
 			if not payload or not payload.get('model'):
 				return {'win_rate': None, 'sharpe': None}
 			backtester = AIBacktester(frame, payload, symbol=symbol)
-			result = backtester.run_simulation(lookback_days=90)
+			lookback_days = int(os.getenv('GEMINI_BACKTEST_LOOKBACK_DAYS', '365'))
+			result = backtester.run_simulation(lookback_days=lookback_days)
 			return {'win_rate': float(result.win_rate), 'sharpe': float(result.sharpe_ratio)}
 		except Exception:
 			return {'win_rate': None, 'sharpe': None}
@@ -3072,7 +3074,8 @@ def _gemini_macro_ok(symbol: str, sector: str, news_titles: list[str]) -> bool:
 			if not payload or not payload.get('model'):
 				return {'win_rate': None, 'sharpe': None}
 			backtester = AIBacktester(frame, payload, symbol=symbol)
-			result = backtester.run_simulation(lookback_days=90)
+			lookback_days = int(os.getenv('GEMINI_BACKTEST_LOOKBACK_DAYS', '365'))
+			result = backtester.run_simulation(lookback_days=lookback_days)
 			return {'win_rate': float(result.win_rate), 'sharpe': float(result.sharpe_ratio)}
 		except Exception:
 			return {'win_rate': None, 'sharpe': None}
@@ -3193,7 +3196,8 @@ def _gemini_macro_ok(symbol: str, sector: str, news_titles: list[str]) -> bool:
 			stats = None
 			try:
 				backtester = AIBacktester(fusion_df, payload, symbol=symbol)
-				result = backtester.run_simulation(lookback_days=90)
+				lookback_days = int(os.getenv('GEMINI_BACKTEST_LOOKBACK_DAYS', '365'))
+				result = backtester.run_simulation(lookback_days=lookback_days)
 				stats = {'win_rate': float(result.win_rate), 'sharpe': float(result.sharpe_ratio)}
 			except Exception:
 				stats = {'win_rate': None, 'sharpe': None}
@@ -4115,7 +4119,8 @@ class AccountDashboardView(APIView):
 			if not payload or not payload.get('model'):
 				return {'win_rate': None, 'sharpe': None}
 			backtester = AIBacktester(frame, payload, symbol=symbol)
-			result = backtester.run_simulation(lookback_days=90)
+			lookback_days = int(os.getenv('GEMINI_BACKTEST_LOOKBACK_DAYS', '365'))
+			result = backtester.run_simulation(lookback_days=lookback_days)
 			return {'win_rate': float(result.win_rate), 'sharpe': float(result.sharpe_ratio)}
 		except Exception:
 			return {'win_rate': None, 'sharpe': None}
