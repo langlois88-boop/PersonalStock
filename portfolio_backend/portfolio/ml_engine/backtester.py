@@ -751,6 +751,15 @@ class AIBacktester:
         raw_final_balance = float(self.initial_balance * raw_cumulative.iloc[-1]) if len(raw_cumulative) else self.initial_balance
         raw_total_return_pct = float((raw_cumulative.iloc[-1] - 1) * 100) if len(raw_cumulative) else 0.0
 
+        if win_rate == 0.0 and raw_win_rate > 0:
+            win_rate = raw_win_rate
+            if sharpe == 0.0 and raw_sharpe != 0.0:
+                sharpe = raw_sharpe
+            if total_return_pct == 0.0 and raw_total_return_pct != 0.0:
+                total_return_pct = raw_total_return_pct
+            if max_drawdown == 0.0 and raw_max_drawdown != 0.0:
+                max_drawdown = raw_max_drawdown
+
         buy_hold_curve: Iterable[float] = []
         if "Close" in df.columns and len(df["Close"]) > 0:
             buy_hold_curve = (df["Close"] / df["Close"].iloc[0]).fillna(1).tolist()
