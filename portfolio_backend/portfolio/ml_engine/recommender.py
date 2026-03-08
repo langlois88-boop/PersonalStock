@@ -18,7 +18,7 @@ def generate_recommendations(symbols: List[str], model_path: str) -> List[Dict[s
     model = payload.get("model")
     feature_list = payload.get("features") or FEATURE_COLUMNS
     debug = os.getenv('RECOMMENDER_DEBUG', 'false').lower() in {'1', 'true', 'yes', 'y'}
-    buy_threshold = float(os.getenv('RECOMMENDER_BUY_THRESHOLD', '0.7'))
+    buy_threshold = float(payload.get('buy_threshold') or os.getenv('RECOMMENDER_BUY_THRESHOLD', '0.7'))
 
     results = []
     if debug:

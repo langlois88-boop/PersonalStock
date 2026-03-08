@@ -60,7 +60,10 @@ def _interval_for_days(days: int) -> tuple[str, str]:
         return '7d', '15m'
     if days <= 30:
         return '30d', '15m'
-    return '60d', '15m'
+    if days <= 60:
+        return '60d', '15m'
+    capped = min(days, 730)
+    return f'{capped}d', '1h'
 
 
 def fetch_crypto_history(symbol: str, days: int = 60) -> pd.DataFrame:
@@ -149,6 +152,7 @@ def train_crypto_model(
     horizon: int | None = None,
     target_pct: float | None = None,
 ) -> dict[str, object]:
+    days = int(os.getenv('CRYPTO_HISTORY_DAYS', str(days)))
     horizon = int(os.getenv('CRYPTO_LABEL_HORIZON', str(horizon or 8)))
     target_pct = float(os.getenv('CRYPTO_TARGET_PCT', str(target_pct or 0.02)))
 

@@ -14,7 +14,7 @@ FEATURE_COLUMNS: List[str] = list(RECOMMENDER_FEATURE_NAMES)
 
 def build_model(random_state: int = 42) -> Pipeline:
     return Pipeline([
-        ("scaler", StandardScaler(with_mean=False)),
+        ("scaler", StandardScaler()),
         (
             "rf",
             RandomForestClassifier(

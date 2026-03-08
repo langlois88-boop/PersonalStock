@@ -154,18 +154,48 @@ def train_stable_model():
             except Exception:
                 sector_close = None
 
-        for i in range(220, len(close) - 20):
-            window_close = close.iloc[:i + 1]
-            window_volume = volume.iloc[:i + 1]
-            if len(window_close) < 220:
-                continue
+        ret = close.pct_change()
+        spy_ret = spy_close.pct_change()
+        aligned = pd.concat([ret, spy_ret], axis=1, join='inner').dropna()
+        aligned.columns = ['stock', 'spy']
+        beta_series = (
+            aligned['stock'].expanding(60).cov(aligned['spy'])
+            / aligned['spy'].expanding(60).var()
+        ).reindex(close.index).ffill()
 
-            features = _build_features(window_close, window_volume, spy_close, dividend_yield, macro, sector_close)
-            if not features:
+        log_ret_20 = np.log(close / close.shift(20))
+        vol_60 = ret.rolling(60).std()
+        rel_volume_200 = volume.rolling(5).mean() / volume.rolling(200).mean()
+
+        sector_strength = pd.Series(0.0, index=close.index)
+        if sector_close is not None and not sector_close.empty:
+            sector_strength = np.log(sector_close / sector_close.shift(20)).reindex(close.index).ffill().fillna(0.0)
+
+        macro_features = [
+            float(macro.sp500_close) if macro else 0.0,
+            float(macro.vix_index) if macro else 0.0,
+            float(macro.interest_rate_10y) if macro else 0.0,
+            float(macro.inflation_rate) if macro else 0.0,
+            float(macro.oil_price) if (macro and macro.oil_price is not None) else 0.0,
+        ]
+
+        for i in range(220, len(close) - 20):
+            if len(close.iloc[:i + 1]) < 220:
+                continue
+            feature_values = [
+                log_ret_20.iloc[i],
+                vol_60.iloc[i],
+                beta_series.iloc[i],
+                rel_volume_200.iloc[i],
+                dividend_yield,
+                sector_strength.iloc[i],
+                *macro_features,
+            ]
+            if any(pd.isna(val) for val in feature_values):
                 continue
             future_return = float((close.iloc[i + 20] - close.iloc[i]) / close.iloc[i])
-            row = {'date': window_close.index[-1], 'target': future_return}
-            row.update({FEATURE_NAMES[j]: features[j] for j in range(len(FEATURE_NAMES))})
+            row = {'date': close.index[i], 'target': future_return}
+            row.update({FEATURE_NAMES[j]: feature_values[j] for j in range(len(FEATURE_NAMES))})
             rows.append(row)
 
     if not rows:

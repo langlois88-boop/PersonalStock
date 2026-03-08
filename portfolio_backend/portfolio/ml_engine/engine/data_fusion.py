@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
-from functools import lru_cache
+import time
 from typing import Optional
 
 import pandas as pd
@@ -341,14 +341,23 @@ SECTOR_CODES = {
 }
 
 
-@lru_cache(maxsize=256)
+_SECTOR_CACHE: dict[str, dict[str, float | int]] = {}
+
+
 def _get_sector_code(ticker: str) -> int:
+    ttl_sec = int(os.getenv('SECTOR_CACHE_TTL_SEC', '86400'))
+    now = time.time()
+    cached = _SECTOR_CACHE.get(ticker)
+    if cached and (now - float(cached.get('ts') or 0)) < ttl_sec:
+        return int(cached.get('code') or 0)
     try:
         info = yf.Ticker(ticker).info or {}
         sector = (info.get("sector") or "").strip().lower()
     except Exception:
         sector = ""
-    return SECTOR_CODES.get(sector, 0)
+    code = SECTOR_CODES.get(sector, 0)
+    _SECTOR_CACHE[ticker] = {'ts': now, 'code': code}
+    return code
 
 
 def _normalize_datetime_index(frame: pd.DataFrame) -> pd.DataFrame:
@@ -448,34 +457,43 @@ def _add_candlestick_patterns(frame: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         pass
 
-    for idx in range(len(df)):
-        row = df.iloc[idx]
-        prev = df.iloc[idx - 1] if idx > 0 else None
-        prev2 = df.iloc[idx - 2] if idx > 1 else None
+    open_arr = df["Open"].to_numpy(dtype=float)
+    high_arr = df["High"].to_numpy(dtype=float)
+    low_arr = df["Low"].to_numpy(dtype=float)
+    close_arr = df["Close"].to_numpy(dtype=float)
+    body = np.abs(close_arr - open_arr)
+    candle_range = np.maximum(high_arr - low_arr, 0.0)
+    lower_shadow = np.minimum(open_arr, close_arr) - low_arr
+    upper_shadow = high_arr - np.maximum(open_arr, close_arr)
 
-        body = abs(float(row["Close"]) - float(row["Open"]))
-        candle_range = max(float(row["High"]) - float(row["Low"]), 0.0)
-        lower_shadow = min(float(row["Open"]), float(row["Close"])) - float(row["Low"])
-        upper_shadow = float(row["High"]) - max(float(row["Open"]), float(row["Close"]))
-        if candle_range > 0 and body <= candle_range * 0.1:
-            df.at[df.index[idx], "pattern_doji"] = 1
-        if body > 0 and lower_shadow >= 2 * body and upper_shadow <= body * 0.5:
-            df.at[df.index[idx], "pattern_hammer"] = 1
-        if prev is not None:
-            prev_red = float(prev["Close"]) < float(prev["Open"])
-            curr_green = float(row["Close"]) > float(row["Open"])
-            engulfs = float(row["Close"]) >= float(prev["Open"]) and float(row["Open"]) <= float(prev["Close"])
-            if prev_red and curr_green and engulfs:
-                df.at[df.index[idx], "pattern_engulfing"] = 1
-        if prev is not None and prev2 is not None:
-            prev2_red = float(prev2["Close"]) < float(prev2["Open"])
-            prev_small = abs(float(prev["Close"]) - float(prev["Open"])) <= (
-                max(float(prev["High"]) - float(prev["Low"]), 0.0) * 0.3
-            )
-            curr_green = float(row["Close"]) > float(row["Open"])
-            gap_down = float(prev["Close"]) < float(prev2["Close"])
-            recover = float(row["Close"]) >= (float(prev2["Open"]) + float(prev2["Close"])) / 2
-            if prev2_red and prev_small and curr_green and gap_down and recover:
-                df.at[df.index[idx], "pattern_morning_star"] = 1
+    doji = (candle_range > 0) & (body <= candle_range * 0.1)
+    hammer = (body > 0) & (lower_shadow >= 2 * body) & (upper_shadow <= body * 0.5)
+
+    prev_open = np.roll(open_arr, 1)
+    prev_close = np.roll(close_arr, 1)
+    prev_high = np.roll(high_arr, 1)
+    prev_low = np.roll(low_arr, 1)
+    prev_open[0] = prev_close[0] = prev_high[0] = prev_low[0] = np.nan
+    prev_red = prev_close < prev_open
+    curr_green = close_arr > open_arr
+    engulfs = (close_arr >= prev_open) & (open_arr <= prev_close)
+    engulfing = prev_red & curr_green & engulfs
+
+    prev2_open = np.roll(open_arr, 2)
+    prev2_close = np.roll(close_arr, 2)
+    prev2_high = np.roll(high_arr, 2)
+    prev2_low = np.roll(low_arr, 2)
+    prev2_open[:2] = prev2_close[:2] = prev2_high[:2] = prev2_low[:2] = np.nan
+    prev2_red = prev2_close < prev2_open
+    prev_range = np.maximum(prev_high - prev_low, 0.0)
+    prev_small = np.abs(prev_close - prev_open) <= (prev_range * 0.3)
+    gap_down = prev_close < prev2_close
+    recover = close_arr >= (prev2_open + prev2_close) / 2
+    morning_star = prev2_red & prev_small & curr_green & gap_down & recover
+
+    df["pattern_doji"] = doji.astype(int)
+    df["pattern_hammer"] = hammer.astype(int)
+    df["pattern_engulfing"] = engulfing.astype(int)
+    df["pattern_morning_star"] = morning_star.astype(int)
 
     return frame.join(df[["pattern_doji", "pattern_hammer", "pattern_engulfing", "pattern_morning_star"]])

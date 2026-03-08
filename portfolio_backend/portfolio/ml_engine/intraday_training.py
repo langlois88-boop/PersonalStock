@@ -10,6 +10,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
@@ -226,13 +227,15 @@ def train_voting_ensemble(
             random_state=42,
         )
 
-    weights_raw = os.getenv('INTRADAY_ENSEMBLE_WEIGHTS', '1,2')
-    try:
-        weights = [float(x.strip()) for x in weights_raw.split(',') if x.strip()]
-        if len(weights) != 2:
-            weights = [1, 2]
-    except Exception:
-        weights = [1, 2]
+    weights_raw = os.getenv('INTRADAY_ENSEMBLE_WEIGHTS', 'auto')
+    weights = None
+    if weights_raw.strip().lower() != 'auto':
+        try:
+            parsed = [float(x.strip()) for x in weights_raw.split(',') if x.strip()]
+            if len(parsed) == 2:
+                weights = parsed
+        except Exception:
+            weights = None
 
     ensemble = VotingClassifier(
         estimators=[
@@ -247,6 +250,21 @@ def train_voting_ensemble(
     y_blue = blue_y.values
     X_penny = penny_df[feature_cols]
     y_penny = penny_y.values
+
+    if weights is None:
+        def _cv_score(X, y, model) -> float:
+            splitter = TimeSeriesSplit(n_splits=3)
+            scores = []
+            for tr, te in splitter.split(X):
+                m = clone(model)
+                m.fit(X.iloc[tr], y[tr])
+                scores.append(float(m.score(X.iloc[te], y[te])))
+            return float(np.mean(scores)) if scores else 1.0
+
+        blue_score = _cv_score(X_blue, y_blue, blue_model)
+        penny_score = _cv_score(X_penny, y_penny, penny_model)
+        weights = [max(blue_score, 0.1), max(penny_score, 0.1)]
+        ensemble.set_params(weights=weights)
 
     volume_cols = [col for col in ['rvol', 'volatility'] if col in feature_cols]
     base_cols = [col for col in feature_cols if col not in volume_cols]

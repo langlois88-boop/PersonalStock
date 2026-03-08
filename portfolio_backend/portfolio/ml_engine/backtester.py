@@ -261,11 +261,25 @@ def _resolve_barrier_pcts(
     return max(up_pct, atr_up), max(down_pct, atr_down)
 
 
+def _future_window_extrema(values: np.ndarray, window: int, mode: str) -> np.ndarray:
+    if values is None or len(values) == 0:
+        return np.array([])
+    series = pd.Series(values)
+    rev = series.iloc[::-1].shift(1)
+    if mode == 'max':
+        rolled = rev.rolling(window=window, min_periods=1).max()
+    else:
+        rolled = rev.rolling(window=window, min_periods=1).min()
+    return rolled.iloc[::-1].values
+
+
 def _triple_barrier_labels(close: pd.Series, atr_pct: pd.Series | None = None) -> pd.Series:
     if close is None or close.empty:
         return pd.Series(dtype=float)
     prices = close.values
     labels = np.full(len(prices), np.nan)
+    future_max = _future_window_extrema(prices, TRIPLE_BARRIER_MAX_DAYS, 'max')
+    future_min = _future_window_extrema(prices, TRIPLE_BARRIER_MAX_DAYS, 'min')
     for i in range(len(prices) - 1):
         entry = prices[i]
         if entry <= 0:
@@ -274,16 +288,25 @@ def _triple_barrier_labels(close: pd.Series, atr_pct: pd.Series | None = None) -
         up_pct, down_pct = _resolve_barrier_pcts(TRIPLE_BARRIER_UP_PCT, TRIPLE_BARRIER_DOWN_PCT, row_atr_pct)
         upper = entry * (1 + up_pct)
         lower = entry * (1 - down_pct)
-        end = min(len(prices), i + TRIPLE_BARRIER_MAX_DAYS + 1)
-        hit = 0
-        for j in range(i + 1, end):
-            if prices[j] >= upper:
-                hit = 1
-                break
-            if prices[j] <= lower:
-                hit = 0
-                break
-        labels[i] = hit
+        hit_up = future_max[i] >= upper if i < len(future_max) else False
+        hit_down = future_min[i] <= lower if i < len(future_min) else False
+        if hit_up and not hit_down:
+            labels[i] = 1
+        elif hit_down and not hit_up:
+            labels[i] = 0
+        elif not hit_up and not hit_down:
+            labels[i] = 0
+        else:
+            end = min(len(prices), i + TRIPLE_BARRIER_MAX_DAYS + 1)
+            hit = 0
+            for j in range(i + 1, end):
+                if prices[j] >= upper:
+                    hit = 1
+                    break
+                if prices[j] <= lower:
+                    hit = 0
+                    break
+            labels[i] = hit
     return pd.Series(labels, index=close.index)
 
 
@@ -302,6 +325,8 @@ def _triple_barrier_labels_with_bands(
     highs = high.values if high is not None and not high.empty else prices
     lows = low.values if low is not None and not low.empty else prices
     labels = np.full(len(prices), np.nan)
+    future_max = _future_window_extrema(highs, max_days, 'max')
+    future_min = _future_window_extrema(lows, max_days, 'min')
     for i in range(len(prices) - 1):
         entry = prices[i]
         if entry <= 0:
@@ -310,16 +335,25 @@ def _triple_barrier_labels_with_bands(
         resolved_up, resolved_down = _resolve_barrier_pcts(up_pct, down_pct, row_atr_pct)
         upper = entry * (1 + resolved_up)
         lower = entry * (1 - resolved_down)
-        end = min(len(prices), i + max_days + 1)
-        hit = 0
-        for j in range(i + 1, end):
-            if highs[j] >= upper:
-                hit = 1
-                break
-            if lows[j] <= lower:
-                hit = 0
-                break
-        labels[i] = hit
+        hit_up = future_max[i] >= upper if i < len(future_max) else False
+        hit_down = future_min[i] <= lower if i < len(future_min) else False
+        if hit_up and not hit_down:
+            labels[i] = 1
+        elif hit_down and not hit_up:
+            labels[i] = 0
+        elif not hit_up and not hit_down:
+            labels[i] = 0
+        else:
+            end = min(len(prices), i + max_days + 1)
+            hit = 0
+            for j in range(i + 1, end):
+                if highs[j] >= upper:
+                    hit = 1
+                    break
+                if lows[j] <= lower:
+                    hit = 0
+                    break
+            labels[i] = hit
     return pd.Series(labels, index=close.index)
 
 
