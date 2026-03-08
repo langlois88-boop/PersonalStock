@@ -11,7 +11,7 @@ import pandas as pd
 import yfinance as yfin
 import requests
 
-from .ml_engine.crypto_training import _build_crypto_features, _normalize_columns, _rsi
+from .ml_engine.crypto_training import CRYPTO_MODEL_PATH, _build_crypto_features, _normalize_columns, _rsi
 
 
 def _crypto_symbols() -> list[str]:
@@ -112,8 +112,11 @@ def _drip_trigger(symbol_df: pd.DataFrame) -> bool:
 
 
 def _load_crypto_model() -> dict[str, Any] | None:
-    model_path = Path(os.getenv('CRYPTO_MODEL_PATH', ''))
+    raw_path = os.getenv('CRYPTO_MODEL_PATH', '').strip()
+    model_path = Path(raw_path) if raw_path else CRYPTO_MODEL_PATH
     if not model_path:
+        return None
+    if not model_path.exists():
         return None
     try:
         payload = joblib.load(model_path)
