@@ -13,10 +13,13 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 import joblib
 
-from .export_utils import export_onnx_with_gatekeeper
+from .export_utils import export_onnx_with_gatekeeper, save_model_with_version
 from .feature_registry import STABLE_FEATURE_NAMES
+from .transformers import RollingStandardScaler
+from .validation import PurgedTimeSeriesSplit
 
 from portfolio.models import Stock, MacroIndicator, PriceHistory
 
@@ -173,12 +176,62 @@ def train_stable_model():
     X = df[FEATURE_NAMES].values
     y = df['target'].values
 
-    pipeline = Pipeline([
-        ('scaler', StandardScaler()),
-        ('model', GradientBoostingRegressor(random_state=42)),
-    ])
+    use_rolling = os.getenv('STABLE_ROLLING_SCALER', 'true').lower() in {'1', 'true', 'yes', 'y'}
+    scaler = RollingStandardScaler(window=int(os.getenv('STABLE_ROLLING_WINDOW', '90'))) if use_rolling else StandardScaler()
 
-    tscv = TimeSeriesSplit(n_splits=5)
+    model = GradientBoostingRegressor(random_state=42)
+    if os.getenv('STABLE_OPTUNA_TRIALS', '0').isdigit() and int(os.getenv('STABLE_OPTUNA_TRIALS', '0')) > 0:
+        try:
+            import optuna
+
+            trials = int(os.getenv('STABLE_OPTUNA_TRIALS', '20'))
+            def objective(trial):
+                n_estimators = trial.suggest_int('n_estimators', 200, 800, step=50)
+                max_depth = trial.suggest_int('max_depth', 2, 5)
+                lr = trial.suggest_float('learning_rate', 0.02, 0.2)
+                reg = GradientBoostingRegressor(
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    learning_rate=lr,
+                    random_state=42,
+                )
+                splitter = PurgedTimeSeriesSplit(
+                    n_splits=int(os.getenv('STABLE_PURGED_SPLITS', '5')),
+                    purge_window=int(os.getenv('STABLE_PURGE_WINDOW', '5')),
+                    embargo_pct=float(os.getenv('STABLE_EMBARGO_PCT', '0.02')),
+                )
+                scores = []
+                for tr, te in splitter.split(X):
+                    reg.fit(X[tr], y[tr])
+                    preds = reg.predict(X[te])
+                    scores.append(mean_absolute_error(y[te], preds))
+                return float(np.mean(scores)) if scores else 999.0
+
+            study = optuna.create_study(direction='minimize')
+            study.optimize(objective, n_trials=trials)
+            params = study.best_params
+            model = GradientBoostingRegressor(
+                n_estimators=params.get('n_estimators', 500),
+                max_depth=params.get('max_depth', 3),
+                learning_rate=params.get('learning_rate', 0.05),
+                random_state=42,
+            )
+        except Exception:
+            pass
+
+    steps = [('scaler', scaler)]
+    if os.getenv('STABLE_PCA_ENABLED', 'false').lower() in {'1', 'true', 'yes', 'y'}:
+        n_comp = int(os.getenv('STABLE_PCA_COMPONENTS', '6'))
+        steps.append(('pca', PCA(n_components=n_comp, random_state=42)))
+    steps.append(('model', model))
+    pipeline = Pipeline(steps)
+
+    use_purged = os.getenv('STABLE_PURGED_CV', 'true').lower() in {'1', 'true', 'yes', 'y'}
+    tscv = PurgedTimeSeriesSplit(
+        n_splits=int(os.getenv('STABLE_PURGED_SPLITS', '5')),
+        purge_window=int(os.getenv('STABLE_PURGE_WINDOW', '5')),
+        embargo_pct=float(os.getenv('STABLE_EMBARGO_PCT', '0.02')),
+    ) if use_purged else TimeSeriesSplit(n_splits=5)
     scores = []
     for train_idx, test_idx in tscv.split(X):
         pipeline.fit(X[train_idx], y[train_idx])
@@ -227,7 +280,7 @@ def train_stable_model():
         'mae': mae_value,
         'walk_forward': walk_forward,
     }
-    joblib.dump(payload, MODEL_PATH)
+    save_model_with_version(payload, MODEL_PATH, 'stable', metric_name='mae', metric_value=mae_value)
     onnx_result = export_onnx_with_gatekeeper(
         payload=payload,
         model_path=MODEL_PATH,

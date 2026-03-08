@@ -8,6 +8,11 @@ from typing import Any
 
 import joblib
 
+try:
+    from portfolio.models import ModelRegistry
+except Exception:  # pragma: no cover
+    ModelRegistry = None
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -70,6 +75,17 @@ def _is_better(new_metric: float | None, old_metric: float | None, direction: st
     return new_metric > old_metric
 
 
+def _passes_gatekeeper(new_metric: float | None, old_metric: float | None, direction: str) -> bool:
+    if new_metric is None:
+        return False
+    if old_metric is None:
+        return True
+    tolerance = float(os.getenv('GATEKEEPER_MAX_DEGRADATION_PCT', '0.05'))
+    if direction == 'lower':
+        return new_metric <= old_metric * (1 + tolerance)
+    return new_metric >= old_metric * (1 - tolerance)
+
+
 def _resolve_export_dir(model_name: str, model_path: Path) -> Path:
     base_dir = Path(os.getenv('ONNX_EXPORT_DIR', str(model_path.parent)))
     use_subdir = os.getenv('ONNX_EXPORT_MODEL_SUBDIR', 'true').lower() in {'1', 'true', 'yes', 'y'}
@@ -124,7 +140,17 @@ def export_onnx_with_gatekeeper(
         except Exception:
             old_metric = None
 
-    if not _is_better(new_metric, old_metric, metric_direction):
+    if ModelRegistry is not None:
+        try:
+            active = ModelRegistry.objects.filter(model_name=model_name.upper(), status='ACTIVE').order_by('-trained_at').first()
+            if active and isinstance(active.notes, dict):
+                stored = active.notes.get(metric_name)
+                if stored is not None:
+                    old_metric = float(stored)
+        except Exception:
+            pass
+
+    if not _passes_gatekeeper(new_metric, old_metric, metric_direction):
         _maybe_notify_training(model_name, metric_name, new_metric, False, onnx_path, old_metric)
         return {
             'exported': False,
@@ -204,3 +230,24 @@ def _maybe_notify_training(
         _send_telegram_message(message)
     except Exception:
         return
+
+
+def save_model_with_version(
+    payload: dict[str, Any],
+    model_path: Path,
+    model_name: str,
+    metric_name: str,
+    metric_value: float | None,
+) -> dict[str, Any]:
+    model_name = (model_name or 'model').strip()
+    version = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+    metric_suffix = f"{metric_value:.4f}" if metric_value is not None else 'na'
+    archive_dir = Path(os.getenv('MODEL_ARCHIVE_DIR', str(model_path.parent / 'models_archive'))) / model_name.lower()
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    version_path = archive_dir / f"{model_path.stem}_{version}_{metric_suffix}.pkl"
+    joblib.dump(payload, version_path)
+    joblib.dump(payload, model_path)
+    return {
+        'archive_path': str(version_path),
+        'latest_path': str(model_path),
+    }

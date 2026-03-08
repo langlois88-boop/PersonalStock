@@ -5068,13 +5068,14 @@ class AIRecommendationsRunView(APIView):
 		as_of = timezone.now().date()
 
 		for stock in Stock.objects.all().order_by('symbol'):
-			predicted_price, recommendation = run_predictions(stock.symbol)
+			predicted_price, recommendation, confidence = run_predictions(stock.symbol)
 			obj, was_created = Prediction.objects.update_or_create(
 				stock=stock,
 				date=as_of,
 				defaults={
 					'predicted_price': predicted_price,
 					'recommendation': recommendation,
+					'confidence': confidence,
 				},
 			)
 			if was_created:

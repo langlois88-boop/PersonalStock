@@ -23,6 +23,11 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     _yfinance = None
 
+try:
+    import finnhub as _finnhub
+except Exception:  # pragma: no cover
+    _finnhub = None
+
 
 
 
@@ -283,7 +288,33 @@ def _yf_download_fallback(
         timeout,
         pd.DataFrame(),
     )
-    return fallback if isinstance(fallback, pd.DataFrame) else pd.DataFrame()
+    if isinstance(fallback, pd.DataFrame) and not fallback.empty:
+        return fallback
+
+    finnhub_key = os.getenv('FINNHUB_API_KEY')
+    if _finnhub is not None and finnhub_key and len(symbols) == 1:
+        try:
+            client = _finnhub.Client(api_key=finnhub_key)
+            symbol = symbols[0]
+            start_dt = _parse_datetime(start) or (datetime.now(timezone.utc) - timedelta(days=_period_to_days(period or '1y')))
+            end_dt = _parse_datetime(end) or datetime.now(timezone.utc)
+            res = client.stock_candles(symbol, interval or 'D', int(start_dt.timestamp()), int(end_dt.timestamp()))
+            if res and res.get('s') == 'ok':
+                frame = pd.DataFrame({
+                    'Open': res.get('o', []),
+                    'High': res.get('h', []),
+                    'Low': res.get('l', []),
+                    'Close': res.get('c', []),
+                    'Volume': res.get('v', []),
+                    'timestamp': [datetime.fromtimestamp(ts, tz=timezone.utc) for ts in res.get('t', [])],
+                })
+                if not frame.empty:
+                    frame = frame.set_index('timestamp')
+                    return frame
+        except Exception:
+            return pd.DataFrame()
+
+    return pd.DataFrame()
 
 
 def screen(scr_id: str, count: int = 200) -> dict[str, Any]:

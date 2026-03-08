@@ -5,10 +5,10 @@ from . import market_data as yf
 from prophet import Prophet
 
 
-def run_predictions(symbol: str) -> tuple[float, str]:
+def run_predictions(symbol: str) -> tuple[float, str, float]:
     data = yf.download(symbol, period="1y", interval="1d", progress=False)
     if data.empty:
-        return 0.0, "HOLD"
+        return 0.0, "HOLD", 0.0
 
     df = data.reset_index()[["Date", "Close"]]
     df.columns = ["ds", "y"]
@@ -26,5 +26,6 @@ def run_predictions(symbol: str) -> tuple[float, str]:
         recommendation = "SELL"
     else:
         recommendation = "HOLD"
+    confidence = abs(predicted_price - last_close) / (last_close or 1)
 
-    return predicted_price, recommendation
+    return predicted_price, recommendation, float(confidence)

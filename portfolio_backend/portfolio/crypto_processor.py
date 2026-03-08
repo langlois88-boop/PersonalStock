@@ -38,14 +38,24 @@ def _pct_change(series: pd.Series, periods: int = 1) -> float | None:
     return (last - prev) / prev
 
 
-def _btc_panic(btc_df: pd.DataFrame) -> bool:
+def _btc_panic(symbol_df: pd.DataFrame, btc_df: pd.DataFrame) -> tuple[bool, float | None]:
     threshold = float(os.getenv('CRYPTO_BTC_PANIC_THRESHOLD', '0.05'))
-    if btc_df is None or btc_df.empty:
-        return False
+    min_corr = float(os.getenv('CRYPTO_BTC_MIN_CORR', '0.35'))
+    if btc_df is None or btc_df.empty or symbol_df is None or symbol_df.empty:
+        return False, None
     change = _pct_change(btc_df['close'], periods=4)  # ~1h on 15m
     if change is None:
-        return False
-    return change <= -abs(threshold)
+        return False, None
+    try:
+        sym_ret = symbol_df['close'].pct_change().dropna()
+        btc_ret = btc_df['close'].pct_change().dropna()
+        aligned = pd.concat([sym_ret, btc_ret], axis=1).dropna()
+        corr = float(aligned.iloc[:, 0].rolling(30).corr(aligned.iloc[:, 1]).iloc[-1]) if len(aligned) >= 30 else None
+    except Exception:
+        corr = None
+    if corr is None or corr < min_corr:
+        return False, corr
+    return change <= -abs(threshold), corr
 
 
 _CRYPTO_PANIC_CACHE: dict[str, Any] = {'ts': 0.0, 'verdict': None, 'reason': None}
@@ -117,8 +127,7 @@ def _load_crypto_model() -> dict[str, Any] | None:
 def scan_crypto_drip() -> list[dict[str, Any]]:
     symbols = _crypto_symbols()
     btc_df = _fetch_15m('BTC-USD')
-    btc_panic = _btc_panic(btc_df)
-    panic_verdict = _crypto_panic_verdict(btc_df) if btc_panic else 'ROTATION'
+    panic_verdict = _crypto_panic_verdict(btc_df)
     model_payload = _load_crypto_model()
     model = model_payload.get('model') if model_payload else None
     feature_cols = model_payload.get('features') if model_payload else None
@@ -153,6 +162,7 @@ def scan_crypto_drip() -> list[dict[str, Any]]:
             except Exception:
                 score = None
 
+        btc_panic, btc_corr = _btc_panic(df, btc_df)
         blocked = btc_panic and panic_verdict == 'SYSTEMIC' and symbol != 'BTC-USD'
         results.append({
             'symbol': symbol,
@@ -162,6 +172,7 @@ def scan_crypto_drip() -> list[dict[str, Any]]:
             'oversold': oversold,
             'btc_panic': btc_panic,
             'panic_verdict': panic_verdict,
+            'btc_corr': btc_corr,
             'blocked': blocked,
             'score': score,
             'price_to_vwap': float(last.get('price_to_vwap', pd.Series([0.0])).iloc[-1]),

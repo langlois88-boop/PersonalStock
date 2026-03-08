@@ -9,7 +9,8 @@ import pandas as pd
 import requests
 from ... import market_data as yf
 
-from ...alpaca_data import get_daily_bars, get_latest_bid_ask_spread_pct
+from ...alpaca_data import get_daily_bars, get_latest_bid_ask_spread_pct, get_order_book_imbalance
+from ..feature_engineering import fractional_diff_series
 
 from ..collectors.news_rss import fetch_news_sentiment
 
@@ -210,6 +211,12 @@ class DataFusionEngine:
         fused["VPT_roc"] = fused["VPT"].pct_change().replace([pd.NA, float('inf'), float('-inf')], 0.0)
         fused["sector_code"] = _get_sector_code(self.ticker)
 
+        try:
+            vol_base = fused["Volume"].rolling(window=10, min_periods=5).mean()
+            fused["trade_velocity"] = fused["Volume"] / vol_base.replace(0, pd.NA)
+        except Exception:
+            fused["trade_velocity"] = 0.0
+
         delta = fused["Close"].diff()
         gain = delta.clip(lower=0).rolling(14, min_periods=7).mean()
         loss = (-delta.clip(upper=0)).rolling(14, min_periods=7).mean()
@@ -241,6 +248,18 @@ class DataFusionEngine:
         if spread_pct is None:
             spread_pct = _fallback_bid_ask_spread_pct(self.ticker)
         fused["bid_ask_spread_pct"] = float(spread_pct or 0.0)
+
+        imbalance = get_order_book_imbalance(self.ticker)
+        fused["order_book_imbalance"] = float(imbalance or 0.0)
+
+        if os.getenv("FRACTIONAL_DIFF_D", "0.0").strip() not in {"0", "0.0", "0.00"}:
+            try:
+                d_val = float(os.getenv("FRACTIONAL_DIFF_D", "0.4"))
+                fused["frac_diff_close"] = fractional_diff_series(fused["Close"], d=d_val)
+            except Exception:
+                fused["frac_diff_close"] = 0.0
+        else:
+            fused["frac_diff_close"] = 0.0
 
         try:
             spy = yf.download(

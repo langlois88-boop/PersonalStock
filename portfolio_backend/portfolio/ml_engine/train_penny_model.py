@@ -11,10 +11,16 @@ from .. import market_data as yf
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import classification_report, accuracy_score, precision_score, recall_score, f1_score
+from sklearn.ensemble import StackingClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 
-from .export_utils import export_onnx_with_gatekeeper
+from .transformers import RollingStandardScaler
+from .validation import PurgedTimeSeriesSplit
+
+from .export_utils import export_onnx_with_gatekeeper, save_model_with_version
 from .feature_registry import PENNY_FEATURE_NAMES
 
 
@@ -48,10 +54,37 @@ def _build_features(close: pd.Series, volume: pd.Series) -> pd.DataFrame:
     return features
 
 
-def _label_targets(close: pd.Series, horizon: int = 3, threshold: float = 0.05) -> pd.Series:
-    future = close.shift(-horizon)
-    future_return = (future - close) / close
-    return (future_return >= threshold).astype(int)
+def _label_targets_triple_barrier(
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    up_pct: float = 0.05,
+    down_pct: float = 0.03,
+    max_days: int = 3,
+) -> pd.Series:
+    if close is None or close.empty:
+        return pd.Series(dtype=int)
+    prices = close.values
+    highs = high.values if high is not None and not high.empty else prices
+    lows = low.values if low is not None and not low.empty else prices
+    labels = np.full(len(prices), np.nan)
+    for i in range(len(prices) - 1):
+        entry = prices[i]
+        if entry <= 0:
+            continue
+        upper = entry * (1 + up_pct)
+        lower = entry * (1 - down_pct)
+        end = min(len(prices), i + max_days + 1)
+        hit = 0
+        for j in range(i + 1, end):
+            if highs[j] >= upper:
+                hit = 1
+                break
+            if lows[j] <= lower:
+                hit = 0
+                break
+        labels[i] = hit
+    return pd.Series(labels, index=close.index)
 
 
 def _get_symbols() -> list[str]:
@@ -107,6 +140,8 @@ def build_dataset(symbols: Iterable[str]) -> tuple[pd.DataFrame, pd.Series]:
             continue
 
         close = _extract_series(data, symbol, ('Adj Close', 'Close')).copy()
+        high = _extract_series(data, symbol, ('High',)).copy()
+        low = _extract_series(data, symbol, ('Low',)).copy()
         volume = _extract_series(data, symbol, ('Volume',)).copy()
         if close.empty:
             continue
@@ -126,7 +161,10 @@ def build_dataset(symbols: Iterable[str]) -> tuple[pd.DataFrame, pd.Series]:
         target_index = feats.index
         if isinstance(target_index, pd.MultiIndex):
             target_index = target_index.get_level_values(0)
-        target = _label_targets(close).reindex(target_index)
+        up_pct = float(os.getenv('PENNY_TRIPLE_BARRIER_UP_PCT', '0.05'))
+        down_pct = float(os.getenv('PENNY_TRIPLE_BARRIER_DOWN_PCT', '0.03'))
+        max_days = int(os.getenv('PENNY_TRIPLE_BARRIER_MAX_DAYS', '3'))
+        target = _label_targets_triple_barrier(close, high, low, up_pct, down_pct, max_days).reindex(target_index)
         if not feats.empty:
             target.index = feats.index
         frames.append(feats)
@@ -200,20 +238,92 @@ def train_model(output_path: Path) -> None:
             X[col] = 0.0
     X = X[feature_names]
 
-    pipeline = Pipeline([
-        ('scaler', StandardScaler()),
-        (
-            'model',
-            RandomForestClassifier(
-                n_estimators=300,
-                max_depth=6,
+    use_rolling = os.getenv('PENNY_ROLLING_SCALER', 'true').lower() in {'1', 'true', 'yes', 'y'}
+    scaler = RollingStandardScaler(window=int(os.getenv('PENNY_ROLLING_WINDOW', '60'))) if use_rolling else StandardScaler()
+
+    model = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=6,
+        random_state=42,
+        class_weight='balanced',
+    )
+    if os.getenv('PENNY_OPTUNA_TRIALS', '0').isdigit() and int(os.getenv('PENNY_OPTUNA_TRIALS', '0')) > 0:
+        try:
+            import optuna
+
+            trials = int(os.getenv('PENNY_OPTUNA_TRIALS', '20'))
+            def objective(trial):
+                n_estimators = trial.suggest_int('n_estimators', 200, 600, step=50)
+                max_depth = trial.suggest_int('max_depth', 3, 10)
+                min_split = trial.suggest_int('min_samples_split', 4, 12)
+                min_leaf = trial.suggest_int('min_samples_leaf', 2, 10)
+                clf = RandomForestClassifier(
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    min_samples_split=min_split,
+                    min_samples_leaf=min_leaf,
+                    random_state=42,
+                    class_weight='balanced',
+                )
+                Xv = X.values
+                yv = y.values
+                splitter = PurgedTimeSeriesSplit(
+                    n_splits=int(os.getenv('PENNY_PURGED_SPLITS', '5')),
+                    purge_window=int(os.getenv('PENNY_PURGE_WINDOW', '5')),
+                    embargo_pct=float(os.getenv('PENNY_EMBARGO_PCT', '0.02')),
+                )
+                scores = []
+                for tr, te in splitter.split(Xv):
+                    clf.fit(Xv[tr], yv[tr])
+                    scores.append(float(clf.score(Xv[te], yv[te])))
+                return float(np.mean(scores)) if scores else 0.0
+
+            study = optuna.create_study(direction='maximize')
+            study.optimize(objective, n_trials=trials)
+            params = study.best_params
+            model = RandomForestClassifier(
+                n_estimators=params.get('n_estimators', 300),
+                max_depth=params.get('max_depth', 6),
+                min_samples_split=params.get('min_samples_split', 6),
+                min_samples_leaf=params.get('min_samples_leaf', 4),
                 random_state=42,
                 class_weight='balanced',
-            ),
-        ),
-    ])
+            )
+        except Exception:
+            pass
 
-    splits = TimeSeriesSplit(n_splits=5)
+    if os.getenv('PENNY_STACKING_ENABLED', 'false').lower() in {'1', 'true', 'yes', 'y'}:
+        estimators = [('rf', model)]
+        try:
+            from xgboost import XGBClassifier
+
+            estimators.append(('xgb', XGBClassifier(
+                n_estimators=300,
+                max_depth=5,
+                learning_rate=0.08,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                eval_metric='logloss',
+                random_state=42,
+            )))
+        except Exception:
+            pass
+        meta = LogisticRegression(max_iter=2000, class_weight='balanced')
+        model = StackingClassifier(estimators=estimators, final_estimator=meta, passthrough=True)
+
+    steps = [('scaler', scaler)]
+    if os.getenv('PENNY_PCA_ENABLED', 'false').lower() in {'1', 'true', 'yes', 'y'}:
+        n_comp = int(os.getenv('PENNY_PCA_COMPONENTS', '6'))
+        steps.append(('pca', PCA(n_components=n_comp, random_state=42)))
+    steps.append(('model', model))
+    pipeline = Pipeline(steps)
+
+    use_purged = os.getenv('PENNY_PURGED_CV', 'true').lower() in {'1', 'true', 'yes', 'y'}
+    splits = PurgedTimeSeriesSplit(
+        n_splits=int(os.getenv('PENNY_PURGED_SPLITS', '5')),
+        purge_window=int(os.getenv('PENNY_PURGE_WINDOW', '5')),
+        embargo_pct=float(os.getenv('PENNY_EMBARGO_PCT', '0.02')),
+    ) if use_purged else TimeSeriesSplit(n_splits=5)
     cv_scores: list[float] = []
     last_test_idx = None
     for train_idx, test_idx in splits.split(X):
@@ -243,7 +353,7 @@ def train_model(output_path: Path) -> None:
         'cv_mean': cv_mean,
         'walk_forward': walk_forward,
     }
-    joblib.dump(payload, output_path)
+    save_model_with_version(payload, output_path, 'penny', metric_name='cv_mean', metric_value=cv_mean)
     onnx_result = export_onnx_with_gatekeeper(
         payload=payload,
         model_path=output_path,

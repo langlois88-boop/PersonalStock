@@ -470,6 +470,12 @@ def get_intraday_context(symbol: str, minutes: int = 390, rvol_window: int = 20)
     
     last = enriched.iloc[-1]
     spread_pct = get_latest_bid_ask_spread_pct(symbol)
+    imbalance = get_order_book_imbalance(symbol)
+    try:
+        vol_series = enriched['volume'].rolling(20, min_periods=5).mean()
+        trade_velocity = float((last.get('volume') or 0.0) / (vol_series.iloc[-1] or 1.0))
+    except Exception:
+        trade_velocity = 0.0
     return {
         'bars': enriched,
         'rvol': float(last.get('rvol') or 0.0),
@@ -483,4 +489,6 @@ def get_intraday_context(symbol: str, minutes: int = 390, rvol_window: int = 20)
         'price_to_vwap': float(last.get('price_to_vwap') or 0.0),
         'last_close': float(last.get('close') or 0.0),
         'bid_ask_spread_pct': float(spread_pct or 0.0),
+        'order_book_imbalance': float(imbalance or 0.0),
+        'trade_velocity': float(trade_velocity or 0.0),
     }

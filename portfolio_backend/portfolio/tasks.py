@@ -3154,11 +3154,12 @@ def calculate_drip(account_id: int) -> list[dict[str, float | str]]:
 def weekly_ai_forecast() -> dict[str, str | float]:
     results: dict[str, str | float] = {}
     for stock in Stock.objects.all().order_by('symbol'):
-        predicted_price, recommendation = run_predictions(stock.symbol)
+        predicted_price, recommendation, confidence = run_predictions(stock.symbol)
         Prediction.objects.create(
             stock=stock,
             predicted_price=predicted_price,
             recommendation=recommendation,
+            confidence=confidence,
             date=timezone.now().date(),
         )
         results[stock.symbol] = predicted_price
@@ -5975,6 +5976,54 @@ def _alpaca_position_qty(position: Any | None) -> float:
 
 
 def _alpaca_position_avg_price(position: Any | None) -> float:
+    
+    @shared_task
+    def detect_model_drift() -> dict[str, Any]:
+        threshold_pct = float(os.getenv('MODEL_DRIFT_WINRATE_PCT', '10'))
+        lookback_days = int(os.getenv('MODEL_DRIFT_LOOKBACK_DAYS', '14'))
+        cutoff = timezone.now() - timedelta(days=lookback_days)
+        results: list[dict[str, Any]] = []
+
+        sandbox_map = {
+            'AI_BLUECHIP': 'BLUECHIP',
+            'AI_PENNY': 'PENNY',
+        }
+
+        for sandbox, model_name in sandbox_map.items():
+            closed = PaperTrade.objects.filter(status='CLOSED', sandbox=sandbox, exit_date__gte=cutoff)
+            trades = closed.count()
+            wins = closed.filter(outcome='WIN').count()
+            if wins == 0 and trades:
+                wins = sum([1 for t in closed if float(t.pnl or 0) > 0])
+            paper_win_rate = (wins / trades) * 100 if trades else 0.0
+
+            registry = ModelRegistry.objects.filter(model_name=model_name, status='ACTIVE').order_by('-trained_at').first()
+            baseline = float(registry.backtest_win_rate or 0) if registry else 0.0
+            delta = paper_win_rate - baseline
+            drift = baseline > 0 and delta <= -abs(threshold_pct)
+
+            results.append({
+                'sandbox': sandbox,
+                'model_name': model_name,
+                'paper_win_rate': round(paper_win_rate, 2),
+                'baseline_win_rate': round(baseline, 2),
+                'delta': round(delta, 2),
+                'drift': drift,
+            })
+
+            if drift:
+                _send_telegram_alert(
+                    "\n".join([
+                        f"⚠️ Drift détecté: {model_name}",
+                        f"Paper win: {paper_win_rate:.2f}%",
+                        f"Baseline: {baseline:.2f}%",
+                        f"Δ: {delta:.2f}%",
+                    ]),
+                    allow_during_blackout=True,
+                    category='mlops',
+                )
+
+        return {'status': 'ok', 'results': results}
     if position is None:
         return 0.0
     price = getattr(position, 'avg_entry_price', None) or getattr(position, 'average_entry_price', None)
@@ -7245,7 +7294,7 @@ def scan_market_for_opportunities(min_score: float | None = None) -> dict[str, A
             ml_score = float(top.get('score') or 0) * 100
             rsi = float(top.get('rsi') or 0) if top.get('rsi') is not None else None
             rvol = float(top.get('rvol') or 0) if top.get('rvol') is not None else None
-            prophet_price, prophet_rec = run_predictions(top['symbol'])
+            prophet_price, prophet_rec, prophet_confidence = run_predictions(top['symbol'])
             news_sentiment = float(top.get('news_sentiment') or 0.0)
             ctx_5m = _intraday_context_for_timeframe(
                 top['symbol'],
@@ -7262,6 +7311,7 @@ def scan_market_for_opportunities(min_score: float | None = None) -> dict[str, A
                 news_titles,
                 prophet_price=prophet_price,
                 prophet_rec=prophet_rec,
+                prophet_confidence=prophet_confidence,
                 news_sentiment=news_sentiment,
                 volatility=volatility,
             )
@@ -9677,6 +9727,7 @@ class DecisionEngine:
         titles: list[str],
         prophet_price: float | None,
         prophet_rec: str | None,
+        prophet_confidence: float | None,
         news_sentiment: float | None,
         volatility: float | None,
     ) -> str:
@@ -9688,6 +9739,7 @@ class DecisionEngine:
             f"RSI14: {rsi if rsi is not None else 'N/A'}",
             f"RVOL: {rvol if rvol is not None else 'N/A'}",
             f"PROPHET_7D: {prophet_price if prophet_price is not None else 'N/A'} ({prophet_rec or 'N/A'})",
+            f"PROPHET_CONF: {prophet_confidence if prophet_confidence is not None else 'N/A'}",
             f"NEWS_SENTIMENT: {news_sentiment if news_sentiment is not None else 'N/A'}",
             f"VOLATILITÉ_INTRA: {volatility if volatility is not None else 'N/A'}",
             f"BROKER_LAG: {self.lag_seconds}s",
@@ -9715,6 +9767,7 @@ class DecisionEngine:
         titles: list[str],
         prophet_price: float | None = None,
         prophet_rec: str | None = None,
+        prophet_confidence: float | None = None,
         news_sentiment: float | None = None,
         volatility: float | None = None,
     ) -> dict[str, Any]:
@@ -9728,6 +9781,7 @@ class DecisionEngine:
             titles,
             prophet_price,
             prophet_rec,
+            prophet_confidence,
             news_sentiment,
             volatility,
         )

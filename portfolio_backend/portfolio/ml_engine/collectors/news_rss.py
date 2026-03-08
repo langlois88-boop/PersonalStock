@@ -4,6 +4,41 @@ from typing import Dict
 import feedparser
 from textblob import TextBlob
 
+_FINBERT_PIPELINE = None
+
+
+def _get_finbert_pipeline():
+    global _FINBERT_PIPELINE
+    if _FINBERT_PIPELINE is not None:
+        return _FINBERT_PIPELINE
+    try:
+        from transformers import pipeline
+        _FINBERT_PIPELINE = pipeline('sentiment-analysis', model='ProsusAI/finbert')
+        return _FINBERT_PIPELINE
+    except Exception:
+        return None
+
+
+def _finbert_score(titles: list[str]) -> float:
+    pipe = _get_finbert_pipeline()
+    if pipe is None:
+        return 0.0
+    score_sum = 0.0
+    count = 0
+    for title in titles:
+        try:
+            result = pipe(title[:256])[0]
+            label = str(result.get('label', '')).upper()
+            conf = float(result.get('score') or 0.0)
+        except Exception:
+            continue
+        if label == 'POSITIVE':
+            score_sum += conf
+        elif label == 'NEGATIVE':
+            score_sum -= conf
+        count += 1
+    return score_sum / count if count else 0.0
+
 
 def fetch_news_sentiment(ticker: str, days: int = 7) -> Dict[str, float]:
     ticker = (ticker or "").upper().strip()
@@ -22,19 +57,27 @@ def fetch_news_sentiment(ticker: str, days: int = 7) -> Dict[str, float]:
     sentiments = []
     neutral_phrases = ("release results", "conference call")
     cutoff = datetime.utcnow() - timedelta(days=days)
+    titles: list[str] = []
     for entry in entries:
         title = getattr(entry, "title", "")
         title_lower = str(title).lower()
+        titles.append(str(title))
         published = getattr(entry, "published_parsed", None)
         if published:
             published_dt = datetime(*published[:6])
             if published_dt < cutoff:
                 continue
+        if str(os.getenv('USE_FINBERT', 'false')).lower() in {'1', 'true', 'yes', 'y'}:
+            continue
         analysis = TextBlob(title)
         polarity = analysis.sentiment.polarity
         if polarity == 0 and any(phrase in title_lower for phrase in neutral_phrases):
             continue
         sentiments.append(polarity)
+
+    if str(os.getenv('USE_FINBERT', 'false')).lower() in {'1', 'true', 'yes', 'y'}:
+        finbert_score = _finbert_score(titles)
+        return {"news_sentiment": round(finbert_score, 4), "news_count": len(entries)}
 
     if not sentiments:
         return {"news_sentiment": 0.0, "news_count": len(entries)}

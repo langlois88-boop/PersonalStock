@@ -208,6 +208,14 @@ def _ensure_features(df: pd.DataFrame, feature_columns: list[str] | None = None)
                 loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
                 rs = gain / loss.replace(0, np.nan)
                 data["RSI14"] = 100 - (100 / (1 + rs))
+            if "frac_diff_close" in data.columns and data["frac_diff_close"].replace(0, np.nan).isna().all():
+                try:
+                    from .feature_engineering import fractional_diff_series
+
+                    d_val = float(os.getenv("FRACTIONAL_DIFF_D", "0.4"))
+                    data["frac_diff_close"] = fractional_diff_series(close, d=d_val)
+                except Exception:
+                    data["frac_diff_close"] = 0.0
     if "VolumeZ" in data.columns:
         data["VolumeZ"] = pd.to_numeric(data["VolumeZ"], errors="coerce").fillna(0.0)
     if "sector_code" in data.columns:

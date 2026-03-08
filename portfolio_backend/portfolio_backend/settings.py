@@ -379,6 +379,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.compute_model_evaluation_daily',
         'schedule': crontab(minute=50, hour=7),
     },
+    'model-drift-check-daily': {
+        'task': 'portfolio.tasks.detect_model_drift',
+        'schedule': crontab(minute=10, hour=8),
+    },
     'cleanup-system-logs-weekly': {
         'task': 'portfolio.tasks.cleanup_system_logs',
         'schedule': crontab(minute=0, hour=3, day_of_week='sun'),

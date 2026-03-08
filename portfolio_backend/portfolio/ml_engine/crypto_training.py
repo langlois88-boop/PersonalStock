@@ -13,7 +13,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler
 
-from .export_utils import export_onnx_with_gatekeeper
+from .export_utils import export_onnx_with_gatekeeper, save_model_with_version
 from .feature_registry import CRYPTO_FEATURE_NAMES
 
 try:
@@ -195,7 +195,7 @@ def train_crypto_model(
 def save_crypto_model(payload: dict, output_path: Path | None = None) -> str:
     path = output_path or Path(os.getenv('CRYPTO_MODEL_PATH', str(CRYPTO_MODEL_PATH)))
     path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(payload, path)
+    save_model_with_version(payload, path, 'crypto', metric_name='cv_mean', metric_value=payload.get('cv_mean'))
     export_onnx_with_gatekeeper(
         payload=payload,
         model_path=path,

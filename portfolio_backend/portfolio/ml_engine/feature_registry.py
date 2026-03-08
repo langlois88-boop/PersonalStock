@@ -71,6 +71,9 @@ FUSION_FEATURE_NAMES: List[str] = [
     "spy_corr_60",
     "tsx_corr_60",
     "bid_ask_spread_pct",
+    "order_book_imbalance",
+    "trade_velocity",
+    "frac_diff_close",
 ]
 
 RECOMMENDER_FEATURE_NAMES: List[str] = [

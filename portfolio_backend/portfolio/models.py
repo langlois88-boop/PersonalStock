@@ -70,6 +70,7 @@ class Prediction(models.Model):
 	date = models.DateField()
 	predicted_price = models.FloatField()
 	recommendation = models.CharField(max_length=10, choices=RECOMMENDATIONS)
+	confidence = models.FloatField(null=True, blank=True)
 
 	def __str__(self) -> str:
 		return f"{self.stock.symbol} {self.date} {self.recommendation}"
