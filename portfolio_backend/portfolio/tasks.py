@@ -6070,7 +6070,12 @@ def _execute_paper_trades_for_crypto_sandbox() -> dict[str, Any]:
     if not enabled:
         return {'status': 'disabled', 'created': 0, 'closed': 0}
 
-    watchlist = _get_watchlist(sandbox, prefix, 'BTC-USD,ETH-USD,SOL-USD')
+    watch = SandboxWatchlist.objects.filter(sandbox=sandbox).first()
+    if watch and watch.symbols:
+        watchlist = [str(s).strip().upper() for s in watch.symbols if str(s).strip()]
+    else:
+        env_list = os.getenv('AI_CRYPTO_WATCHLIST') or os.getenv('CRYPTO_SYMBOLS') or 'BTC-USD,ETH-USD,SOL-USD'
+        watchlist = [s.strip().upper() for s in str(env_list).split(',') if s.strip()]
     buy_threshold = _env_float(prefix, 'BUY_THRESHOLD', '0.65')
     stop_loss_pct = _env_float(prefix, 'STOP_LOSS_PCT', '0.05')
     take_profit_pct = _env_float(prefix, 'TAKE_PROFIT_PCT', '0.08')
