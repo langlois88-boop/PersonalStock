@@ -74,7 +74,7 @@ def _google_news_from_db(symbol: str, start: datetime, end: datetime) -> list[di
     qs = (
         StockNews.objects.filter(stock__symbol__iexact=symbol, published_at__gte=start, published_at__lte=end)
         .order_by('published_at')
-        .values('headline', 'summary', 'published_at')
+        .values('headline', 'raw', 'published_at')
     )
     results = []
     for item in qs:
@@ -83,7 +83,7 @@ def _google_news_from_db(symbol: str, start: datetime, end: datetime) -> list[di
             continue
         results.append({
             'headline': item.get('headline') or '',
-            'summary': item.get('summary') or '',
+            'summary': item.get('raw') or '',
             'datetime': published_at,
         })
     return results
@@ -157,30 +157,90 @@ def train_sentiment_impact() -> dict[str, Any]:
                 'hour_of_day': published.astimezone(timezone.utc).hour,
                 'day_of_week': published.weekday(),
                 'volatility_4h': float(move),
+                'published_at': published,
             })
 
     if not rows:
         return {'status': 'no_samples'}
 
     dataset = pd.DataFrame(rows).fillna(0.0)
+    dataset['published_at'] = pd.to_datetime(dataset['published_at'], errors='coerce')
+    dataset = dataset.dropna(subset=['published_at']).sort_values('published_at')
     X = dataset[['finbert_score', 'initial_volume', 'hour_of_day', 'day_of_week']]
     y = dataset['volatility_4h']
 
     from sklearn.ensemble import RandomForestRegressor
+    from sklearn.model_selection import TimeSeriesSplit
+    from sklearn.metrics import mean_squared_error
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
 
-    model = RandomForestRegressor(
-        n_estimators=300,
-        max_depth=8,
-        random_state=42,
-    )
-    model.fit(X, y)
+    pipeline = Pipeline([
+        ('scaler', StandardScaler()),
+        (
+            'model',
+            RandomForestRegressor(
+                n_estimators=300,
+                max_depth=8,
+                random_state=42,
+            ),
+        ),
+    ])
+
+    splits = TimeSeriesSplit(n_splits=5)
+    rmse_scores: list[float] = []
+    for train_idx, test_idx in splits.split(X):
+        pipeline.fit(X.iloc[train_idx], y.iloc[train_idx])
+        preds = pipeline.predict(X.iloc[test_idx])
+        rmse_scores.append(float(mean_squared_error(y.iloc[test_idx], preds, squared=False)))
+
+    def _walk_forward_rmse() -> list[dict[str, float | int | str]]:
+        reports = []
+        if dataset.empty:
+            return reports
+        start_ts = dataset['published_at'].min()
+        end_ts = dataset['published_at'].max()
+        if start_ts is None or end_ts is None:
+            return reports
+        test_start = start_ts + pd.DateOffset(months=3)
+        while test_start < end_ts:
+            test_end = test_start + pd.DateOffset(months=3)
+            train_mask = dataset['published_at'] < test_start
+            test_mask = (dataset['published_at'] >= test_start) & (dataset['published_at'] < test_end)
+            if train_mask.sum() < 60 or test_mask.sum() == 0:
+                test_start = test_end
+                continue
+            X_train = dataset.loc[train_mask, ['finbert_score', 'initial_volume', 'hour_of_day', 'day_of_week']]
+            y_train = y.loc[train_mask]
+            X_test = dataset.loc[test_mask, ['finbert_score', 'initial_volume', 'hour_of_day', 'day_of_week']]
+            y_test = y.loc[test_mask]
+            pipeline.fit(X_train, y_train)
+            preds = pipeline.predict(X_test)
+            rmse = float(mean_squared_error(y_test, preds, squared=False)) if len(y_test) else 0.0
+            reports.append({
+                'start': test_start.strftime('%Y-%m-%d'),
+                'end': test_end.strftime('%Y-%m-%d'),
+                'samples': int(len(y_test)),
+                'rmse': rmse,
+            })
+            test_start = test_end
+        return reports
+
+    walk_forward = _walk_forward_rmse()
+    pipeline.fit(X, y)
 
     model_path = Path(__file__).resolve().parents[1] / 'ml_engine' / 'sentiment_impact_model.pkl'
     model_path.parent.mkdir(parents=True, exist_ok=True)
     import joblib
 
-    joblib.dump({'model': model, 'features': list(X.columns)}, model_path)
-    return {'status': 'ok', 'samples': len(dataset), 'model_path': str(model_path)}
+    joblib.dump({'model': pipeline, 'features': list(X.columns), 'cv_rmse': rmse_scores, 'walk_forward': walk_forward}, model_path)
+    return {
+        'status': 'ok',
+        'samples': len(dataset),
+        'cv_rmse': rmse_scores,
+        'walk_forward': walk_forward,
+        'model_path': str(model_path),
+    }
 
 
 if __name__ == '__main__':

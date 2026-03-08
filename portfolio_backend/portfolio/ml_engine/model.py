@@ -6,17 +6,10 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from .feature_registry import RECOMMENDER_FEATURE_NAMES
 
-FEATURE_COLUMNS: List[str] = [
-    "rsi_14",
-    "vol_zscore",
-    "return_20d",
-    "roe",
-    "debt_to_equity",
-    "news_sentiment",
-    "news_count",
-    "fred_rate",
-]
+
+FEATURE_COLUMNS: List[str] = list(RECOMMENDER_FEATURE_NAMES)
 
 
 def build_model(random_state: int = 42) -> Pipeline:

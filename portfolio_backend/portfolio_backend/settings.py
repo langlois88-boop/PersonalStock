@@ -64,6 +64,7 @@ MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
+    'portfolio.middleware.DisableCSRFMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
@@ -77,8 +78,16 @@ CORS_ALLOWED_ORIGINS = [
     'http://100.88.73.110:3001',
 ]
 
+CSRF_TRUSTED_ORIGINS = [
+    'http://localhost:3000',
+    'http://localhost:3001',
+    'http://192.168.2.92:3001',
+    'http://100.88.73.110:3001',
+]
+
 # Dev LAN convenience
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOW_CREDENTIALS = True
 
 ROOT_URLCONF = 'portfolio_backend.urls'
 
@@ -253,6 +262,37 @@ CELERY_BEAT_SCHEDULE = {
     },
     'match-plan-0945': {
         'task': 'portfolio.tasks.send_match_plan_report',
+        'schedule': crontab(minute=45, hour=9, day_of_week='mon-fri'),
+    },
+    'optimizer-snapshot-open-0935': {
+        'task': 'portfolio.tasks.cache_optimizer_snapshot',
+        'schedule': crontab(minute=35, hour=9, day_of_week='mon-fri'),
+        'kwargs': {'fast': True},
+    },
+    'optimizer-snapshot-midday-1230': {
+        'task': 'portfolio.tasks.cache_optimizer_snapshot',
+        'schedule': crontab(minute=30, hour=12, day_of_week='mon-fri'),
+        'kwargs': {'fast': True},
+    },
+    'optimizer-snapshot-close-1605': {
+        'task': 'portfolio.tasks.cache_optimizer_snapshot',
+        'schedule': crontab(minute=5, hour=16, day_of_week='mon-fri'),
+        'kwargs': {'fast': True},
+    },
+    'ai-center-snapshot-open-0935': {
+        'task': 'portfolio.tasks.cache_ai_center_snapshot',
+        'schedule': crontab(minute=35, hour=9, day_of_week='mon-fri'),
+    },
+    'ai-center-snapshot-midday-1230': {
+        'task': 'portfolio.tasks.cache_ai_center_snapshot',
+        'schedule': crontab(minute=30, hour=12, day_of_week='mon-fri'),
+    },
+    'ai-center-snapshot-close-1605': {
+        'task': 'portfolio.tasks.cache_ai_center_snapshot',
+        'schedule': crontab(minute=5, hour=16, day_of_week='mon-fri'),
+    },
+    'deepseek-open-0945': {
+        'task': 'portfolio.tasks.run_morning_ai_analysis',
         'schedule': crontab(minute=45, hour=9, day_of_week='mon-fri'),
     },
     'update-user-preferences-daily': {

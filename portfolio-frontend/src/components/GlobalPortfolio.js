@@ -119,9 +119,20 @@ function GlobalPortfolio() {
     api
       .get('dashboard/portfolio/', { params })
       .then((res) => setData(res.data))
-      .catch(() => {
-        setError("Impossible de charger le portefeuille.");
-        setData(emptyState);
+      .catch(async () => {
+        try {
+          const fallbackUrl = `${window.location.protocol}//${window.location.hostname}:8001/api/dashboard/portfolio/`;
+          const query = new URLSearchParams(params).toString();
+          const resp = await fetch(query ? `${fallbackUrl}?${query}` : fallbackUrl);
+          if (!resp.ok) throw new Error('fallback failed');
+          const payload = await resp.json();
+          setData(payload);
+          setError('');
+          return;
+        } catch (fallbackErr) {
+          setError("Impossible de charger le portefeuille.");
+          setData(emptyState);
+        }
       })
       .finally(() => setLoading(false));
   };
@@ -174,7 +185,19 @@ function GlobalPortfolio() {
     api
       .get('dashboard/accounts/', { params })
       .then((res) => setAccountData(res.data || { accounts: [], top_movers: {} }))
-      .catch(() => setAccountData({ accounts: [], top_movers: {} }))
+      .catch(async () => {
+        try {
+          const fallbackUrl = `${window.location.protocol}//${window.location.hostname}:8001/api/dashboard/accounts/`;
+          const query = new URLSearchParams(params).toString();
+          const resp = await fetch(query ? `${fallbackUrl}?${query}` : fallbackUrl);
+          if (!resp.ok) throw new Error('fallback failed');
+          const payload = await resp.json();
+          setAccountData(payload || { accounts: [], top_movers: {} });
+          return;
+        } catch (fallbackErr) {
+          setAccountData({ accounts: [], top_movers: {} });
+        }
+      })
       .finally(() => setAccountLoading(false));
   }, [selectedAccountId]);
 

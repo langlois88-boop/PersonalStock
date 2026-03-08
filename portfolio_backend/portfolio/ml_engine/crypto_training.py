@@ -13,6 +13,9 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler
 
+from .export_utils import export_onnx_with_gatekeeper
+from .feature_registry import CRYPTO_FEATURE_NAMES
+
 try:
     from xgboost import XGBClassifier
 except Exception:  # pragma: no cover
@@ -129,14 +132,7 @@ def build_crypto_dataset(symbols: Iterable[str], days: int = 60) -> tuple[pd.Dat
         return pd.DataFrame(), pd.Series(dtype=int), []
 
     dataset = pd.concat(frames, ignore_index=True)
-    feature_cols = [
-        'return_1',
-        'rsi_14',
-        'rubber_band_index',
-        'price_to_vwap',
-        'volatility_spike',
-        'btc_correlation',
-    ]
+    feature_cols = list(CRYPTO_FEATURE_NAMES)
     dataset = dataset.dropna(subset=feature_cols + ['label'])
     labels = dataset['label']
     return dataset, labels, feature_cols
@@ -189,6 +185,7 @@ def train_crypto_model(
         'model': pipeline,
         'features': feature_cols,
         'scores': scores,
+        'cv_mean': float(sum(scores) / len(scores)) if scores else None,
         'symbols': list(symbols),
         'horizon': horizon,
         'target_pct': target_pct,
@@ -199,6 +196,14 @@ def save_crypto_model(payload: dict, output_path: Path | None = None) -> str:
     path = output_path or Path(os.getenv('CRYPTO_MODEL_PATH', str(CRYPTO_MODEL_PATH)))
     path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(payload, path)
+    export_onnx_with_gatekeeper(
+        payload=payload,
+        model_path=path,
+        model_name='crypto',
+        feature_names=list(payload.get('features') or CRYPTO_FEATURE_NAMES),
+        metric_name='cv_mean',
+        metric_direction='higher',
+    )
     return str(path)
 
 

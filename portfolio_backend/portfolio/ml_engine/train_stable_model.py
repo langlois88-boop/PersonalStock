@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -10,12 +11,34 @@ from .. import market_data as yf
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 import joblib
 
-from portfolio.models import Stock, MacroIndicator
+from .export_utils import export_onnx_with_gatekeeper
+from .feature_registry import STABLE_FEATURE_NAMES
+
+from portfolio.models import Stock, MacroIndicator, PriceHistory
 
 
 MODEL_PATH = Path(__file__).resolve().parent / 'stable_brain_v1.pkl'
+FEATURE_NAMES = list(STABLE_FEATURE_NAMES)
+
+SECTOR_ETF_MAP = {
+    'Technology': 'XLK',
+    'Healthcare': 'XLV',
+    'Health Care': 'XLV',
+    'Financial Services': 'XLF',
+    'Financials': 'XLF',
+    'Energy': 'XLE',
+    'Consumer Defensive': 'XLP',
+    'Consumer Cyclical': 'XLY',
+    'Industrials': 'XLI',
+    'Utilities': 'XLU',
+    'Real Estate': 'XLRE',
+    'Communication Services': 'XLC',
+    'Basic Materials': 'XLB',
+}
 
 
 def _is_valid_symbol(symbol: str) -> bool:
@@ -27,7 +50,7 @@ def _is_valid_symbol(symbol: str) -> bool:
     return bool(re.fullmatch(r"[A-Z0-9\.\-]{1,10}", symbol))
 
 
-def _build_features(close: pd.Series, volume: pd.Series, spy_close: pd.Series, dividend_yield: float, macro: MacroIndicator | None):
+def _build_features(close: pd.Series, volume: pd.Series, spy_close: pd.Series, dividend_yield: float, macro: MacroIndicator | None, sector_close: pd.Series | None = None):
     ret = close.pct_change().dropna()
     spy_ret = spy_close.pct_change().dropna()
     aligned = pd.concat([ret, spy_ret], axis=1, join='inner').dropna()
@@ -39,6 +62,13 @@ def _build_features(close: pd.Series, volume: pd.Series, spy_close: pd.Series, d
     log_ret_20 = float(np.log(close.iloc[-1] / close.iloc[-21]))
     vol_60 = float(ret.tail(60).std())
     rel_volume_200 = float(volume.tail(5).mean() / (volume.tail(200).mean() or 1))
+
+    sector_strength = 0.0
+    if sector_close is not None and len(sector_close) >= 21:
+        try:
+            sector_strength = float(np.log(sector_close.iloc[-1] / sector_close.iloc[-21]))
+        except Exception:
+            sector_strength = 0.0
 
     macro_features = [
         float(macro.sp500_close) if macro else 0.0,
@@ -54,8 +84,22 @@ def _build_features(close: pd.Series, volume: pd.Series, spy_close: pd.Series, d
         beta,
         rel_volume_200,
         dividend_yield,
+        sector_strength,
         *macro_features,
     ]
+
+
+def _price_history_series(symbol: str, days: int = 365 * 2) -> pd.Series | None:
+    stock = Stock.objects.filter(symbol__iexact=symbol).first()
+    if not stock:
+        return None
+    cutoff = datetime.now().date() - pd.Timedelta(days=days)
+    rows = PriceHistory.objects.filter(stock=stock, date__gte=cutoff).order_by('date')
+    if not rows.exists():
+        return None
+    series = pd.Series({row.date: float(row.close_price or 0) for row in rows})
+    series = series.replace(0, np.nan).dropna()
+    return series if not series.empty else None
 
 
 def train_stable_model():
@@ -65,24 +109,46 @@ def train_stable_model():
 
     macro = MacroIndicator.objects.order_by('-date').first()
 
-    X = []
-    y = []
+    rows = []
+    targets = []
 
     spy = yf.Ticker('SPY').history(period='2y', interval='1d', timeout=10)
-    if spy is None or spy.empty or 'Close' not in spy:
-        raise RuntimeError('SPY history missing.')
-    spy_close = spy['Close']
+    if spy is None or spy.empty or ('Close' not in spy and 'Adj Close' not in spy):
+        spy = yf.Ticker('QQQ').history(period='2y', interval='1d', timeout=10)
+    if spy is None or spy.empty or ('Close' not in spy and 'Adj Close' not in spy):
+        spy_close = _price_history_series('SPY') or _price_history_series('QQQ')
+        if spy_close is None:
+            return {
+                'status': 'no_index',
+                'reason': 'Index history missing (SPY/QQQ).',
+            }
+    else:
+        spy_close = spy['Adj Close'] if 'Adj Close' in spy else spy['Close']
 
     for symbol in symbols:
         try:
             data = yf.Ticker(symbol).history(period='2y', interval='1d', timeout=10)
         except Exception:
-            continue
-        if data is None or data.empty or 'Close' not in data:
-            continue
-        close = data['Close']
+            data = None
+        if data is None or data.empty or ('Close' not in data and 'Adj Close' not in data):
+            close = _price_history_series(symbol)
+            if close is None:
+                continue
+        else:
+            close = data['Adj Close'] if 'Adj Close' in data else data['Close']
         volume = data['Volume'] if 'Volume' in data else pd.Series([0] * len(close), index=close.index)
-        dividend_yield = float(Stock.objects.filter(symbol=symbol).values_list('dividend_yield', flat=True).first() or 0)
+        stock_row = Stock.objects.filter(symbol=symbol).values('dividend_yield', 'sector').first() or {}
+        dividend_yield = float(stock_row.get('dividend_yield') or 0)
+        sector_name = stock_row.get('sector') or ''
+        sector_symbol = SECTOR_ETF_MAP.get(str(sector_name).strip(), '')
+        sector_close = None
+        if sector_symbol:
+            try:
+                sector_hist = yf.Ticker(sector_symbol).history(period='2y', interval='1d', timeout=10)
+                if sector_hist is not None and not sector_hist.empty:
+                    sector_close = sector_hist['Adj Close'] if 'Adj Close' in sector_hist else sector_hist['Close']
+            except Exception:
+                sector_close = None
 
         for i in range(220, len(close) - 20):
             window_close = close.iloc[:i + 1]
@@ -90,34 +156,93 @@ def train_stable_model():
             if len(window_close) < 220:
                 continue
 
-            features = _build_features(window_close, window_volume, spy_close, dividend_yield, macro)
+            features = _build_features(window_close, window_volume, spy_close, dividend_yield, macro, sector_close)
             if not features:
                 continue
             future_return = float((close.iloc[i + 20] - close.iloc[i]) / close.iloc[i])
-            X.append(features)
-            y.append(future_return)
+            row = {'date': window_close.index[-1], 'target': future_return}
+            row.update({FEATURE_NAMES[i]: features[i] for i in range(len(FEATURE_NAMES))})
+            rows.append(row)
 
-    if not X:
+    if not rows:
         raise RuntimeError('No training samples created.')
 
-    X = np.array(X)
-    y = np.array(y)
+    df = pd.DataFrame(rows)
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df = df.dropna(subset=['date']).sort_values('date')
+    X = df[FEATURE_NAMES].values
+    y = df['target'].values
 
-    model = GradientBoostingRegressor(random_state=42)
-    tscv = TimeSeriesSplit(n_splits=4)
+    pipeline = Pipeline([
+        ('scaler', StandardScaler()),
+        ('model', GradientBoostingRegressor(random_state=42)),
+    ])
+
+    tscv = TimeSeriesSplit(n_splits=5)
     scores = []
     for train_idx, test_idx in tscv.split(X):
-        model.fit(X[train_idx], y[train_idx])
-        preds = model.predict(X[test_idx])
+        pipeline.fit(X[train_idx], y[train_idx])
+        preds = pipeline.predict(X[test_idx])
         scores.append(mean_absolute_error(y[test_idx], preds))
 
-    model.fit(X, y)
-    joblib.dump(model, MODEL_PATH)
+    def _walk_forward_mae() -> list[dict[str, float | int | str]]:
+        reports = []
+        if df.empty:
+            return reports
+        start = df['date'].min()
+        end = df['date'].max()
+        if start is None or end is None:
+            return reports
+        test_start = start + pd.DateOffset(months=3)
+        while test_start < end:
+            test_end = test_start + pd.DateOffset(months=3)
+            train_mask = df['date'] < test_start
+            test_mask = (df['date'] >= test_start) & (df['date'] < test_end)
+            if train_mask.sum() < 60 or test_mask.sum() == 0:
+                test_start = test_end
+                continue
+            X_train = df.loc[train_mask, FEATURE_NAMES].values
+            y_train = y[train_mask.values]
+            X_test = df.loc[test_mask, FEATURE_NAMES].values
+            y_test = y[test_mask.values]
+            pipeline.fit(X_train, y_train)
+            preds = pipeline.predict(X_test)
+            mae = float(mean_absolute_error(y_test, preds)) if len(y_test) else 0.0
+            reports.append({
+                'start': test_start.strftime('%Y-%m-%d'),
+                'end': test_end.strftime('%Y-%m-%d'),
+                'samples': int(len(y_test)),
+                'mae': mae,
+            })
+            test_start = test_end
+        return reports
+
+    walk_forward = _walk_forward_mae()
+    pipeline.fit(X, y)
+    mae_value = float(np.mean(scores)) if scores else None
+    payload = {
+        'model': pipeline,
+        'features': FEATURE_NAMES,
+        'model_type': 'regressor',
+        'mae': mae_value,
+        'walk_forward': walk_forward,
+    }
+    joblib.dump(payload, MODEL_PATH)
+    onnx_result = export_onnx_with_gatekeeper(
+        payload=payload,
+        model_path=MODEL_PATH,
+        model_name='stable',
+        feature_names=FEATURE_NAMES,
+        metric_name='mae',
+        metric_direction='lower',
+    )
 
     return {
         'samples': len(X),
-        'mae': float(np.mean(scores)) if scores else None,
+        'mae': mae_value,
+        'walk_forward': walk_forward,
         'model_path': str(MODEL_PATH),
+        'onnx': onnx_result,
     }
 
 

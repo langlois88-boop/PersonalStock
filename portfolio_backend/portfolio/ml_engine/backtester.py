@@ -15,54 +15,15 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 
+from .feature_registry import CRYPTO_FEATURE_NAMES, FUSION_FEATURE_NAMES
+
 
 MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_v1.pkl"
 BLUECHIP_MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_bluechip_v1.pkl"
 PENNY_MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_penny_v1.pkl"
 CRYPTO_MODEL_PATH = Path(__file__).resolve().parent / "crypto_brain_v1.pkl"
-FEATURE_COLUMNS = [
-    "MA20",
-    "MA50",
-    "MA200",
-    "EMA9",
-    "EMA20",
-    "price_to_ema9",
-    "price_to_ema20",
-    "vol_regime",
-    "Volatility",
-    "Momentum20",
-    "VolumeZ",
-    "RVOL10",
-    "VPT",
-    "VPT_roc",
-    "RSI14",
-    "MACD_HIST",
-    "CandleBodyPct",
-    "CandleRangePct",
-    "gap_pct",
-    "intraday_range_pct",
-    "close_pos_in_range",
-    "pattern_doji",
-    "pattern_hammer",
-    "pattern_engulfing",
-    "pattern_morning_star",
-    "sentiment_score",
-    "news_count",
-    "VIXCLS",
-    "DCOILWTICO",
-    "CPIAUCSL",
-    "spy_corr_60",
-    "tsx_corr_60",
-    "bid_ask_spread_pct",
-]
-CRYPTO_FEATURE_COLUMNS = [
-    "return_1",
-    "rsi_14",
-    "rubber_band_index",
-    "price_to_vwap",
-    "volatility_spike",
-    "btc_correlation",
-]
+FEATURE_COLUMNS = list(FUSION_FEATURE_NAMES)
+CRYPTO_FEATURE_COLUMNS = list(CRYPTO_FEATURE_NAMES)
 
 TRIPLE_BARRIER_UP_PCT = float(os.getenv("TRIPLE_BARRIER_UP_PCT", "0.05"))
 TRIPLE_BARRIER_DOWN_PCT = float(os.getenv("TRIPLE_BARRIER_DOWN_PCT", "0.03"))
@@ -444,23 +405,29 @@ def train_fusion_model(df: pd.DataFrame, model_path: Path = MODEL_PATH) -> dict 
     if len(y) >= 20:
         tscv = TimeSeriesSplit(n_splits=min(TIME_SERIES_SPLITS, max(2, len(y) // 20)))
         for train_idx, test_idx in tscv.split(X):
-            model_cv = RandomForestClassifier(
-                n_estimators=300,
-                max_depth=5,
-                min_samples_split=8,
-                min_samples_leaf=10,
-                random_state=42,
+            model_cv = make_pipeline(
+                StandardScaler(),
+                RandomForestClassifier(
+                    n_estimators=300,
+                    max_depth=5,
+                    min_samples_split=8,
+                    min_samples_leaf=10,
+                    random_state=42,
+                ),
             )
             model_cv.fit(X[train_idx], y[train_idx])
             score = model_cv.score(X[test_idx], y[test_idx])
             cv_scores.append(float(score))
 
-    model = RandomForestClassifier(
-        n_estimators=500,
-        max_depth=5,
-        min_samples_split=8,
-        min_samples_leaf=10,
-        random_state=42,
+    model = make_pipeline(
+        StandardScaler(),
+        RandomForestClassifier(
+            n_estimators=500,
+            max_depth=5,
+            min_samples_split=8,
+            min_samples_leaf=10,
+            random_state=42,
+        ),
     )
     model.fit(X, y)
     payload = {
@@ -485,6 +452,8 @@ def train_fusion_model_from_labels(
         return None
 
     data = _ensure_features(samples.copy())
+    if 'entry_date' in data.columns:
+        data = data.sort_values('entry_date')
     X_df = data[FEATURE_COLUMNS].fillna(0)
     y = data[label_col].fillna(0).astype(int).values
 
@@ -494,12 +463,15 @@ def train_fusion_model_from_labels(
     selected = _select_features(X_df, y)
     X_df = X_df[selected]
 
-    model = RandomForestClassifier(
-        n_estimators=500,
-        max_depth=5,
-        min_samples_split=8,
-        min_samples_leaf=10,
-        random_state=42,
+    model = make_pipeline(
+        StandardScaler(),
+        RandomForestClassifier(
+            n_estimators=500,
+            max_depth=5,
+            min_samples_split=8,
+            min_samples_leaf=10,
+            random_state=42,
+        ),
     )
     if sample_weight and len(sample_weight) == len(y):
         model.fit(X_df.values, y, sample_weight=sample_weight)
@@ -750,15 +722,6 @@ class AIBacktester:
         raw_win_rate = float(len(raw_wins) / len(raw_trades) * 100) if len(raw_trades) else 0.0
         raw_final_balance = float(self.initial_balance * raw_cumulative.iloc[-1]) if len(raw_cumulative) else self.initial_balance
         raw_total_return_pct = float((raw_cumulative.iloc[-1] - 1) * 100) if len(raw_cumulative) else 0.0
-
-        if win_rate == 0.0 and raw_win_rate > 0:
-            win_rate = raw_win_rate
-            if sharpe == 0.0 and raw_sharpe != 0.0:
-                sharpe = raw_sharpe
-            if total_return_pct == 0.0 and raw_total_return_pct != 0.0:
-                total_return_pct = raw_total_return_pct
-            if max_drawdown == 0.0 and raw_max_drawdown != 0.0:
-                max_drawdown = raw_max_drawdown
 
         buy_hold_curve: Iterable[float] = []
         if "Close" in df.columns and len(df["Close"]) > 0:

@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import AIRecommendations from './AIRecommendations';
 import api from '../api/api';
 
@@ -54,6 +54,25 @@ function OptimizerPage() {
       }
       return { text: 'WAITING', className: 'bg-slate-700/40 text-slate-300 border border-slate-600' };
     };
+    const autoOpenTriggered = useRef(false);
+    const splitThinkSegments = (text) => {
+      const segments = [];
+      if (!text) return segments;
+      const regex = /<think>[\s\S]*?<\/think>/gi;
+      let lastIndex = 0;
+      let match;
+      while ((match = regex.exec(text)) !== null) {
+        if (match.index > lastIndex) {
+          segments.push({ type: 'text', value: text.slice(lastIndex, match.index) });
+        }
+        segments.push({ type: 'think', value: match[0].replace(/<\/?.*?think>/gi, '').trim() });
+        lastIndex = regex.lastIndex;
+      }
+      if (lastIndex < text.length) {
+        segments.push({ type: 'text', value: text.slice(lastIndex) });
+      }
+      return segments.length ? segments : [{ type: 'text', value: text }];
+    };
   const [actions, setActions] = useState([]);
   const [suggestions, setSuggestions] = useState([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -67,6 +86,10 @@ function OptimizerPage() {
   const [hoverGemini, setHoverGemini] = useState({});
   const [hoverLoading, setHoverLoading] = useState({});
   const [hoverPlacement, setHoverPlacement] = useState({});
+  const [consultQuestion, setConsultQuestion] = useState('');
+  const [consultMessages, setConsultMessages] = useState([]);
+  const [consultLoading, setConsultLoading] = useState(false);
+  const [consultError, setConsultError] = useState('');
   const [trackForm, setTrackForm] = useState({ ticker: '', entry: '', targetPct: '0.1', stopPct: '0.05' });
   const [trackStatus, setTrackStatus] = useState('');
   const [trackedSignals, setTrackedSignals] = useState([]);
@@ -97,7 +120,7 @@ function OptimizerPage() {
     try {
       const res = await api.get('optimizer/', {
         params: { fast: fastMode ? 1 : 0 },
-        timeout: 60000,
+        timeout: fastMode ? 60000 : 180000,
       });
       const payload = res?.data || {};
       if (Array.isArray(payload.actions)) {
@@ -112,7 +135,10 @@ function OptimizerPage() {
       const isTimeout = String(err?.message || '').toLowerCase().includes('timeout')
         || err?.code === 'ECONNABORTED';
       if (isTimeout) {
-        setOptimizerError('Délai dépassé. Passage en mode rapide…');
+        setOptimizerError(fastMode
+          ? 'Délai dépassé. Passage en mode rapide…'
+          : 'Délai dépassé en mode lent. Réessaie ou repasse en mode rapide.'
+        );
       }
     }
 
@@ -216,6 +242,94 @@ function OptimizerPage() {
     loadHoverGemini(symbol);
   }, [loadHoverGemini]);
 
+  const submitConsult = useCallback(async (overrideQuestion) => {
+    let incoming = overrideQuestion;
+    if (incoming && typeof incoming === 'object' && typeof incoming.preventDefault === 'function') {
+      incoming.preventDefault();
+      incoming = null;
+    }
+    const question = String(incoming || consultQuestion || '').trim();
+    if (!question) {
+      setConsultError('Question requise.');
+      return;
+    }
+    if (question === '[object Object]') {
+      setConsultError('Question requise.');
+      return;
+    }
+    setConsultError('');
+    setConsultLoading(true);
+    setConsultMessages((prev) => [...prev, { role: 'user', content: question }]);
+    if (!overrideQuestion) {
+      setConsultQuestion('');
+    }
+    try {
+      const baseUrl = api?.defaults?.baseURL || '';
+      const endpoint = `${baseUrl}ask-the-quant-stream/`;
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: question }),
+      });
+      if (!response.ok || !response.body) {
+        throw new Error('stream_unavailable');
+      }
+      const assistantId = `${Date.now()}-assistant`;
+      setConsultMessages((prev) => [...prev, { id: assistantId, role: 'assistant', content: '' }]);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let done = false;
+      while (!done) {
+        const result = await reader.read();
+        done = result.done;
+        buffer += decoder.decode(result.value || new Uint8Array(), { stream: !done });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || '';
+        parts.forEach((part) => {
+          const line = part.trim();
+          if (!line.startsWith('data:')) return;
+          const payloadText = line.replace(/^data:\s*/, '');
+          let payload;
+          try {
+            payload = JSON.parse(payloadText);
+          } catch (err) {
+            payload = { text: payloadText };
+          }
+          const chunk = payload?.text || '';
+          if (chunk) {
+            setConsultMessages((prev) => prev.map((msg) => (
+              msg.id === assistantId ? { ...msg, content: `${msg.content}${chunk}` } : msg
+            )));
+          }
+        });
+      }
+    } catch (err) {
+      try {
+        const fallback = await api.post('ai/consult/', { question });
+        const answer = fallback?.data?.answer || 'Réponse indisponible.';
+        setConsultMessages((prev) => [...prev, { role: 'assistant', content: answer, context: fallback?.data?.context }]);
+      } catch (fallbackErr) {
+        try {
+          const fallbackUrl = `${window.location.protocol}//${window.location.hostname}:8001/api/ai/consult/`;
+          const fallbackRes = await fetch(fallbackUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ question }),
+          });
+          if (!fallbackRes.ok) throw new Error('fallback_failed');
+          const fallbackPayload = await fallbackRes.json();
+          const answer = fallbackPayload?.answer || 'Réponse indisponible.';
+          setConsultMessages((prev) => [...prev, { role: 'assistant', content: answer, context: fallbackPayload?.context }]);
+        } catch (finalErr) {
+          setConsultError('Impossible de contacter Ask the Quant.');
+        }
+      }
+    } finally {
+      setConsultLoading(false);
+    }
+  }, [consultQuestion]);
+
   useEffect(() => {
     loadOptimizer();
   }, [loadOptimizer]);
@@ -223,6 +337,18 @@ function OptimizerPage() {
   useEffect(() => {
     loadTrackedSignals();
   }, [loadTrackedSignals]);
+
+  useEffect(() => {
+    if (autoOpenTriggered.current) return;
+    if (consultMessages.length > 0) return;
+    const now = new Date();
+    const hours = now.getHours();
+    const minutes = now.getMinutes();
+    if (hours === 9 && minutes >= 45 && minutes <= 59) {
+      autoOpenTriggered.current = true;
+      submitConsult("Analyse de l'ouverture 9h45 pour mes principaux tickers.");
+    }
+  }, [consultMessages.length, submitConsult]);
 
   const isCoreCandidate = useCallback(
     (item) => {
@@ -287,10 +413,10 @@ function OptimizerPage() {
         {!fastMode && (geminiReview || geminiReport) ? (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-slate-200 space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Avis Gemini</p>
+              <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Avis DeepSeek</p>
               {geminiReview?.score != null && (
                 <span className={`text-xs font-semibold ${scoreColor(geminiReview.score)}`}>
-                  Score Gemini {normalizeScore(geminiReview.score).toFixed(0)}%
+                  Score DeepSeek {normalizeScore(geminiReview.score).toFixed(0)}%
                 </span>
               )}
             </div>
@@ -316,6 +442,15 @@ function OptimizerPage() {
                 ))}
               </div>
             )}
+            {Array.isArray(geminiReview?.stock_insights) && geminiReview.stock_insights.length > 0 && (
+              <div className="text-xs text-slate-300 space-y-1">
+                {geminiReview.stock_insights.map((item, index) => (
+                  <p key={`${item?.ticker || 'insight'}-${index}`}>
+                    • {item?.ticker ? `${item.ticker}: ` : ''}{item?.note || item}
+                  </p>
+                ))}
+              </div>
+            )}
             {Array.isArray(geminiReview?.risks) && geminiReview.risks.length > 0 && (
               <div className="text-xs text-rose-200 space-y-1">
                 {geminiReview.risks.map((item, index) => (
@@ -325,6 +460,105 @@ function OptimizerPage() {
             )}
           </div>
         ) : null}
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-slate-200 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Ask the Quant</p>
+            {consultLoading ? (
+              <span className="text-xs text-slate-400">Analyse en cours…</span>
+            ) : null}
+          </div>
+          <div className="max-h-52 overflow-y-auto space-y-3 text-sm">
+            {consultMessages.length === 0 ? (
+              <p className="text-slate-400">Pose une question sur un ticker, ex: “HIVE est à 2.80$, on achète le dip ?”</p>
+            ) : (
+              consultMessages.map((msg, index) => (
+                <div
+                  key={`${msg.id || msg.role}-${index}`}
+                  className={msg.role === 'user' ? 'text-slate-100' : 'text-slate-200'}
+                >
+                  <p className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                    {msg.role === 'user' ? 'Question' : 'Réponse'}
+                  </p>
+                  {msg.role === 'assistant' ? (
+                    <div className="space-y-2">
+                      {splitThinkSegments(msg.content).map((segment, segIndex) => (
+                        <p
+                          key={`${segment.type}-${segIndex}`}
+                          className={segment.type === 'think'
+                            ? 'whitespace-pre-line text-xs italic text-slate-400'
+                            : 'whitespace-pre-line'}
+                        >
+                          {segment.value}
+                        </p>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="whitespace-pre-line">{msg.content}</p>
+                  )}
+                  {msg.role === 'assistant' && msg.context ? (
+                    <div className="text-xs text-slate-400 space-y-1">
+                      {msg.context?.latest_price ? (
+                        <p>Prix: {msg.context.latest_price}</p>
+                      ) : null}
+                      {msg.context?.indicators?.rsi14 ? (
+                        <p>RSI14: {Number(msg.context.indicators.rsi14).toFixed(2)}</p>
+                      ) : null}
+                      {msg.context?.backtest ? (
+                        <p>
+                          Backtest {msg.context.backtest.lookback_days}j · Win {Number(msg.context.backtest.win_rate || 0).toFixed(2)}% · Sharpe {Number(msg.context.backtest.sharpe_ratio || 0).toFixed(2)}
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              ))
+            )}
+          </div>
+          {consultError ? <p className="text-xs text-rose-300">{consultError}</p> : null}
+          <div className="flex flex-col gap-2">
+            <button
+              type="button"
+              onClick={() => submitConsult('Analyse mes sandboxes et compare SIM vs Alpaca.')}
+              disabled={consultLoading}
+              className="self-start px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-200 border border-slate-700"
+            >
+              Analyser mes Sandboxes
+            </button>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => submitConsult('Analyse mon TFSA et propose un rééquilibrage prudent.')}
+                disabled={consultLoading}
+                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-200 border border-slate-700"
+              >
+                Analyse mon TFSA
+              </button>
+              <button
+                type="button"
+                onClick={() => submitConsult('Cherche des Penny élastiques (RVOL élevé + drop) et propose un plan.')}
+                disabled={consultLoading}
+                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-200 border border-slate-700"
+              >
+                Cherche des Penny Élastiques
+              </button>
+            </div>
+            <textarea
+              rows={2}
+              value={consultQuestion}
+              onChange={(event) => setConsultQuestion(event.target.value)}
+              placeholder="Écris ta question…"
+              className="w-full rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-200 p-3 focus:outline-none focus:ring-1 focus:ring-indigo-500/60"
+            />
+            <button
+              type="button"
+              onClick={submitConsult}
+              disabled={consultLoading}
+              className="self-end px-4 py-2 rounded-lg text-xs font-semibold bg-indigo-500/20 text-indigo-200 border border-indigo-400/40"
+            >
+              {consultLoading ? 'Envoi…' : 'Envoyer'}
+            </button>
+          </div>
+        </div>
         <div className="flex items-center gap-2">
           <button
             type="button"

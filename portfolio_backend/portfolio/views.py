@@ -4,6 +4,7 @@ import json
 import os
 import math
 import time
+import re
 from pathlib import Path
 from datetime import datetime, timedelta, date, time as dt_time
 from typing import Any
@@ -17,12 +18,18 @@ from django.db.utils import OperationalError
 from django.db.models import Prefetch
 from django.utils import timezone
 from django.shortcuts import render
+from django.http import StreamingHttpResponse
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
 import finnhub
+import yfinance as yfin
+from celery.exceptions import TimeoutError as CeleryTimeoutError
 from . import market_data as yf
 import numpy as np
 import pandas as pd
 import joblib
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from openai import OpenAI
 from rest_framework import viewsets
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.views import APIView
@@ -102,6 +109,7 @@ from .serializers import (
 	SandboxWatchlistSerializer,
 )
 from .ai_module import run_predictions
+from .ai_advisor import DeepSeekAdvisor
 from .tasks import (
 	_fetch_yahoo_screener,
 	_fetch_yfinance_screeners,
@@ -114,6 +122,8 @@ from .tasks import (
 	analyze_ticker_for_ui,
 )
 from .ai_scout import build_scout_summary
+from .services.danas_broker import DanasBroker
+from .services.validation_service import ValidationService
 from .alpaca_data import get_intraday_bars, get_intraday_context
 from .patterns import build_pattern_annotations, enrich_bars_with_patterns
 from .ml_engine.engine.data_fusion import DataFusionEngine
@@ -341,6 +351,8 @@ def _predict_model_signal(payload: dict[str, Any], fusion_df: pd.DataFrame) -> f
 class StockViewSet(viewsets.ModelViewSet):
 	queryset = Stock.objects.all()
 	serializer_class = StockSerializer
+	authentication_classes: list = []
+	permission_classes: list = []
 
 	@action(detail=False, methods=['post'])
 	def create_from_symbol(self, request):
@@ -951,9 +963,12 @@ class AccountViewSet(viewsets.ModelViewSet):
 		serializer.save(user=user)
 
 
+@method_decorator(csrf_exempt, name='dispatch')
 class AccountTransactionViewSet(viewsets.ModelViewSet):
 	queryset = AccountTransaction.objects.select_related('account', 'stock').all()
 	serializer_class = AccountTransactionSerializer
+	authentication_classes: list = []
+	permission_classes: list = []
 
 
 class DividendViewSet(viewsets.ModelViewSet):
@@ -4333,6 +4348,113 @@ class AccountDashboardView(APIView):
 		if account_id:
 			tx_qs = tx_qs.filter(account_id=account_id)
 
+		if not accounts.exists() and not tx_qs.exists():
+			portfolio = Portfolio.objects.first()
+			if portfolio:
+				portfolio_holdings = list(
+					PortfolioHolding.objects.select_related('stock').filter(portfolio=portfolio)
+				)
+				if portfolio_holdings:
+					account_payload = {
+						'account_id': None,
+						'account_name': portfolio.name,
+						'account_type': 'PORTFOLIO',
+						'total_value': 0.0,
+						'total_cost': 0.0,
+						'positions': [],
+						'macro': self._macro_snapshot(),
+					}
+					all_positions = []
+					today = timezone.now().date()
+					weekly_date = today - timedelta(days=7)
+					monthly_date = today - timedelta(days=30)
+					annual_date = today - timedelta(days=365)
+					for holding in portfolio_holdings:
+						stock = holding.stock
+						shares = float(holding.shares or 0)
+						if shares <= 0 or not stock:
+							continue
+						buy_qs = Transaction.objects.filter(
+							portfolio=portfolio,
+							stock=stock,
+							transaction_type='BUY',
+						)
+						buy_qty = sum([float(tx.shares or 0) for tx in buy_qs])
+						buy_cost = sum([float(tx.shares or 0) * float(tx.price_per_share or 0) for tx in buy_qs])
+						avg_cost = (buy_cost / buy_qty) if buy_qty else 0.0
+						current = self._current_price(stock)
+						current_value = current * shares
+						cost_value = avg_cost * shares
+						account_payload['total_value'] += current_value
+						account_payload['total_cost'] += cost_value
+						symbol = (stock.symbol or '').strip().upper()
+						rsi = self._get_rsi(symbol)
+						ma20 = self._get_ma20(symbol)
+						volume_z = self._get_volume_z(symbol)
+						pyramid = self._pyramid_steps(symbol, current, avg_cost, volume_z=volume_z, rsi=rsi, ma20=ma20)
+
+						weekly_price = self._price_at_or_before(stock, weekly_date)
+						monthly_price = self._price_at_or_before(stock, monthly_date)
+						annual_price = self._price_at_or_before(stock, annual_date)
+
+						weekly_return = ((current - weekly_price) / weekly_price * 100) if weekly_price else None
+						monthly_return = ((current - monthly_price) / monthly_price * 100) if monthly_price else None
+						annual_return = ((current - annual_price) / annual_price * 100) if annual_price else None
+
+						latest_two = list(PriceHistory.objects.filter(stock=stock).order_by('-date')[:2])
+						prev_close = float(latest_two[1].close_price) if len(latest_two) > 1 else None
+						day_change_pct = ((current - prev_close) / prev_close * 100) if prev_close else None
+						day_change_value = ((current - prev_close) * shares) if prev_close else None
+
+						position_payload = {
+							'account_id': None,
+							'account_name': portfolio.name,
+							'account_type': 'PORTFOLIO',
+							'ticker': stock.symbol,
+							'name': stock.name,
+							'avg_cost': round(avg_cost, 4),
+							'shares': round(shares, 4),
+							'cost_value': round(cost_value, 2),
+							'current_price': round(current, 4),
+							'current_value': round(current_value, 2),
+							'rsi': round(rsi, 2) if rsi is not None else None,
+							'ma20': round(ma20, 4) if ma20 is not None else None,
+							'volume_z': round(volume_z, 2) if volume_z is not None else None,
+							'stop_price': self._stop_price(symbol, current),
+							'pyramid': pyramid,
+							'insider': None,
+							'institutional': None,
+							'model_win_rate': None,
+							'model_sharpe': None,
+							'unrealized_pnl_pct': round(((current_value - cost_value) / cost_value * 100), 2) if cost_value else None,
+							'weekly_return_pct': round(weekly_return, 2) if weekly_return is not None else None,
+							'monthly_return_pct': round(monthly_return, 2) if monthly_return is not None else None,
+							'annual_return_pct': round(annual_return, 2) if annual_return is not None else None,
+							'day_change_pct': round(day_change_pct, 2) if day_change_pct is not None else None,
+							'day_change_value': round(day_change_value, 2) if day_change_value is not None else None,
+						}
+						account_payload['positions'].append(position_payload)
+						all_positions.append(position_payload)
+
+					gainer = None
+					loser = None
+					for pos in all_positions:
+						change = pos.get('day_change_pct')
+						if change is None:
+							continue
+						if gainer is None or change > gainer.get('day_change_pct', -9999):
+							gainer = pos
+						if loser is None or change < loser.get('day_change_pct', 9999):
+							loser = pos
+
+					return Response({
+						'accounts': [account_payload],
+						'top_movers': {
+							'gainer': gainer,
+							'loser': loser,
+						},
+					})
+
 		position_map: dict[int, dict[str, dict[str, Any]]] = {}
 		for tx in tx_qs:
 			if tx.type == 'DIVIDEND':
@@ -5398,17 +5520,894 @@ class AIScoutBatchView(APIView):
 		return Response({'results': results})
 
 
+def _extract_ticker_from_question(question: str) -> str | None:
+	if not question:
+		return None
+	upper = question.upper()
+	tokens = re.findall(r'\b[A-Z0-9]{1,6}(?:\.[A-Z]{1,3})?(?:-[A-Z]{2,4})?\b', upper)
+	if not tokens:
+		return None
+	stopwords = {
+		'TFSA',
+		'CELI',
+		'CELI/TFSA',
+		'RETRAITE',
+		'PLAN',
+		'QUESTION',
+		'AVIS',
+		'SALUT',
+		'ALLO',
+		'BONJOUR',
+		'BONSOIR',
+		'HELLO',
+		'HI',
+		'YO',
+		'HEY',
+		'MERCI',
+		'INFO',
+		'INFOS',
+		'NEWS',
+		'SIGNAL',
+		'SIGNAUX',
+		'GOLD',
+		'OIL',
+		'DXY',
+		'OR',
+		'ET',
+		'TU',
+		'EN',
+		'PENSE',
+		'PENSES',
+		'PENSER',
+		'QUOI',
+		'LE',
+		'LA',
+		'LES',
+		'UN',
+		'UNE',
+		'DES',
+		'MON',
+		'MA',
+		'MES',
+		'TON',
+		'TA',
+		'TES',
+		'SUR',
+		'POUR',
+		'DE',
+		'DU',
+		'DANS',
+		'AVEC',
+		'EST',
+		'ES',
+		'A',
+		'AU',
+		'AUX',
+		'CE',
+		'CET',
+		'CETTE',
+		'CA',
+		'ÇA',
+	}
+	filtered_tokens = [t for t in tokens if t not in stopwords]
+	if not filtered_tokens:
+		return None
+	uniq_tokens = list(dict.fromkeys(filtered_tokens))
+	force_v = {s.strip().upper() for s in (os.getenv('FORCE_V_SUFFIX_SYMBOLS') or '').split(',') if s.strip()}
+	force_to = {s.strip().upper() for s in (os.getenv('FORCE_TO_SUFFIX_SYMBOLS') or '').split(',') if s.strip()}
+	for token in uniq_tokens:
+		if '.' in token:
+			continue
+		if token in force_v:
+			return f"{token}.V"
+		if token in force_to:
+			return f"{token}.TO"
+	known = set(
+		Stock.objects.filter(symbol__in=uniq_tokens).values_list('symbol', flat=True)
+	)
+	if known:
+		for token in uniq_tokens:
+			if token in known:
+				return token
+	# Try common Canadian suffixes when base symbol is in DB.
+	for token in uniq_tokens:
+		if '.' in token:
+			continue
+		candidate = Stock.objects.filter(symbol__in=[f"{token}.TO", f"{token}.V"]).values_list('symbol', flat=True).first()
+		if candidate:
+			return str(candidate)
+	watchlist_symbols: set[str] = set()
+	for sandbox in SandboxWatchlist.objects.all():
+		if sandbox.symbols:
+			watchlist_symbols.update([str(s).strip().upper() for s in sandbox.symbols if str(s).strip()])
+	for token in uniq_tokens:
+		if token in watchlist_symbols:
+			return token
+
+	for token in uniq_tokens:
+		if any(char in token for char in ('.', '-', '=')):
+			return token
+
+	text = (question or '').lower()
+	intent_phrases = (
+		'tu en penses quoi',
+		'tu en pense quoi',
+		'tu en pense',
+		'tu en penses',
+		'avis sur',
+		'ton avis sur',
+		'peux-tu me dire',
+		'peux tu me dire',
+		'quoi sur',
+	)
+	if any(phrase in text for phrase in intent_phrases):
+		return uniq_tokens[0]
+	return None
+
+
+def _holding_memory(portfolio: Portfolio | None, stock: Stock | None) -> dict[str, Any]:
+	if not portfolio or not stock:
+		return {}
+	holding = PortfolioHolding.objects.filter(portfolio=portfolio, stock=stock).first()
+	if not holding:
+		return {}
+	buy_qs = Transaction.objects.filter(
+		portfolio=portfolio,
+		stock=stock,
+		transaction_type='BUY',
+	)
+	buy_qty = sum([float(tx.shares or 0) for tx in buy_qs])
+	buy_cost = sum([float(tx.shares or 0) * float(tx.price_per_share or 0) for tx in buy_qs])
+	avg_cost = (buy_cost / buy_qty) if buy_qty else None
+	price = float(stock.latest_price or 0)
+	portfolio_capital = float(portfolio.capital or 0)
+	exposure = (float(holding.shares or 0) * price) / portfolio_capital * 100 if price and portfolio_capital else None
+	return {
+		'shares': float(holding.shares or 0),
+		'avg_cost': round(avg_cost, 4) if avg_cost else None,
+		'exposure_pct': round(exposure, 2) if exposure is not None else None,
+	}
+
+
+def _sandbox_performance_summary() -> dict[str, Any]:
+	def _initial_capital(sandbox: str) -> float:
+		if sandbox == 'AI_BLUECHIP':
+			return float(os.getenv('AI_BLUECHIP_CAPITAL', os.getenv('PAPER_CAPITAL', '10000')))
+		if sandbox == 'AI_PENNY':
+			return float(os.getenv('AI_PENNY_CAPITAL', os.getenv('PAPER_CAPITAL', '10000')))
+		return float(os.getenv('PAPER_CAPITAL', '10000'))
+
+	def _metrics(sandbox: str, broker: str | None = None) -> dict[str, Any]:
+		initial = _initial_capital(sandbox)
+		closed = PaperTrade.objects.filter(status='CLOSED', sandbox=sandbox).order_by('exit_date')
+		if broker:
+			closed = closed.filter(broker=broker)
+		trades = closed.count()
+		wins = closed.filter(outcome='WIN').count()
+		if wins == 0 and trades:
+			wins = sum([1 for t in closed if float(t.pnl or 0) > 0])
+		win_rate = (wins / trades) * 100 if trades else 0.0
+		total_pnl = float(sum([float(t.pnl or 0) for t in closed]))
+		total_return_pct = (total_pnl / initial) * 100 if initial else 0.0
+		returns = []
+		equity = initial
+		for t in closed:
+			entry_value = float(t.entry_price) * float(t.quantity)
+			trade_return = float(t.pnl or 0) / entry_value if entry_value else 0.0
+			returns.append(trade_return)
+			equity += float(t.pnl or 0)
+		mean_ret = float(np.mean(returns)) if returns else 0.0
+		std_ret = float(np.std(returns)) if returns else 0.0
+		sharpe = (mean_ret / std_ret) * np.sqrt(len(returns)) if std_ret else 0.0
+		return {
+			'trades': trades,
+			'win_rate': round(win_rate, 2),
+			'total_return_pct': round(total_return_pct, 2),
+			'sharpe': round(float(sharpe), 3),
+			'final_balance': round(float(equity), 2),
+			'initial_balance': round(float(initial), 2),
+		}
+
+	sandboxes = [
+		('Sandbox_1_Watchlist', 'WATCHLIST'),
+		('Sandbox_2_Bluechip', 'AI_BLUECHIP'),
+		('Sandbox_3_Penny', 'AI_PENNY'),
+	]
+	results = []
+	for label, key in sandboxes:
+		sim = _metrics(key, broker='SIM')
+		alpaca = _metrics(key, broker='ALPACA')
+		results.append({
+			'id': label,
+			'sandbox': key,
+			'sim': sim,
+			'alpaca': alpaca,
+		})
+
+	internal_return = sum([item['sim'].get('total_return_pct', 0) for item in results])
+	external_return = sum([item['alpaca'].get('total_return_pct', 0) for item in results])
+	broker_sync = {
+		'alpaca_status': 'lagging' if abs(external_return) < abs(internal_return) else 'in_sync',
+		'diff_internal_external': round(float(external_return - internal_return), 3),
+	}
+	return {'sandboxes': results, 'broker_sync': broker_sync}
+
+
+def _sandbox_signal_brain(question: str, context: dict[str, Any]) -> str | None:
+	if not _is_sandbox_question(question) and not context.get('ticker'):
+		return None
+	sandboxes = context.get('sandbox_performance') or []
+	if not sandboxes:
+		return None
+
+	broker_sync = context.get('broker_sync') or {}
+	lagging = broker_sync.get('alpaca_status') == 'lagging'
+	diff = broker_sync.get('diff_internal_external')
+
+	label_map = {
+		'WATCHLIST': 'Sandbox 1 (Watchlist)',
+		'AI_BLUECHIP': 'Sandbox 2 (Bluechip)',
+		'AI_PENNY': 'Sandbox 3 (Penny)',
+	}
+
+	def _get_metrics(key: str) -> tuple[dict[str, Any], dict[str, Any]]:
+		for item in sandboxes:
+			if item.get('sandbox') == key:
+				return (item.get('sim') or {}), (item.get('alpaca') or {})
+		return {}, {}
+
+	def _pick_value(sim: dict[str, Any], alpaca: dict[str, Any], field: str) -> float | None:
+		value = sim.get(field)
+		if value is None:
+			value = alpaca.get(field)
+		try:
+			return float(value)
+		except (TypeError, ValueError):
+			return None
+
+	def _ticker_tokens(text: str) -> list[str]:
+		primary = _extract_ticker_from_question(text or '')
+		return [primary] if primary else []
+
+	def _lag_warning() -> str:
+		if not lagging:
+			return ''
+			
+		if diff is None:
+			return " Attention : Il y a un écart entre la simulation et Alpaca. Ne prends pas de décision basée sur le solde Alpaca pour l'instant, fie-toi aux résultats SIM."
+		return f" Attention : Il y a un écart de {diff} entre la simulation et Alpaca. Ne prends pas de décision basée sur le solde Alpaca pour l'instant, fie-toi aux résultats SIM."
+
+	def _sharpe_verdict(sharpe: float | None, sandbox_label: str) -> str:
+		if sharpe is None:
+			return f"{sandbox_label} : Sharpe indisponible."
+		if sharpe < 0:
+			return f"{sandbox_label} : Sharpe {sharpe:.3f}. Échec statistique détecté. J'arrête les achats sur ce moteur."
+		if sharpe > 1.5:
+			return f"{sandbox_label} : Sharpe {sharpe:.3f}. Excellent, priorité d'achat."
+		if sharpe > 1:
+			return f"{sandbox_label} : Sharpe {sharpe:.3f}. Bon signal, je recommande d'augmenter l'exposition."
+		return f"{sandbox_label} : Sharpe {sharpe:.3f}. Signal faible, je reste en attente."
+
+	# Règle 1 : Sandbox Penny ultra forte (sauf si ticker bluechip)
+	penny_sim, penny_alp = _get_metrics('AI_PENNY')
+	penny_sharpe = _pick_value(penny_sim, penny_alp, 'sharpe')
+	penny_win = _pick_value(penny_sim, penny_alp, 'win_rate')
+	latest_price = context.get('latest_price')
+	bluechip_focus = bool(context.get('ticker')) and (latest_price is not None and float(latest_price) >= 5)
+	if penny_sharpe is not None and penny_win is not None:
+		if not bluechip_focus and penny_sharpe > 1.5 and abs(penny_win - 100.0) < 0.001:
+			base = (
+				"Signal FORT détecté sur le moteur Penny. "
+				"La simulation interne surpasse le marché. "
+				"Stratégie recommandée : Allouer du capital sur ce secteur dès l'ouverture."
+			)
+			return base + _lag_warning()
+
+	# Règle 2 : Question avec tickers -> focus Bluechip
+	tokens = _ticker_tokens(question)
+	blue_sim, blue_alp = _get_metrics('AI_BLUECHIP')
+	blue_sharpe = _pick_value(blue_sim, blue_alp, 'sharpe')
+	if tokens and blue_sharpe is not None:
+		ticker_list = ", ".join(tokens)
+		if abs(blue_sharpe) < 0.0001:
+			message = (
+				f"Pour {ticker_list}, ton moteur Bluechip est actuellement neutre (Sharpe {blue_sharpe:.3f}). "
+				"Il n'y a pas d'avantage statistique à acheter massivement maintenant."
+			)
+			if not bluechip_focus and penny_sharpe is not None and penny_sharpe > blue_sharpe:
+				message += (
+					f" Cependant, ta Sandbox 3 (Penny) performe mieux (Sharpe {penny_sharpe:.3f}). "
+					"Je recommande d'attendre que le signal Bluechip se renforce avant d'engager un gros capital sur les banques."
+				)
+			return message + _lag_warning()
+		message = _sharpe_verdict(blue_sharpe, label_map['AI_BLUECHIP'])
+		return message + _lag_warning()
+
+	# Règle 4 : Priorité Sharpe global (SIM d'abord)
+	best_key = None
+	best_sharpe = None
+	for item in sandboxes:
+		sim = item.get('sim') or {}
+		alp = item.get('alpaca') or {}
+		sharpe = _pick_value(sim, alp, 'sharpe')
+		if sharpe is None:
+			continue
+			
+		if best_sharpe is None or sharpe > best_sharpe:
+			best_sharpe = sharpe
+			best_key = item.get('sandbox')
+	if best_key and best_sharpe is not None:
+		label = label_map.get(best_key, best_key)
+		return _sharpe_verdict(best_sharpe, label) + _lag_warning()
+
+	return None
+
+
+def _ticker_intro_analysis(context: dict[str, Any]) -> str | None:
+	ind = context.get('indicators') or {}
+	fund = context.get('fundamentals') or {}
+	sector = context.get('sector') or 'n/a'
+	latest_price = context.get('latest_price')
+	lines: list[str] = []
+	if latest_price:
+		lines.append(f"Analyse du ticker demandé : prix actuel {latest_price}.")
+	if sector and sector != 'n/a':
+		lines.append(f"Secteur détecté : {sector}.")
+	if ind:
+		rsi = ind.get('rsi14')
+		ma20 = ind.get('ma20')
+		ma50 = ind.get('ma50')
+		vol = ind.get('volatility')
+		if rsi is not None:
+			if rsi >= 70:
+				lines.append(f"RSI14 à {float(rsi):.2f} : signal de surachat, je recommande de réduire l'exposition.")
+			elif rsi <= 30:
+				lines.append(f"RSI14 à {float(rsi):.2f} : zone de survente, opportunité potentielle mais prudence." )
+			else:
+				lines.append(f"RSI14 à {float(rsi):.2f} : momentum neutre.")
+		if ma20 is not None and ma50 is not None:
+			if float(ma20) > float(ma50):
+				lines.append("MA20 au-dessus de MA50 : biais haussier à court terme.")
+			elif float(ma20) < float(ma50):
+				lines.append("MA20 sous MA50 : biais baissier à court terme.")
+		if vol is not None:
+			lines.append(f"Volatilité récente : {float(vol):.3f}.")
+	roe = fund.get('roe')
+	free_cf = fund.get('free_cashflow')
+	market_cap = fund.get('market_cap')
+	if roe is not None:
+		lines.append(f"ROE: {float(roe):.2f}.")
+	if free_cf is not None:
+		lines.append(f"Free cash-flow: {float(free_cf):.0f}.")
+	if market_cap is not None:
+		lines.append(f"Market cap: {float(market_cap):.0f}.")
+	# Recommandation simple
+	if ind:
+		rsi = ind.get('rsi14')
+		ma20 = ind.get('ma20')
+		ma50 = ind.get('ma50')
+		if rsi is not None and ma20 is not None and ma50 is not None:
+			if float(rsi) >= 70 or float(ma20) < float(ma50):
+				lines.append("Décision: ATTENDRE (momentum fragile / surachat).")
+			elif float(rsi) <= 35 and float(ma20) > float(ma50):
+				lines.append("Décision: ACHETER PRUDENT (reprise technique possible).")
+			else:
+				lines.append("Décision: ATTENDRE / CONSOLIDER.")
+	return " ".join(lines) if lines else None
+
+
+def _is_smalltalk(question: str) -> bool:
+	text = (question or '').strip().lower()
+	if not text:
+		return False
+	if len(text.split()) > 4:
+		return False
+	return text in {
+		"allo",
+		"allô",
+		"salut",
+		"bonjour",
+		"bonsoir",
+		"hey",
+		"yo",
+		"hi",
+		"hello",
+	}
+
+
+def _is_sandbox_question(question: str) -> bool:
+	text = (question or '').lower()
+	if not text:
+		return False
+	keywords = (
+		"sandbox",
+		"sandboxes",
+		"sim",
+		"alpaca",
+		"sharpe",
+		"win rate",
+		"moteur",
+		"penny",
+		"bluechip",
+		"watchlist",
+		"broker",
+		"sync",
+		"lag",
+	)
+	return any(word in text for word in keywords)
+
+
+def _is_tfsa_question(question: str) -> bool:
+	text = (question or '').lower()
+	if not text:
+		return False
+	keywords = (
+		"tfsa",
+		"celi",
+		"céli",
+		"celi/tfsa",
+		"plan retraite",
+		"plan de retraite",
+		"compte retraite",
+		"retraite",
+	)
+	return any(word in text for word in keywords)
+
+
+def _tfsa_positions_snapshot(user: Any | None = None) -> dict[str, Any]:
+	account_qs = AccountTransaction.objects.select_related('stock', 'account').filter(
+		account__account_type='TFSA'
+	)
+	if user and getattr(user, 'is_authenticated', False):
+		account_qs = account_qs.filter(account__user=user)
+	positions: dict[int, dict[str, Any]] = {}
+	for tx in account_qs:
+		if not tx.stock:
+			continue
+		if tx.type == 'DIVIDEND':
+			continue
+		sign = 1 if tx.type == 'BUY' else -1
+		entry = positions.setdefault(
+			tx.stock_id,
+			{'stock': tx.stock, 'shares': 0.0, 'buy_qty': 0.0, 'buy_cost': 0.0},
+		)
+		qty = float(tx.quantity or 0)
+		entry['shares'] += qty * sign
+		if tx.type == 'BUY':
+			entry['buy_qty'] += qty
+			entry['buy_cost'] += qty * float(tx.price or 0)
+
+	rows: list[dict[str, Any]] = []
+	for entry in positions.values():
+		stock = entry['stock']
+		shares = float(entry['shares'] or 0)
+		if shares <= 0:
+			continue
+		avg_cost = (entry['buy_cost'] / entry['buy_qty']) if entry['buy_qty'] else None
+		price = float(stock.latest_price or 0)
+		value = price * shares if price else 0.0
+		rows.append({
+			'symbol': (stock.symbol or '').strip().upper(),
+			'name': stock.name,
+			'sector': stock.sector,
+			'shares': shares,
+			'avg_cost': round(avg_cost, 4) if avg_cost is not None else None,
+			'price': round(price, 4) if price else None,
+			'value': round(value, 2),
+			'stock_id': stock.id,
+		})
+
+	rows.sort(key=lambda item: float(item.get('value') or 0), reverse=True)
+	return {
+		'positions': rows,
+		'total_value': round(sum(float(item.get('value') or 0) for item in rows), 2),
+	}
+
+
+def _tfsa_scan_summary(user: Any | None = None, limit: int = 6) -> tuple[str | None, dict[str, Any]]:
+	snapshot = _tfsa_positions_snapshot(user)
+	positions = snapshot.get('positions') or []
+	if not positions:
+		return None, snapshot
+
+	lines = [f"TFSA: {len(positions)} positions · Valeur estimée {snapshot.get('total_value', 0)}."]
+	news_cutoff = timezone.now() - timedelta(days=7)
+	for item in positions[:limit]:
+		symbol = item.get('symbol')
+		stock = item.get('stock')
+		rsi = None
+		try:
+			fusion = DataFusionEngine(symbol, fast_mode=True)
+			frame = fusion.fuse_all()
+			if frame is not None and not frame.empty:
+				last = frame.tail(1).iloc[0]
+				rsi = float(last.get('RSI14') or 0.0)
+		except Exception:
+			rsi = None
+
+		news_items = []
+		if stock:
+			news_qs = StockNews.objects.filter(stock=stock, published_at__gte=news_cutoff).order_by('-published_at')[:3]
+			for news in news_qs:
+				news_items.append({
+					'headline': news.headline,
+					'sentiment': float(news.sentiment) if news.sentiment is not None else None,
+				})
+		sentiments = [n['sentiment'] for n in news_items if n.get('sentiment') is not None]
+		avg_sent = round(sum(sentiments) / len(sentiments), 3) if sentiments else None
+		if rsi is not None and rsi >= 70:
+			signal = f"RSI {rsi:.1f} (surachat)"
+		elif rsi is not None and rsi <= 30:
+			signal = f"RSI {rsi:.1f} (survente)"
+		elif rsi is not None:
+			signal = f"RSI {rsi:.1f} (neutre)"
+		else:
+			signal = "RSI n/a"
+		news_note = f"Sentiment {avg_sent}" if avg_sent is not None else "Sentiment n/a"
+		price = item.get('price')
+		lines.append(f"{symbol}: prix {price} · {signal} · {news_note}.")
+
+	return " ".join(lines), snapshot
+
+
+def _macro_question_response(question: str) -> str | None:
+	text = (question or '').lower()
+	if not text:
+		return None
+	latest = MacroIndicator.objects.order_by('-date').first()
+	if 'gold' in text or 'or' in text:
+		return (
+			"Je n'ai pas encore de série Or en base. Donne un ticker (GLD, GC=F, XAUUSD) "
+			"ou ajoute une source macro pour que je puisse analyser le prix, RSI et tendance."
+		)
+	if 'oil' in text or 'pétrole' in text or 'petrole' in text:
+		if latest and latest.oil_price is not None:
+			return f"Pétrole: dernier point macro = {float(latest.oil_price):.2f}. Souhaites-tu un ticker (USO, CL=F) pour une analyse technique ?"
+		return "Je n'ai pas de prix pétrole disponible en base. Donne un ticker (USO, CL=F) pour l'analyse."
+	if 'dxy' in text or 'usd' in text or 'dollar' in text:
+		return "Donne un ticker (DXY, UUP) pour une analyse technique du dollar."
+	return None
+
+
+class AIConsultView(APIView):
+	def post(self, request):
+		question = (request.data.get('question') or request.query_params.get('question') or '').strip()
+		if not question:
+			return Response({'error': 'question is required'}, status=400)
+		if _is_smalltalk(question):
+			return Response({
+				'answer': "Salut ! Dis-moi ce que tu veux analyser (ticker, sandboxes, CELI/TFSA, plan de retraite).",
+				'context': {'question': question, 'as_of': timezone.now().isoformat()},
+			})
+		portfolio_id = request.data.get('portfolio_id') or request.query_params.get('portfolio_id')
+		portfolio = None
+		if portfolio_id:
+			portfolio = Portfolio.objects.filter(id=portfolio_id).first()
+		if portfolio is None:
+			portfolio = Portfolio.objects.first()
+
+		ticker = (request.data.get('ticker') or '').strip().upper() or _extract_ticker_from_question(question)
+		if _is_tfsa_question(question) and not ticker:
+			answer, tfsa_context = _tfsa_scan_summary(request.user)
+			context = {
+				'question': question,
+				'as_of': timezone.now().isoformat(),
+				'tfsa': tfsa_context,
+			}
+			if not answer:
+				answer = (
+					"Aucune position TFSA détectée. Ajoute des transactions TFSA ou importe un CSV "
+					"pour activer le scan (RSI, news, sentiment)."
+				)
+			return Response({'answer': answer, 'context': context})
+		if not ticker:
+			context: dict[str, Any] = {
+				'question': question,
+				'as_of': timezone.now().isoformat(),
+			}
+			macro_answer = _macro_question_response(question)
+			if macro_answer:
+				return Response({'answer': macro_answer, 'context': context})
+			try:
+				sandbox_perf = _sandbox_performance_summary()
+				context['sandbox_performance'] = sandbox_perf.get('sandboxes')
+				context['broker_sync'] = sandbox_perf.get('broker_sync')
+			except Exception:
+				context['sandbox_performance'] = []
+				context['broker_sync'] = {}
+
+			api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
+			model_name = getattr(settings, 'GEMINI_AI_MODEL', 'models/gemini-2.5-flash')
+			answer = None
+			sandbox_conclusion = _sandbox_signal_brain(question, context) if _is_sandbox_question(question) else None
+			if sandbox_conclusion:
+				answer = sandbox_conclusion
+			elif api_key:
+				try:
+					from google import genai
+
+					client = genai.Client(api_key=api_key)
+					system_prompt = (
+						"Tu es un assistant financier conversationnel. "
+						"Réponds en français, clairement et sans inventer des données. "
+						"Si une information manque (fichier, plan, chiffres), demande-la. "
+						"Ne parle des sandboxes que si l'utilisateur le demande explicitement."
+					)
+					prompt = (
+						f"Question utilisateur: {question}\n"
+						f"Contexte JSON: {json.dumps(context, ensure_ascii=False)}\n"
+						"Réponds en 3-6 phrases maximum."
+					)
+					response = client.models.generate_content(
+						model=model_name,
+						contents=f"{system_prompt}\n\n{prompt}",
+					)
+					answer = (getattr(response, 'text', None) or '').strip()
+				except Exception:
+					answer = None
+
+			if not answer:
+				if re.search(r'\b(tfsa|celi|retraite|plan)\b', question.lower()):
+					answer = (
+						"Je peux analyser ton CELI/TFSA, mais il me faut le fichier ou les chiffres clés "
+						"(cotisations, date de départ, allocations cibles)."
+					)
+				else:
+					answer = (
+						"Je peux t'aider sur un ticker, tes sandboxes ou ton CELI/TFSA. "
+						"Pose une question précise ou donne un ticker."
+					)
+
+			return Response({'answer': answer, 'context': context})
+
+		stock = Stock.objects.filter(symbol__iexact=ticker).first()
+		context: dict[str, Any] = {
+			'ticker': ticker,
+			'question': question,
+			'as_of': timezone.now().isoformat(),
+		}
+		if stock and stock.sector:
+			context['sector'] = stock.sector
+
+		def _to_float(value: Any) -> float | None:
+			try:
+				if value is None:
+					return None
+				return float(value)
+			except (TypeError, ValueError):
+				return None
+
+		latest_price = float(stock.latest_price or 0) if stock else 0.0
+		fusion_df = None
+		try:
+			fusion = DataFusionEngine(ticker, fast_mode=True)
+			fusion_df = fusion.fuse_all()
+			if fusion_df is not None and not fusion_df.empty:
+				last = fusion_df.tail(1).iloc[0]
+				latest_price = float(last.get('Close') or latest_price or 0.0)
+				context['indicators'] = {
+					'close': float(last.get('Close') or 0.0),
+					'rsi14': float(last.get('RSI14') or 0.0),
+					'ma20': float(last.get('MA20') or 0.0),
+					'ma50': float(last.get('MA50') or 0.0),
+					'ma200': float(last.get('MA200') or 0.0),
+					'volume_z': float(last.get('VolumeZ') or 0.0),
+					'sentiment_score': float(last.get('sentiment_score') or 0.0),
+					'news_count': int(last.get('news_count') or 0),
+					'volatility': float(last.get('Volatility') or 0.0),
+				}
+		except Exception:
+			fusion_df = None
+
+		if latest_price:
+			context['latest_price'] = round(float(latest_price), 4)
+
+		if not context.get('indicators'):
+			try:
+				hist = yf.download(ticker, period='6mo', interval='1d', progress=False)
+				close = None
+				if hist is not None and not hist.empty:
+					if 'Close' in hist:
+						close = hist['Close'].dropna()
+					elif 'close' in hist:
+						close = hist['close'].dropna()
+				if close is not None and not close.empty:
+					rsi14 = _compute_rsi_from_series(close, period=14)
+					ma20 = float(close.rolling(20).mean().iloc[-1]) if len(close) >= 20 else None
+					ma50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else None
+					ma200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else None
+					volatility = float(close.pct_change().std() * np.sqrt(252)) if len(close) >= 2 else None
+					context['indicators'] = {
+						'close': float(close.iloc[-1]),
+						'rsi14': rsi14,
+						'ma20': ma20,
+						'ma50': ma50,
+						'ma200': ma200,
+						'volatility': volatility,
+					}
+			except Exception:
+				pass
+
+		if not context.get('indicators') and stock:
+			try:
+				prices = PriceHistory.objects.filter(stock=stock).order_by('date')
+				if prices.exists():
+					series = pd.Series({p.date: float(p.close_price or 0) for p in prices}).sort_index()
+					series = series[series > 0]
+					if not series.empty:
+						rsi14 = _compute_rsi_from_series(series, period=14)
+						ma20 = float(series.rolling(20).mean().iloc[-1]) if len(series) >= 20 else None
+						ma50 = float(series.rolling(50).mean().iloc[-1]) if len(series) >= 50 else None
+						ma200 = float(series.rolling(200).mean().iloc[-1]) if len(series) >= 200 else None
+						volatility = float(series.pct_change().std() * np.sqrt(252)) if len(series) >= 2 else None
+						context['indicators'] = {
+							'close': float(series.iloc[-1]),
+							'rsi14': rsi14,
+							'ma20': ma20,
+							'ma50': ma50,
+							'ma200': ma200,
+							'volatility': volatility,
+						}
+			except Exception:
+				pass
+
+		fundamentals = {}
+		try:
+			info = yf.Ticker(ticker).info or {}
+			fundamentals = {
+				'roe': _to_float(info.get('returnOnEquity')),
+				'free_cashflow': _to_float(info.get('freeCashflow')),
+				'operating_cashflow': _to_float(info.get('operatingCashflow')),
+				'market_cap': _to_float(info.get('marketCap')),
+			}
+			fundamentals = {k: v for k, v in fundamentals.items() if v is not None}
+		except Exception:
+			fundamentals = {}
+		if fundamentals:
+			context['fundamentals'] = fundamentals
+
+		if not stock and not context.get('indicators') and not context.get('latest_price'):
+			return Response({
+				'answer': (
+					f"Je ne trouve pas {ticker} en base pour l'instant. "
+					"Essaie un suffixe (ex: HIVE.TO ou HIVE.V) ou ajoute le ticker à la base."
+				),
+				'context': context,
+			})
+
+		context['memory'] = _holding_memory(portfolio, stock)
+
+		news_items = []
+		if stock:
+			cutoff = timezone.now() - timedelta(days=7)
+			news_qs = StockNews.objects.filter(stock=stock, published_at__gte=cutoff).order_by('-published_at')[:5]
+			for item in news_qs:
+				news_items.append({
+					'headline': item.headline,
+					'sentiment': float(item.sentiment) if item.sentiment is not None else None,
+					'published_at': item.published_at.isoformat() if item.published_at else None,
+				})
+		context['news'] = news_items
+
+		try:
+			sandbox_perf = _sandbox_performance_summary()
+			context['sandbox_performance'] = sandbox_perf.get('sandboxes')
+			context['broker_sync'] = sandbox_perf.get('broker_sync')
+		except Exception:
+			context['sandbox_performance'] = []
+			context['broker_sync'] = {}
+
+		backtest_summary = None
+		lookback_days = int(os.getenv('GEMINI_BACKTEST_LOOKBACK_DAYS', '365'))
+		cache_key = f"ai_consult:backtest:{ticker}:{lookback_days}"
+		cached = cache.get(cache_key)
+		if cached:
+			backtest_summary = cached
+		elif fusion_df is not None and not fusion_df.empty:
+			try:
+				payload = load_or_train_model(fusion_df, model_path=get_model_path('BLUECHIP'))
+				backtester = AIBacktester(fusion_df, payload, symbol=ticker)
+				buy_threshold = float(os.getenv('BACKTEST_BUY_THRESHOLD', '0.64'))
+				sell_threshold = float(os.getenv('BACKTEST_SELL_THRESHOLD', '0.35'))
+				result = backtester.run_simulation(
+					lookback_days=lookback_days,
+					buy_threshold=buy_threshold,
+					sell_threshold=sell_threshold,
+				)
+				backtest_summary = {
+					'lookback_days': lookback_days,
+					'win_rate': float(result.win_rate or 0.0),
+					'sharpe_ratio': float(result.sharpe_ratio or 0.0),
+					'total_return_pct': float(result.total_return_pct or 0.0),
+					'max_drawdown': float(result.max_drawdown or 0.0),
+				}
+				cache.set(cache_key, backtest_summary, timeout=60 * 60)
+			except Exception:
+				backtest_summary = None
+		context['backtest'] = backtest_summary
+
+		api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
+		model_name = getattr(settings, 'GEMINI_AI_MODEL', 'models/gemini-2.5-flash')
+		ticker_intro = _ticker_intro_analysis(context)
+		sandbox_conclusion = _sandbox_signal_brain(question, context)
+		answer = None
+		if ticker_intro and sandbox_conclusion:
+			answer = f"{ticker_intro} Conclusion sandboxes : {sandbox_conclusion}"
+		elif ticker_intro:
+			answer = ticker_intro
+		elif sandbox_conclusion:
+			answer = sandbox_conclusion
+		if not answer and api_key:
+			try:
+				from google import genai
+
+				client = genai.Client(api_key=api_key)
+				system_prompt = (
+					"Tu es un gestionnaire de hedge fund rigoureux et prudent. "
+					"Tu réponds en français, de manière concise et factuelle. "
+					"Commence par l'analyse du ticker (prix, secteur, RSI, MA), puis termine par la conclusion sandboxes. "
+					"Tu dois citer les données fournies (prix, RSI, MA, news, backtest, sandboxes) "
+					"et préciser quand une information est manquante. "
+					"Utilise des formulations actives (Je recommande, Le signal indique, Attention au risque). "
+					"Priorise le Sharpe Ratio si disponible."
+				)
+				prompt = (
+					f"Question utilisateur: {question}\n"
+					f"Contexte JSON: {json.dumps(context, ensure_ascii=False)}\n"
+					"Réponds en 5-8 phrases maximum."
+				)
+				response = client.models.generate_content(
+					model=model_name,
+					contents=f"{system_prompt}\n\n{prompt}",
+				)
+				answer = (getattr(response, 'text', None) or '').strip()
+			except Exception:
+				answer = None
+
+		if not answer:
+			answer = (
+				"Voici le contexte disponible pour ce ticker. "
+				"J'analyse d'abord le prix et le secteur, puis je tranche via les sandboxes. "
+				"Le signal principal dépend du Sharpe et du momentum actuel."
+			)
+
+		return Response({
+			'ticker': ticker,
+			'answer': answer,
+			'context': context,
+			'used_gemini': bool(api_key and answer),
+			'model': model_name if api_key else None,
+		})
+
+
+class AskTheQuantStreamView(APIView):
+	def post(self, request):
+		question = (request.data.get('message') or request.data.get('question') or '').strip()
+		symbol = (request.data.get('symbol') or request.data.get('ticker') or '').strip().upper()
+		if not question and not symbol:
+			return Response({'error': 'message or symbol is required'}, status=400)
+		symbol = symbol or _extract_ticker_from_question(question)
+		advisor = DeepSeekAdvisor()
+
+		def _stream():
+			for chunk in advisor.stream_answer(symbol, question):
+				yield f"data: {chunk}\n\n"
+
+		return StreamingHttpResponse(_stream(), content_type='text/event-stream; charset=utf-8')
+
+
 class GetAIAnalysisView(APIView):
 	def get(self, request):
 		ticker = (request.query_params.get('ticker') or '').strip().upper()
 		if not ticker:
 			return Response({'error': 'Ticker requis'}, status=400)
+		cache_key = f"ai_analysis:{ticker}"
+		cached = cache.get(cache_key)
+		if cached:
+			return Response(cached)
 		try:
-			task = analyze_ticker_for_ui.delay(ticker)
-			result = task.get(timeout=25)
-			if isinstance(result, dict) and result.get('error'):
-				return Response(result, status=400)
-			return Response(result)
+			analyze_ticker_for_ui.delay(ticker)
+			return Response({'status': 'processing', 'ticker': ticker}, status=202)
 		except Exception as exc:
 			return Response({'error': f"Analyse échouée: {str(exc)}"}, status=504)
 
@@ -5790,6 +6789,32 @@ class TradingDiagnosticView(APIView):
 
 
 class PortfolioOptimizerView(APIView):
+	def _strip_llm_artifacts(self, text: str | None) -> str:
+		if not text:
+			return ''
+		cleaned = re.sub(r'<think>.*?</think>', '', str(text), flags=re.DOTALL | re.IGNORECASE)
+		cleaned = re.sub(r'```(?:json)?', '', cleaned, flags=re.IGNORECASE)
+		cleaned = cleaned.replace('```', '')
+		return cleaned.strip()
+
+	def _extract_json(self, text: str | None) -> tuple[dict[str, Any] | None, str]:
+		cleaned = self._strip_llm_artifacts(text)
+		if not cleaned:
+			return None, ''
+		try:
+			parsed = json.loads(cleaned)
+			return parsed if isinstance(parsed, dict) else None, cleaned
+		except Exception:
+			json_start = cleaned.find('{')
+			json_end = cleaned.rfind('}')
+			if json_start >= 0 and json_end > json_start:
+				try:
+					parsed = json.loads(cleaned[json_start:json_end + 1])
+					return parsed if isinstance(parsed, dict) else None, cleaned
+				except Exception:
+					return None, cleaned
+		return None, cleaned
+
 	def _fallback_optimizer_review(
 		self,
 		actions: list[dict[str, Any]],
@@ -5806,6 +6831,7 @@ class PortfolioOptimizerView(APIView):
 
 		scores = [_normalize_score(item.get('ai_score') or item.get('confidence')) for item in actions]
 		score = round(sum(scores) / len(scores), 1) if scores else 50.0
+		avg_signal = round(sum(scores) / len(scores), 1) if scores else 50.0
 		low_conf = sum(1 for item in actions if _normalize_score(item.get('ai_score') or item.get('confidence')) < 40)
 		speculative = sum(1 for item in actions if item.get('speculative'))
 		sector_counts: dict[str, int] = {}
@@ -5845,26 +6871,26 @@ class PortfolioOptimizerView(APIView):
 		risks = []
 		audit = []
 		if low_conf:
-			advice.append("Plusieurs positions affichent une confiance faible: surveille le risque.")
+			advice.append("Plusieurs positions ont un score faible: garde des stops serrés.")
 		if speculative:
-			risks.append("Exposition spéculative détectée: privilégie une gestion stricte des stops.")
+			risks.append("Exposition spéculative: limiter la taille de position et le levier.")
 		if sector_top and sector_pct >= 45:
 			audit.append(f"Concentration sectorielle élevée: {sector_top} ({sector_pct}%).")
-			advice.append("Réduis la concentration en ajoutant des secteurs non corrélés.")
+			advice.append("Diversifie par secteur/poids pour réduire la corrélation.")
 		if dividend_pct >= 55:
 			audit.append(f"Orientation dividendes élevée ({dividend_pct}%).")
-			advice.append("Pour un TFSA, privilégie un mix croissance + qualité plutôt qu'un biais dividende.")
+			advice.append("Pour un TFSA: équilibrer dividendes avec croissance/qualité.")
 		if growth_pct <= 25:
 			audit.append(f"Faible exposition à la croissance ({growth_pct}%).")
-			advice.append("Ajoute des titres/ETF axés croissance pour équilibrer le rendement total.")
+			advice.append("Ajouter des titres/ETF growth pour équilibrer le rendement total.")
 		if not advice:
-			advice.append("Contexte stable: conserve une approche prudente et diversifiée.")
+			advice.append("Contexte stable: rester diversifié et discipliné sur les stops.")
 		if not risks:
-			risks.append("Analyse rapide (sans backtest complet).")
+			risks.append("Analyse courte: backtest complet non disponible.")
 		exposure = f"Exposition: {sector_top or '—'} {sector_pct:.0f}% · Dividendes {dividend_pct:.0f}% · Croissance {growth_pct:.0f}%"
 		summary = (
-			f"Score global {score:.0f}%. {len(actions)} positions analysées"
-			f" et {len(suggestions)} suggestions surveillées."
+			f"Score global {score:.0f}% · Signal moyen {avg_signal:.0f}% · {len(actions)} positions. "
+			f"{len(suggestions)} suggestions surveillées."
 		)
 		return {
 			'score': score,
@@ -5882,12 +6908,24 @@ class PortfolioOptimizerView(APIView):
 		actions: list[dict[str, Any]],
 		suggestions: list[dict[str, Any]],
 	) -> str | dict[str, Any] | None:
-		api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
-		if not api_key:
+		llm_enabled = str(os.getenv('OPTIMIZER_LLM_ENABLED', '1')).lower() in {'1', 'true', 'yes'}
+		base_url = (
+			os.getenv('DANAS_CHAT_BASE_URL')
+			or os.getenv('OLLAMA_CHAT_BASE_URL')
+			or os.getenv('OLLAMA_BASE_URL')
+			or ''
+		).strip().rstrip('/')
+		if base_url and '/v1' not in base_url:
+			base_url = f"{base_url}/v1"
+		if not base_url or not llm_enabled:
 			return None
 		try:
-			from google import genai
-			client = genai.Client(api_key=api_key)
+			client = OpenAI(
+				base_url=base_url,
+				api_key=os.getenv('DANAS_API_KEY', 'sk-no-key-required'),
+				timeout=12.0,
+				max_retries=1,
+			)
 			portfolio_name = portfolio.get('name') if portfolio else 'Portfolio'
 			positions = []
 			penny_count = 0
@@ -5900,10 +6938,15 @@ class PortfolioOptimizerView(APIView):
 				positions.append(
 					{
 						'ticker': item.get('ticker'),
-						'avg_cost': item.get('avg_cost'),
 						'price': item.get('price'),
+						'avg_cost': item.get('avg_cost'),
 						'unrealized_pnl_pct': item.get('unrealized_pnl_pct'),
 						'ai_score': item.get('ai_score'),
+						'rsi': item.get('rsi'),
+						'volume_z': item.get('volume_z'),
+						'candle_patterns': item.get('candle_patterns'),
+						'alerts': item.get('alerts'),
+						'news_sentiment': item.get('news_sentiment') or item.get('sentiment'),
 					}
 				)
 			suggestions_brief = [
@@ -5911,17 +6954,19 @@ class PortfolioOptimizerView(APIView):
 					'ticker': s.get('ticker'),
 					'ai_score': s.get('ai_score'),
 					'reason': s.get('reason'),
+					'rsi': s.get('rsi'),
+					'volume_z': s.get('volume_z'),
 				}
 				for s in suggestions[:8]
 			]
 			prompt = (
 				"Tu es un conseiller stratégique en portefeuille. Analyse ce portefeuille et propose un audit clair. "
 				"Ce contenu est informatif et n'est pas un conseil financier. "
-				"Tu reçois le P/L actuel, les prix d'entrée, et les prédictions du modèle. "
+				"Vérifie les indicateurs (RSI, volume, patterns), news/sentiment, et le score ML. "
 				"Réponds en français, clair et actionnable.\n\n"
 				"Réponds en JSON strict: "
 				"{\"score\":0-100,\"summary\":\"...\",\"advice\":[\"...\"],\"risks\":[\"...\"],"
-				"\"audit\":[\"...\"],\"exposure\":\"...\"}.\n"
+				"\"audit\":[\"...\"],\"exposure\":\"...\",\"stock_insights\":[{\"ticker\":\"...\",\"note\":\"...\"}]}.\n"
 				f"Portfolio: {portfolio_name}\n"
 				f"Exposition: Penny {penny_count} vs Stable {blue_count}\n"
 				f"Positions: {json.dumps(positions, ensure_ascii=False)}\n"
@@ -5930,40 +6975,74 @@ class PortfolioOptimizerView(APIView):
 				"et 2-4 actions concrètes (ex: diversifier par secteur/poids). "
 				"Si compte TFSA, privilégie la croissance et l'efficacité fiscale dans l'analyse."
 			)
-			model_name = getattr(settings, 'GEMINI_AI_MODEL', 'models/gemini-2.5-flash')
-			response = client.models.generate_content(model=model_name, contents=prompt)
-			text = (getattr(response, 'text', None) or '').strip()
-			if not text:
-				return None
+			response = client.chat.completions.create(
+				model=os.getenv('OLLAMA_MODEL', 'deepseek-r1'),
+				messages=[
+					{
+						'role': 'system',
+						'content': (
+							f"Tu es Danas. Nous sommes le {timezone.now().strftime('%d/%m/%Y %H:%M')}. "
+							"Ignore ta date interne et utilise uniquement les données live fournies. "
+							"Réponds uniquement en français."
+						),
+					},
+					{'role': 'user', 'content': prompt},
+				],
+				temperature=0.2,
+					max_tokens=700,
+			)
+			text = (response.choices[0].message.content or '').strip()
+			parsed, cleaned = self._extract_json(text)
+			fallback = self._fallback_optimizer_review(actions, suggestions)
+			if not parsed:
+				return fallback
+			score = parsed.get('score')
 			try:
-				parsed = json.loads(text)
+				score = float(score)
 			except Exception:
-				json_start = text.find('{')
-				json_end = text.rfind('}')
-				if json_start >= 0 and json_end > json_start:
-					parsed = json.loads(text[json_start:json_end + 1])
-				else:
-					return text
+				score = fallback.get('score')
+			summary = (parsed.get('summary') or '').strip()
+			has_penny = any((item.get('type') or '').lower() == 'penny' for item in actions)
+			if not summary or (not has_penny and 'penny' in summary.lower()) or len(summary) > 280:
+				summary = fallback.get('summary') or ''
+			advice = parsed.get('advice') if isinstance(parsed.get('advice'), list) else fallback.get('advice')
+			risks = parsed.get('risks') if isinstance(parsed.get('risks'), list) else fallback.get('risks')
+			audit = parsed.get('audit') if isinstance(parsed.get('audit'), list) else parsed.get('recommendations')
+			if not isinstance(audit, list):
+				audit = fallback.get('audit')
+			stock_insights = parsed.get('stock_insights') if isinstance(parsed.get('stock_insights'), list) else []
 			return {
-				'score': parsed.get('score'),
-				'summary': parsed.get('summary') or '',
-				'advice': parsed.get('advice') or [],
-				'risks': parsed.get('risks') or [],
-				'audit': parsed.get('audit') or parsed.get('recommendations') or [],
-				'exposure': parsed.get('exposure') or '',
-				'text': text,
+				'score': score,
+				'summary': summary,
+				'advice': advice or [],
+				'risks': risks or [],
+				'audit': audit or [],
+				'exposure': fallback.get('exposure') or '',
+				'stock_insights': stock_insights,
+				'text': cleaned,
 			}
 		except Exception:
 			return None
 
 	def _gemini_confirm_action(self, payload: dict[str, Any]) -> dict[str, Any] | None:
-		api_key = getattr(settings, 'GEMINI_AI_API_KEY', None)
-		if not api_key:
+		llm_enabled = str(os.getenv('OPTIMIZER_LLM_ENABLED', '1')).lower() in {'1', 'true', 'yes'}
+		base_url = (
+			os.getenv('DANAS_CHAT_BASE_URL')
+			or os.getenv('OLLAMA_CHAT_BASE_URL')
+			or os.getenv('OLLAMA_BASE_URL')
+			or ''
+		).strip().rstrip('/')
+		if base_url and '/v1' not in base_url:
+			base_url = f"{base_url}/v1"
+		if not base_url or not llm_enabled:
 			return None
 		try:
-			from google import genai
-			client = genai.Client(api_key=api_key)
-			model_name = getattr(settings, 'GEMINI_AI_MODEL', 'models/gemini-2.5-flash')
+			client = OpenAI(
+				base_url=base_url,
+				api_key=os.getenv('DANAS_API_KEY', 'sk-no-key-required'),
+				timeout=8.0,
+				max_retries=1,
+			)
 			prompt = (
 				"Tu es un auditeur de signaux trading."
 				"Analyse les métriques et réponds en JSON strict: "
@@ -5977,17 +7056,56 @@ class PortfolioOptimizerView(APIView):
 				f"Distance MA20: {payload.get('ma20_distance')}%\n"
 				"Règle: si win rate < 45% ou Volume Z < -0.5, verdict PRUDENCE."
 			)
-			response = client.models.generate_content(model=model_name, contents=prompt)
-			text = (getattr(response, 'text', None) or '').strip()
-			if not text:
-				return None
+			response = client.chat.completions.create(
+				model=os.getenv('OLLAMA_MODEL', 'deepseek-r1'),
+				messages=[
+					{
+						'role': 'system',
+						'content': (
+							f"Tu es Danas. Nous sommes le {timezone.now().strftime('%d/%m/%Y %H:%M')}. "
+							"Ignore ta date interne et utilise uniquement les données live fournies. "
+							"Réponds uniquement en français."
+						),
+					},
+					{'role': 'user', 'content': prompt},
+				],
+				temperature=0.2,
+				max_tokens=220,
+			)
+			text = (response.choices[0].message.content or '').strip()
+			parsed, cleaned = self._extract_json(text)
+			verdict = parsed.get('verdict') if parsed else None
+			if verdict not in {'CONFIRME', 'PRUDENCE'}:
+				verdict = None
+			confidence = parsed.get('confidence') if parsed else None
 			try:
-				parsed = json.loads(text)
+				confidence = float(confidence) if confidence is not None else None
 			except Exception:
-				parsed = {'verdict': None, 'confidence': None, 'note': text}
-			verdict = parsed.get('verdict')
-			confidence = parsed.get('confidence')
-			note = parsed.get('note')
+				confidence = None
+			note = (parsed.get('note') if parsed else None) or cleaned
+			win_rate = payload.get('win_rate')
+			volume_z = payload.get('volume_z')
+			try:
+				win_rate = float(win_rate) if win_rate is not None else None
+			except Exception:
+				win_rate = None
+			try:
+				volume_z = float(volume_z) if volume_z is not None else None
+			except Exception:
+				volume_z = None
+			if verdict is None:
+				is_prudence = (win_rate is not None and win_rate < 45) or (volume_z is not None and volume_z < -0.5)
+				verdict = 'PRUDENCE' if is_prudence else 'CONFIRME'
+				confidence = 100.0 if is_prudence else 70.0
+				if is_prudence:
+					note = 'Signal faible: win rate ou volume défavorable. Prudence, stops serrés.'
+				else:
+					note = 'Signal acceptable: conditions de volume/precision correctes.'
+			elif confidence is None:
+				confidence = 100.0 if verdict == 'PRUDENCE' else 70.0
+			note = (note or '').strip()
+			if len(note) > 280:
+				note = note[:277].rstrip() + '...'
 			return {
 				'gemini_verdict': verdict,
 				'gemini_confidence': confidence,
@@ -6011,6 +7129,21 @@ class PortfolioOptimizerView(APIView):
 		if parsed is None:
 			return None
 		return round(parsed * 100, 2) if parsed <= 1 else round(parsed, 2)
+
+	def _stable_price_override(self, symbol: str, fallback_price: float | None) -> float | None:
+		symbol_upper = (symbol or '').strip().upper()
+		if symbol_upper not in {'RY', 'RY.TO'}:
+			return fallback_price
+		try:
+			info = yf.Ticker('RY.TO').info or {}
+			price = self._to_float(
+				info.get('currentPrice')
+				or info.get('regularMarketPrice')
+				or info.get('previousClose')
+			)
+			return price if price else fallback_price
+		except Exception:
+			return fallback_price
 
 	def _df_value(self, df: pd.DataFrame | None, labels: list[str]) -> float | None:
 		if df is None or df.empty:
@@ -6165,6 +7298,8 @@ class PortfolioOptimizerView(APIView):
 		}
 		cache.set(cache_key, result, 60 * 60 * 24)
 		return result
+
+
 
 	def _model_bundle(self, symbol: str, universe: str) -> tuple[pd.DataFrame, dict] | tuple[None, None]:
 		try:
@@ -6388,6 +7523,23 @@ class PortfolioOptimizerView(APIView):
 				if corr is not None:
 					metrics.append({'label': 'Corr NASDAQ', 'value': f"{corr:.2f}"})
 		return metrics
+
+	def _candle_patterns(self, row: pd.Series) -> list[str]:
+		patterns = {
+			'pattern_doji': 'Doji',
+			'pattern_hammer': 'Hammer',
+			'pattern_engulfing': 'Engulfing',
+			'pattern_morning_star': 'Morning Star',
+		}
+		result: list[str] = []
+		for key, label in patterns.items():
+			try:
+				value = float(row.get(key) or 0.0)
+			except Exception:
+				value = 0.0
+			if value > 0:
+				result.append(label)
+		return result
 
 	def _build_risks(self, row: pd.Series, result: BacktestResult | None) -> list[str]:
 		risks: list[str] = []
@@ -6620,6 +7772,7 @@ class PortfolioOptimizerView(APIView):
 			'reason': reason,
 			'drivers': self._build_drivers(signal, buy_threshold, sell_threshold, row),
 			'metrics': self._build_metrics(data, row, symbol, signal, result, fundamentals, fast_mode=fast_mode),
+			'candle_patterns': self._candle_patterns(row),
 			'risks': self._build_risks(row, result),
 			'advice': advice,
 			'advice_color': advice_color,
@@ -6694,6 +7847,7 @@ class PortfolioOptimizerView(APIView):
 			'reason': 'Mode rapide: position détectée (analyse légère).',
 			'drivers': ['Mode rapide activé', 'Analyse complète disponible hors mode rapide'],
 			'metrics': ([{'label': 'Prix', 'value': f"${price_value:.2f}"}] if price_value else []),
+			'candle_patterns': [],
 			'risks': ['Analyse rapide (sans backtest)'],
 			'advice': ['✋ HOLD / NEUTRAL (mode rapide).'],
 			'advice_color': 'Yellow',
@@ -6769,6 +7923,7 @@ class PortfolioOptimizerView(APIView):
 			'reason': reason,
 			'drivers': self._build_drivers(signal, buy_threshold, sell_threshold, row),
 			'metrics': self._build_metrics(data, row, symbol, signal, result, fundamentals, fast_mode=fast_mode),
+			'candle_patterns': self._candle_patterns(row),
 			'risks': self._build_risks(row, result),
 			'altman_z': altman_z,
 			'speculative': is_speculative,
@@ -6859,6 +8014,7 @@ class PortfolioOptimizerView(APIView):
 
 	def get(self, request):
 		try:
+			started_at = time.monotonic()
 			hover_flag = str(request.query_params.get('hover', '')).strip().lower() in {'1', 'true', 'yes'}
 			hover_symbol = (request.query_params.get('ticker') or '').strip().upper()
 			if hover_flag and hover_symbol:
@@ -6898,16 +8054,30 @@ class PortfolioOptimizerView(APIView):
 			fast_param = str(request.query_params.get('fast', '')).strip().lower()
 			default_fast = str(os.getenv('OPTIMIZER_DEFAULT_FAST', '1')).strip().lower() in {'1', 'true', 'yes', 'y'}
 			fast_mode = fast_param in {'1', 'true', 'yes'} or (not fast_param and default_fast)
+			max_seconds = float(os.getenv('OPTIMIZER_MAX_SECONDS', '55'))
+			def _time_budget_exceeded() -> bool:
+				return (time.monotonic() - started_at) > max_seconds
 			slow_max_holdings = int(os.getenv('OPTIMIZER_SLOW_MAX_HOLDINGS', '8'))
 			slow_lookback_days = int(os.getenv('OPTIMIZER_SLOW_LOOKBACK_DAYS', '60'))
-			gemini_confirm_on = str(os.getenv('OPTIMIZER_GEMINI_CONFIRM', '1')).lower() in {'1', 'true', 'yes'}
+			gemini_confirm_on = str(os.getenv('OPTIMIZER_GEMINI_CONFIRM', '0')).lower() in {'1', 'true', 'yes'}
 			gemini_confirm_limit = int(os.getenv('OPTIMIZER_GEMINI_CONFIRM_LIMIT', '3'))
+			max_suggestions = int(os.getenv('OPTIMIZER_SUGGESTIONS_LIMIT', '8'))
+			suggestion_pool = int(os.getenv('OPTIMIZER_SUGGESTIONS_POOL', str(max_suggestions * 2)))
+			time_budget_hit = False
 			portfolio = None
 			if portfolio_id:
 				portfolio = Portfolio.objects.filter(id=portfolio_id).first()
 			if not portfolio:
 				portfolio = Portfolio.objects.first()
 			portfolio_payload = {'id': portfolio.id, 'name': portfolio.name} if portfolio else None
+
+			scheduled_cache_key = f"optimizer:scheduled:{portfolio_payload.get('id') if portfolio_payload else 'default'}:{'fast' if fast_mode else 'slow'}"
+			scheduled_payload = cache.get(scheduled_cache_key)
+			if not scheduled_payload and not fast_mode:
+				fallback_key = f"optimizer:scheduled:{portfolio_payload.get('id') if portfolio_payload else 'default'}:fast"
+				scheduled_payload = cache.get(fallback_key)
+			if scheduled_payload:
+				return Response(scheduled_payload, status=200)
 
 			optimizer_cache_key = f"optimizer:payload:{portfolio_payload.get('id') if portfolio_payload else 'default'}:{'fast' if fast_mode else 'slow'}"
 			cached_payload = cache.get(optimizer_cache_key)
@@ -6936,12 +8106,32 @@ class PortfolioOptimizerView(APIView):
 			)
 			if request.user and request.user.is_authenticated:
 				account_qs = account_qs.filter(account__user=request.user)
+			if not account_qs.exists():
+				account_qs = AccountTransaction.objects.select_related('stock', 'account').filter(
+					account__account_type__in=['TFSA', 'CRI', 'CASH']
+				)
+			if not account_qs.exists():
+				account_qs = AccountTransaction.objects.select_related('stock', 'account').all()
+			positions: dict[int, dict[str, Any]] = {}
 			for tx in account_qs:
 				if not tx.stock or not tx.stock.symbol:
 					continue
-				symbol = tx.stock.symbol.strip().upper()
+				if tx.type == 'DIVIDEND':
+					continue
+				sign = 1 if tx.type == 'BUY' else -1
+				entry = positions.setdefault(
+					tx.stock_id,
+					{'stock': tx.stock, 'shares': 0.0},
+				)
+				entry['shares'] += float(tx.quantity or 0) * sign
+			for entry in positions.values():
+				stock = entry.get('stock')
+				shares = float(entry.get('shares') or 0)
+				if not stock or shares <= 0:
+					continue
+				symbol = (stock.symbol or '').strip().upper()
 				if symbol and symbol not in existing_symbols:
-					holdings.append(SimpleNamespace(stock=tx.stock))
+					holdings.append(SimpleNamespace(stock=stock, shares=shares))
 					existing_symbols.add(symbol)
 
 			if fast_mode:
@@ -6957,6 +8147,9 @@ class PortfolioOptimizerView(APIView):
 			existing = set()
 			gemini_used = 0
 			for holding in holdings:
+				if _time_budget_exceeded():
+					time_budget_hit = True
+					break
 				symbol = (holding.stock.symbol or '').strip().upper()
 				if not symbol:
 					continue
@@ -6990,6 +8183,11 @@ class PortfolioOptimizerView(APIView):
 			suggestions: list[dict[str, Any]] = []
 			if not fast_mode:
 				for symbol in bluechip_candidates:
+					if _time_budget_exceeded():
+						time_budget_hit = True
+						break
+					if len(suggestions) >= suggestion_pool:
+						break
 					if symbol in existing:
 						continue
 					suggestion = self._build_suggestion(
@@ -7004,6 +8202,11 @@ class PortfolioOptimizerView(APIView):
 					if suggestion:
 						suggestions.append(self._apply_manual_category_overrides(suggestion))
 				for symbol in penny_candidates:
+					if _time_budget_exceeded():
+						time_budget_hit = True
+						break
+					if len(suggestions) >= suggestion_pool:
+						break
 					if symbol in existing:
 						continue
 					suggestion = self._build_suggestion(
@@ -7025,7 +8228,6 @@ class PortfolioOptimizerView(APIView):
 				return (altman_ok, altman_score, float(item.get('confidence', 0)))
 
 			suggestions.sort(key=_priority, reverse=True)
-			max_suggestions = int(os.getenv('OPTIMIZER_SUGGESTIONS_LIMIT', '8'))
 			if not actions and not suggestions:
 				fallback = []
 				for symbol in bluechip_candidates + penny_candidates:
@@ -7049,7 +8251,7 @@ class PortfolioOptimizerView(APIView):
 			if not fast_mode:
 				gemini_cache_key = f"optimizer:gemini:{portfolio_payload.get('id') if portfolio_payload else 'default'}"
 				gemini_payload = cache.get(gemini_cache_key)
-				if gemini_payload is None:
+				if gemini_payload is None and not _time_budget_exceeded():
 					gemini_payload = self._gemini_optimizer_report(portfolio_payload, actions, suggestions)
 					cache.set(gemini_cache_key, gemini_payload, timeout=60 * 15)
 				gemini_review = gemini_payload if isinstance(gemini_payload, dict) else None
@@ -7059,6 +8261,8 @@ class PortfolioOptimizerView(APIView):
 				if not gemini_review and not gemini_report:
 					gemini_review = self._fallback_optimizer_review(actions, suggestions)
 					gemini_report = (gemini_review.get('summary') or '').strip() or None
+				if _time_budget_exceeded():
+					time_budget_hit = True
 
 			response_payload = {
 				'portfolio': portfolio_payload,
@@ -7074,6 +8278,7 @@ class PortfolioOptimizerView(APIView):
 				'fast_mode': fast_mode,
 				'gemini_report': gemini_report,
 				'gemini_review': gemini_review,
+				'degraded': time_budget_hit,
 			}
 			cache.set(optimizer_cache_key, response_payload, timeout=60 * 2)
 			return Response(response_payload, status=200)
@@ -7087,6 +8292,324 @@ class PortfolioOptimizerView(APIView):
 				'fast_mode': False,
 				'error': str(exc),
 			}, status=200)
+
+
+class PortfolioOptimizerEndpointView(APIView):
+	def get(self, request):
+		return PortfolioOptimizerView().get(request)
+
+
+class AICenterView(APIView):
+	def _coerce_series(self, series: Any, symbol: str | None = None) -> pd.Series | None:
+		if series is None:
+			return None
+		if isinstance(series, pd.DataFrame):
+			if symbol and symbol in series.columns:
+				series = series[symbol]
+			elif len(series.columns) == 1:
+				series = series.iloc[:, 0]
+			else:
+				series = series.iloc[:, 0]
+		if isinstance(series, pd.Series):
+			return series.dropna()
+		return None
+
+	def _sanitize_payload(self, value: Any) -> Any:
+		if isinstance(value, float):
+			return value if math.isfinite(value) else None
+		if isinstance(value, (np.floating,)):
+			try:
+				value = float(value)
+			except Exception:
+				return None
+			return value if math.isfinite(value) else None
+		if isinstance(value, dict):
+			return {k: self._sanitize_payload(v) for k, v in value.items()}
+		if isinstance(value, list):
+			return [self._sanitize_payload(v) for v in value]
+		return value
+	def _fallback_ai_center(
+		self,
+		indices: list[dict[str, Any]],
+		macro: list[dict[str, Any]],
+		portfolio_holdings: list[dict[str, Any]],
+		watchlist_symbols: list[str],
+	) -> dict[str, Any]:
+		primary = []
+		for item in (indices + macro):
+			label = item.get('label') or item.get('symbol')
+			price = item.get('price')
+			change = item.get('change_pct')
+			if label and price is not None and change is not None:
+				primary.append(f"{label}: {price} ({change:+.2f}%)")
+			if len(primary) >= 4:
+				break
+		portfolio_symbols = [h.get('symbol') for h in portfolio_holdings if h.get('symbol')]
+		focus = [s for s in portfolio_symbols[:5] if s] or watchlist_symbols[:3]
+		suggestions = [s for s in portfolio_symbols[5:8] if s] or watchlist_symbols[:3]
+		return {
+			'yesterday_summary': (
+				"Briefing indisponible (modèle hors ligne). "
+				+ (" | ".join(primary) if primary else "Données de marché limitées.")
+			),
+			'today_outlook': "Prudence: données incomplètes; surveiller la volatilité et les news majeures.",
+			'sector_focus': ["Technologie", "Financières", "Énergie"],
+			'stock_predictions': [
+				{
+					'ticker': symbol,
+					'bias': 'neutral',
+					'reason': "Données insuffisantes pour une prédiction fiable aujourd'hui.",
+				}
+				for symbol in focus
+			],
+			'add_suggestions': [
+				{
+					'ticker': symbol,
+					'reason': "Suggestion neutre: surveiller les volumes et les niveaux clés.",
+				}
+				for symbol in suggestions
+			],
+			'swing_trades': [],
+			'macro_calls': ["Données macro incomplètes; éviter les paris directionnels agressifs."],
+			'risks': ["Modèle indisponible", "Données de marché partielles"],
+		}
+
+	def _close_series(self, frame: pd.DataFrame, symbol: str) -> pd.Series | None:
+		if frame is None or frame.empty:
+			return None
+		if isinstance(frame.columns, pd.MultiIndex):
+			col = ('Close', symbol)
+			if col in frame.columns:
+				return self._coerce_series(frame[col], symbol)
+			for maybe in frame.columns:
+				if isinstance(maybe, tuple) and maybe[0] == 'Close':
+					return self._coerce_series(frame[maybe], symbol)
+		if 'Close' in frame.columns:
+			return self._coerce_series(frame['Close'], symbol)
+		return None
+
+	def _asset_snapshot(self, symbol: str, label: str | None = None) -> dict[str, Any]:
+		frame = yf.download(symbol, period='1mo', interval='1d', progress=False)
+		series = self._close_series(frame, symbol)
+		mapped_symbol = yf.SYMBOL_ALIASES.get(symbol, symbol)
+		if (series is None or series.empty) and mapped_symbol != symbol:
+			frame = yf.download(mapped_symbol, period='1mo', interval='1d', progress=False)
+			series = self._close_series(frame, mapped_symbol)
+		if series is None or series.empty:
+			try:
+				alt = yfin.download(
+					tickers=mapped_symbol,
+					period='7d',
+					interval='1d',
+					progress=False,
+					threads=False,
+				)
+				if isinstance(alt, pd.DataFrame) and not alt.empty and 'Close' in alt.columns:
+					series = self._coerce_series(alt['Close'], mapped_symbol)
+			except Exception:
+				series = None
+		if series is None or series.empty:
+			try:
+				hist = yfin.Ticker(mapped_symbol).history(period='7d', interval='1d')
+				if isinstance(hist, pd.DataFrame) and not hist.empty and 'Close' in hist.columns:
+					series = self._coerce_series(hist['Close'], mapped_symbol)
+			except Exception:
+				series = None
+		series = self._coerce_series(series, mapped_symbol)
+		if series is None or series.empty:
+			return {
+				'symbol': symbol,
+				'label': label or symbol,
+				'price': None,
+				'change_pct': None,
+			}
+		last = float(series.iloc[-1])
+		prev = float(series.iloc[-2]) if len(series) >= 2 else last
+		change_pct = ((last - prev) / prev * 100) if prev else 0.0
+		return {
+			'symbol': symbol,
+			'label': label or symbol,
+			'price': round(last, 4),
+			'change_pct': round(change_pct, 2),
+		}
+
+	def _watchlist_symbols(self) -> list[str]:
+		watchlist_symbols: list[str] = []
+		for sandbox in SandboxWatchlist.objects.all():
+			for symbol in sandbox.symbols or []:
+				clean = str(symbol).strip().upper()
+				if clean and clean not in watchlist_symbols:
+					watchlist_symbols.append(clean)
+		return watchlist_symbols
+
+	def get(self, request):
+		scheduled = cache.get('ai_center:scheduled')
+		if scheduled:
+			sanitized = self._sanitize_payload(scheduled)
+			if sanitized != scheduled:
+				cache.set('ai_center:scheduled', sanitized, timeout=60 * 3)
+			return Response(sanitized)
+
+		cache_key = 'ai_center:payload'
+		cached = cache.get(cache_key)
+		if cached:
+			sanitized = self._sanitize_payload(cached)
+			if sanitized != cached:
+				cache.set(cache_key, sanitized, timeout=60 * 3)
+			return Response(sanitized)
+
+		broker = DanasBroker(user=request.user if request.user and request.user.is_authenticated else None)
+		tfsa_snapshot = _tfsa_positions_snapshot(request.user if request.user and request.user.is_authenticated else None)
+		tfsa_positions = tfsa_snapshot.get('positions') or []
+		if tfsa_positions:
+			portfolio_holdings = [
+				{
+					'symbol': item.get('symbol'),
+					'shares': item.get('shares'),
+					'avg_cost': item.get('avg_cost'),
+					'latest_price': item.get('price'),
+					'value': item.get('value'),
+				}
+				for item in tfsa_positions
+				if item.get('symbol')
+			]
+		else:
+			portfolio_holdings = broker._portfolio_snapshot()
+		holding_symbols = [item.get('symbol') for item in portfolio_holdings if item.get('symbol')]
+		watchlist_symbols = [s for s in self._watchlist_symbols() if s not in holding_symbols]
+		watchlist_symbols = watchlist_symbols[:10]
+
+		stock_contexts = []
+		focus_symbols = holding_symbols[:10] if holding_symbols else watchlist_symbols[:10]
+		for symbol in focus_symbols:
+			try:
+				ctx = broker.get_market_context(symbol)
+			except Exception:
+				ctx = None
+			if not ctx:
+				continue
+			stock_contexts.append({
+				'symbol': ctx.symbol,
+				'price': ctx.price,
+				'rsi14': ctx.rsi14,
+				'patterns': ctx.patterns,
+				'rvol': ctx.rvol,
+				'ml_signal': ctx.ml_signal,
+				'ml_confidence': ctx.ml_confidence,
+				'sentiment': ctx.sentiment,
+			})
+
+		indices = [
+			self._asset_snapshot('^GSPC', 'S&P 500'),
+			self._asset_snapshot('^IXIC', 'NASDAQ'),
+			self._asset_snapshot('^GSPTSE', 'TSX'),
+		]
+		macro = [
+			self._asset_snapshot('BTC-CAD', 'Bitcoin'),
+			self._asset_snapshot('GC=F', 'Gold'),
+			self._asset_snapshot('SI=F', 'Silver'),
+		]
+
+		prompt = (
+			"Tu es Danas, un analyste quant. Réponds uniquement en français en JSON strict. "
+			"Analyse les indices, macro (BTC, or, argent), et donne un briefing. "
+			"Fourni aussi: 1) résumé d'hier, 2) prévision pour aujourd'hui, "
+			"3) prédictions sur mes actions, 4) suggestions d'ajout, 5) idées swing trade de la journée, "
+			"6) secteurs à surveiller.\n\n"
+			"Format JSON strict: "
+			"{\"yesterday_summary\":\"...\",\"today_outlook\":\"...\",\"sector_focus\":[\"...\"],"
+			"\"stock_predictions\":[{\"ticker\":\"...\",\"bias\":\"bullish|bearish|neutral\",\"reason\":\"...\"}],"
+			"\"add_suggestions\":[{\"ticker\":\"...\",\"reason\":\"...\"}],"
+			"\"swing_trades\":[{\"ticker\":\"...\",\"entry\":\"...\",\"stop\":\"...\",\"tp\":\"...\",\"reason\":\"...\"}],"
+			"\"macro_calls\":[\"...\"],\"risks\":[\"...\"]}.\n"
+			f"Indices: {json.dumps(indices, ensure_ascii=False)}\n"
+			f"Macro: {json.dumps(macro, ensure_ascii=False)}\n"
+			f"Portfolio: {json.dumps(portfolio_holdings, ensure_ascii=False)}\n"
+			f"Watchlist: {json.dumps(watchlist_symbols, ensure_ascii=False)}\n"
+			f"Stock context: {json.dumps(stock_contexts, ensure_ascii=False)}\n"
+		)
+
+		base_url = (
+			os.getenv('DANAS_CHAT_BASE_URL')
+			or os.getenv('OLLAMA_CHAT_BASE_URL')
+			or os.getenv('OLLAMA_BASE_URL')
+			or ''
+		).strip().rstrip('/')
+		if base_url and '/v1' not in base_url:
+			base_url = f"{base_url}/v1"
+		ai_payload: dict[str, Any] | None = None
+		ai_text = ''
+		llm_enabled = os.getenv('AI_CENTER_LLM_ENABLED', '0').lower() in {'1', 'true', 'yes'}
+		if request.query_params.get('llm') == '1':
+			llm_enabled = True
+		if base_url and llm_enabled:
+			try:
+				client = OpenAI(
+					base_url=base_url,
+					api_key=os.getenv('DANAS_API_KEY', 'sk-no-key-required'),
+					timeout=20.0,
+					max_retries=1,
+				)
+				response = client.chat.completions.create(
+					model=os.getenv('OLLAMA_MODEL', 'deepseek-r1'),
+					messages=[
+						{
+							'role': 'system',
+							'content': (
+								f"Tu es Danas. Nous sommes le {timezone.now().strftime('%d/%m/%Y %H:%M')}. "
+								"Ignore ta date interne et utilise uniquement les données live fournies. "
+								"Réponds uniquement en français."
+							),
+						},
+						{'role': 'user', 'content': prompt},
+					],
+					temperature=0.3,
+					max_tokens=800,
+					timeout=12.0,
+				)
+				ai_text = (response.choices[0].message.content or '').strip()
+				if ai_text:
+					try:
+						ai_payload = json.loads(ai_text)
+					except Exception:
+						json_start = ai_text.find('{')
+						json_end = ai_text.rfind('}')
+						if json_start >= 0 and json_end > json_start:
+							ai_payload = json.loads(ai_text[json_start:json_end + 1])
+						else:
+							ai_payload = None
+			except Exception:
+				ai_payload = None
+
+		if not ai_payload:
+			ai_payload = self._fallback_ai_center(indices, macro, portfolio_holdings, watchlist_symbols)
+
+		payload = {
+			'indices': indices,
+			'macro': macro,
+			'stocks': stock_contexts,
+			'watchlist': watchlist_symbols,
+			'ai_center': ai_payload or {},
+			'consensus': cache.get('danas_consensus_results') or {},
+			'ai_text': ai_text,
+			'as_of': timezone.now().isoformat(),
+		}
+		payload = self._sanitize_payload(payload)
+		all_assets = indices + macro
+		all_missing = bool(all_assets) and all(
+			item.get('price') is None and item.get('change_pct') is None for item in all_assets
+		)
+		if not all_missing:
+			cache.set(cache_key, payload, timeout=60 * 3)
+		return Response(payload)
+
+
+class DanasConsensusView(APIView):
+	def get(self, request):
+		refresh = (request.query_params.get('refresh') or '').strip().lower() in {'1', 'true', 'yes', 'y'}
+		service = ValidationService()
+		payload = service.run_consensus(refresh=refresh)
+		return Response(payload)
 
 
 class HealthCheckView(APIView):

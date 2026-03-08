@@ -29,4 +29,4 @@ RUN python manage.py collectstatic --noinput || true
 
 EXPOSE 8000
 
-CMD ["gunicorn", "portfolio_backend.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3", "--timeout", "120"]
+CMD ["gunicorn", "portfolio_backend.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3", "--timeout", "600"]

@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
 import './App.css';
-import Sidebar from './components/Sidebar';
 import GlobalPortfolio from './components/GlobalPortfolio';
 import OptimizerPage from './components/OptimizerPage';
 import ScoutEyePage from './components/ScoutEyePage';
@@ -8,31 +9,48 @@ import AnalyticsLabPage from './components/AnalyticsLabPage';
 import LivePaperTrading from './components/LivePaperTrading';
 import ManagePortfolioPage from './components/ManagePortfolioPage';
 import IntradayAI from './components/IntradayAI';
-import QuickSearchBar from './components/QuickSearchBar';
 import RiskControlCenter from './components/RiskControlCenter';
 import LogsCenterPage from './components/LogsCenterPage';
+import AskQuantPage from './components/AskQuantPage';
+import AICenterPage from './components/AICenterPage';
+import WarRoomPage from './components/WarRoomPage';
+import MainLayout from './components/layout/MainLayout';
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 60_000,
+      retry: 1,
+      refetchOnWindowFocus: false,
+    },
+  },
+});
 
 function App() {
-  const [page, setPage] = useState('home');
-
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col lg:flex-row">
-      <Sidebar active={page} onSelect={setPage} />
-      <main className="flex-1 p-6 lg:p-10 bg-slate-950">
-        <div className="mb-6">
-          <QuickSearchBar />
-        </div>
-        {page === 'home' && <GlobalPortfolio />}
-        {page === 'manage' && <ManagePortfolioPage />}
-        {page === 'optimizer' && <OptimizerPage />}
-        {page === 'scout' && <ScoutEyePage />}
-        {page === 'lab' && <AnalyticsLabPage />}
-        {page === 'paper' && <LivePaperTrading />}
-        {page === 'intraday' && <IntradayAI />}
-        {page === 'risk' && <RiskControlCenter />}
-        {page === 'logs' && <LogsCenterPage />}
-      </main>
-    </div>
+    <QueryClientProvider client={queryClient}>
+      <Router>
+        <MainLayout>
+          <Routes>
+            <Route path="/" element={<WarRoomPage />} />
+            <Route path="/war-room" element={<WarRoomPage />} />
+            <Route path="/portfolio" element={<GlobalPortfolio />} />
+            <Route path="/manage" element={<ManagePortfolioPage />} />
+            <Route path="/optimizer" element={<OptimizerPage />} />
+            <Route path="/ai-center" element={<AICenterPage />} />
+            <Route path="/scout" element={<ScoutEyePage />} />
+            <Route path="/lab" element={<AnalyticsLabPage />} />
+            <Route path="/paper" element={<LivePaperTrading />} />
+            <Route path="/intraday" element={<IntradayAI />} />
+            <Route path="/risk" element={<RiskControlCenter />} />
+            <Route path="/logs" element={<LogsCenterPage />} />
+            <Route path="/ask-quant" element={<AskQuantPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </MainLayout>
+      </Router>
+      <ReactQueryDevtools initialIsOpen={false} />
+    </QueryClientProvider>
   );
 }
 

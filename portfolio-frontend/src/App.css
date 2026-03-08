@@ -209,3 +209,75 @@ body[data-theme='dark'] .MuiTab-root.Mui-selected {
 body[data-theme='dark'] .delete-portfolio {
   color: #ef4444;
 }
+
+.war-room-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: 24px;
+  margin-bottom: 24px;
+}
+
+.war-room-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.war-room-panel--full {
+  margin-top: 8px;
+}
+
+.war-room-list {
+  display: grid;
+  gap: 12px;
+}
+
+.war-room-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+}
+
+.war-room-ticker {
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.war-room-price {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.war-room-score {
+  font-weight: 600;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(99, 102, 241, 0.18);
+  color: #c7d2fe;
+}
+
+.war-room-score.is-hot {
+  background: rgba(16, 185, 129, 0.2);
+  color: #a7f3d0;
+}
+
+.war-room-empty {
+  padding: 12px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.war-room-ask {
+  max-height: 520px;
+  overflow: auto;
+}
+
+@media (max-width: 1100px) {
+  .war-room-grid {
+    grid-template-columns: 1fr;
+  }
+}

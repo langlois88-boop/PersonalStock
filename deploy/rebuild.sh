@@ -4,8 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-echo "[rebuild] Pull latest code"
-git pull
+if [[ "${SKIP_PULL:-0}" != "1" ]]; then
+	echo "[rebuild] Pull latest code"
+	git pull
+else
+	echo "[rebuild] Skipping git pull"
+fi
 
 echo "[rebuild] Build and restart containers"
 docker compose build --no-cache

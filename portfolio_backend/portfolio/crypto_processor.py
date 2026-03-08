@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import yfinance as yfin
+import requests
 
 from .ml_engine.crypto_training import _build_crypto_features, _normalize_columns, _rsi
 
@@ -46,6 +48,51 @@ def _btc_panic(btc_df: pd.DataFrame) -> bool:
     return change <= -abs(threshold)
 
 
+_CRYPTO_PANIC_CACHE: dict[str, Any] = {'ts': 0.0, 'verdict': None, 'reason': None}
+
+
+def _crypto_panic_verdict(btc_df: pd.DataFrame) -> str:
+    global _CRYPTO_PANIC_CACHE
+    if _CRYPTO_PANIC_CACHE.get('verdict') and (time.time() - float(_CRYPTO_PANIC_CACHE.get('ts') or 0)) < 300:
+        return str(_CRYPTO_PANIC_CACHE.get('verdict'))
+    change = _pct_change(btc_df['close'], periods=4) if btc_df is not None and not btc_df.empty else None
+    base_url = (
+        os.getenv('DANAS_CHAT_BASE_URL')
+        or os.getenv('OLLAMA_CHAT_BASE_URL')
+        or os.getenv('OLLAMA_BASE_URL')
+        or ''
+    ).strip().rstrip('/')
+    if base_url and '/v1' not in base_url:
+        base_url = f"{base_url}/v1"
+    if not base_url:
+        return 'SYSTEMIC'
+    model = os.getenv('OLLAMA_MODEL', 'deepseek-r1')
+    prompt = (
+        "CRYPTO PANIC CHECK\n"
+        f"BTC 1H change: {round((change or 0) * 100, 2)}%\n"
+        "Question: Est-ce une panique systémique (SYSTEMIC) ou une rotation (ROTATION) ?\n"
+        "Réponds uniquement par SYSTEMIC ou ROTATION."
+    )
+    try:
+        payload = {
+            'model': model,
+            'messages': [
+                {'role': 'system', 'content': 'Réponds en français mais un seul mot SYSTEMIC ou ROTATION.'},
+                {'role': 'user', 'content': prompt},
+            ],
+            'stream': False,
+        }
+        resp = requests.post(f"{base_url}/chat/completions", json=payload, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        text = ((data.get('choices') or [{}])[0].get('message') or {}).get('content') or ''
+        verdict = 'ROTATION' if 'ROTATION' in text.upper() else 'SYSTEMIC'
+        _CRYPTO_PANIC_CACHE = {'ts': time.time(), 'verdict': verdict, 'reason': text.strip()[:300]}
+        return verdict
+    except Exception:
+        return 'SYSTEMIC'
+
+
 def _drip_trigger(symbol_df: pd.DataFrame) -> bool:
     threshold = float(os.getenv('CRYPTO_DRIP_THRESHOLD', '0.03'))
     change = _pct_change(symbol_df['close'], periods=1)
@@ -71,6 +118,7 @@ def scan_crypto_drip() -> list[dict[str, Any]]:
     symbols = _crypto_symbols()
     btc_df = _fetch_15m('BTC-USD')
     btc_panic = _btc_panic(btc_df)
+    panic_verdict = _crypto_panic_verdict(btc_df) if btc_panic else 'ROTATION'
     model_payload = _load_crypto_model()
     model = model_payload.get('model') if model_payload else None
     feature_cols = model_payload.get('features') if model_payload else None
@@ -105,7 +153,7 @@ def scan_crypto_drip() -> list[dict[str, Any]]:
             except Exception:
                 score = None
 
-        blocked = btc_panic and symbol != 'BTC-USD'
+        blocked = btc_panic and panic_verdict == 'SYSTEMIC' and symbol != 'BTC-USD'
         results.append({
             'symbol': symbol,
             'price': float(last['close'].iloc[-1]),
@@ -113,6 +161,7 @@ def scan_crypto_drip() -> list[dict[str, Any]]:
             'rsi': rsi_val,
             'oversold': oversold,
             'btc_panic': btc_panic,
+            'panic_verdict': panic_verdict,
             'blocked': blocked,
             'score': score,
             'price_to_vwap': float(last.get('price_to_vwap', pd.Series([0.0])).iloc[-1]),

@@ -29,6 +29,7 @@ except Exception:  # pragma: no cover - optional dependency
 SYMBOL_ALIASES = {
     '^GSPC': 'SPY',
     '^IXIC': 'QQQ',
+    '^GSPTSE': 'XIU.TO',
     '^DJI': 'DIA',
     '^VIX': 'VIXY',
     'DX-Y.NYB': 'UUP',

@@ -10,8 +10,24 @@ from .collectors.fred_api import fetch_fred_latest
 from .collectors.news_rss import fetch_news_sentiment
 
 
+class MacroImputerMixin:
+    MACRO_DEFAULTS: Dict[str, float] = {
+        'fred_rate': 0.0,
+    }
+
+    def _impute_macro_features(self, payload: Dict[str, Optional[float]]) -> Dict[str, float]:
+        cleaned: Dict[str, float] = {}
+        for key, default in self.MACRO_DEFAULTS.items():
+            value = payload.get(key)
+            if value is None or (isinstance(value, float) and np.isnan(value)):
+                cleaned[key] = float(default)
+            else:
+                cleaned[key] = float(value)
+        return cleaned
+
+
 @dataclass
-class DataMerger:
+class DataMerger(MacroImputerMixin):
     fred_rate_series: str = "GS10"
 
     def _rsi(self, series: pd.Series, window: int = 14) -> float:
@@ -78,11 +94,12 @@ class DataMerger:
         if not symbol:
             return {}
 
+        macro_features = self._impute_macro_features(self.fetch_macro_features())
         features = {
             "symbol": symbol,
             **self.fetch_price_features(symbol),
             **self.fetch_fundamental_features(symbol),
-            **self.fetch_macro_features(),
+            **macro_features,
             **self.fetch_news_features(symbol),
         }
         return features

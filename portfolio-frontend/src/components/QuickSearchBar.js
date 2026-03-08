@@ -28,6 +28,27 @@ function QuickSearchBar() {
     return () => clearInterval(interval);
   }, [loading]);
 
+  const pollAnalysis = async (symbol, attempt = 0) => {
+    try {
+      const response = await api.get('ai/analysis/', { params: { ticker: symbol } });
+      if (response?.data?.status === 'processing') {
+        if (attempt >= 10) {
+          setError('Analyse en cours. Réessaie dans quelques instants.');
+          setLoading(false);
+          return;
+        }
+        setTimeout(() => pollAnalysis(symbol, attempt + 1), 2000);
+        return;
+      }
+      setAnalysis(response.data);
+      setLoading(false);
+    } catch (err) {
+      const message = err?.response?.data?.error || 'Analyse indisponible.';
+      setError(message);
+      setLoading(false);
+    }
+  };
+
   const runAnalysis = async () => {
     const symbol = ticker.trim().toUpperCase();
     if (!symbol) return;
@@ -35,15 +56,7 @@ function QuickSearchBar() {
     setError(null);
     setAnalysis(null);
     setOpen(true);
-    try {
-      const response = await api.get('ai/analysis/', { params: { ticker: symbol } });
-      setAnalysis(response.data);
-    } catch (err) {
-      const message = err?.response?.data?.error || 'Analyse indisponible.';
-      setError(message);
-    } finally {
-      setLoading(false);
-    }
+    pollAnalysis(symbol);
   };
 
   const handleSubmit = (event) => {

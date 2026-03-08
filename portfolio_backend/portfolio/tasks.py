@@ -14,6 +14,7 @@ import requests
 import random
 import json
 import pandas as pd
+from time import sleep
 from zoneinfo import ZoneInfo
 from celery import shared_task
 from django.conf import settings
@@ -77,6 +78,7 @@ from .models import (
     SystemLog,
     UserPreference,
 )
+from .services.danas_broker import DanasMLRouter
 from .ai_module import run_predictions
 from .alpaca_data import (
     get_daily_bars,
@@ -111,6 +113,7 @@ from .ml_engine.backtester import (
     train_fusion_model,
     train_fusion_model_from_labels,
 )
+from .ai_advisor import DeepSeekAdvisor
 
 
 DEFAULT_YIELD = 0.02
@@ -683,6 +686,74 @@ def _send_telegram_inline_message(message: str, reply_markup: dict[str, Any], ch
         requests.post(url, json=payload, timeout=10)
     except Exception:
         pass
+
+
+def _queue_telegram_candidate(payload: dict[str, Any]) -> None:
+    queue_key = 'telegram_signal_queue'
+    queue = cache.get(queue_key) or []
+    queue.append(payload)
+    cache.set(queue_key, queue, timeout=60 * 60)
+
+
+def send_telegram_signal(ticker: str, score: float, diagnostic: str, deepseek_score: float | None = None) -> bool:
+    min_score = float(os.getenv('TELEGRAM_MIN_SCORE', '80'))
+    if score < min_score:
+        _queue_telegram_candidate({
+            'ticker': ticker,
+            'score': score,
+            'diagnostic': diagnostic,
+            'deepseek_score': deepseek_score,
+            'ts': timezone.now().isoformat(),
+        })
+        return False
+
+    emoji = "🚀" if score >= 90 else "📈"
+    message = (
+        f"{emoji} *ALERTE DANAS : {ticker}*\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"🎯 *Score ML:* {score:.1f}%\n"
+        f"🧠 *DeepSeek:* {deepseek_score if deepseek_score is not None else '—'}/10\n"
+        f"📝 *Analyse:* {diagnostic}\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"🔗 [Wealthsimple](https://my.wealthsimple.com/app/invest/search?query={ticker})"
+    )
+    _send_telegram_alert(message, allow_during_blackout=True, category='signal')
+    return True
+
+
+def should_send_to_telegram(score: float | None, ai_text: str) -> bool:
+    min_score = float(os.getenv('TELEGRAM_MIN_SCORE', '80'))
+    if score is not None and score < min_score:
+        return False
+    danger_words = [
+        'éviter',
+        'trop risqué',
+        'pas recommandé',
+        'no-go',
+        'bearish',
+        'prudence',
+    ]
+    text = (ai_text or '').lower()
+    return not any(word in text for word in danger_words)
+
+
+@shared_task
+def telegram_summary_task(limit: int = 3) -> dict[str, Any]:
+    queue_key = 'telegram_signal_queue'
+    queue = cache.get(queue_key) or []
+    if not queue:
+        return {'status': 'empty', 'count': 0}
+
+    ranked = sorted(queue, key=lambda item: float(item.get('score') or 0), reverse=True)
+    top = ranked[:limit]
+    lines = ["🧠 *RÉCAP DANAS (Top Opportunités)*", ""]
+    for item in top:
+        ticker = item.get('ticker') or '—'
+        score = float(item.get('score') or 0)
+        lines.append(f"• {ticker} — {score:.1f}%")
+    _send_telegram_alert("\n".join(lines), allow_during_blackout=True, category='report')
+    cache.delete(queue_key)
+    return {'status': 'ok', 'count': len(top)}
 
 
 def telegram_answer_callback(callback_id: str) -> None:
@@ -1823,6 +1894,28 @@ def _percent_change(symbol: str) -> float | None:
         return None
 
 
+def _latest_price_with_status(symbol: str) -> tuple[float | None, str]:
+    price = _latest_price_snapshot(symbol)
+    status = 'offline'
+    try:
+        hist = yf.Ticker(symbol).history(period='5d', interval='1h', timeout=10)
+        if hist is not None and not hist.empty and 'Close' in hist:
+            last_ts = hist.index[-1]
+            if last_ts is not None:
+                if hasattr(last_ts, 'tzinfo') and last_ts.tzinfo:
+                    last_seen = last_ts.tz_convert('UTC')
+                else:
+                    last_seen = timezone.make_aware(last_ts, dt_timezone.utc)
+                now = timezone.now()
+                if now - last_seen <= timedelta(hours=2):
+                    status = 'live'
+            if price is None:
+                price = _safe_float(hist['Close'].iloc[-1])
+    except Exception:
+        pass
+    return (float(price) if _is_valid_price(price) else None), status
+
+
 def _overnight_window(now_ny: datetime) -> tuple[datetime, datetime]:
     morning = now_ny.replace(hour=8, minute=0, second=0, microsecond=0)
     evening = now_ny.replace(hour=20, minute=0, second=0, microsecond=0)
@@ -2151,12 +2244,11 @@ def _to_cad_price(symbol: str, price: float | None, info: dict[str, Any]) -> flo
     if price is None:
         return None
     symbol_upper = (symbol or '').upper()
-    force_list = {'RY'}
-    force_list.update({
+    force_list = {
         s.strip().upper()
         for s in str(os.getenv('FORCE_CAD_TICKERS', '')).split(',')
         if s.strip()
-    })
+    }
     if symbol_upper in force_list:
         return float(price) * _usd_cad_rate()
     if not symbol_upper.endswith('.TO'):
@@ -2601,6 +2693,8 @@ def fetch_google_news_daily(days: int = 1) -> dict[str, int]:
 
     created = 0
     seen = 0
+    skipped = 0
+    skipped = 0
 
     try:
         for stock in Stock.objects.all().order_by('symbol'):
@@ -4069,6 +4163,37 @@ def _weak_list_health() -> dict[str, Any]:
     return payload
 
 
+def _has_hammer_pattern(ctx: dict[str, Any] | None) -> bool:
+    if not ctx:
+        return False
+    patterns = ctx.get('patterns') or []
+    if isinstance(patterns, list):
+        return any('hammer' in str(p).lower() for p in patterns)
+    return False
+
+
+def _rsi_divergence(ctx: dict[str, Any] | None, lookback: int = 6) -> bool:
+    if not ctx:
+        return False
+    bars = ctx.get('bars')
+    if bars is None or bars.empty or 'close' not in bars:
+        return False
+    closes = pd.to_numeric(bars['close'], errors='coerce').dropna()
+    if len(closes) < lookback + 1:
+        return False
+    series = closes.tail(lookback + 1)
+    low_recent = float(series.iloc[-1])
+    low_prev = float(series.iloc[:-1].min())
+    if low_recent >= low_prev:
+        return False
+    rsi_series = _compute_rsi(series)
+    if rsi_series is None or rsi_series.empty:
+        return False
+    rsi_recent = float(rsi_series.iloc[-1])
+    rsi_prev = float(rsi_series.iloc[:-1].min())
+    return rsi_recent > rsi_prev
+
+
 @lru_cache(maxsize=512)
 def _correlation_group(symbol: str) -> str | None:
     overrides = _parse_driver_map(os.getenv('CORRELATION_GROUP_OVERRIDES'))
@@ -5006,6 +5131,120 @@ def _mean_reversion_score(symbol: str) -> tuple[float, float | None, float | Non
     return score, rsi, lower
 
 
+def _volume_zscore_20(volume: pd.Series) -> float | None:
+    if volume is None or volume.empty:
+        return None
+    tail = volume.tail(20)
+    if len(tail) < 5:
+        return None
+    mean = float(tail.mean()) if float(tail.mean() or 0) else 0.0
+    std = float(tail.std()) if float(tail.std() or 0) else 0.0
+    if std <= 0:
+        return None
+    return float((tail.iloc[-1] - mean) / std)
+
+
+def _distance_from_ma200(close: pd.Series) -> float | None:
+    if close is None or close.empty:
+        return None
+    ma200 = close.rolling(200, min_periods=50).mean().iloc[-1]
+    if ma200 is None or not np.isfinite(ma200) or ma200 == 0:
+        return None
+    last = float(close.iloc[-1])
+    return float((last - ma200) / ma200)
+
+
+def _rsi_edge(rsi: float | None) -> float | None:
+    if rsi is None:
+        return None
+    return float(max(0.0, (30.0 - rsi) / 30.0))
+
+
+def _keyword_news_sentiment(symbol: str, keywords: list[str], days: int = 7) -> tuple[float, list[str]]:
+    titles = _google_news_titles(symbol, days=days)
+    if not titles:
+        return 0.0, []
+    analyzer = SentimentIntensityAnalyzer()
+    scored_titles: list[str] = []
+    scores: list[float] = []
+    for title in titles:
+        text = str(title or '').strip()
+        if not text:
+            continue
+        if keywords and not any(k.lower() in text.lower() for k in keywords):
+            continue
+        compound = analyzer.polarity_scores(text).get('compound', 0.0)
+        scores.append(float(compound))
+        scored_titles.append(text)
+    if not scores:
+        return 0.0, []
+    return float(np.mean(scores)), scored_titles[:5]
+
+
+def _finnhub_price_target(symbol: str) -> float | None:
+    key = os.getenv('FINNHUB_API_KEY') or os.getenv('FINNHUB_KEY')
+    if not key:
+        return None
+    try:
+        client = finnhub.Client(api_key=key)
+        payload = client.price_target(symbol)
+        target = payload.get('targetMean') if isinstance(payload, dict) else None
+        return float(target) if target is not None else None
+    except Exception:
+        return None
+
+
+def _penny_mean_reversion_snapshot(symbol: str) -> dict[str, Any] | None:
+    try:
+        daily = yfin.Ticker(symbol).history(period='1y', interval='1d', timeout=10)
+    except Exception:
+        daily = None
+    if daily is None or daily.empty:
+        return None
+    close_col = 'Adj Close' if 'Adj Close' in daily.columns else 'Close'
+    if close_col not in daily.columns:
+        return None
+    close = daily[close_col].dropna()
+    if close.empty:
+        return None
+    price = float(close.iloc[-1])
+    high_52w = float(close.max()) if not close.empty else price
+    drawdown = ((price - high_52w) / high_52w) if high_52w else 0.0
+    volume = daily['Volume'] if 'Volume' in daily.columns else pd.Series(index=daily.index, dtype='float64')
+    volume_z = _volume_zscore_20(volume)
+    rsi = _compute_rsi(close, 14)
+    dist_ma200 = _distance_from_ma200(close)
+
+    try:
+        hourly = yfin.Ticker(symbol).history(period='60d', interval='1h', timeout=10)
+    except Exception:
+        hourly = None
+    if hourly is not None and not hourly.empty:
+        h_close_col = 'Adj Close' if 'Adj Close' in hourly.columns else 'Close'
+        if h_close_col in hourly.columns:
+            h_close = hourly[h_close_col].dropna()
+            if not h_close.empty:
+                rsi = _compute_rsi(h_close, 14) or rsi
+                dist_ma200 = _distance_from_ma200(h_close) or dist_ma200
+
+    rsi_edge = _rsi_edge(rsi)
+    news_sentiment, news_titles = _keyword_news_sentiment(symbol, ['oil', 'contract', 'fda'])
+    target_price = _finnhub_price_target(symbol)
+
+    return {
+        'symbol': symbol,
+        'price': price,
+        'drawdown': drawdown,
+        'volume_z': volume_z,
+        'rsi': rsi,
+        'rsi_edge': rsi_edge,
+        'distance_from_ma200': dist_ma200,
+        'news_sentiment': news_sentiment,
+        'news_titles': news_titles,
+        'target_price': target_price,
+    }
+
+
 def _finbert_recent_sentiment(symbol: str, days: int = 2) -> tuple[float, list[str]]:
     titles = _google_news_titles(symbol, days=days)
     score = _finbert_score_from_titles(titles)
@@ -5103,7 +5342,6 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     if sandbox == 'WATCHLIST':
         buy_threshold = 0.60
         sell_threshold = 0.25
-
     capital = initial_capital + closed_pnl
     available = max(0.0, capital - open_value)
     min_available_capital = _env_float(prefix, 'MIN_AVAILABLE_CAPITAL', '0.0')
@@ -5302,6 +5540,16 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
 
     created = 0
     closed = 0
+    decision_stats = {
+        'watchlist': len(watchlist),
+        'created': 0,
+        'blocked_low_capital': 0,
+        'blocked_market_sentiment': 0,
+        'blocked_threshold': 0,
+        'blocked_confidence': 0,
+        'blocked_volume_z': 0,
+        'blocked_intraday': 0,
+    }
 
     market_sentiment, market_meta = get_market_sentiment()
     market_score = _market_sentiment_score()
@@ -5432,6 +5680,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         existing_trades = open_trades_by_symbol.get(symbol, [])
         if _midday_blackout():
             _decision_log(symbol, sandbox, 'SKIP', 'midday_blackout')
+            decision_stats['blocked_intraday'] += 1
             continue
         reentry_candidate = _is_reentry_candidate(symbol, sandbox)
         master_entry = master_entries.get(symbol)
@@ -5459,15 +5708,18 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 min_intraday_rvol = float(os.getenv('MIN_INTRADAY_RVOL', '1.0'))
                 if rvol < min_intraday_rvol:
                     _decision_log(symbol, sandbox, 'SKIP', f'rvol<{min_intraday_rvol}')
+                    decision_stats['blocked_intraday'] += 1
                     continue
                 if _vwap_filter_block(intraday_ctx):
                     _decision_log(symbol, sandbox, 'SKIP', 'below_vwap')
+                    decision_stats['blocked_intraday'] += 1
                     continue
                 spread_pct = float(intraday_ctx.get('bid_ask_spread_pct') or 0.0)
                 penny_max_spread = float(os.getenv('PENNY_MAX_SPREAD_PCT', '0.02'))
                 spread_limit = penny_max_spread if sandbox == 'AI_PENNY' else max_spread_pct
                 if spread_pct > 0 and spread_pct > spread_limit:
                     _decision_log(symbol, sandbox, 'SKIP', f'spread>{spread_limit}')
+                    decision_stats['blocked_intraday'] += 1
                     continue
         signal_payload = _signal(symbol, intraday_ctx=intraday_ctx)
         signal = signal_payload['signal'] if signal_payload else None
@@ -5501,10 +5753,13 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                     allow_during_blackout=True,
                     category='risk',
                 )
+            decision_stats['blocked_market_sentiment'] += 1
             continue
         if signal is None or signal < buy_threshold:
+            decision_stats['blocked_threshold'] += 1
             continue
         if block_new_entries:
+            decision_stats['blocked_low_capital'] += 1
             continue
         if _atr_spike(symbol, use_alpaca=use_alpaca):
             _decision_log(symbol, sandbox, 'SKIP', 'atr_spike')
@@ -5576,6 +5831,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 )
                 stock = Stock.objects.filter(symbol__iexact=symbol).first()
                 AlertEvent.objects.create(category='PAPER_NON_TRADE', message=message, stock=stock)
+                decision_stats['blocked_volume_z'] += 1
                 continue
         if sandbox == 'AI_PENNY':
             min_rvol = float(os.getenv('AI_PENNY_MIN_RVOL', '1.8'))
@@ -5616,6 +5872,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             continue
         confidence_factor = max(0.0, min(1.0, (float(signal) - 0.65) / 0.35)) if signal is not None else 0.0
         if confidence_factor <= 0:
+            decision_stats['blocked_confidence'] += 1
             continue
         position_value = _dynamic_position_target(capital)
         position_value = min(position_value, available, position_cap, risk_budget)
@@ -5679,7 +5936,23 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             )
         _decision_log(symbol, sandbox, 'BUY', 'paper_trade_created', signal)
         created += 1
+        decision_stats['created'] += 1
         available = max(0.0, available - (quantity * price))
+
+    if created == 0 and decision_stats['watchlist']:
+        _system_log(
+            'SYSTEM',
+            'WARNING',
+            f"Paper trade: aucun trade pour {sandbox}",
+            metadata={
+                **decision_stats,
+                'buy_threshold': buy_threshold,
+                'min_volume_z': min_volume_z,
+                'available_capital': round(available, 2),
+                'block_new_entries': block_new_entries,
+                'market_sentiment': market_sentiment,
+            },
+        )
 
     return {
         'created': created,
@@ -6532,10 +6805,11 @@ def auto_discover_top_movers(min_score: float | None = None) -> dict[str, Any]:
         filtered = [r for r in results if float(r.get('score') or 0) >= threshold]
         if filtered:
             top = filtered[0]
-            _send_telegram_alert(
-                f"🚀 Top Movers: {top['symbol']} score {top['score']:.2f} RVOL {top['rvol']}",
-                allow_during_blackout=True,
-                category='signal',
+            send_telegram_signal(
+                top['symbol'],
+                score=float(top.get('score') or 0) * 100,
+                diagnostic=f"Top Movers RVOL {top.get('rvol')}",
+                deepseek_score=None,
             )
         payload['filtered'] = filtered[:5]
         payload['min_score'] = threshold
@@ -6562,6 +6836,7 @@ def bluechip_dip_scanner() -> dict[str, Any]:
     max_price = float(os.getenv('BLUECHIP_DIP_MAX_PRICE', '500'))
     min_score = float(os.getenv('BLUECHIP_DIP_MIN_SCORE', '0.65'))
     limit = int(os.getenv('BLUECHIP_DIP_LIMIT', '40'))
+    require_rsi_divergence = os.getenv('BLUECHIP_REQUIRE_RSI_DIVERGENCE', 'true').lower() in {'1', 'true', 'yes', 'y'}
 
     quotes = _fetch_yfinance_screeners(screener_ids, count=limit)
     candidates: list[dict[str, Any]] = []
@@ -6575,6 +6850,15 @@ def bluechip_dip_scanner() -> dict[str, Any]:
         if not symbol or price is None:
             continue
         if not (min_price <= price <= max_price):
+            continue
+
+        ctx_5m = _intraday_context_for_timeframe(
+            symbol,
+            minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
+            timeframe=int(os.getenv('REVERSAL_TIMEFRAME', '5')),
+            rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
+        )
+        if require_rsi_divergence and not _rsi_divergence(ctx_5m):
             continue
 
         score, rsi, lower = _mean_reversion_score(symbol)
@@ -6591,6 +6875,7 @@ def bluechip_dip_scanner() -> dict[str, Any]:
 
     candidates.sort(key=lambda x: x.get('score', 0), reverse=True)
     if candidates:
+        cache.set('bluechip_dip_candidates', candidates, timeout=60 * 30)
         SandboxWatchlist.objects.update_or_create(
             sandbox='AI_BLUECHIP',
             defaults={'symbols': [row['symbol'] for row in candidates[:25]], 'source': 'bluechip_dip_scanner'},
@@ -6610,14 +6895,19 @@ def penny_opportunity_scanner() -> dict[str, Any]:
         for s in os.getenv('PENNY_SCAN_SCREENERS', 'small_cap_gainers,day_gainers,most_actives').split(',')
         if s.strip()
     ]
-    min_price = float(os.getenv('PENNY_MIN_PRICE', '0.00001'))
-    max_price = float(os.getenv('PENNY_MAX_PRICE', '2.0'))
+    min_price = float(os.getenv('PENNY_MIN_PRICE', '0.10'))
+    max_price = float(os.getenv('PENNY_MAX_PRICE', '5.0'))
     min_volume = float(os.getenv('PENNY_MIN_VOLUME', '100000'))
     min_score = float(os.getenv('PENNY_SCAN_MIN_SCORE', '0.7'))
     limit = int(os.getenv('PENNY_SCAN_LIMIT', '80'))
+    require_hammer = os.getenv('PENNY_REQUIRE_HAMMER', 'true').lower() in {'1', 'true', 'yes', 'y'}
+    min_rsi = float(os.getenv('PENNY_MEANREV_RSI_MAX', '30'))
+    min_volume_z = float(os.getenv('PENNY_MEANREV_VOLUME_Z', '2'))
+    min_drawdown = float(os.getenv('PENNY_MEANREV_DRAWDOWN', '-0.30'))
+    strong_news_sent = float(os.getenv('PENNY_MEANREV_NEWS_SENT', '0.5'))
 
     quotes = _fetch_yfinance_screeners(screener_ids, count=limit)
-    candidates: list[dict[str, Any]] = []
+    base_candidates: list[dict[str, Any]] = []
     for item in quotes:
         symbol = (item.get('symbol') or '').strip().upper()
         price = item.get('regularMarketPrice') or item.get('price') or item.get('lastPrice')
@@ -6637,20 +6927,69 @@ def penny_opportunity_scanner() -> dict[str, Any]:
         if volume < min_volume:
             continue
 
-        score, rsi, lower = _mean_reversion_score(symbol)
-        score = _canadian_boost(score, symbol)
-        if score < min_score:
-            continue
-        candidates.append({
-            'symbol': symbol,
-            'price': round(price, 4),
-            'score': round(score, 4),
-            'rsi': None if rsi is None else round(float(rsi), 2),
-            'lower_band': None if lower is None else round(float(lower), 4),
-        })
+        base_candidates.append({'symbol': symbol, 'price': price, 'volume': volume})
+
+    candidates: list[dict[str, Any]] = []
+    if base_candidates:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _enrich(symbol: str) -> dict[str, Any] | None:
+            snapshot = _penny_mean_reversion_snapshot(symbol)
+            if not snapshot:
+                return None
+            ctx_5m = _intraday_context_for_timeframe(
+                symbol,
+                minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
+                timeframe=int(os.getenv('REVERSAL_TIMEFRAME', '5')),
+                rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
+            )
+            if require_hammer and not _has_hammer_pattern(ctx_5m):
+                return None
+
+            score, rsi, lower = _mean_reversion_score(symbol)
+            score = _canadian_boost(score, symbol)
+            rsi_val = snapshot.get('rsi')
+            volume_z = snapshot.get('volume_z')
+            drawdown = snapshot.get('drawdown')
+            news_sentiment = snapshot.get('news_sentiment')
+
+            if rsi_val is None or rsi_val > min_rsi:
+                return None
+            if volume_z is None or volume_z < min_volume_z:
+                return None
+            if drawdown is None or drawdown > min_drawdown:
+                return None
+
+            if news_sentiment is not None and news_sentiment > strong_news_sent and rsi_val < min_rsi:
+                score = min(1.0, score + 0.15)
+
+            if score < min_score:
+                return None
+
+            return {
+                'symbol': symbol,
+                'price': round(float(snapshot.get('price') or 0), 4),
+                'score': round(score, 4),
+                'rsi': None if rsi_val is None else round(float(rsi_val), 2),
+                'lower_band': None if lower is None else round(float(lower), 4),
+                'volume_z': None if volume_z is None else round(float(volume_z), 2),
+                'distance_from_ma200': None if snapshot.get('distance_from_ma200') is None else round(float(snapshot.get('distance_from_ma200')), 4),
+                'rsi_edge': None if snapshot.get('rsi_edge') is None else round(float(snapshot.get('rsi_edge')), 3),
+                'drawdown_52w': None if drawdown is None else round(float(drawdown) * 100, 2),
+                'news_sentiment': None if news_sentiment is None else round(float(news_sentiment), 3),
+                'news_titles': snapshot.get('news_titles') or [],
+                'target_price': None if snapshot.get('target_price') is None else round(float(snapshot.get('target_price')), 4),
+            }
+
+        max_workers = int(os.getenv('PENNY_SCAN_WORKERS', '8'))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for result in executor.map(lambda x: _enrich(x['symbol']), base_candidates[:limit]):
+                if result:
+                    candidates.append(result)
 
     candidates.sort(key=lambda x: x.get('score', 0), reverse=True)
     if candidates:
+        cache.set('penny_opportunity_candidates', candidates, timeout=60 * 30)
         SandboxWatchlist.objects.update_or_create(
             sandbox='AI_PENNY',
             defaults={'symbols': [row['symbol'] for row in candidates[:25]], 'source': 'penny_opportunity_scanner'},
@@ -6741,10 +7080,12 @@ def market_scanner_task(symbols: list[str] | None = None) -> dict[str, Any]:
             continue
         if pattern_signal_15 <= 0:
             if rvol > 3:
-                _send_telegram_alert(
-                    f"⚠️ ALERTE DE CHUTE : ${symbol} RVOL {rvol:.2f} mais pattern négatif.",
-                    category='alert',
-                )
+                _queue_telegram_candidate({
+                    'ticker': symbol,
+                    'score': 0,
+                    'diagnostic': f"Pattern négatif (RVOL {rvol:.2f})",
+                    'ts': timezone.now().isoformat(),
+                })
             continue
         if pattern_signal_15 <= 0.5:
             continue
@@ -6857,7 +7198,12 @@ def market_scanner_task(symbols: list[str] | None = None) -> dict[str, Any]:
                 news_source='Google News' if title else None,
                 news_note=top.get('news_note'),
             )
-        _send_telegram_alert(message, category='signal')
+        send_telegram_signal(
+            top['symbol'],
+            score=float(top.get('confidence_pct') or 0),
+            diagnostic=message[:400],
+            deepseek_score=None,
+        )
         if not _active_signal_exists(top['symbol']):
             ActiveSignal.objects.create(
                 ticker=top['symbol'],
@@ -6893,16 +7239,355 @@ def scan_market_for_opportunities(min_score: float | None = None) -> dict[str, A
         filtered = [r for r in results if float(r.get('score') or 0) >= min_score]
         if filtered:
             top = filtered[0]
-            _send_telegram_alert(
-                f"🚀 Scanner Opportunité: {top['symbol']} score {top['score']:.2f} RVOL {top['rvol']}",
-                allow_during_blackout=True,
-                category='signal',
+            engine = DecisionEngine()
+            news_titles = top.get('news_titles') or []
+            ml_score = float(top.get('score') or 0) * 100
+            rsi = float(top.get('rsi') or 0) if top.get('rsi') is not None else None
+            rvol = float(top.get('rvol') or 0) if top.get('rvol') is not None else None
+            prophet_price, prophet_rec = run_predictions(top['symbol'])
+            news_sentiment = float(top.get('news_sentiment') or 0.0)
+            ctx_5m = _intraday_context_for_timeframe(
+                top['symbol'],
+                minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
+                timeframe=int(os.getenv('REVERSAL_TIMEFRAME', '5')),
+                rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
             )
+            volatility = float(ctx_5m.get('volatility') or 0.0) if ctx_5m else None
+            verdict = engine.evaluate(
+                top['symbol'],
+                ml_score,
+                rsi,
+                rvol,
+                news_titles,
+                prophet_price=prophet_price,
+                prophet_rec=prophet_rec,
+                news_sentiment=news_sentiment,
+                volatility=volatility,
+            )
+            sentiment_score = (news_sentiment + 1) * 50
+            deepseek_score = float(verdict.get('score') or 0) * 10
+            convergence = (ml_score + sentiment_score + deepseek_score) / 3
+            payload['decision'] = {
+                'symbol': top['symbol'],
+                'verdict': verdict.get('verdict'),
+                'deepseek_score': verdict.get('score'),
+                'prophet': prophet_rec,
+                'prophet_price': prophet_price,
+                'volatility': volatility,
+                'convergence': round(convergence, 2),
+            }
+            min_convergence = float(os.getenv('DECISION_CONVERGENCE_MIN', '75'))
+            risk_flag = ' ⚠️ RISQUÉE' if float(verdict.get('score') or 0) < 7 else ''
+            if verdict.get('verdict') == 'BUY' and convergence >= min_convergence:
+                diagnostic = (verdict.get('raw') or verdict.get('verdict') or '').strip() or "Validation DeepSeek OK."
+                send_telegram_signal(
+                    top['symbol'],
+                    score=round(convergence, 2),
+                    diagnostic=f"{diagnostic}{risk_flag}",
+                    deepseek_score=float(verdict.get('score') or 0),
+                )
         payload['filtered'] = filtered[:5]
         payload['min_score'] = min_score
         return payload
     except Exception:
         return payload
+
+
+@shared_task
+def global_screener_task(limit: int | None = None) -> dict[str, Any]:
+    """Global screener that finds top losers/actives and scores with DanasMLRouter."""
+    screener_ids = [
+        s.strip()
+        for s in os.getenv('GLOBAL_SCREENER_IDS', 'day_losers,most_actives').split(',')
+        if s.strip()
+    ]
+    min_price = float(os.getenv('GLOBAL_SCREENER_MIN_PRICE', '0.5'))
+    max_price = float(os.getenv('GLOBAL_SCREENER_MAX_PRICE', '500'))
+    min_volume = float(os.getenv('GLOBAL_SCREENER_MIN_VOLUME', '200000'))
+    min_rvol = float(os.getenv('GLOBAL_SCREENER_MIN_RVOL', '2.0'))
+    limit = int(limit if limit is not None else os.getenv('GLOBAL_SCREENER_LIMIT', '50'))
+    prefer_canadian = os.getenv('PREFER_CANADIAN_SYMBOLS', 'true').lower() in {'1', 'true', 'yes', 'y'}
+
+    quotes = _fetch_yfinance_screeners(screener_ids, count=max(200, limit * 3))
+    router = DanasMLRouter()
+    candidates: list[dict[str, Any]] = []
+
+    for item in quotes:
+        symbol = (item.get('symbol') or '').strip().upper()
+        if not symbol:
+            continue
+        price = item.get('regularMarketPrice') or item.get('price') or item.get('lastPrice')
+        volume = item.get('regularMarketVolume') or item.get('volume') or 0
+        avg_volume = item.get('averageDailyVolume10Day') or item.get('averageVolume') or 0
+        try:
+            price = float(price)
+        except Exception:
+            price = None
+        try:
+            volume = float(volume)
+        except Exception:
+            volume = 0.0
+        try:
+            avg_volume = float(avg_volume)
+        except Exception:
+            avg_volume = 0.0
+        if price is None or not (min_price <= price <= max_price):
+            continue
+        if volume < min_volume:
+            continue
+        rvol = (volume / avg_volume) if avg_volume else 0.0
+        if rvol and rvol < min_rvol:
+            continue
+
+        ml = router.predict(symbol)
+        candidates.append({
+            'symbol': symbol,
+            'price': round(price, 4),
+            'volume': int(volume),
+            'rvol': round(rvol, 3),
+            'signal': ml.get('signal'),
+            'confidence': ml.get('confidence'),
+        })
+
+    def _sort_key(item: dict[str, Any]) -> tuple:
+        sym = item.get('symbol') or ''
+        is_ca = sym.endswith('.TO') or sym.endswith('.V')
+        return (1 if (prefer_canadian and is_ca) else 0, float(item.get('confidence') or 0))
+
+    candidates.sort(key=_sort_key, reverse=True)
+    candidates = candidates[:limit]
+    cache.set('global_screener_candidates', candidates, timeout=60 * 30)
+
+    if candidates and os.getenv('GLOBAL_SCREENER_TELEGRAM', 'true').lower() in {'1', 'true', 'yes', 'y'}:
+        lines = ["🌍 Global Screener (Top Opportunités)"]
+        for row in candidates[:5]:
+            lines.append(
+                f"• {row.get('symbol')}: conf {float(row.get('confidence') or 0):.1f}% "
+                f"RVOL {row.get('rvol')} price {row.get('price')}"
+            )
+        _send_telegram_alert("\n".join(lines), allow_during_blackout=True, category='report')
+
+    return {'status': 'ok', 'count': len(candidates), 'results': candidates}
+
+
+def get_full_market_tickers(limit: int | None = None) -> list[str]:
+    def _read_ticker_file(path: str) -> list[str]:
+        if not path:
+            return []
+        try:
+            with open(path, 'r', encoding='utf-8') as handle:
+                raw = handle.read()
+            parts = [p.strip().upper() for p in re.split(r"[\n,;\t ]+", raw) if p.strip()]
+            return [p for p in parts if p]
+        except Exception:
+            return []
+
+    def _write_ticker_file(path: str, symbols: list[str]) -> None:
+        if not path or not symbols:
+            return
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write("\n".join(symbols))
+        except Exception:
+            return
+
+    us_url = os.getenv(
+        'US_TICKERS_URL',
+        'https://pkgstore.datahub.io/core/nasdaq-listings/nasdaq-listed_csv/data/7660c753dc68d118ee2a9022e355262e/nasdaq-listed_csv.csv',
+    )
+    us_file = os.getenv('US_TICKERS_FILE', '').strip()
+    ca_file = os.getenv('CA_TICKERS_FILE', '').strip()
+
+    ca_symbols = _read_ticker_file(ca_file)
+    if not ca_symbols:
+        ca_symbols = [s.strip().upper() for s in os.getenv('CA_TICKERS', '').split(',') if s.strip()]
+        if ca_symbols:
+            _write_ticker_file(ca_file, ca_symbols)
+
+    us_symbols_file = _read_ticker_file(us_file)
+    if us_symbols_file:
+        symbols = us_symbols_file
+    else:
+        symbols = []
+    symbols: list[str] = []
+    if not symbols:
+        try:
+            us_df = pd.read_csv(us_url)
+            us_symbols = [str(s).strip().upper() for s in us_df.get('Symbol', []) if str(s).strip()]
+            symbols.extend(us_symbols)
+            _write_ticker_file(us_file, us_symbols)
+        except Exception:
+            pass
+
+    if ca_symbols:
+        symbols.extend([_normalize_yf_symbol(s) for s in ca_symbols])
+
+    # Deduplicate, keep order
+    symbols = [s for s in dict.fromkeys(symbols) if s and s.isalnum() or '.' in s]
+    if limit:
+        symbols = symbols[:limit]
+    return symbols
+
+
+@shared_task
+def master_market_scanner_task() -> dict[str, Any]:
+    """Scan US+CA universe with RVOL, Hammer/RSI divergence, then DeepSeek validation."""
+    if os.getenv('MASTER_SCANNER_ENABLED', 'false').lower() not in {'1', 'true', 'yes', 'y'}:
+        return {'status': 'disabled'}
+
+    universe_limit = int(os.getenv('MASTER_SCANNER_UNIVERSE_LIMIT', '5000'))
+    rvol_min = float(os.getenv('MASTER_SCANNER_MIN_RVOL', '1.5'))
+    change_min = float(os.getenv('MASTER_SCANNER_MIN_CHANGE', '3'))
+    chunk_size = int(os.getenv('MASTER_SCANNER_CHUNK_SIZE', '200'))
+    candidate_limit = int(os.getenv('MASTER_SCANNER_CANDIDATES', '100'))
+    final_limit = int(os.getenv('MASTER_SCANNER_FINAL_COUNT', '5'))
+
+    require_hammer = os.getenv('PENNY_REQUIRE_HAMMER', 'true').lower() in {'1', 'true', 'yes', 'y'}
+    require_div = os.getenv('BLUECHIP_REQUIRE_RSI_DIVERGENCE', 'true').lower() in {'1', 'true', 'yes', 'y'}
+
+    tickers = get_full_market_tickers(limit=universe_limit)
+    if not tickers:
+        return {'status': 'empty', 'count': 0}
+
+    candidates: list[dict[str, Any]] = []
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i:i + chunk_size]
+        try:
+            data = yfin.download(chunk, period='2d', interval='5m', group_by='ticker', threads=True, progress=False)
+        except Exception:
+            continue
+
+        for symbol in chunk:
+            try:
+                if isinstance(data.columns, pd.MultiIndex):
+                    df = data[symbol]
+                else:
+                    df = data
+                if df is None or df.empty or 'Close' not in df or 'Volume' not in df:
+                    continue
+                df = df.dropna()
+                if df.empty:
+                    continue
+                price = float(df['Close'].iloc[-1])
+                open_price = float(df['Open'].iloc[0]) if 'Open' in df else price
+                change = ((price - open_price) / open_price * 100) if open_price else 0.0
+                current_vol = float(df['Volume'].tail(5).mean())
+                avg_vol = float(df['Volume'].mean() or 0.0)
+                rvol = (current_vol / avg_vol) if avg_vol else 0.0
+                if rvol < rvol_min or abs(change) < change_min:
+                    continue
+                candidates.append({
+                    'symbol': symbol,
+                    'price': price,
+                    'change': round(change, 2),
+                    'rvol': round(rvol, 2),
+                })
+            except Exception:
+                continue
+
+    candidates.sort(key=lambda x: (abs(x.get('change') or 0), x.get('rvol') or 0), reverse=True)
+    candidates = candidates[:candidate_limit]
+
+    survivors: list[dict[str, Any]] = []
+    for item in candidates:
+        symbol = item['symbol']
+        ctx_5m = _intraday_context_for_timeframe(
+            symbol,
+            minutes=int(os.getenv('ALPACA_INTRADAY_MINUTES', '390')),
+            timeframe=int(os.getenv('REVERSAL_TIMEFRAME', '5')),
+            rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
+        )
+        if not ctx_5m:
+            continue
+        is_penny = float(item.get('price') or 0) < 7
+        if is_penny and require_hammer and not _has_hammer_pattern(ctx_5m):
+            continue
+        if (not is_penny) and require_div and not _rsi_divergence(ctx_5m):
+            continue
+        survivors.append({**item, 'ctx': ctx_5m})
+
+    survivors = survivors[:final_limit]
+    if not survivors:
+        return {'status': 'ok', 'count': 0, 'results': []}
+
+    router = DanasMLRouter()
+    engine = DecisionEngine()
+    best = None
+    for item in survivors:
+        symbol = item['symbol']
+        ctx = item.get('ctx') or {}
+        rsi = float(ctx.get('rsi14') or 0) if ctx.get('rsi14') is not None else None
+        rvol = float(ctx.get('rvol') or item.get('rvol') or 0)
+        ml_conf = router.predict(symbol).get('confidence') or 50.0
+        news_sentiment, news_titles = _news_sentiment_score(symbol, days=1)
+        verdict = engine.evaluate(
+            symbol,
+            ml_score=float(ml_conf),
+            rsi=rsi,
+            rvol=rvol,
+            titles=news_titles,
+            news_sentiment=news_sentiment,
+            volatility=float(ctx.get('volatility') or 0) if ctx else None,
+        )
+        deepseek_score = float(verdict.get('score') or 0) * 10
+        sentiment_score = (news_sentiment + 1) * 50
+        convergence = (float(ml_conf) + sentiment_score + deepseek_score) / 3
+        item.update({
+            'ml_confidence': ml_conf,
+            'deepseek': verdict,
+            'convergence': round(convergence, 2),
+        })
+        if verdict.get('verdict') == 'BUY' and should_send_to_telegram(convergence, verdict.get('raw') or ''):
+            if best is None or convergence > float(best.get('convergence') or 0):
+                best = item
+
+    if not best:
+        return {'status': 'ok', 'count': 0, 'results': []}
+
+    diagnostic = (best.get('deepseek') or {}).get('raw') or 'Validation DeepSeek OK.'
+    extra = f"Prix {best.get('price'):.2f} | Drop {best.get('change')}% | RVOL {best.get('rvol')}"
+    send_telegram_signal(
+        best['symbol'],
+        score=float(best.get('convergence') or 0),
+        diagnostic=f"{extra}\n{diagnostic[:350]}",
+        deepseek_score=float((best.get('deepseek') or {}).get('score') or 0),
+    )
+    return {'status': 'ok', 'count': 1, 'results': [best]}
+
+
+@shared_task
+def update_ticker_files_task() -> dict[str, Any]:
+    """Refresh US/CA ticker files from sources and save to disk."""
+    us_file = os.getenv('US_TICKERS_FILE', '').strip()
+    ca_file = os.getenv('CA_TICKERS_FILE', '').strip()
+    us_url = os.getenv(
+        'US_TICKERS_URL',
+        'https://pkgstore.datahub.io/core/nasdaq-listings/nasdaq-listed_csv/data/7660c753dc68d118ee2a9022e355262e/nasdaq-listed_csv.csv',
+    )
+    updated = {'us': 0, 'ca': 0}
+    try:
+        us_df = pd.read_csv(us_url)
+        us_symbols = [str(s).strip().upper() for s in us_df.get('Symbol', []) if str(s).strip()]
+        if us_file and us_symbols:
+            Path(us_file).parent.mkdir(parents=True, exist_ok=True)
+            with open(us_file, 'w', encoding='utf-8') as handle:
+                handle.write("\n".join(us_symbols))
+            updated['us'] = len(us_symbols)
+    except Exception:
+        pass
+
+    ca_symbols = [s.strip().upper() for s in os.getenv('CA_TICKERS', '').split(',') if s.strip()]
+    if ca_file and ca_symbols:
+        try:
+            Path(ca_file).parent.mkdir(parents=True, exist_ok=True)
+            with open(ca_file, 'w', encoding='utf-8') as handle:
+                handle.write("\n".join(ca_symbols))
+            updated['ca'] = len(ca_symbols)
+        except Exception:
+            pass
+
+    return {'status': 'ok', 'updated': updated}
 
 
 @shared_task
@@ -8967,6 +9652,128 @@ def _news_sentiment_score(ticker: str, days: int = 7) -> tuple[float, list[str]]
     return float(sum(scores) / len(scores)), titles
 
 
+class DecisionEngine:
+    def __init__(self) -> None:
+        base_url = (
+            os.getenv('DANAS_CHAT_BASE_URL')
+            or os.getenv('OLLAMA_CHAT_BASE_URL')
+            or os.getenv('OLLAMA_BASE_URL')
+            or ''
+        ).strip().rstrip('/')
+        if base_url and '/v1' not in base_url:
+            base_url = f"{base_url}/v1"
+        self.base_url = base_url
+        self.model = os.getenv('OLLAMA_MODEL', 'deepseek-r1')
+        self.timeout = int(os.getenv('OLLAMA_TIMEOUT', '90'))
+        self.lag_seconds = float(os.getenv('BROKER_LAG_SECONDS', '-0.58'))
+
+    def _build_prompt(
+        self,
+        symbol: str,
+        ml_score: float,
+        rsi: float | None,
+        rvol: float | None,
+        titles: list[str],
+        prophet_price: float | None,
+        prophet_rec: str | None,
+        news_sentiment: float | None,
+        volatility: float | None,
+    ) -> str:
+        lines = [
+            "VALIDATION DE SIGNAL - COMITÉ D'INVESTISSEMENT",
+            "----------------------------------------------",
+            f"TICKER: {symbol}",
+            f"ML_SCORE: {ml_score:.2f}/100",
+            f"RSI14: {rsi if rsi is not None else 'N/A'}",
+            f"RVOL: {rvol if rvol is not None else 'N/A'}",
+            f"PROPHET_7D: {prophet_price if prophet_price is not None else 'N/A'} ({prophet_rec or 'N/A'})",
+            f"NEWS_SENTIMENT: {news_sentiment if news_sentiment is not None else 'N/A'}",
+            f"VOLATILITÉ_INTRA: {volatility if volatility is not None else 'N/A'}",
+            f"BROKER_LAG: {self.lag_seconds}s",
+            "NEWS:",
+            *([f"- {t}" for t in titles] if titles else ["- Aucune news disponible"]),
+            "",
+            "MISSION:",
+            "1) Détermine si le dip est technique (opportunité) ou fondamental (danger).",
+            "2) Donne un verdict final: BUY, WAIT, ou AVOID.",
+            "3) Donne un score de validation sur 10.",
+            "",
+            "RÉPONSE COURTE:",
+            "- DIAGNOSTIC: ...",
+            "- VERDICT: BUY/WAIT/AVOID",
+            "- VALIDATION: X/10",
+        ]
+        return "\n".join(lines)
+
+    def evaluate(
+        self,
+        symbol: str,
+        ml_score: float,
+        rsi: float | None,
+        rvol: float | None,
+        titles: list[str],
+        prophet_price: float | None = None,
+        prophet_rec: str | None = None,
+        news_sentiment: float | None = None,
+        volatility: float | None = None,
+    ) -> dict[str, Any]:
+        if not self.base_url:
+            return {'verdict': 'WAIT', 'score': 6.0, 'raw': ''}
+        prompt = self._build_prompt(
+            symbol,
+            ml_score,
+            rsi,
+            rvol,
+            titles,
+            prophet_price,
+            prophet_rec,
+            news_sentiment,
+            volatility,
+        )
+        payload = {
+            'model': self.model,
+            'messages': [
+                {
+                    'role': 'system',
+                    'content': (
+                        f"Tu es Danas. Nous sommes le {timezone.now().strftime('%d/%m/%Y %H:%M')}. "
+                        "Réponds uniquement en français."
+                    ),
+                },
+                {'role': 'user', 'content': prompt},
+            ],
+            'stream': False,
+        }
+        try:
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+            text = ((data.get('choices') or [{}])[0].get('message') or {}).get('content') or ''
+        except Exception:
+            text = ''
+
+        verdict = 'WAIT'
+        if re.search(r'\bBUY\b', text, re.IGNORECASE):
+            verdict = 'BUY'
+        elif re.search(r'\bAVOID\b', text, re.IGNORECASE):
+            verdict = 'AVOID'
+
+        score = None
+        match = re.search(r'(\d+(?:\.\d+)?)\s*/\s*10', text)
+        if match:
+            try:
+                score = float(match.group(1))
+            except Exception:
+                score = None
+        if score is None:
+            score = 9.0 if verdict == 'BUY' else 6.0 if verdict == 'WAIT' else 2.5
+        return {'verdict': verdict, 'score': score, 'raw': text}
+
+
 @lru_cache(maxsize=1)
 def _finbert_pipeline():
     try:
@@ -9135,8 +9942,10 @@ def deep_learning_retro_train() -> dict[str, Any]:
     try:
         import numpy as np
         import pandas_ta as ta
-        from sklearn.model_selection import train_test_split
+        from sklearn.model_selection import TimeSeriesSplit
         from sklearn.metrics import mean_squared_error
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
         import joblib
 
         watch = SandboxWatchlist.objects.filter(sandbox='WATCHLIST').first()
@@ -9158,6 +9967,7 @@ def deep_learning_retro_train() -> dict[str, Any]:
 
         feature_rows: list[dict[str, Any]] = []
         target_rows: list[float] = []
+        sample_dates: list[pd.Timestamp] = []
 
         for symbol in symbols:
             daily = get_daily_bars(symbol, days=365 * 5)
@@ -9166,11 +9976,12 @@ def deep_learning_retro_train() -> dict[str, Any]:
                 if daily is None or daily.empty:
                     continue
                 if not isinstance(daily.columns, pd.MultiIndex):
+                    close_col = 'Adj Close' if 'Adj Close' in daily.columns else 'Close'
                     daily = daily.rename(columns={
                         'Open': 'open',
                         'High': 'high',
                         'Low': 'low',
-                        'Close': 'close',
+                        close_col: 'close',
                         'Volume': 'volume',
                     })
                 if isinstance(daily.index, pd.DatetimeIndex):
@@ -9244,6 +10055,7 @@ def deep_learning_retro_train() -> dict[str, Any]:
                     **fundamentals,
                 })
                 target_rows.append(float(target))
+                sample_dates.append(pd.to_datetime(row.name))
 
         if not feature_rows:
             payload = {'status': 'no_samples'}
@@ -9251,29 +10063,77 @@ def deep_learning_retro_train() -> dict[str, Any]:
             return payload
 
         dataset = pd.DataFrame(feature_rows).fillna(0.0)
-        target = np.array(target_rows)
+        dataset['date'] = pd.to_datetime(sample_dates, errors='coerce')
+        dataset['target'] = target_rows
+        dataset = dataset.dropna(subset=['date']).sort_values('date')
+        target = dataset['target'].values
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            dataset, target, test_size=0.2, shuffle=False
-        )
+        pipeline = Pipeline([
+            ('scaler', StandardScaler()),
+            (
+                'model',
+                RandomForestRegressor(
+                    n_estimators=300,
+                    max_depth=8,
+                    random_state=42,
+                ),
+            ),
+        ])
 
-        model = RandomForestRegressor(
-            n_estimators=300,
-            max_depth=8,
-            random_state=42,
-        )
-        model.fit(X_train, y_train)
-        preds = model.predict(X_test) if len(X_test) else []
-        rmse = float(mean_squared_error(y_test, preds, squared=False)) if len(preds) else 0.0
+        splits = TimeSeriesSplit(n_splits=5)
+        rmse_scores: list[float] = []
+        last_test_idx = None
+        for train_idx, test_idx in splits.split(dataset):
+            pipeline.fit(dataset.iloc[train_idx].drop(columns=['date', 'target']), target[train_idx])
+            preds = pipeline.predict(dataset.iloc[test_idx].drop(columns=['date', 'target']))
+            rmse_scores.append(float(mean_squared_error(target[test_idx], preds, squared=False)))
+            last_test_idx = test_idx
+
+        def _walk_forward_rmse() -> list[dict[str, float | int | str]]:
+            reports = []
+            if dataset.empty:
+                return reports
+            start = dataset['date'].min()
+            end = dataset['date'].max()
+            if start is None or end is None:
+                return reports
+            test_start = start + pd.DateOffset(months=3)
+            while test_start < end:
+                test_end = test_start + pd.DateOffset(months=3)
+                train_mask = dataset['date'] < test_start
+                test_mask = (dataset['date'] >= test_start) & (dataset['date'] < test_end)
+                if train_mask.sum() < 60 or test_mask.sum() == 0:
+                    test_start = test_end
+                    continue
+                X_train = dataset.loc[train_mask].drop(columns=['date', 'target'])
+                y_train = target[train_mask.values]
+                X_test = dataset.loc[test_mask].drop(columns=['date', 'target'])
+                y_test = target[test_mask.values]
+                pipeline.fit(X_train, y_train)
+                preds = pipeline.predict(X_test)
+                rmse = float(mean_squared_error(y_test, preds, squared=False)) if len(y_test) else 0.0
+                reports.append({
+                    'start': test_start.strftime('%Y-%m-%d'),
+                    'end': test_end.strftime('%Y-%m-%d'),
+                    'samples': int(len(y_test)),
+                    'rmse': rmse,
+                })
+                test_start = test_end
+            return reports
+
+        walk_forward = _walk_forward_rmse()
+        pipeline.fit(dataset.drop(columns=['date', 'target']), target)
+        rmse = float(np.mean(rmse_scores)) if rmse_scores else 0.0
 
         model_path = Path(__file__).resolve().parent / 'ml_engine' / 'retro_pattern_success.pkl'
-        joblib.dump({'model': model, 'features': list(dataset.columns)}, model_path)
+        joblib.dump({'model': pipeline, 'features': [c for c in dataset.columns if c not in {'date', 'target'}]}, model_path)
 
         payload = {
             'status': 'ok',
             'symbols': len(symbols),
             'samples': len(dataset),
             'rmse': round(rmse, 4),
+            'walk_forward': walk_forward,
             'model_path': str(model_path),
         }
         _task_log_finish(log, 'SUCCESS', payload)
@@ -9318,6 +10178,9 @@ def backtesting_critique_task(sandbox_override: str | None = None) -> dict[str, 
     log = _task_log_start('backtesting_critique_task')
     try:
         from sklearn.ensemble import RandomForestClassifier
+        from sklearn.model_selection import TimeSeriesSplit
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
         import numpy as np
 
         lookback_days = int(os.getenv('ERROR_TRAIN_LOOKBACK_DAYS', '120'))
@@ -9397,24 +10260,39 @@ def backtesting_critique_task(sandbox_override: str | None = None) -> dict[str, 
                 results.append({'sandbox': sb, 'status': 'insufficient_labels'})
                 continue
 
-            model = RandomForestClassifier(
-                n_estimators=400,
-                max_depth=6,
-                min_samples_split=6,
-                min_samples_leaf=6,
-                random_state=42,
-            )
-            model.fit(X, y, sample_weight=np.array(sample_weights))
+            pipeline = Pipeline([
+                ('scaler', StandardScaler()),
+                (
+                    'model',
+                    RandomForestClassifier(
+                        n_estimators=400,
+                        max_depth=6,
+                        min_samples_split=6,
+                        min_samples_leaf=6,
+                        random_state=42,
+                    ),
+                ),
+            ])
+
+            cv_scores: list[float] = []
+            if len(y) >= 20:
+                splits = TimeSeriesSplit(n_splits=5)
+                for train_idx, test_idx in splits.split(X):
+                    pipeline.fit(X[train_idx], y[train_idx], sample_weight=np.array(sample_weights)[train_idx])
+                    cv_scores.append(float(pipeline.score(X[test_idx], y[test_idx])))
+
+            pipeline.fit(X, y, sample_weight=np.array(sample_weights))
 
             universe = 'PENNY' if sb == 'AI_PENNY' else 'BLUECHIP'
             model_path = get_model_path(universe)
-            joblib.dump({'model': model, 'features': list(df.columns)}, model_path)
+            joblib.dump({'model': pipeline, 'features': list(df.columns), 'cv_scores': cv_scores}, model_path)
 
             results.append({
                 'sandbox': sb,
                 'status': 'ok',
                 'samples': int(len(df)),
                 'loss_labels': len(error_labels),
+                'cv_scores': cv_scores,
                 'model_path': str(model_path),
             })
 
@@ -9640,7 +10518,7 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
         target_price = round(last_price * (1 + (confidence_score / 5)), 2)
         stop_loss = round(last_price * 0.95, 2)
 
-        return {
+        result = {
             'symbol': symbol,
             'price': round(last_price, 4),
             'confidence': round(confidence_score * 100, 2),
@@ -9654,6 +10532,8 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
             'universe': universe,
             'sandbox': 'AI_PENNY' if universe == 'PENNY' else 'AI_BLUECHIP',
         }
+        cache.set(f"ai_analysis:{symbol}", result, timeout=60 * 10)
+        return result
     except Exception as exc:
         return {'error': str(exc)}
 
@@ -9949,6 +10829,9 @@ def nightly_summary_report() -> dict[str, Any]:
         spy_change = _percent_change('SPY')
         gold_change = _percent_change('GC=F')
         oil_change = _percent_change('CL=F')
+        spy_price, spy_status = _latest_price_with_status('SPY')
+        gold_price, gold_status = _latest_price_with_status('GC=F')
+        oil_price, oil_status = _latest_price_with_status('CL=F')
         sentiment, meta = get_market_sentiment()
         vix = meta.get('vix')
 
@@ -9956,11 +10839,20 @@ def nightly_summary_report() -> dict[str, Any]:
         if sentiment == 'BULLISH' and (vix is None or float(vix) < float(os.getenv('VIX_STRESS_THRESHOLD', '30'))):
             rec = "Aujourd'hui, sois agressif"
 
+        def _format_line(label: str, change: float | None, price: float | None, status: str) -> str:
+            if change is not None:
+                if price is not None:
+                    return f"{label}: {change:+.2f}% ({price:.2f}$, {status})"
+                return f"{label}: {change:+.2f}%"
+            if price is not None:
+                return f"{label}: {price:.2f}$ ({status})"
+            return f"{label}: n/a"
+
         lines = [
             "🌙 *Nightly Summary*",
-            f"SPY: {spy_change:+.2f}%" if spy_change is not None else "SPY: n/a",
-            f"Or (GC=F): {gold_change:+.2f}%" if gold_change is not None else "Or (GC=F): n/a",
-            f"Pétrole (CL=F): {oil_change:+.2f}%" if oil_change is not None else "Pétrole (CL=F): n/a",
+            _format_line("SPY", spy_change, spy_price, spy_status),
+            _format_line("Or (GC=F)", gold_change, gold_price, gold_status),
+            _format_line("Pétrole (CL=F)", oil_change, oil_price, oil_status),
             f"Régime: {sentiment}",
             "",
             "Top 3 news positives overnight:",
@@ -11363,3 +12255,137 @@ def scan_long_goal_candidates(limit: int = 15) -> dict[str, Any]:
     payload = {'status': 'ok', 'count': len(results), 'results': results}
     _task_log_finish(log, 'SUCCESS', payload)
     return payload
+
+
+@shared_task
+def run_morning_ai_analysis() -> dict[str, Any]:
+    log = _task_log_start('run_morning_ai_analysis')
+    try:
+        def _parse_symbols(env_key: str) -> list[str]:
+            raw = os.getenv(env_key, '')
+            return [s.strip().upper() for s in raw.split(',') if s.strip()]
+
+        growth = _parse_symbols('OPTIMIZER_GROWTH_SYMBOLS')
+        spec = _parse_symbols('OPTIMIZER_SPEC_SYMBOLS')
+        blue = _parse_symbols('OPTIMIZER_BLUECHIP_SYMBOLS')
+        watchlist = list(dict.fromkeys(growth + spec + blue))
+        if not watchlist:
+            _task_log_finish(log, 'SUCCESS', {'status': 'empty'})
+            return {'status': 'empty'}
+
+        advisor = DeepSeekAdvisor()
+        router = DanasMLRouter()
+        alerts = []
+        for symbol in watchlist:
+            context = get_intraday_context(symbol)
+            if not context:
+                continue
+            bars = context.get('bars')
+            if bars is None or getattr(bars, 'empty', True):
+                continue
+            try:
+                price = float(bars.iloc[-1]['close'])
+            except Exception:
+                price = None
+            try:
+                rvol = float(context.get('rvol') or 0)
+            except Exception:
+                rvol = 0.0
+            try:
+                day_change = float(context.get('day_change_pct') or 0)
+            except Exception:
+                day_change = 0.0
+
+            is_penny = price is not None and price < 7
+            passes = False
+            if is_penny:
+                passes = rvol >= 2.0 and day_change <= -7.0
+            else:
+                passes = rvol >= 1.2 and day_change <= -3.0
+            if not passes:
+                continue
+
+            prompt = "Analyse l'ouverture 9h45 et propose un plan d'action complet."
+            chunks = []
+            for item in advisor.stream_answer(symbol, prompt):
+                try:
+                    payload = json.loads(item)
+                except Exception:
+                    payload = {'text': str(item)}
+                text = payload.get('text') or ''
+                chunks.append(text)
+                if payload.get('done'):
+                    break
+
+            ai_text = "".join(chunks).strip()
+            ml_conf = router.predict(symbol).get('confidence')
+            if should_send_to_telegram(ml_conf, ai_text):
+                message = (
+                    f"🎯 *SIGNAL VALIDÉ : {symbol}*\n"
+                    f"💰 *Prix:* {price} | *Drop:* {day_change:.2f}%\n"
+                    f"📊 *RVOL:* {rvol:.2f}\n\n"
+                    f"🧠 *ANALYSE DANAS :*\n{ai_text[:400]}...\n\n"
+                    f"🔗 [Wealthsimple](https://my.wealthsimple.com/app/invest/search?query={symbol})"
+                )
+                _send_telegram_alert(message, allow_during_blackout=True, category='report')
+                alerts.append(symbol)
+            else:
+                _queue_telegram_candidate({
+                    'ticker': symbol,
+                    'score': ml_conf or 0,
+                    'diagnostic': ai_text[:200],
+                    'ts': timezone.now().isoformat(),
+                })
+            sleep(5)
+
+        result = {'status': 'ok', 'alerts': alerts}
+        _task_log_finish(log, 'SUCCESS', result)
+        return result
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+@shared_task
+def cache_optimizer_snapshot(fast: bool = True, portfolio_id: int | None = None) -> dict[str, Any]:
+    log = _task_log_start('cache_optimizer_snapshot')
+    try:
+        from types import SimpleNamespace
+        from portfolio.views import PortfolioOptimizerView
+
+        params: dict[str, str] = {'fast': '1' if fast else '0'}
+        if portfolio_id:
+            params['portfolio_id'] = str(portfolio_id)
+        request = SimpleNamespace(query_params=params, user=None)
+
+        response = PortfolioOptimizerView().get(request)
+        payload = getattr(response, 'data', None)
+        if isinstance(payload, dict):
+            cache_key = f"optimizer:scheduled:{portfolio_id or 'default'}:{'fast' if fast else 'slow'}"
+            ttl_min = int(os.getenv('OPTIMIZER_SCHEDULE_TTL_MIN', '360'))
+            cache.set(cache_key, payload, timeout=max(60, ttl_min * 60))
+        _task_log_finish(log, 'SUCCESS', {'status': 'ok'})
+        return {'status': 'ok'}
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}
+
+
+@shared_task
+def cache_ai_center_snapshot() -> dict[str, Any]:
+    log = _task_log_start('cache_ai_center_snapshot')
+    try:
+        from types import SimpleNamespace
+        from portfolio.views import AICenterView
+
+        request = SimpleNamespace(query_params={}, user=None)
+        response = AICenterView().get(request)
+        payload = getattr(response, 'data', None)
+        if isinstance(payload, dict):
+            ttl_min = int(os.getenv('AI_CENTER_SCHEDULE_TTL_MIN', '360'))
+            cache.set('ai_center:scheduled', payload, timeout=max(60, ttl_min * 60))
+        _task_log_finish(log, 'SUCCESS', {'status': 'ok'})
+        return {'status': 'ok'}
+    except Exception as exc:
+        _task_log_finish(log, 'FAILED', error=str(exc))
+        return {'status': 'failed', 'error': str(exc)}

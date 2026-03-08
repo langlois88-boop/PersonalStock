@@ -1,18 +1,21 @@
-import { BarChart3, Brain, Eye, LayoutDashboard, Activity, UploadCloud, TrendingUp, Shield, ClipboardList } from 'lucide-react';
+import { NavLink } from 'react-router-dom';
+import { BarChart3, Brain, Eye, LayoutDashboard, Activity, UploadCloud, TrendingUp, Shield, ClipboardList, MessageCircle } from 'lucide-react';
 
 const navItems = [
-  { id: 'home', label: 'Dashboard Home', icon: LayoutDashboard },
-  { id: 'manage', label: 'Import & Transactions', icon: UploadCloud },
-  { id: 'optimizer', label: 'AI Portfolio Optimizer', icon: Brain },
-  { id: 'scout', label: 'The Scout Eye', icon: Eye },
-  { id: 'lab', label: 'Analytics & ML Lab', icon: BarChart3 },
-  { id: 'paper', label: 'Live Paper Trading', icon: Activity },
-  { id: 'intraday', label: 'Intraday AI Guide', icon: TrendingUp },
-  { id: 'risk', label: 'Risk Control Center', icon: Shield },
-  { id: 'logs', label: 'Logs Center', icon: ClipboardList },
+  { id: 'home', label: 'Dashboard Home', icon: LayoutDashboard, to: '/' },
+  { id: 'manage', label: 'Import & Transactions', icon: UploadCloud, to: '/manage' },
+  { id: 'optimizer', label: 'AI Portfolio Optimizer', icon: Brain, to: '/optimizer' },
+  { id: 'ai-center', label: 'AI Center', icon: Brain, to: '/ai-center' },
+  { id: 'chat', label: 'Ask the Quant', icon: MessageCircle, to: '/ask-quant' },
+  { id: 'scout', label: 'The Scout Eye', icon: Eye, to: '/scout' },
+  { id: 'lab', label: 'Analytics & ML Lab', icon: BarChart3, to: '/lab' },
+  { id: 'paper', label: 'Live Paper Trading', icon: Activity, to: '/paper' },
+  { id: 'intraday', label: 'Intraday AI Guide', icon: TrendingUp, to: '/intraday' },
+  { id: 'risk', label: 'Risk Control Center', icon: Shield, to: '/risk' },
+  { id: 'logs', label: 'Logs Center', icon: ClipboardList, to: '/logs' },
 ];
 
-function Sidebar({ active, onSelect }) {
+function Sidebar() {
   return (
     <aside className="bg-slate-950 text-slate-200 w-full lg:w-64 p-6 flex lg:flex-col gap-6 border-r border-slate-900">
       <div>
@@ -22,13 +25,11 @@ function Sidebar({ active, onSelect }) {
       <nav className="flex flex-col gap-2">
         {navItems.map((item) => {
           const Icon = item.icon;
-          const isActive = active === item.id;
           return (
-            <button
+            <NavLink
               key={item.id}
-              type="button"
-              onClick={() => onSelect(item.id)}
-              className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition ${
+              to={item.to}
+              className={({ isActive }) => `flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition ${
                 isActive
                   ? 'bg-indigo-500/15 text-indigo-200 border border-indigo-500/30'
                   : 'text-slate-400 hover:text-white hover:bg-slate-900'
@@ -36,7 +37,7 @@ function Sidebar({ active, onSelect }) {
             >
               <Icon size={18} />
               <span>{item.label}</span>
-            </button>
+            </NavLink>
           );
         })}
       </nav>

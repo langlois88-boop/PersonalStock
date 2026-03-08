@@ -23,7 +23,34 @@ const apiBaseUrl = normalizeApiBase(
 	process.env.REACT_APP_API_BASE_URL || defaultApiBase
 );
 
-const api = axios.create({ baseURL: apiBaseUrl, timeout: 30000 });
+const getCookie = (name) => {
+	if (!document?.cookie) return null;
+	const cookie = document.cookie
+		.split(';')
+		.map((item) => item.trim())
+		.find((item) => item.startsWith(`${name}=`));
+	if (!cookie) return null;
+	return decodeURIComponent(cookie.split('=')[1]);
+};
+
+const api = axios.create({
+	baseURL: apiBaseUrl,
+	timeout: 30000,
+	withCredentials: true,
+	xsrfCookieName: 'csrftoken',
+	xsrfHeaderName: 'X-CSRFToken',
+});
+
+api.interceptors.request.use((config) => {
+	const token = getCookie('csrftoken');
+	if (token) {
+		config.headers = {
+			...config.headers,
+			'X-CSRFToken': token,
+		};
+	}
+	return config;
+});
 
 api.interceptors.response.use(
 	(response) => response,
