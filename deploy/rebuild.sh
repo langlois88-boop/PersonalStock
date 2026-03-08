@@ -12,7 +12,11 @@ else
 fi
 
 echo "[rebuild] Build and restart containers"
-docker compose build --no-cache
+BUILD_FLAGS=""
+if [[ "${FORCE_NO_CACHE:-0}" == "1" ]]; then
+	BUILD_FLAGS="--no-cache"
+fi
+docker compose build ${BUILD_FLAGS}
 
 docker compose up -d
 
