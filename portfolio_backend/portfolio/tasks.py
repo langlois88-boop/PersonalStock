@@ -4492,7 +4492,7 @@ def send_value_hunter_report() -> dict[str, Any]:
 
 
 def _midday_blackout() -> bool:
-    if os.getenv('MIDDAY_NO_TRADE_ENABLED', 'true').lower() not in {'1', 'true', 'yes', 'y'}:
+    if os.getenv('MIDDAY_NO_TRADE_ENABLED', 'false').lower() not in {'1', 'true', 'yes', 'y'}:
         return False
     now_ny = _ny_time_now()
     start_raw = os.getenv('MIDDAY_START', '11:45').strip()
@@ -5283,7 +5283,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     watchlist = _get_watchlist(sandbox, prefix, 'SPY,AAPL,MSFT,NVDA,AMZN')
     universe = 'PENNY' if sandbox == 'AI_PENNY' else 'BLUECHIP'
     model_path = get_model_path(universe)
-    buy_threshold = _env_float(prefix, 'BUY_THRESHOLD', '0.82')
+    buy_threshold = _env_float(prefix, 'BUY_THRESHOLD', '0.75')
     sell_threshold = _env_float(prefix, 'SELL_THRESHOLD', '0.4')
     trail_pct = _env_float(prefix, 'TRAIL_PCT', '0.04')
     atr_mult = _env_float(prefix, 'ATR_MULT', '1.5')
@@ -5292,7 +5292,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     risk_pct = _env_float(prefix, 'RISK_PCT', '0.015')
     position_cap_pct = _env_float(prefix, 'POSITION_CAP_PCT', '0.10')
     initial_capital = _env_float(prefix, 'CAPITAL', '10000')
-    min_volume_z = _env_float(prefix, 'VOLUME_ZSCORE_MIN', '0.5')
+    min_volume_z = _env_float(prefix, 'VOLUME_ZSCORE_MIN', '0.2')
     break_even_pct = _env_float(prefix, 'BREAK_EVEN_PCT', '0.015')
     break_even_fee_pct = _env_float(prefix, 'BREAK_EVEN_FEE_PCT', '0.0')
     lock_profit_trigger_pct = _env_float(prefix, 'LOCK_PROFIT_TRIGGER_PCT', '0.05')
@@ -5335,12 +5335,12 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     position_cap_pct = min(position_cap_pct, hard_position_cap_pct)
 
     if sandbox == 'AI_BLUECHIP':
-        buy_threshold = 0.85
-        sell_threshold = 0.65
+        buy_threshold = 0.80
+        sell_threshold = 0.60
         trail_pct = 0.05
-        min_volume_z = max(min_volume_z, 0.5)
+        min_volume_z = max(min_volume_z, 0.2)
     if sandbox == 'WATCHLIST':
-        buy_threshold = 0.60
+        buy_threshold = 0.55
         sell_threshold = 0.25
     capital = initial_capital + closed_pnl
     available = max(0.0, capital - open_value)
@@ -5705,7 +5705,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 if _is_halted(intraday_ctx) or _flash_crash(intraday_ctx):
                     _decision_log(symbol, sandbox, 'SKIP', 'halt_or_flash')
                     continue
-                min_intraday_rvol = float(os.getenv('MIN_INTRADAY_RVOL', '1.0'))
+                min_intraday_rvol = float(os.getenv('MIN_INTRADAY_RVOL', '0.7'))
                 if rvol < min_intraday_rvol:
                     _decision_log(symbol, sandbox, 'SKIP', f'rvol<{min_intraday_rvol}')
                     decision_stats['blocked_intraday'] += 1
@@ -5834,10 +5834,11 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 decision_stats['blocked_volume_z'] += 1
                 continue
         if sandbox == 'AI_PENNY':
-            min_rvol = float(os.getenv('AI_PENNY_MIN_RVOL', '1.8'))
+            min_rvol = float(os.getenv('AI_PENNY_MIN_RVOL', '1.2'))
+            breakout_score_min = float(os.getenv('AI_PENNY_BREAKOUT_SCORE_MIN', '0.15'))
             intraday_rvol = float((intraday_ctx or {}).get('rvol') or 0.0)
-            breakout_flag = float((signal_payload or {}).get('features', {}).get('breakout_1m') or 0.0)
-            if intraday_rvol < min_rvol or breakout_flag <= 0:
+            breakout_score = float((signal_payload or {}).get('features', {}).get('breakout_score') or 0.0)
+            if intraday_rvol < min_rvol or breakout_score < breakout_score_min:
                 continue
             if _reddit_hype_risk(symbol):
                 continue
