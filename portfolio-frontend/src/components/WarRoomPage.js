@@ -56,6 +56,16 @@ const fallbackSandbox = [
     max_drawdown: 0,
     final_balance: 0,
   },
+  {
+    sandbox: 'AI_CRYPTO',
+    broker: 'ALL',
+    trades: 0,
+    win_rate: 0,
+    total_return_pct: 0,
+    sharpe_ratio: 0,
+    max_drawdown: 0,
+    final_balance: 0,
+  },
 ];
 
 const formatPct = (value, digits = 1) => {

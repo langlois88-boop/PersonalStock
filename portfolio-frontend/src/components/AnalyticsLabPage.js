@@ -215,11 +215,12 @@ function AnalyticsLabPage() {
     WATCHLIST: 'Sandbox 1 · Watchlist',
     AI_BLUECHIP: 'Sandbox 2 · AI Bluechip',
     AI_PENNY: 'Sandbox 3 · AI Penny',
+    AI_CRYPTO: 'Sandbox 4 · AI Crypto',
   };
 
   const orderedSandboxStats = useMemo(() => {
     const map = new Map((sandboxStats || []).map((stat) => [stat.sandbox, stat]));
-    return ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'].map((key) => (
+    return ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY', 'AI_CRYPTO'].map((key) => (
       map.get(key) || {
         sandbox: key,
         initial_capital: 0,
@@ -235,7 +236,7 @@ function AnalyticsLabPage() {
 
   const orderedAlpacaStats = useMemo(() => {
     const map = new Map((alpacaStats || []).map((stat) => [stat.sandbox, stat]));
-    return ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'].map((key) => (
+    return ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY', 'AI_CRYPTO'].map((key) => (
       map.get(key) || {
         sandbox: key,
         initial_capital: 0,
@@ -356,6 +357,7 @@ function AnalyticsLabPage() {
                 <option value="WATCHLIST">Sandbox 1: Watchlist</option>
                 <option value="AI_BLUECHIP">Sandbox 2: AI Bluechip</option>
                 <option value="AI_PENNY">Sandbox 3: AI Penny</option>
+                <option value="AI_CRYPTO">Sandbox 4: AI Crypto</option>
               </select>
             </div>
           </div>
@@ -413,6 +415,9 @@ function AnalyticsLabPage() {
                   )}
                   {(sandboxFilter === 'ALL' || sandboxFilter === 'AI_PENNY') && (
                     <Line type="monotone" dataKey="AI_PENNY" name="Sandbox 3 · AI Penny" stroke="#f59e0b" strokeWidth={2} dot={false} />
+                  )}
+                  {(sandboxFilter === 'ALL' || sandboxFilter === 'AI_CRYPTO') && (
+                    <Line type="monotone" dataKey="AI_CRYPTO" name="Sandbox 4 · AI Crypto" stroke="#8b5cf6" strokeWidth={2} dot={false} />
                   )}
                   {sandboxCurve?.series?.some((entry) => entry.sandbox === 'SPY_BUY_HOLD') && (
                     <Line type="monotone" dataKey="SPY_BUY_HOLD" name="SPY Buy & Hold" stroke="#e2e8f0" strokeWidth={2} strokeDasharray="4 4" dot={false} />

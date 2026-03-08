@@ -31,7 +31,11 @@ function AnalysisModal({ open, loading, error, data, onClose }) {
     setTradeLoading(true);
     setTradeStatus(null);
     const universe = String(data?.universe || '').toUpperCase();
-    const defaultSandbox = universe === 'PENNY' ? 'AI_PENNY' : 'AI_BLUECHIP';
+    const defaultSandbox = universe === 'PENNY'
+      ? 'AI_PENNY'
+      : universe === 'CRYPTO'
+        ? 'AI_CRYPTO'
+        : 'AI_BLUECHIP';
     const sandbox = String(data?.sandbox || defaultSandbox || 'WATCHLIST').toUpperCase();
     try {
       const res = await api.post('paper-trades/manual/', {

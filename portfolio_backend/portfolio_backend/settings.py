@@ -339,6 +339,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.execute_paper_trades_ai_penny',
         'schedule': crontab(minute='*/15', hour='9-16', day_of_week='mon-fri'),
     },
+    'paper-trades-ai-crypto-15min': {
+        'task': 'portfolio.tasks.execute_paper_trades_ai_crypto',
+        'schedule': crontab(minute='*/15', hour='*'),
+    },
     'alpaca-paper-watchlist-1min': {
         'task': 'portfolio.tasks.execute_alpaca_paper_trades_watchlist',
         'schedule': crontab(minute='*/1', hour='9-16', day_of_week='mon-fri'),

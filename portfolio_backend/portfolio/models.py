@@ -90,6 +90,7 @@ class PaperTrade(models.Model):
 		('WATCHLIST', 'WATCHLIST'),
 		('AI_BLUECHIP', 'AI_BLUECHIP'),
 		('AI_PENNY', 'AI_PENNY'),
+		('AI_CRYPTO', 'AI_CRYPTO'),
 	)
 
 	ticker = models.CharField(max_length=10)
@@ -132,6 +133,7 @@ class SandboxWatchlist(models.Model):
 		('WATCHLIST', 'WATCHLIST'),
 		('AI_BLUECHIP', 'AI_BLUECHIP'),
 		('AI_PENNY', 'AI_PENNY'),
+		('AI_CRYPTO', 'AI_CRYPTO'),
 	)
 
 	sandbox = models.CharField(max_length=20, choices=SANDBOX_CHOICES, unique=True)

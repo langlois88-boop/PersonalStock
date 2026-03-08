@@ -1030,7 +1030,7 @@ class PaperTradeViewSet(viewsets.ReadOnlyModelViewSet):
 			queryset = queryset.filter(status=status)
 		if sandbox:
 			sandbox = sandbox.upper()
-			if sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'}:
+			if sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY', 'AI_CRYPTO'}:
 				raise ValidationError({'sandbox': 'Invalid sandbox.'})
 			queryset = queryset.filter(sandbox=sandbox)
 		if ticker:
@@ -1214,7 +1214,7 @@ class PaperTradeManualCreateView(APIView):
 		if not ticker:
 			return Response({'error': 'Ticker requis.'}, status=400)
 		sandbox = (request.data.get('sandbox') or 'WATCHLIST').strip().upper()
-		if sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'}:
+		if sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY', 'AI_CRYPTO'}:
 			return Response({'error': 'Sandbox invalide.'}, status=400)
 
 		price = request.data.get('price')
@@ -1433,7 +1433,7 @@ class ActiveSignalCloseView(APIView):
 class SandboxWatchlistView(APIView):
 	def get(self, request):
 		sandbox = (request.query_params.get('sandbox') or 'WATCHLIST').strip().upper()
-		if sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'}:
+		if sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY', 'AI_CRYPTO'}:
 			raise ValidationError({'sandbox': 'Invalid sandbox.'})
 		watch = SandboxWatchlist.objects.filter(sandbox=sandbox).first()
 		if not watch:
@@ -1442,7 +1442,7 @@ class SandboxWatchlistView(APIView):
 
 	def post(self, request):
 		sandbox = (request.data.get('sandbox') or 'WATCHLIST').strip().upper()
-		if sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'}:
+		if sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY', 'AI_CRYPTO'}:
 			raise ValidationError({'sandbox': 'Invalid sandbox.'})
 		symbols = request.data.get('symbols') or []
 		if isinstance(symbols, str):
@@ -1464,7 +1464,7 @@ class PaperTradeExplanationLogView(APIView):
 		status = (request.query_params.get('status') or '').strip().upper()
 		page = max(int(request.query_params.get('page', 1)), 1)
 		page_size = max(min(int(request.query_params.get('page_size', 25)), 200), 1)
-		if sandbox and sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'}:
+		if sandbox and sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY', 'AI_CRYPTO'}:
 			raise ValidationError({'sandbox': 'Invalid sandbox.'})
 		if status and status not in {'OPEN', 'CLOSED'}:
 			raise ValidationError({'status': 'Invalid status.'})
@@ -1491,7 +1491,7 @@ class ModelMonitoringSummaryView(APIView):
 		sandbox = (request.query_params.get('sandbox') or '').strip().upper()
 		if model_name and model_name not in {'BLUECHIP', 'PENNY'}:
 			raise ValidationError({'model': 'Invalid model.'})
-		if sandbox and sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'}:
+		if sandbox and sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY', 'AI_CRYPTO'}:
 			raise ValidationError({'sandbox': 'Invalid sandbox.'})
 
 		def _latest(qs, fields: list[str]) -> dict[str, Any] | None:
@@ -1539,6 +1539,8 @@ class PaperTradePerformanceView(APIView):
 			return float(os.getenv('AI_BLUECHIP_CAPITAL', os.getenv('PAPER_CAPITAL', '10000')))
 		if sandbox == 'AI_PENNY':
 			return float(os.getenv('AI_PENNY_CAPITAL', os.getenv('PAPER_CAPITAL', '10000')))
+		if sandbox == 'AI_CRYPTO':
+			return float(os.getenv('AI_CRYPTO_CAPITAL', os.getenv('PAPER_CAPITAL', '10000')))
 		return float(os.getenv('PAPER_CAPITAL', '10000'))
 
 	def _max_drawdown(self, equity_curve: list[float]) -> float:
@@ -1554,7 +1556,7 @@ class PaperTradePerformanceView(APIView):
 	def get(self, request):
 		sandbox_param = (request.query_params.get('sandbox') or '').strip().upper()
 		broker = (request.query_params.get('broker') or '').strip().upper()
-		sandboxes = [sandbox_param] if sandbox_param else ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY']
+		sandboxes = [sandbox_param] if sandbox_param else ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY', 'AI_CRYPTO']
 		if broker and broker not in {'SIM', 'ALPACA'}:
 			return Response({'error': 'Invalid broker.'}, status=400)
 		results = []
@@ -1604,13 +1606,15 @@ class PaperTradeEquityCurveView(APIView):
 			return float(os.getenv('AI_BLUECHIP_CAPITAL', os.getenv('PAPER_CAPITAL', '10000')))
 		if sandbox == 'AI_PENNY':
 			return float(os.getenv('AI_PENNY_CAPITAL', os.getenv('PAPER_CAPITAL', '10000')))
+		if sandbox == 'AI_CRYPTO':
+			return float(os.getenv('AI_CRYPTO_CAPITAL', os.getenv('PAPER_CAPITAL', '10000')))
 		return float(os.getenv('PAPER_CAPITAL', '10000'))
 
 	def get(self, request):
 		broker = (request.query_params.get('broker') or '').strip().upper()
 		if broker and broker not in {'SIM', 'ALPACA'}:
 			return Response({'error': 'Invalid broker.'}, status=400)
-		sandboxes = ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY']
+		sandboxes = ['WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY', 'AI_CRYPTO']
 		curves: dict[str, dict[str, float]] = {s: {} for s in sandboxes}
 		all_dates: set[str] = set()
 

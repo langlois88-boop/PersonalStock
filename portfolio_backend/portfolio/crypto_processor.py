@@ -127,8 +127,10 @@ def _load_crypto_model() -> dict[str, Any] | None:
     return None
 
 
-def scan_crypto_drip() -> list[dict[str, Any]]:
-    symbols = _crypto_symbols()
+def scan_crypto_drip(symbols: list[str] | None = None) -> list[dict[str, Any]]:
+    symbols = [s.strip().upper() for s in (symbols or []) if s and str(s).strip()]
+    if not symbols:
+        symbols = _crypto_symbols()
     btc_df = _fetch_15m('BTC-USD')
     panic_verdict = _crypto_panic_verdict(btc_df)
     model_payload = _load_crypto_model()

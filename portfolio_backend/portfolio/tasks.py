@@ -6047,6 +6047,126 @@ def _alpaca_buying_power() -> float:
     return 0.0
 
 
+def _crypto_latest_price(symbol: str) -> float | None:
+    try:
+        hist = yfin.Ticker(symbol).history(period='2d', interval='15m', timeout=10)
+    except Exception:
+        return None
+    if hist is None or hist.empty:
+        return None
+    close_col = 'Close' if 'Close' in hist.columns else 'close'
+    if close_col not in hist.columns:
+        return None
+    close = hist[close_col].dropna()
+    if close.empty:
+        return None
+    return float(close.iloc[-1])
+
+
+def _execute_paper_trades_for_crypto_sandbox() -> dict[str, Any]:
+    sandbox = 'AI_CRYPTO'
+    prefix = 'AI_CRYPTO'
+    enabled = os.getenv('AI_CRYPTO_ENABLED', 'true').lower() in {'1', 'true', 'yes', 'y'}
+    if not enabled:
+        return {'status': 'disabled', 'created': 0, 'closed': 0}
+
+    watchlist = _get_watchlist(sandbox, prefix, 'BTC-USD,ETH-USD,SOL-USD')
+    buy_threshold = _env_float(prefix, 'BUY_THRESHOLD', '0.65')
+    stop_loss_pct = _env_float(prefix, 'STOP_LOSS_PCT', '0.05')
+    take_profit_pct = _env_float(prefix, 'TAKE_PROFIT_PCT', '0.08')
+    trail_trigger_pct = _env_float(prefix, 'TRAIL_TRIGGER_PCT', '0.04')
+    trail_pct = _env_float(prefix, 'TRAIL_PCT', '0.03')
+    position_cap_pct = _env_float(prefix, 'POSITION_CAP_PCT', '0.10')
+    risk_pct = _env_float(prefix, 'RISK_PCT', '0.02')
+    initial_capital = _env_float(prefix, 'CAPITAL', '10000')
+    require_oversold = os.getenv('AI_CRYPTO_REQUIRE_OVERSOLD', 'true').lower() in {'1', 'true', 'yes', 'y'}
+
+    closed_trades = PaperTrade.objects.filter(status='CLOSED', sandbox=sandbox)
+    closed_pnl = float(sum([float(t.pnl or 0) for t in closed_trades]))
+    open_trades = list(PaperTrade.objects.filter(status='OPEN', sandbox=sandbox))
+    open_by_symbol = {t.ticker.upper(): t for t in open_trades}
+    open_value = sum([float(t.entry_price) * float(t.quantity) for t in open_trades])
+
+    capital = initial_capital + closed_pnl
+    available = max(0.0, capital - open_value)
+
+    closed = 0
+    for trade in open_trades:
+        price = _crypto_latest_price(trade.ticker) or float(trade.entry_price)
+        entry_price = float(trade.entry_price)
+        stop_loss = float(trade.stop_loss or (entry_price * (1 - stop_loss_pct)))
+        if price >= entry_price * (1 + trail_trigger_pct):
+            new_stop = max(stop_loss, price * (1 - trail_pct))
+            if new_stop > stop_loss:
+                trade.stop_loss = round(new_stop, 2)
+                trade.save(update_fields=['stop_loss'])
+                stop_loss = float(trade.stop_loss)
+
+        should_close = price <= stop_loss or price >= entry_price * (1 + take_profit_pct)
+        if should_close:
+            trade.exit_price = round(price, 2)
+            trade.exit_date = timezone.now()
+            trade.status = 'CLOSED'
+            trade.pnl = float(trade.exit_price - float(trade.entry_price)) * float(trade.quantity)
+            trade.outcome = 'WIN' if float(trade.pnl or 0) > 0 else 'LOSS'
+            trade.notes = (trade.notes or '') + ' | crypto exit'
+            trade.save(update_fields=['exit_price', 'exit_date', 'status', 'pnl', 'outcome', 'notes'])
+            closed += 1
+
+    results = scan_crypto_drip(symbols=watchlist)
+    created = 0
+    for item in results:
+        symbol = str(item.get('symbol') or '').strip().upper()
+        if not symbol or symbol in open_by_symbol:
+            continue
+        if item.get('blocked'):
+            continue
+        if require_oversold and not bool(item.get('oversold')):
+            continue
+        score = item.get('score')
+        if score is not None and float(score) < buy_threshold:
+            continue
+        price = float(item.get('price') or 0) or (_crypto_latest_price(symbol) or 0.0)
+        if price <= 0:
+            continue
+        max_position_value = min(capital * position_cap_pct, capital * max(risk_pct, 0.001))
+        qty = int(max_position_value / price)
+        if qty <= 0 or (qty * price) > available:
+            continue
+        stop_loss = price * (1 - stop_loss_pct)
+        PaperTrade.objects.create(
+            ticker=symbol,
+            sandbox=sandbox,
+            entry_price=round(price, 2),
+            quantity=qty,
+            entry_signal=float(score) if score is not None else None,
+            entry_features={
+                'score': score,
+                'rsi': item.get('rsi'),
+                'price_to_vwap': item.get('price_to_vwap'),
+                'btc_corr': item.get('btc_corr'),
+                'oversold': item.get('oversold'),
+                'panic_verdict': item.get('panic_verdict'),
+            },
+            model_name='CRYPTO',
+            broker='SIM',
+            stop_loss=round(stop_loss, 2),
+            status='OPEN',
+            pnl=0,
+            notes='auto crypto sandbox',
+        )
+        available = max(0.0, available - (qty * price))
+        created += 1
+
+    return {
+        'status': 'ok',
+        'created': created,
+        'closed': closed,
+        'available': round(available, 2),
+        'symbols': watchlist,
+    }
+
+
 def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, Any]:
     """Execute paper trades on Alpaca using model signals."""
     watchlist = _get_watchlist(sandbox, prefix, 'SPY,AAPL,MSFT,NVDA,AMZN')
@@ -6800,6 +6920,11 @@ def execute_paper_trades_ai_bluechip() -> dict[str, Any]:
 @shared_task
 def execute_paper_trades_ai_penny() -> dict[str, Any]:
     return _execute_paper_trades_for_sandbox('AI_PENNY', 'AI_PENNY')
+
+
+@shared_task
+def execute_paper_trades_ai_crypto() -> dict[str, Any]:
+    return _execute_paper_trades_for_crypto_sandbox()
 
 
 def _default_scanner_symbols() -> list[str]:
