@@ -114,7 +114,12 @@ def _label_targets(close: pd.Series, horizon: int = 8, target_pct: float = 0.02)
     return (future_return >= target_pct).astype(int)
 
 
-def build_crypto_dataset(symbols: Iterable[str], days: int = 60) -> tuple[pd.DataFrame, pd.Series, list[str]]:
+def build_crypto_dataset(
+    symbols: Iterable[str],
+    days: int = 60,
+    horizon: int | None = None,
+    target_pct: float | None = None,
+) -> tuple[pd.DataFrame, pd.Series, list[str]]:
     btc_df = fetch_crypto_history('BTC-USD', days=days)
     btc_df = _normalize_columns(btc_df)
     frames = []
@@ -125,7 +130,7 @@ def build_crypto_dataset(symbols: Iterable[str], days: int = 60) -> tuple[pd.Dat
         raw = _normalize_columns(raw)
         features = _build_crypto_features(raw, btc_df=btc_df)
         features['symbol'] = symbol
-        features['label'] = _label_targets(features['close'])
+        features['label'] = _label_targets(features['close'], horizon=horizon or 8, target_pct=target_pct or 0.02)
         frames.append(features)
 
     if not frames:
@@ -147,14 +152,13 @@ def train_crypto_model(
     horizon = int(os.getenv('CRYPTO_LABEL_HORIZON', str(horizon or 8)))
     target_pct = float(os.getenv('CRYPTO_TARGET_PCT', str(target_pct or 0.02)))
 
-    dataset, labels, feature_cols = build_crypto_dataset(symbols, days=days)
+    dataset, labels, feature_cols = build_crypto_dataset(symbols, days=days, horizon=horizon, target_pct=target_pct)
     if dataset.empty:
         raise ValueError('No crypto dataset available')
 
     dataset = dataset.copy()
-    dataset['label'] = _label_targets(dataset['close'], horizon=horizon, target_pct=target_pct)
     X = dataset[feature_cols]
-    y = dataset['label'].values
+    y = labels.values
 
     if XGBClassifier is None:
         model = RandomForestClassifier(n_estimators=300, max_depth=8, random_state=42, class_weight='balanced')

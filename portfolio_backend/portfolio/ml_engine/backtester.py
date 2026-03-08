@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 from typing import Iterable
@@ -61,7 +61,7 @@ def get_feature_columns(universe: str | None = None) -> list[str]:
 
 
 def _new_model_version() -> str:
-    return datetime.utcnow().strftime('%Y%m%d%H%M%S')
+    return datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
 
 
 def get_model_version(payload: dict | None, model_path: Path) -> str:
@@ -672,7 +672,6 @@ class AIBacktester:
 
         df["cumulative_returns"] = pd.Series(equity_curve, index=df.index[: len(equity_curve)]).reindex(df.index).ffill().fillna(1.0)
         df["strategy_returns"] = df["strategy_returns"].fillna(0)
-        df["cumulative_returns"] = (1 + df["strategy_returns"]).cumprod()
 
         cumulative = df["cumulative_returns"]
         peak = np.maximum.accumulate(cumulative.values)
@@ -682,10 +681,12 @@ class AIBacktester:
         strat_returns = df["strategy_returns"].values
         mean_ret = float(np.mean(strat_returns)) if len(strat_returns) else 0.0
         std_ret = float(np.std(strat_returns)) if len(strat_returns) else 0.0
-        sharpe = float((mean_ret / std_ret) * np.sqrt(252)) if std_ret else 0.0
+        rf_rate = float(os.getenv('BACKTEST_RF_RATE', '0'))
+        rf_daily = rf_rate / 252
+        sharpe = float(((mean_ret - rf_daily) / std_ret) * np.sqrt(252)) if std_ret else 0.0
         downside = np.where(strat_returns < 0, strat_returns, 0.0)
         downside_std = float(np.std(downside)) if len(downside) else 0.0
-        sortino = float((mean_ret / downside_std) * np.sqrt(252)) if downside_std else 0.0
+        sortino = float(((mean_ret - rf_daily) / downside_std) * np.sqrt(252)) if downside_std else 0.0
 
         gains = strat_returns[strat_returns > 0].sum() if len(strat_returns) else 0.0
         losses = abs(strat_returns[strat_returns < 0].sum()) if len(strat_returns) else 0.0
@@ -723,7 +724,7 @@ class AIBacktester:
         raw_max_drawdown = float(np.min(raw_drawdown)) if len(raw_drawdown) else 0.0
         raw_mean = float(np.mean(raw_returns)) if len(raw_returns) else 0.0
         raw_std = float(np.std(raw_returns)) if len(raw_returns) else 0.0
-        raw_sharpe = float((raw_mean / raw_std) * np.sqrt(252)) if raw_std else 0.0
+        raw_sharpe = float(((raw_mean - rf_daily) / raw_std) * np.sqrt(252)) if raw_std else 0.0
         raw_active = pd.Series(raw_position, index=df.index)
         raw_trades = raw_active[raw_active != 0]
         raw_wins = raw_returns[raw_trades.index][raw_returns[raw_trades.index] > 0]

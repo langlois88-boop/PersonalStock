@@ -259,13 +259,12 @@ def train_voting_ensemble(
     )
     X_all = pd.concat([X_blue, X_penny], ignore_index=True)
     y_all = np.concatenate([y_blue, y_penny])
-    X_all_scaled = scaler.fit_transform(X_all)
-    ensemble.fit(X_all_scaled, y_all)
 
     pipeline = Pipeline([
         ('scaler', scaler),
         ('model', ensemble),
     ])
+    pipeline.fit(X_all, y_all)
 
     return IntradayModelResult(model=pipeline, features=feature_cols, scores=[], importances=[])
 

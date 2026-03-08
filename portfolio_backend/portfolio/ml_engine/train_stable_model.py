@@ -13,6 +13,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.base import clone
 from sklearn.decomposition import PCA
 import joblib
 
@@ -164,7 +165,7 @@ def train_stable_model():
                 continue
             future_return = float((close.iloc[i + 20] - close.iloc[i]) / close.iloc[i])
             row = {'date': window_close.index[-1], 'target': future_return}
-            row.update({FEATURE_NAMES[i]: features[i] for i in range(len(FEATURE_NAMES))})
+            row.update({FEATURE_NAMES[j]: features[j] for j in range(len(FEATURE_NAMES))})
             rows.append(row)
 
     if not rows:
@@ -258,8 +259,9 @@ def train_stable_model():
             y_train = y[train_mask.values]
             X_test = df.loc[test_mask, FEATURE_NAMES].values
             y_test = y[test_mask.values]
-            pipeline.fit(X_train, y_train)
-            preds = pipeline.predict(X_test)
+            window_pipeline = clone(pipeline)
+            window_pipeline.fit(X_train, y_train)
+            preds = window_pipeline.predict(X_test)
             mae = float(mean_absolute_error(y_test, preds)) if len(y_test) else 0.0
             reports.append({
                 'start': test_start.strftime('%Y-%m-%d'),
