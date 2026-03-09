@@ -112,7 +112,7 @@ def train_recommender_model() -> dict[str, object]:
     oof_probs = np.full(len(y), np.nan)
     for train_idx, test_idx in splitter.split(X):
         base = build_model()
-        calibrated = CalibratedClassifierCV(base_estimator=base, method=method, cv=3)
+        calibrated = CalibratedClassifierCV(estimator=base, method=method, cv=3)
         calibrated.fit(X[train_idx], y[train_idx])
         oof_probs[test_idx] = calibrated.predict_proba(X[test_idx])[:, 1]
 
@@ -124,7 +124,7 @@ def train_recommender_model() -> dict[str, object]:
     f1 = float(f1_score(y[valid_mask], oof_preds)) if valid_mask.any() else 0.0
 
     final_base = build_model()
-    final_calibrated = CalibratedClassifierCV(base_estimator=final_base, method=method, cv=3)
+    final_calibrated = CalibratedClassifierCV(estimator=final_base, method=method, cv=3)
     final_calibrated.fit(X, y)
 
     return {
