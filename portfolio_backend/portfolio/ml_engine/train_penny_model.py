@@ -27,6 +27,16 @@ from portfolio.ml_engine.export_utils import export_onnx_with_gatekeeper, save_m
 from portfolio.ml_engine.feature_registry import PENNY_FEATURE_NAMES
 from portfolio.ml_engine.collectors.news_rss import fetch_news_sentiment
 from portfolio.ml_engine.push_model import _build_meta_from_payload, push_to_portfolio_app
+def _ensure_django() -> None:
+    if not os.getenv('DJANGO_SETTINGS_MODULE'):
+        os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'portfolio_backend.settings')
+    try:
+        import django
+
+        django.setup()
+    except Exception:
+        return
+
 
 
 def _rsi(series: pd.Series, window: int = 14) -> pd.Series:
@@ -290,6 +300,7 @@ def _deepseek_confidence(symbol: str, date_value: str, features: dict[str, float
 
 
 def train_model(output_path: Path, auto_push: bool | None = None) -> None:
+    _ensure_django()
     print(f"[{datetime.utcnow().isoformat()}Z] Training started")
     symbols = _get_symbols()
     X, y = build_dataset(symbols)
@@ -476,4 +487,5 @@ def train_model(output_path: Path, auto_push: bool | None = None) -> None:
 if __name__ == '__main__':
     base_dir = Path(__file__).resolve().parents[1]
     model_path = base_dir / 'ml_engine' / 'scout_brain_v1.pkl'
+    _ensure_django()
     train_model(model_path)

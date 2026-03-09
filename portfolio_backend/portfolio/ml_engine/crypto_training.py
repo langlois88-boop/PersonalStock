@@ -18,6 +18,16 @@ from sklearn.preprocessing import RobustScaler
 from portfolio.ml_engine.export_utils import export_onnx_with_gatekeeper, save_model_with_version, write_meta_sidecar
 from portfolio.ml_engine.feature_registry import CRYPTO_FEATURE_NAMES
 from portfolio.ml_engine.push_model import _build_meta_from_payload, push_to_portfolio_app
+def _ensure_django() -> None:
+    if not os.getenv('DJANGO_SETTINGS_MODULE'):
+        os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'portfolio_backend.settings')
+    try:
+        import django
+
+        django.setup()
+    except Exception:
+        return
+
 
 DEFAULT_SYMBOLS = [
     'BTC-USD',
@@ -155,6 +165,7 @@ def train_crypto_model(
     horizon: int | None = None,
     target_pct: float | None = None,
 ) -> dict[str, object]:
+    _ensure_django()
     print(f"[{datetime.utcnow().isoformat()}Z] Training started")
     days = int(os.getenv('CRYPTO_HISTORY_DAYS', str(days)))
     horizon = int(os.getenv('CRYPTO_LABEL_HORIZON', str(horizon or 8)))

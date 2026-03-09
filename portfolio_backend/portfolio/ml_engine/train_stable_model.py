@@ -30,6 +30,16 @@ from portfolio.models import Stock, PriceHistory
 
 MODEL_PATH = Path(__file__).resolve().parent / 'stable_brain_v1.pkl'
 FEATURE_NAMES = list(STABLE_FEATURE_NAMES)
+def _ensure_django() -> None:
+    if not os.getenv('DJANGO_SETTINGS_MODULE'):
+        os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'portfolio_backend.settings')
+    try:
+        import django
+
+        django.setup()
+    except Exception:
+        return
+
 
 SECTOR_ETF_MAP = {
     'Technology': 'XLK',
@@ -213,6 +223,7 @@ def _label_targets_triple_barrier(
 
 
 def train_stable_model(auto_push: bool | None = None):
+    _ensure_django()
     print(f"[{datetime.utcnow().isoformat()}Z] Training started")
     symbols = [s.symbol for s in Stock.objects.all().order_by('symbol') if _is_valid_symbol(s.symbol)]
     if not symbols:
@@ -474,5 +485,6 @@ def train_stable_model(auto_push: bool | None = None):
 
 
 if __name__ == '__main__':
+    _ensure_django()
     result = train_stable_model()
     print(result)
