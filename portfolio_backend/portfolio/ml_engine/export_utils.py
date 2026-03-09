@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from pathlib import Path
 from typing import Any
 
@@ -117,6 +117,31 @@ def write_manifest(
     return manifest_path
 
 
+def write_meta_sidecar(
+    onnx_path: Path,
+    cv_scores: list[float] | None,
+    feature_names: list[str],
+    universe: str,
+    n_samples: int,
+    label_balance: float,
+) -> Path:
+    scores = [float(s) for s in (cv_scores or [])]
+    cv_mean = float(sum(scores) / len(scores)) if scores else None
+    meta = {
+        'model_version': f"v{date.today().isoformat()}",
+        'trained_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+        'cv_mean': cv_mean,
+        'cv_scores': scores,
+        'features': list(feature_names),
+        'universe': universe,
+        'n_samples': int(n_samples),
+        'label_balance': float(label_balance),
+    }
+    sidecar_path = onnx_path.with_suffix('.json')
+    sidecar_path.write_text(json.dumps(meta, indent=2, default=str))
+    return sidecar_path
+
+
 def export_onnx_with_gatekeeper(
     payload: dict[str, Any],
     model_path: Path,
@@ -177,9 +202,11 @@ def export_onnx_with_gatekeeper(
 
     model = payload.get('model') if isinstance(payload, dict) else payload
     initial_type = [("float_input", FloatTensorType([None, len(feature_names)]))]
-    onnx_model = convert_sklearn(model, initial_types=initial_type)
-    with open(onnx_path, 'wb') as f:
-        f.write(onnx_model.SerializeToString())
+    options = {id(model): {'zipmap': False}}
+    onnx_model = convert_sklearn(model, initial_types=initial_type, options=options)
+    tmp_path = onnx_path.with_suffix('.onnx.tmp')
+    tmp_path.write_bytes(onnx_model.SerializeToString())
+    tmp_path.replace(onnx_path)
 
     write_manifest(
         export_dir,
@@ -245,9 +272,15 @@ def save_model_with_version(
     archive_dir = Path(os.getenv('MODEL_ARCHIVE_DIR', str(model_path.parent / 'models_archive'))) / model_name.lower()
     archive_dir.mkdir(parents=True, exist_ok=True)
     version_path = archive_dir / f"{model_path.stem}_{version}_{metric_suffix}.pkl"
+    if isinstance(payload, dict):
+        payload.setdefault('model_name', model_name)
+        payload.setdefault('model_version', version)
+        payload.setdefault('metric_name', metric_name)
+        payload.setdefault('metric_value', metric_value)
     joblib.dump(payload, version_path)
     joblib.dump(payload, model_path)
     return {
         'archive_path': str(version_path),
         'latest_path': str(model_path),
+        'model_version': version,
     }

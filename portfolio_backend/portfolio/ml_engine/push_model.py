@@ -88,7 +88,7 @@ def _build_meta_from_payload(payload: dict) -> dict:
         "cv_mean": payload.get("cv_mean"),
         "cv_scores": payload.get("cv_scores"),
         "features": payload.get("features"),
-        "universe": payload.get("model_type"),
+        "universe": payload.get("universe") or payload.get("model_type"),
     }
 
 

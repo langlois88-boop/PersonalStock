@@ -19,7 +19,7 @@ from portfolio import market_data as yf
 from portfolio.alpaca_data import get_intraday_context
 from portfolio.ml_engine.collectors.news_rss import fetch_news_sentiment
 from portfolio.ml_engine import train_penny_model, train_stable_model
-from portfolio.models import MacroIndicator, Stock
+from portfolio.models import Stock
 from portfolio.tasks import (
     _fetch_yfinance_screeners,
     _google_news_titles,
@@ -301,9 +301,17 @@ class ValidationService:
             return None
         close = data['Close']
         volume = data['Volume'] if 'Volume' in data else close * 0
-        macro = MacroIndicator.objects.order_by('-date').first()
         dividend_yield = float(Stock.objects.filter(symbol__iexact=symbol).values_list('dividend_yield', flat=True).first() or 0)
-        features = train_stable_model._build_features(close, volume, spy['Close'], dividend_yield, macro)
+        news_payload = fetch_news_sentiment(symbol)
+        sentiment_score = float(news_payload.get('news_sentiment') or 0.0)
+        features = train_stable_model._build_features(
+            close,
+            volume,
+            spy['Close'],
+            dividend_yield,
+            sector_close=None,
+            sentiment_score=sentiment_score,
+        )
         if not features:
             return None
         try:

@@ -3,29 +3,26 @@ from __future__ import annotations
 from typing import Dict, List
 
 STABLE_FEATURE_NAMES: List[str] = [
-    'log_ret_20',
-    'vol_60',
-    'beta',
-    'rel_volume_200',
+    'rsi_14',
+    'sma_ratio_10_50',
+    'sma_ratio_20_50',
+    'volatility_20',
+    'volume_zscore_20',
+    'return_20d',
+    'spy_correlation',
     'dividend_yield',
-    'sector_strength',
-    'macro_sp500_close',
-    'macro_vix_index',
-    'macro_rate_10y',
-    'macro_inflation',
-    'macro_oil_price',
+    'sector_beta',
+    'sentiment_score',
 ]
 
 PENNY_FEATURE_NAMES: List[str] = [
-    'close',
-    'sma_10',
-    'sma_20',
-    'sma_50',
+    'rsi_14',
+    'sma_ratio_10_20',
     'volatility_20',
-    'volume_change_10',
     'volume_zscore_20',
     'rvol_20',
-    'rsi_14',
+    'return_5d',
+    'sentiment_score',
 ]
 
 CRYPTO_FEATURE_NAMES: List[str] = [

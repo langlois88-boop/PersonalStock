@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -8,6 +10,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from .. import market_data as yf
+import requests
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import classification_report, accuracy_score, precision_score, recall_score, f1_score
@@ -20,36 +23,43 @@ from sklearn.decomposition import PCA
 from .transformers import RollingStandardScaler
 from .validation import PurgedTimeSeriesSplit
 
-from .export_utils import export_onnx_with_gatekeeper, save_model_with_version
+from .export_utils import export_onnx_with_gatekeeper, save_model_with_version, write_meta_sidecar
 from .feature_registry import PENNY_FEATURE_NAMES
+from .collectors.news_rss import fetch_news_sentiment
+from .push_model import _build_meta_from_payload, push_to_portfolio_app
 
 
 def _rsi(series: pd.Series, window: int = 14) -> pd.Series:
     delta = series.diff()
-    gain = delta.clip(lower=0).rolling(window).mean()
-    loss = (-delta.clip(upper=0)).rolling(window).mean()
-    rs = gain / loss.replace(0, np.nan)
+    gain = delta.clip(lower=0)
+    loss = (-delta.clip(upper=0))
+    avg_gain = gain.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
+    avg_loss = loss.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
 
-def _build_features(close: pd.Series, volume: pd.Series) -> pd.DataFrame:
+def _build_features(
+    close: pd.Series,
+    volume: pd.Series,
+    sentiment_score: float,
+) -> pd.DataFrame:
     ret = close.pct_change()
 
     volume_mean_20 = volume.rolling(20).mean()
     volume_std_20 = volume.rolling(20).std().replace(0, np.nan)
-    volume_zscore_20 = (volume - volume_mean_20) / volume_std_20
-    rvol_20 = volume / volume_mean_20.replace(0, np.nan)
+    volume_zscore_20 = ((volume - volume_mean_20) / volume_std_20).clip(-3, 3).fillna(0)
+    rvol_20 = (volume / volume_mean_20.replace(0, np.nan)).clip(0, 10).fillna(1.0)
+    sma_ratio_10_20 = (close.rolling(10).mean() / close.rolling(20).mean().replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(1.0)
 
     features = pd.DataFrame({
-        'close': close,
-        'sma_10': close.rolling(10).mean(),
-        'sma_20': close.rolling(20).mean(),
-        'sma_50': close.rolling(50).mean(),
+        'rsi_14': _rsi(close, 14),
+        'sma_ratio_10_20': sma_ratio_10_20,
         'volatility_20': ret.rolling(20).std(),
-        'volume_change_10': volume.pct_change().rolling(10).mean(),
         'volume_zscore_20': volume_zscore_20,
         'rvol_20': rvol_20,
-        'rsi_14': _rsi(close, 14),
+        'return_5d': close.pct_change(5),
+        'sentiment_score': float(sentiment_score),
     })
     return features
 
@@ -147,9 +157,11 @@ def build_dataset(symbols: Iterable[str]) -> tuple[pd.DataFrame, pd.Series]:
             continue
         if volume.empty:
             volume = pd.Series(0.0, index=close.index, dtype='float64')
-        features = _build_features(close, volume)
+        news_payload = fetch_news_sentiment(symbol)
+        sentiment_score = float(news_payload.get('news_sentiment') or 0.0)
+        features = _build_features(close, volume, sentiment_score)
         features = features.replace([np.inf, -np.inf], np.nan)
-        for col in ('volume_change_10', 'volume_zscore_20', 'rvol_20'):
+        for col in ('volume_zscore_20', 'rvol_20'):
             if col in features.columns:
                 features[col] = features[col].fillna(0)
         feats = features.dropna()
@@ -161,9 +173,9 @@ def build_dataset(symbols: Iterable[str]) -> tuple[pd.DataFrame, pd.Series]:
         target_index = feats.index
         if isinstance(target_index, pd.MultiIndex):
             target_index = target_index.get_level_values(0)
-        up_pct = float(os.getenv('PENNY_TRIPLE_BARRIER_UP_PCT', '0.05'))
-        down_pct = float(os.getenv('PENNY_TRIPLE_BARRIER_DOWN_PCT', '0.03'))
-        max_days = int(os.getenv('PENNY_TRIPLE_BARRIER_MAX_DAYS', '3'))
+        up_pct = float(os.getenv('PENNY_TRIPLE_BARRIER_UP_PCT', '0.15'))
+        down_pct = float(os.getenv('PENNY_TRIPLE_BARRIER_DOWN_PCT', '0.10'))
+        max_days = int(os.getenv('PENNY_TRIPLE_BARRIER_MAX_DAYS', '10'))
         target = _label_targets_triple_barrier(close, high, low, up_pct, down_pct, max_days).reindex(target_index)
         if not feats.empty:
             target.index = feats.index
@@ -229,7 +241,56 @@ def _walk_forward_report(
     return reports
 
 
-def train_model(output_path: Path) -> None:
+def _auto_push_enabled() -> bool:
+    return (
+        os.getenv('AUTO_PUSH_MODEL', '')
+        or os.getenv('AUTO_PUSH_MODELS', '')
+    ).lower() in {'1', 'true', 'yes', 'y'}
+
+
+def _deepseek_enabled() -> bool:
+    return os.getenv('DEEPSEEK_WEIGHTING_ENABLED', 'false').lower() in {'1', 'true', 'yes', 'y'}
+
+
+def _deepseek_confidence(symbol: str, date_value: str, features: dict[str, float], raw_label: int) -> float:
+    base_url = (os.getenv('DEEPSEEK_API_URL') or '').strip().rstrip('/')
+    if not base_url:
+        return 1.0
+    prompt = (
+        "Stock: {symbol}, Date: {date}, Raw label: {label}\n"
+        "Features: RSI={rsi:.1f}, SMA_ratio={sma_ratio:.3f}, "
+        "Vol_zscore={vol_z:.2f}, Return_5d={ret_5d:.3f}\n"
+        "Sentiment: {sentiment:.2f}\n\n"
+        "Given these indicators, rate your confidence 0.0-1.0 that the label "
+        "({label}) is correct. Respond with ONLY a float number, nothing else."
+    ).format(
+        symbol=symbol,
+        date=date_value,
+        label=raw_label,
+        rsi=features.get('rsi_14', 0.0),
+        sma_ratio=features.get('sma_ratio_10_20', 1.0),
+        vol_z=features.get('volume_zscore_20', 0.0),
+        ret_5d=features.get('return_5d', 0.0),
+        sentiment=features.get('sentiment_score', 0.0),
+    )
+    try:
+        resp = requests.post(
+            base_url,
+            json={'prompt': prompt},
+            timeout=int(os.getenv('DEEPSEEK_TIMEOUT', '20')),
+        )
+        resp.raise_for_status()
+        text = (resp.json().get('response') if resp.headers.get('content-type', '').startswith('application/json') else resp.text)
+        if isinstance(text, dict):
+            text = json.dumps(text)
+        value = float(str(text).strip().split()[0])
+        return max(0.0, min(1.0, value))
+    except Exception:
+        return 1.0
+
+
+def train_model(output_path: Path, auto_push: bool | None = None) -> None:
+    print(f"[{datetime.utcnow().isoformat()}Z] Training started")
     symbols = _get_symbols()
     X, y = build_dataset(symbols)
     feature_names = list(PENNY_FEATURE_NAMES)
@@ -237,6 +298,22 @@ def train_model(output_path: Path) -> None:
         if col not in X.columns:
             X[col] = 0.0
     X = X[feature_names]
+    X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
+    if len(set(y)) < 2:
+        raise ValueError('Only one class')
+
+    weights = None
+    if _deepseek_enabled():
+        weights = []
+        for idx, row in X.iterrows():
+            if isinstance(idx, tuple):
+                row_date, symbol = idx[0], str(idx[-1])
+            else:
+                row_date, symbol = idx, ''
+            date_str = row_date.strftime('%Y-%m-%d') if hasattr(row_date, 'strftime') else str(row_date)
+            features = row.to_dict()
+            weights.append(_deepseek_confidence(symbol, date_str, features, int(y.loc[idx])))
+        weights = np.array(weights, dtype=float)
 
     use_rolling = os.getenv('PENNY_ROLLING_SCALER', 'true').lower() in {'1', 'true', 'yes', 'y'}
     scaler = RollingStandardScaler(window=int(os.getenv('PENNY_ROLLING_WINDOW', '60'))) if use_rolling else StandardScaler()
@@ -318,20 +395,21 @@ def train_model(output_path: Path) -> None:
     steps.append(('model', model))
     pipeline = Pipeline(steps)
 
-    use_purged = os.getenv('PENNY_PURGED_CV', 'true').lower() in {'1', 'true', 'yes', 'y'}
-    splits = PurgedTimeSeriesSplit(
-        n_splits=int(os.getenv('PENNY_PURGED_SPLITS', '5')),
-        purge_window=int(os.getenv('PENNY_PURGE_WINDOW', '5')),
-        embargo_pct=float(os.getenv('PENNY_EMBARGO_PCT', '0.02')),
-    ) if use_purged else TimeSeriesSplit(n_splits=5)
+    splits = TimeSeriesSplit(n_splits=5)
     cv_scores: list[float] = []
     last_test_idx = None
     for train_idx, test_idx in splits.split(X):
-        pipeline.fit(X.iloc[train_idx], y.iloc[train_idx])
+        if weights is not None:
+            pipeline.fit(X.iloc[train_idx], y.iloc[train_idx], model__sample_weight=weights[train_idx])
+        else:
+            pipeline.fit(X.iloc[train_idx], y.iloc[train_idx])
         cv_scores.append(float(pipeline.score(X.iloc[test_idx], y.iloc[test_idx])))
         last_test_idx = test_idx
 
-    pipeline.fit(X, y)
+    if weights is not None:
+        pipeline.fit(X, y, model__sample_weight=weights)
+    else:
+        pipeline.fit(X, y)
     walk_forward = _walk_forward_report(X, y, pipeline)
     print('TimeSeriesSplit scores:', cv_scores)
     if walk_forward:
@@ -345,15 +423,23 @@ def train_model(output_path: Path) -> None:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cv_mean = float(np.mean(cv_scores)) if cv_scores else None
+    wf_f1 = float(np.mean([row.get('f1', 0.0) for row in walk_forward])) if walk_forward else 0.0
+    if cv_mean is None or cv_mean < 0.55:
+        raise ValueError(f"CV mean {cv_mean:.3f} below threshold 0.55 — not deploying")
+    if wf_f1 < 0.50:
+        raise ValueError(f"Walk-forward F1 {wf_f1:.3f} below threshold 0.50")
     payload = {
         'model': pipeline,
         'features': feature_names,
         'model_type': 'classifier',
+        'universe': 'PENNY',
+        'model_version': f"v{datetime.utcnow().date().isoformat()}",
+        'trained_at': datetime.utcnow().isoformat() + 'Z',
         'cv_scores': cv_scores,
         'cv_mean': cv_mean,
         'walk_forward': walk_forward,
     }
-    save_model_with_version(payload, output_path, 'penny', metric_name='cv_mean', metric_value=cv_mean)
+    version_info = save_model_with_version(payload, output_path, 'penny', metric_name='cv_mean', metric_value=cv_mean)
     onnx_result = export_onnx_with_gatekeeper(
         payload=payload,
         model_path=output_path,
@@ -364,7 +450,27 @@ def train_model(output_path: Path) -> None:
     )
     print(f"Saved model to {output_path}")
     if onnx_result.get('exported'):
-        print(f"Exported ONNX to {onnx_result.get('onnx_path')}")
+        onnx_path = Path(onnx_result.get('onnx_path'))
+        label_balance = float(y.mean()) if len(y) else 0.0
+        write_meta_sidecar(onnx_path, cv_scores, feature_names, 'PENNY', len(y), label_balance)
+        print(f"Exported ONNX to {onnx_path}")
+        if auto_push is None:
+            auto_push = _auto_push_enabled()
+        if auto_push:
+            try:
+                meta = _build_meta_from_payload(payload)
+                meta.update({'model_version': version_info.get('model_version')})
+                push_to_portfolio_app('penny', str(onnx_path), meta=meta)
+            except Exception:
+                pass
+    print(f"[{datetime.utcnow().isoformat()}Z] Training completed")
+
+    model_obj = pipeline.named_steps.get('model') if hasattr(pipeline, 'named_steps') else None
+    if model_obj is not None and hasattr(model_obj, 'feature_importances_'):
+        importances = list(zip(feature_names, model_obj.feature_importances_))
+        print('Feature importances:')
+        for name, score in sorted(importances, key=lambda x: x[1], reverse=True):
+            print(f"{name}: {score:.4f}")
 
 
 if __name__ == '__main__':

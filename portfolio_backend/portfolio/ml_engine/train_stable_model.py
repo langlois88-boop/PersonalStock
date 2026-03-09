@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from datetime import datetime
@@ -8,21 +9,23 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from .. import market_data as yf
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.base import clone
 from sklearn.decomposition import PCA
 import joblib
+import requests
 
-from .export_utils import export_onnx_with_gatekeeper, save_model_with_version
+from .export_utils import export_onnx_with_gatekeeper, save_model_with_version, write_meta_sidecar
 from .feature_registry import STABLE_FEATURE_NAMES
 from .transformers import RollingStandardScaler
-from .validation import PurgedTimeSeriesSplit
+from .collectors.news_rss import fetch_news_sentiment
+from .push_model import _build_meta_from_payload, push_to_portfolio_app
 
-from portfolio.models import Stock, MacroIndicator, PriceHistory
+from portfolio.models import Stock, PriceHistory
 
 
 MODEL_PATH = Path(__file__).resolve().parent / 'stable_brain_v1.pkl'
@@ -54,42 +57,64 @@ def _is_valid_symbol(symbol: str) -> bool:
     return bool(re.fullmatch(r"[A-Z0-9\.\-]{1,10}", symbol))
 
 
-def _build_features(close: pd.Series, volume: pd.Series, spy_close: pd.Series, dividend_yield: float, macro: MacroIndicator | None, sector_close: pd.Series | None = None):
-    ret = close.pct_change().dropna()
-    spy_ret = spy_close.pct_change().dropna()
+def _rsi(series: pd.Series, window: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta.clip(upper=0))
+    avg_gain = gain.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
+    avg_loss = loss.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def _build_features(
+    close: pd.Series,
+    volume: pd.Series,
+    spy_close: pd.Series,
+    dividend_yield: float,
+    sector_close: pd.Series | None = None,
+    sentiment_score: float = 0.0,
+):
+    ret = close.pct_change()
+    spy_ret = spy_close.pct_change()
     aligned = pd.concat([ret, spy_ret], axis=1, join='inner').dropna()
     aligned.columns = ['stock', 'spy']
     if len(aligned) < 60 or len(close) < 220:
         return None
 
-    beta = float(aligned['stock'].cov(aligned['spy']) / (aligned['spy'].var() or 1))
-    log_ret_20 = float(np.log(close.iloc[-1] / close.iloc[-21]))
-    vol_60 = float(ret.tail(60).std())
-    rel_volume_200 = float(volume.tail(5).mean() / (volume.tail(200).mean() or 1))
+    volume_mean_20 = volume.rolling(20).mean()
+    volume_std_20 = volume.rolling(20).std().replace(0, np.nan)
+    volume_zscore_20 = ((volume - volume_mean_20) / volume_std_20).clip(-3, 3).fillna(0)
 
-    sector_strength = 0.0
-    if sector_close is not None and len(sector_close) >= 21:
-        try:
-            sector_strength = float(np.log(sector_close.iloc[-1] / sector_close.iloc[-21]))
-        except Exception:
-            sector_strength = 0.0
+    spy_corr = ret.rolling(60).corr(spy_ret).fillna(0)
+    sector_beta = pd.Series(0.0, index=close.index)
+    if sector_close is not None and not sector_close.empty:
+        sector_ret = sector_close.pct_change()
+        aligned_sector = pd.concat([ret, sector_ret], axis=1, join='inner').dropna()
+        aligned_sector.columns = ['stock', 'sector']
+        if len(aligned_sector) >= 60:
+            sector_beta = (
+                aligned_sector['stock'].rolling(60).cov(aligned_sector['sector'])
+                / aligned_sector['sector'].rolling(60).var().replace(0, np.nan)
+            ).reindex(close.index).ffill()
 
-    macro_features = [
-        float(macro.sp500_close) if macro else 0.0,
-        float(macro.vix_index) if macro else 0.0,
-        float(macro.interest_rate_10y) if macro else 0.0,
-        float(macro.inflation_rate) if macro else 0.0,
-        float(macro.oil_price) if (macro and macro.oil_price is not None) else 0.0,
-    ]
+    sma_10 = close.rolling(10).mean()
+    sma_20 = close.rolling(20).mean()
+    sma_50 = close.rolling(50).mean().replace(0, np.nan)
+    sma_ratio_10_50 = (sma_10 / sma_50).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    sma_ratio_20_50 = (sma_20 / sma_50).replace([np.inf, -np.inf], np.nan).fillna(1.0)
 
     return [
-        log_ret_20,
-        vol_60,
-        beta,
-        rel_volume_200,
-        dividend_yield,
-        sector_strength,
-        *macro_features,
+        float(_rsi(close, 14).iloc[-1]),
+        float(sma_ratio_10_50.iloc[-1]),
+        float(sma_ratio_20_50.iloc[-1]),
+        float(ret.rolling(20).std().iloc[-1]),
+        float(volume_zscore_20.iloc[-1]),
+        float(close.pct_change(20).iloc[-1]),
+        float(spy_corr.iloc[-1]),
+        float(dividend_yield),
+        float(sector_beta.iloc[-1]),
+        float(sentiment_score),
     ]
 
 
@@ -106,12 +131,92 @@ def _price_history_series(symbol: str, days: int = 365 * 2) -> pd.Series | None:
     return series if not series.empty else None
 
 
-def train_stable_model():
+def _auto_push_enabled() -> bool:
+    return (
+        os.getenv('AUTO_PUSH_MODEL', '')
+        or os.getenv('AUTO_PUSH_MODELS', '')
+    ).lower() in {'1', 'true', 'yes', 'y'}
+
+
+def _deepseek_enabled() -> bool:
+    return os.getenv('DEEPSEEK_WEIGHTING_ENABLED', 'false').lower() in {'1', 'true', 'yes', 'y'}
+
+
+def _deepseek_confidence(symbol: str, date_value: str, features: dict[str, float], raw_label: int) -> float:
+    base_url = (os.getenv('DEEPSEEK_API_URL') or '').strip().rstrip('/')
+    if not base_url:
+        return 1.0
+    prompt = (
+        "Stock: {symbol}, Date: {date}, Raw label: {label}\n"
+        "Features: RSI={rsi:.1f}, SMA_ratio={sma_ratio:.3f}, "
+        "Vol_zscore={vol_z:.2f}, Return_20d={ret_20d:.3f}\n"
+        "Sentiment: {sentiment:.2f}\n\n"
+        "Given these indicators, rate your confidence 0.0-1.0 that the label "
+        "({label}) is correct. Respond with ONLY a float number, nothing else."
+    ).format(
+        symbol=symbol,
+        date=date_value,
+        label=raw_label,
+        rsi=features.get('rsi_14', 0.0),
+        sma_ratio=features.get('sma_ratio_10_50', 1.0),
+        vol_z=features.get('volume_zscore_20', 0.0),
+        ret_20d=features.get('return_20d', 0.0),
+        sentiment=features.get('sentiment_score', 0.0),
+    )
+    try:
+        resp = requests.post(
+            base_url,
+            json={'prompt': prompt},
+            timeout=int(os.getenv('DEEPSEEK_TIMEOUT', '20')),
+        )
+        resp.raise_for_status()
+        text = (resp.json().get('response') if resp.headers.get('content-type', '').startswith('application/json') else resp.text)
+        if isinstance(text, dict):
+            text = json.dumps(text)
+        value = float(str(text).strip().split()[0])
+        return max(0.0, min(1.0, value))
+    except Exception:
+        return 1.0
+
+
+def _label_targets_triple_barrier(
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    up_pct: float = 0.15,
+    down_pct: float = 0.07,
+    max_days: int = 20,
+) -> pd.Series:
+    if close is None or close.empty:
+        return pd.Series(dtype=int)
+    prices = close.values
+    highs = high.values if high is not None and not high.empty else prices
+    lows = low.values if low is not None and not low.empty else prices
+    labels = np.full(len(prices), np.nan)
+    for i in range(len(prices) - 1):
+        entry = prices[i]
+        if entry <= 0:
+            continue
+        upper = entry * (1 + up_pct)
+        lower = entry * (1 - down_pct)
+        end = min(len(prices), i + max_days + 1)
+        hit = 0
+        for j in range(i + 1, end):
+            if highs[j] >= upper:
+                hit = 1
+                break
+            if lows[j] <= lower:
+                hit = 0
+                break
+        labels[i] = hit
+    return pd.Series(labels, index=close.index)
+
+
+def train_stable_model(auto_push: bool | None = None):
+    print(f"[{datetime.utcnow().isoformat()}Z] Training started")
     symbols = [s.symbol for s in Stock.objects.all().order_by('symbol') if _is_valid_symbol(s.symbol)]
     if not symbols:
         raise RuntimeError('No stocks found to train on.')
-
-    macro = MacroIndicator.objects.order_by('-date').first()
 
     rows = []
     targets = []
@@ -138,9 +243,14 @@ def train_stable_model():
             close = _price_history_series(symbol)
             if close is None:
                 continue
+            volume = pd.Series([0.0] * len(close), index=close.index)
+            high = close
+            low = close
         else:
             close = data['Adj Close'] if 'Adj Close' in data else data['Close']
-        volume = data['Volume'] if 'Volume' in data else pd.Series([0] * len(close), index=close.index)
+            volume = data['Volume'] if 'Volume' in data else pd.Series([0.0] * len(close), index=close.index)
+            high = data['High'] if 'High' in data else close
+            low = data['Low'] if 'Low' in data else close
         stock_row = Stock.objects.filter(symbol=symbol).values('dividend_yield', 'sector').first() or {}
         dividend_yield = float(stock_row.get('dividend_yield') or 0)
         sector_name = stock_row.get('sector') or ''
@@ -154,47 +264,35 @@ def train_stable_model():
             except Exception:
                 sector_close = None
 
-        ret = close.pct_change()
-        spy_ret = spy_close.pct_change()
-        aligned = pd.concat([ret, spy_ret], axis=1, join='inner').dropna()
-        aligned.columns = ['stock', 'spy']
-        beta_series = (
-            aligned['stock'].expanding(60).cov(aligned['spy'])
-            / aligned['spy'].expanding(60).var()
-        ).reindex(close.index).ffill()
-
-        log_ret_20 = np.log(close / close.shift(20))
-        vol_60 = ret.rolling(60).std()
-        rel_volume_200 = volume.rolling(5).mean() / volume.rolling(200).mean()
-
-        sector_strength = pd.Series(0.0, index=close.index)
-        if sector_close is not None and not sector_close.empty:
-            sector_strength = np.log(sector_close / sector_close.shift(20)).reindex(close.index).ffill().fillna(0.0)
-
-        macro_features = [
-            float(macro.sp500_close) if macro else 0.0,
-            float(macro.vix_index) if macro else 0.0,
-            float(macro.interest_rate_10y) if macro else 0.0,
-            float(macro.inflation_rate) if macro else 0.0,
-            float(macro.oil_price) if (macro and macro.oil_price is not None) else 0.0,
-        ]
-
-        for i in range(220, len(close) - 20):
-            if len(close.iloc[:i + 1]) < 220:
+        news_payload = fetch_news_sentiment(symbol)
+        sentiment_score = float(news_payload.get('news_sentiment') or 0.0)
+        label_series = _label_targets_triple_barrier(
+            close=close,
+            high=high,
+            low=low,
+            up_pct=float(os.getenv('STABLE_TRIPLE_BARRIER_UP_PCT', '0.15')),
+            down_pct=float(os.getenv('STABLE_TRIPLE_BARRIER_DOWN_PCT', '0.07')),
+            max_days=int(os.getenv('STABLE_TRIPLE_BARRIER_MAX_DAYS', '20')),
+        )
+        for i in range(60, len(close) - 20):
+            if len(close.iloc[:i + 1]) < 60:
                 continue
-            feature_values = [
-                log_ret_20.iloc[i],
-                vol_60.iloc[i],
-                beta_series.iloc[i],
-                rel_volume_200.iloc[i],
+            slice_close = close.iloc[:i + 1]
+            slice_volume = volume.iloc[:i + 1]
+            slice_spy = spy_close.reindex(slice_close.index).ffill()
+            slice_sector = sector_close.reindex(slice_close.index).ffill() if sector_close is not None else None
+            feature_values = _build_features(
+                slice_close,
+                slice_volume,
+                slice_spy,
                 dividend_yield,
-                sector_strength.iloc[i],
-                *macro_features,
-            ]
+                sector_close=slice_sector,
+                sentiment_score=sentiment_score,
+            )
             if any(pd.isna(val) for val in feature_values):
                 continue
-            future_return = float((close.iloc[i + 20] - close.iloc[i]) / close.iloc[i])
-            row = {'date': close.index[i], 'target': future_return}
+            label_value = label_series.iloc[i] if i < len(label_series) else np.nan
+            row = {'date': close.index[i], 'label': label_value, 'symbol': symbol}
             row.update({FEATURE_NAMES[j]: feature_values[j] for j in range(len(FEATURE_NAMES))})
             rows.append(row)
 
@@ -204,13 +302,19 @@ def train_stable_model():
     df = pd.DataFrame(rows)
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
     df = df.dropna(subset=['date']).sort_values('date')
-    X = df[FEATURE_NAMES].values
-    y = df['target'].values
+    df = df.dropna(subset=['label'])
+    X = df[FEATURE_NAMES].replace([np.inf, -np.inf], np.nan).fillna(0).values
+    y = df['label'].astype(int).values
+    if len(set(y)) < 2:
+        raise ValueError('Only one class')
 
-    use_rolling = os.getenv('STABLE_ROLLING_SCALER', 'true').lower() in {'1', 'true', 'yes', 'y'}
-    scaler = RollingStandardScaler(window=int(os.getenv('STABLE_ROLLING_WINDOW', '90'))) if use_rolling else StandardScaler()
-
-    model = GradientBoostingRegressor(random_state=42)
+    scaler = StandardScaler()
+    model = RandomForestClassifier(
+        n_estimators=400,
+        max_depth=8,
+        random_state=42,
+        class_weight='balanced',
+    )
     if os.getenv('STABLE_OPTUNA_TRIALS', '0').isdigit() and int(os.getenv('STABLE_OPTUNA_TRIALS', '0')) > 0:
         try:
             import optuna
@@ -257,19 +361,24 @@ def train_stable_model():
     steps.append(('model', model))
     pipeline = Pipeline(steps)
 
-    use_purged = os.getenv('STABLE_PURGED_CV', 'true').lower() in {'1', 'true', 'yes', 'y'}
-    tscv = PurgedTimeSeriesSplit(
-        n_splits=int(os.getenv('STABLE_PURGED_SPLITS', '5')),
-        purge_window=int(os.getenv('STABLE_PURGE_WINDOW', '5')),
-        embargo_pct=float(os.getenv('STABLE_EMBARGO_PCT', '0.02')),
-    ) if use_purged else TimeSeriesSplit(n_splits=5)
+    tscv = TimeSeriesSplit(n_splits=5)
     scores = []
+    weights = None
+    if _deepseek_enabled():
+        weights = []
+        for i, row in df.iterrows():
+            date_str = row['date'].strftime('%Y-%m-%d') if hasattr(row['date'], 'strftime') else str(row['date'])
+            feature_dict = {name: float(row[name]) for name in FEATURE_NAMES}
+            weights.append(_deepseek_confidence(str(row.get('symbol', '')), date_str, feature_dict, int(row['label'])))
+        weights = np.array(weights, dtype=float)
     for train_idx, test_idx in tscv.split(X):
-        pipeline.fit(X[train_idx], y[train_idx])
-        preds = pipeline.predict(X[test_idx])
-        scores.append(mean_absolute_error(y[test_idx], preds))
+        if weights is not None:
+            pipeline.fit(X[train_idx], y[train_idx], model__sample_weight=weights[train_idx])
+        else:
+            pipeline.fit(X[train_idx], y[train_idx])
+        scores.append(float(pipeline.score(X[test_idx], y[test_idx])))
 
-    def _walk_forward_mae() -> list[dict[str, float | int | str]]:
+    def _walk_forward_f1() -> list[dict[str, float | int | str]]:
         reports = []
         if df.empty:
             return reports
@@ -285,46 +394,79 @@ def train_stable_model():
             if train_mask.sum() < 60 or test_mask.sum() == 0:
                 test_start = test_end
                 continue
-            X_train = df.loc[train_mask, FEATURE_NAMES].values
-            y_train = y[train_mask.values]
-            X_test = df.loc[test_mask, FEATURE_NAMES].values
-            y_test = y[test_mask.values]
+            X_train = df.loc[train_mask, FEATURE_NAMES].replace([np.inf, -np.inf], np.nan).fillna(0).values
+            y_train = df.loc[train_mask, 'label'].astype(int).values
+            X_test = df.loc[test_mask, FEATURE_NAMES].replace([np.inf, -np.inf], np.nan).fillna(0).values
+            y_test = df.loc[test_mask, 'label'].astype(int).values
             window_pipeline = clone(pipeline)
             window_pipeline.fit(X_train, y_train)
             preds = window_pipeline.predict(X_test)
-            mae = float(mean_absolute_error(y_test, preds)) if len(y_test) else 0.0
+            f1 = float(f1_score(y_test, preds, zero_division=0)) if len(y_test) else 0.0
             reports.append({
                 'start': test_start.strftime('%Y-%m-%d'),
                 'end': test_end.strftime('%Y-%m-%d'),
                 'samples': int(len(y_test)),
-                'mae': mae,
+                'f1': f1,
             })
             test_start = test_end
         return reports
 
-    walk_forward = _walk_forward_mae()
-    pipeline.fit(X, y)
-    mae_value = float(np.mean(scores)) if scores else None
+    walk_forward = _walk_forward_f1()
+    if weights is not None:
+        pipeline.fit(X, y, model__sample_weight=weights)
+    else:
+        pipeline.fit(X, y)
+    cv_mean = float(np.mean(scores)) if scores else None
+    wf_f1 = float(np.mean([row.get('f1', 0.0) for row in walk_forward])) if walk_forward else 0.0
+    if cv_mean is None or cv_mean < 0.55:
+        raise ValueError(f"CV mean {cv_mean:.3f} below threshold 0.55 — not deploying")
+    if wf_f1 < 0.50:
+        raise ValueError(f"Walk-forward F1 {wf_f1:.3f} below threshold 0.50")
     payload = {
         'model': pipeline,
         'features': FEATURE_NAMES,
-        'model_type': 'regressor',
-        'mae': mae_value,
+        'model_type': 'classifier',
+        'universe': 'STABLE',
+        'model_version': f"v{datetime.utcnow().date().isoformat()}",
+        'trained_at': datetime.utcnow().isoformat() + 'Z',
+        'cv_scores': scores,
+        'cv_mean': cv_mean,
         'walk_forward': walk_forward,
     }
-    save_model_with_version(payload, MODEL_PATH, 'stable', metric_name='mae', metric_value=mae_value)
+    version_info = save_model_with_version(payload, MODEL_PATH, 'stable', metric_name='cv_mean', metric_value=cv_mean)
     onnx_result = export_onnx_with_gatekeeper(
         payload=payload,
         model_path=MODEL_PATH,
         model_name='stable',
         feature_names=FEATURE_NAMES,
-        metric_name='mae',
-        metric_direction='lower',
+        metric_name='cv_mean',
+        metric_direction='higher',
     )
+    if onnx_result.get('exported'):
+        onnx_path = Path(onnx_result.get('onnx_path'))
+        label_balance = float(np.mean(y)) if len(y) else 0.0
+        write_meta_sidecar(onnx_path, scores, FEATURE_NAMES, 'STABLE', len(y), label_balance)
+        if auto_push is None:
+            auto_push = _auto_push_enabled()
+        if auto_push:
+            try:
+                meta = _build_meta_from_payload(payload)
+                meta.update({'model_version': version_info.get('model_version')})
+                push_to_portfolio_app('stable', str(onnx_path), meta=meta)
+            except Exception:
+                pass
+    print(f"[{datetime.utcnow().isoformat()}Z] Training completed")
+
+    model_obj = pipeline.named_steps.get('model') if hasattr(pipeline, 'named_steps') else None
+    if model_obj is not None and hasattr(model_obj, 'feature_importances_'):
+        importances = list(zip(FEATURE_NAMES, model_obj.feature_importances_))
+        print('Feature importances:')
+        for name, score in sorted(importances, key=lambda x: x[1], reverse=True):
+            print(f"{name}: {score:.4f}")
 
     return {
         'samples': len(X),
-        'mae': mae_value,
+        'cv_mean': cv_mean,
         'walk_forward': walk_forward,
         'model_path': str(MODEL_PATH),
         'onnx': onnx_result,
