@@ -9,7 +9,7 @@ from typing import Iterable
 import joblib
 import numpy as np
 import pandas as pd
-from .. import market_data as yf
+from portfolio import market_data as yf
 import requests
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit
@@ -20,13 +20,13 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 
-from .transformers import RollingStandardScaler
-from .validation import PurgedTimeSeriesSplit
+from portfolio.ml_engine.transformers import RollingStandardScaler
+from portfolio.ml_engine.validation import PurgedTimeSeriesSplit
 
-from .export_utils import export_onnx_with_gatekeeper, save_model_with_version, write_meta_sidecar
-from .feature_registry import PENNY_FEATURE_NAMES
-from .collectors.news_rss import fetch_news_sentiment
-from .push_model import _build_meta_from_payload, push_to_portfolio_app
+from portfolio.ml_engine.export_utils import export_onnx_with_gatekeeper, save_model_with_version, write_meta_sidecar
+from portfolio.ml_engine.feature_registry import PENNY_FEATURE_NAMES
+from portfolio.ml_engine.collectors.news_rss import fetch_news_sentiment
+from portfolio.ml_engine.push_model import _build_meta_from_payload, push_to_portfolio_app
 
 
 def _rsi(series: pd.Series, window: int = 14) -> pd.Series:

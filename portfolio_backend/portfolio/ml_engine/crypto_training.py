@@ -15,9 +15,9 @@ from sklearn.metrics import f1_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler
 
-from .export_utils import export_onnx_with_gatekeeper, save_model_with_version, write_meta_sidecar
-from .feature_registry import CRYPTO_FEATURE_NAMES
-from .push_model import _build_meta_from_payload, push_to_portfolio_app
+from portfolio.ml_engine.export_utils import export_onnx_with_gatekeeper, save_model_with_version, write_meta_sidecar
+from portfolio.ml_engine.feature_registry import CRYPTO_FEATURE_NAMES
+from portfolio.ml_engine.push_model import _build_meta_from_payload, push_to_portfolio_app
 
 DEFAULT_SYMBOLS = [
     'BTC-USD',

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from .. import market_data as yf
+from portfolio import market_data as yf
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
@@ -19,11 +19,11 @@ from sklearn.decomposition import PCA
 import joblib
 import requests
 
-from .export_utils import export_onnx_with_gatekeeper, save_model_with_version, write_meta_sidecar
-from .feature_registry import STABLE_FEATURE_NAMES
-from .transformers import RollingStandardScaler
-from .collectors.news_rss import fetch_news_sentiment
-from .push_model import _build_meta_from_payload, push_to_portfolio_app
+from portfolio.ml_engine.export_utils import export_onnx_with_gatekeeper, save_model_with_version, write_meta_sidecar
+from portfolio.ml_engine.feature_registry import STABLE_FEATURE_NAMES
+from portfolio.ml_engine.transformers import RollingStandardScaler
+from portfolio.ml_engine.collectors.news_rss import fetch_news_sentiment
+from portfolio.ml_engine.push_model import _build_meta_from_payload, push_to_portfolio_app
 
 from portfolio.models import Stock, PriceHistory
 
