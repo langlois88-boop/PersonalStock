@@ -107,7 +107,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.url:
-        global PUSH_ENDPOINT
         PUSH_ENDPOINT = f"{args.url}/api/ml/push"
 
     meta = None
