@@ -25,7 +25,7 @@ from portfolio.ml_engine.transformers import RollingStandardScaler
 from portfolio.ml_engine.collectors.news_rss import fetch_news_sentiment
 from portfolio.ml_engine.push_model import _build_meta_from_payload, push_to_portfolio_app
 
-from portfolio.models import Stock, PriceHistory
+
 
 
 MODEL_PATH = Path(__file__).resolve().parent / 'stable_brain_v1.pkl'
@@ -129,6 +129,8 @@ def _build_features(
 
 
 def _price_history_series(symbol: str, days: int = 365 * 2) -> pd.Series | None:
+    from portfolio.models import Stock, PriceHistory
+
     stock = Stock.objects.filter(symbol__iexact=symbol).first()
     if not stock:
         return None
@@ -225,6 +227,7 @@ def _label_targets_triple_barrier(
 def train_stable_model(auto_push: bool | None = None):
     _ensure_django()
     print(f"[{datetime.utcnow().isoformat()}Z] Training started")
+    from portfolio.models import Stock
     symbols = [s.symbol for s in Stock.objects.all().order_by('symbol') if _is_valid_symbol(s.symbol)]
     if not symbols:
         raise RuntimeError('No stocks found to train on.')
