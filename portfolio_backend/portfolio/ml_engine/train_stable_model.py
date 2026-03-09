@@ -79,7 +79,7 @@ def _build_features(
     spy_ret = spy_close.pct_change()
     aligned = pd.concat([ret, spy_ret], axis=1, join='inner').dropna()
     aligned.columns = ['stock', 'spy']
-    if len(aligned) < 60 or len(close) < 220:
+    if len(aligned) < 60 or len(close) < 60:
         return None
 
     volume_mean_20 = volume.rolling(20).mean()
