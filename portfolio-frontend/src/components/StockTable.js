@@ -15,6 +15,21 @@ import {
 
 import api from '../api/api';
 
+const TO_SUFFIX_SYMBOLS = new Set(
+  (process.env.REACT_APP_FORCE_TO_SUFFIX_SYMBOLS || 'TEC')
+    .split(',')
+    .map((item) => item.trim().toUpperCase())
+    .filter(Boolean)
+);
+
+const formatTicker = (symbol) => {
+  const clean = String(symbol || '').trim().toUpperCase();
+  if (!clean) return '';
+  if (clean.includes('.')) return clean;
+  if (TO_SUFFIX_SYMBOLS.has(clean)) return `${clean}.TO`;
+  return clean;
+};
+
 function StockTable() {
   const [stocks, setStocks] = useState([]);
   const [sortBy, setSortBy] = useState('symbol');
@@ -151,15 +166,20 @@ function StockTable() {
           {sorted.map((s) => (
             <TableRow key={s.id}>
               <TableCell>
+                {(() => {
+                  const displaySymbol = formatTicker(s.symbol);
+                  return (
                 <Typography
                   component="a"
-                  href={`https://finance.yahoo.com/quote/${s.symbol}`}
+                  href={`https://finance.yahoo.com/quote/${displaySymbol}`}
                   target="_blank"
                   rel="noreferrer"
                   sx={{ textDecoration: 'none', color: 'inherit', fontWeight: 600 }}
                 >
-                  {s.symbol}
+                  {displaySymbol}
                 </Typography>
+                  );
+                })()}
               </TableCell>
               <TableCell>{s.name}</TableCell>
               <TableCell>{s.sector}</TableCell>

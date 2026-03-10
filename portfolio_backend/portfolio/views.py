@@ -124,10 +124,14 @@ from .tasks import (
 from .ai_scout import build_scout_summary
 from .services.danas_broker import DanasBroker
 from .services.validation_service import ValidationService
+from .services.signal_engine_patches import cached_view_result
+from .services.quant_context_builder import build_quant_context, context_to_prompt
+from .services.correlation_guard import compute_correlation_matrix, marginal_correlation_impact
 from .alpaca_data import get_intraday_bars, get_intraday_context
 from .patterns import build_pattern_annotations, enrich_bars_with_patterns
 from .ml_engine.engine.data_fusion import DataFusionEngine
 from .ml_engine.collectors.news_rss import fetch_news_sentiment
+from .ml_engine.shap_explainer import explain_prediction, global_feature_importance
 
 import feedparser
 from textblob import TextBlob
@@ -139,6 +143,47 @@ from .ml_engine.backtester import (
 	get_model_path,
 	apply_feature_weighting_to_signal,
 )
+
+
+def ml_performance_view(request):
+	log_path = os.getenv('BACKTEST_LOG_PATH') or '/app/logs/backtest_history.csv'
+	if not os.path.exists(log_path):
+		log_path = os.path.join(settings.BASE_DIR, 'logs', 'backtest_history.csv')
+	if not os.path.exists(log_path):
+		return render(request, 'portfolio/ml_performance.html', {'error': 'Le fichier de log n\'existe pas encore.'})
+	try:
+		df = pd.read_csv(log_path)
+	except Exception:
+		return render(request, 'portfolio/ml_performance.html', {'error': 'Impossible de lire le fichier de log.'})
+	if df.empty:
+		return render(request, 'portfolio/ml_performance.html', {'error': 'Le fichier de log est vide.'})
+
+	symbols = sorted([s for s in df['symbol'].dropna().unique().tolist() if s])
+	selected_symbol = request.GET.get('symbol') or (symbols[0] if symbols else '')
+	if selected_symbol:
+		df = df[df['symbol'] == selected_symbol]
+
+	if df.empty:
+		return render(
+			request,
+			'portfolio/ml_performance.html',
+			{
+				'error': 'Aucune donnée pour ce symbole.',
+				'symbols': symbols,
+				'selected_symbol': selected_symbol,
+			},
+		)
+
+	df = df.sort_values('date')
+	context = {
+		'dates': df['date'].tolist(),
+		'symbols': symbols,
+		'selected_symbol': selected_symbol,
+		'strat_returns': df['strat_return'].fillna(0).tolist(),
+		'market_returns': df['market_return'].fillna(0).tolist(),
+		'table_data': df.sort_values('date', ascending=False).to_dict('records'),
+	}
+	return render(request, 'portfolio/ml_performance.html', context)
 
 
 def generate_expert_advice(metrics: dict[str, float | None]) -> list[str]:
@@ -1464,6 +1509,7 @@ class PaperTradeExplanationLogView(APIView):
 		status = (request.query_params.get('status') or '').strip().upper()
 		page = max(int(request.query_params.get('page', 1)), 1)
 		page_size = max(min(int(request.query_params.get('page_size', 25)), 200), 1)
+		include_explain = str(request.query_params.get('explain', '1')).strip().lower() in {'1', 'true', 'yes', 'y'}
 		if sandbox and sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY', 'AI_CRYPTO'}:
 			raise ValidationError({'sandbox': 'Invalid sandbox.'})
 		if status and status not in {'OPEN', 'CLOSED'}:
@@ -1477,6 +1523,42 @@ class PaperTradeExplanationLogView(APIView):
 		start = (page - 1) * page_size
 		end = start + page_size
 		rows = PaperTradeSerializer(qs[start:end], many=True).data
+		if include_explain and rows:
+			payload_cache: dict[str, dict[str, Any] | None] = {}
+			for row in rows:
+				symbol = (row.get('ticker') or '').strip().upper()
+				entry_features = row.get('entry_features') or {}
+				existing_expl = row.get('entry_explanations') or {}
+				if isinstance(existing_expl, dict) and existing_expl:
+					row['explanation'] = existing_expl.get('text') or existing_expl.get('explanation')
+					row['top_factors'] = existing_expl.get('top_positive') or existing_expl.get('top_factors')
+					row['risk_factors'] = existing_expl.get('top_negative') or existing_expl.get('risk_factors')
+					if row.get('explanation'):
+						continue
+				if not symbol or not isinstance(entry_features, dict) or not entry_features:
+					continue
+				model_name = (row.get('model_name') or 'BLUECHIP').strip().upper()
+				if model_name not in payload_cache:
+					model_key = model_name if model_name in {'BLUECHIP', 'PENNY'} else 'BLUECHIP'
+					payload_cache[model_name] = _load_signal_model_payload(get_model_path(model_key))
+				payload = payload_cache.get(model_name)
+				if not payload:
+					continue
+				signal = row.get('entry_signal')
+				try:
+					signal = float(signal) if signal is not None else None
+				except (TypeError, ValueError):
+					signal = None
+				explanation = explain_prediction(
+					model_payload=payload,
+					feature_row=entry_features,
+					symbol=symbol,
+					signal=signal,
+				)
+				row['explanation'] = explanation.get('text')
+				row['top_factors'] = explanation.get('top_positive', [])[:3]
+				row['risk_factors'] = explanation.get('top_negative', [])[:3]
+				row['explanation_method'] = explanation.get('method')
 		return Response({
 			'count': total,
 			'page': page,
@@ -2317,6 +2399,7 @@ class PortfolioDashboardView(APIView):
 		except Exception:
 			return {'symbol': symbol, 'status': 'unavailable'}
 
+	@cached_view_result(ttl=300, key_prefix="atr_value")
 	def _atr_value(self, symbol: str, window: int = 14) -> float | None:
 		try:
 			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
@@ -3033,6 +3116,7 @@ def _gemini_macro_ok(symbol: str, sector: str, news_titles: list[str]) -> bool:
 		except Exception:
 			return None, None
 
+	@cached_view_result(ttl=300, key_prefix="atr_value")
 	def _atr_value(self, symbol: str, window: int = 14) -> float | None:
 		try:
 			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
@@ -4078,6 +4162,7 @@ class AccountDashboardView(APIView):
 		except Exception:
 			return None, None
 
+	@cached_view_result(ttl=300, key_prefix="atr_value")
 	def _atr_value(self, symbol: str, window: int = 14) -> float | None:
 		try:
 			fusion = DataFusionEngine(symbol, fast_mode=self._fast_mode())
@@ -6392,10 +6477,19 @@ class AskTheQuantStreamView(APIView):
 		if not question and not symbol:
 			return Response({'error': 'message or symbol is required'}, status=400)
 		symbol = symbol or _extract_ticker_from_question(question)
+		include_context = request.data.get('include_context', True)
+		context_block = ''
+		if include_context:
+			try:
+				ctx = build_quant_context(user=request.user, question=question)
+				context_block = context_to_prompt(ctx, question)
+			except Exception:
+				context_block = ''
+		enriched_question = f"{context_block}\n{question}" if context_block else question
 		advisor = DeepSeekAdvisor()
 
 		def _stream():
-			for chunk in advisor.stream_answer(symbol, question):
+			for chunk in advisor.stream_answer(symbol, enriched_question):
 				yield f"data: {chunk}\n\n"
 
 		return StreamingHttpResponse(_stream(), content_type='text/event-stream; charset=utf-8')
@@ -6634,17 +6728,20 @@ class AIBacktesterView(APIView):
 		model_version = ''
 		if payload and payload.get('model'):
 			model_version = str(payload.get('model_version') or '')
-			features = payload.get('features') or []
-			importances = getattr(payload['model'], 'feature_importances_', None)
-			if importances is not None and len(features) == len(importances):
-				feature_importance = sorted(
-					[
-						{'name': features[i], 'value': float(importances[i]) * 100}
-						for i in range(len(features))
-					],
-					key=lambda item: item['value'],
-					reverse=True,
-				)[:8]
+			feature_importance = global_feature_importance(payload, top_n=20)
+
+		if not feature_importance:
+			path = os.getenv('FEATURE_IMPORTANCE_PATH') or '/app/logs/feature_importance.json'
+			if not os.path.exists(path):
+				path = os.path.join(settings.BASE_DIR, 'logs', 'feature_importance.json')
+			try:
+				with open(path, 'r', encoding='utf-8') as handle:
+					payload = json.load(handle)
+					record = payload.get((universe or '').upper())
+					if record and record.get('features'):
+						feature_importance = record['features'][:8]
+			except Exception:
+				pass
 
 		macro_log = TaskRunLog.objects.filter(task_name='fetch_macro_daily').order_by('-started_at').first()
 		news_log = TaskRunLog.objects.filter(task_name='fetch_news_daily').order_by('-started_at').first()
@@ -8251,6 +8348,28 @@ class PortfolioOptimizerView(APIView):
 						break
 				suggestions = suggestions or fallback
 
+			correlation_payload = None
+			corr_symbols = sorted({item.get('ticker') for item in actions if item.get('ticker')})
+			if corr_symbols and not _time_budget_exceeded():
+				try:
+					corr_info = compute_correlation_matrix(corr_symbols)
+					correlation_payload = {
+						'symbols': corr_info.get('symbols'),
+						'avg_portfolio_corr': corr_info.get('avg_portfolio_corr'),
+						'diversification_score': corr_info.get('diversification_score'),
+						'high_corr_pairs': corr_info.get('high_corr_pairs'),
+						'clusters': corr_info.get('clusters'),
+						'alerts': corr_info.get('alerts'),
+						'matrix': corr_info.get('matrix_dict'),
+					}
+					if suggestions and not fast_mode:
+						for suggestion in suggestions[:5]:
+							sym = suggestion.get('ticker')
+							if sym:
+								suggestion['correlation_impact'] = marginal_correlation_impact(sym, corr_symbols)
+				except Exception:
+					correlation_payload = None
+
 			gemini_review = None
 			gemini_report = None
 			if not fast_mode:
@@ -8274,6 +8393,7 @@ class PortfolioOptimizerView(APIView):
 				'as_of': timezone.now().isoformat(),
 				'actions': actions,
 				'suggestions': suggestions[:max_suggestions],
+				'correlation': correlation_payload,
 				'params': {
 					'lookback_days': lookback_days,
 					'buy_threshold': buy_threshold,
@@ -9820,7 +9940,28 @@ class PortfolioCsvImportView(APIView):
 
 class SystemLogPageView(APIView):
 	def get(self, request):
-		return render(request, 'portfolio/logs.html')
+		log_path = '/app/logs/market_scanner.log'
+		if not os.path.exists(log_path):
+			log_path = os.path.join(settings.BASE_DIR, 'logs', 'market_scanner.log')
+		scanner_alerts = []
+		if os.path.exists(log_path):
+			try:
+				with open(log_path, 'r', encoding='utf-8') as handle:
+					lines = handle.readlines()[-20:]
+				for line in lines:
+					parts = line.strip().split('|')
+					if len(parts) == 5:
+						scanner_alerts.append({
+							'time': parts[0],
+							'symbol': parts[1],
+							'dip': parts[2],
+							'vol': parts[3],
+							'score': parts[4],
+						})
+			except Exception:
+				scanner_alerts = []
+
+		return render(request, 'portfolio/logs.html', {'scanner_alerts': scanner_alerts})
 
 
 class SystemLogDataView(APIView):

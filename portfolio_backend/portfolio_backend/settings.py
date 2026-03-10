@@ -198,7 +198,7 @@ CHANNEL_LAYERS = {
 CELERY_BEAT_SCHEDULE = {
     'fetch-prices-2min': {
         'task': 'portfolio.tasks.fetch_prices_hourly',
-        'schedule': crontab(minute='*/2', hour='*'),
+        'schedule': crontab(minute='*/10', hour='9-16', day_of_week='mon-fri'),
     },
     'fetch-fundamentals-12h': {
         'task': 'portfolio.tasks.fetch_fundamentals_daily',
@@ -345,15 +345,15 @@ CELERY_BEAT_SCHEDULE = {
     },
     'alpaca-paper-watchlist-1min': {
         'task': 'portfolio.tasks.execute_alpaca_paper_trades_watchlist',
-        'schedule': crontab(minute='*/1', hour='9-16', day_of_week='mon-fri'),
+        'schedule': crontab(minute='*/2', hour='9-16', day_of_week='mon-fri'),
     },
     'alpaca-paper-bluechip-1min': {
         'task': 'portfolio.tasks.execute_alpaca_paper_trades_ai_bluechip',
-        'schedule': crontab(minute='*/1', hour='9-16', day_of_week='mon-fri'),
+        'schedule': crontab(minute='*/2', hour='9-16', day_of_week='mon-fri'),
     },
     'alpaca-paper-penny-1min': {
         'task': 'portfolio.tasks.execute_alpaca_paper_trades_ai_penny',
-        'schedule': crontab(minute='*/1', hour='9-16', day_of_week='mon-fri'),
+        'schedule': crontab(minute='*/2', hour='9-16', day_of_week='mon-fri'),
     },
     'alpaca-paper-sync-5min': {
         'task': 'portfolio.tasks.sync_alpaca_paper_trades',
@@ -361,19 +361,19 @@ CELERY_BEAT_SCHEDULE = {
     },
     'crypto-scan-15min': {
         'task': 'portfolio.tasks.task_crypto_scan',
-        'schedule': crontab(minute='*/15', hour='*'),
+        'schedule': crontab(minute='*/30', hour='*'),
     },
     'market-scanner-5min': {
         'task': 'portfolio.tasks.market_scanner_task',
-        'schedule': crontab(minute='*/5', hour='9-16', day_of_week='mon-fri'),
+        'schedule': crontab(minute='*/10', hour='9-16', day_of_week='mon-fri'),
     },
     'active-signal-monitor-1min': {
         'task': 'portfolio.tasks.monitor_active_signals',
-        'schedule': crontab(minute='*/1', hour='9-16', day_of_week='mon-fri'),
+        'schedule': crontab(minute='*/2', hour='9-16', day_of_week='mon-fri'),
     },
     'tsx-guardian-30s': {
         'task': 'portfolio.tasks.monitor_active_trade',
-        'schedule': timedelta(seconds=30),
+        'schedule': timedelta(seconds=120),
     },
     'paper-trade-retrain-daily': {
         'task': 'portfolio.tasks.retrain_from_paper_trades_daily',
@@ -523,11 +523,11 @@ CELERY_BEAT_SCHEDULE = {
     },
     'monitor-hive-trade-1min': {
         'task': 'portfolio.tasks.monitor_hive_trade',
-        'schedule': crontab(minute='*/1', hour='9-16', day_of_week='mon-fri'),
+        'schedule': crontab(minute='*/2', hour='9-16', day_of_week='mon-fri'),
     },
     'penny-sniper-1min': {
         'task': 'portfolio.tasks.penny_sniper_alert',
-        'schedule': crontab(minute='*/1', hour='9-16', day_of_week='mon-fri'),
+        'schedule': crontab(minute='*/2', hour='9-16', day_of_week='mon-fri'),
     },
     'discover-opportunities-morning': {
         'task': 'portfolio.tasks.auto_discover_top_movers',

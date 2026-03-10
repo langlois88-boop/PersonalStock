@@ -1,5 +1,14 @@
 import { NavLink } from 'react-router-dom';
-import { BarChart3, Activity, TrendingUp, Shield, ClipboardList } from 'lucide-react';
+import { BarChart3, Activity, TrendingUp, Shield, ClipboardList, LineChart } from 'lucide-react';
+
+const backendBase = (() => {
+  const host = window.location.hostname;
+  const isLocal = host === 'localhost' || host === '127.0.0.1';
+  if (isLocal) {
+    return `${window.location.protocol}//${host}:8001`;
+  }
+  return window.location.origin;
+})();
 
 const navItems = [
   { id: 'lab', label: 'Analytics & ML Lab', icon: BarChart3, to: '/lab' },
@@ -7,6 +16,13 @@ const navItems = [
   { id: 'intraday', label: 'Intraday AI Guide', icon: TrendingUp, to: '/intraday' },
   { id: 'risk', label: 'Risk Control Center', icon: Shield, to: '/risk' },
   { id: 'logs', label: 'Logs Center', icon: ClipboardList, to: '/logs' },
+  {
+    id: 'ml-performance',
+    label: 'ML Performance',
+    icon: LineChart,
+    to: `${backendBase}/models/performance/`,
+    external: true,
+  },
 ];
 
 function Sidebar() {
@@ -19,6 +35,20 @@ function Sidebar() {
       <nav className="flex flex-col gap-2">
         {navItems.map((item) => {
           const Icon = item.icon;
+          if (item.external) {
+            return (
+              <a
+                key={item.id}
+                href={item.to}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition text-slate-400 hover:text-white hover:bg-slate-900"
+              >
+                <Icon size={18} />
+                <span>{item.label}</span>
+              </a>
+            );
+          }
           return (
             <NavLink
               key={item.id}

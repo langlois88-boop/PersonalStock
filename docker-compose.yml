@@ -29,6 +29,7 @@ services:
       - backend_static:/app/staticfiles
       - backend_db:/app/db
       - backend_models:/app/portfolio/ml_engine
+      - ${BACKUP_SSD_PATH:-/mnt/BackupSSD}:/mnt/BackupSSD
     ports:
       - "8001:8000"
     restart: unless-stopped
@@ -49,6 +50,7 @@ services:
       - backend_static:/app/staticfiles
       - backend_db:/app/db
       - backend_models:/app/portfolio/ml_engine
+      - ${BACKUP_SSD_PATH:-/mnt/BackupSSD}:/mnt/BackupSSD
     restart: unless-stopped
 
   celery_beat:
@@ -58,6 +60,8 @@ services:
     command: celery -A portfolio_backend beat --loglevel=INFO
     env_file:
       - ./deploy/.env
+    environment:
+      - CELERYBEAT_SCHEDULE=/tmp/celerybeat-schedule
     depends_on:
       - postgres
       - redis
@@ -67,6 +71,7 @@ services:
       - backend_static:/app/staticfiles
       - backend_db:/app/db
       - backend_models:/app/portfolio/ml_engine
+      - ${BACKUP_SSD_PATH:-/mnt/BackupSSD}:/mnt/BackupSSD
     restart: unless-stopped
 
   realtime_tracker:

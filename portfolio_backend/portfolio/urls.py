@@ -74,6 +74,7 @@ from .views import (
     SystemLogDataView,
     TaskRunLogDataView,
     TelegramWebhookView,
+    ml_performance_view,
 )
 
 router = routers.DefaultRouter()
@@ -148,5 +149,6 @@ urlpatterns = [
     path('logs/', SystemLogPageView.as_view()),
     path('logs/data/', SystemLogDataView.as_view()),
     path('logs/tasks/', TaskRunLogDataView.as_view()),
+    path('models/performance/', ml_performance_view),
     path('', include(router.urls)),
 ]

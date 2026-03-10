@@ -11,6 +11,7 @@ from ... import market_data as yf
 
 from ...alpaca_data import get_daily_bars, get_latest_bid_ask_spread_pct, get_order_book_imbalance
 from ..feature_engineering import fractional_diff_series
+from ..features.technical import add_all_technical_features
 
 from ..collectors.news_rss import fetch_news_sentiment
 
@@ -211,6 +212,13 @@ class DataFusionEngine:
         fused["VPT_roc"] = fused["VPT"].pct_change().replace([pd.NA, float('inf'), float('-inf')], 0.0)
         fused["sector_code"] = _get_sector_code(self.ticker)
 
+        if "Open" not in fused.columns:
+            fused["Open"] = fused["Close"]
+        if "High" not in fused.columns:
+            fused["High"] = fused["Close"]
+        if "Low" not in fused.columns:
+            fused["Low"] = fused["Close"]
+
         try:
             vol_base = fused["Volume"].rolling(window=10, min_periods=5).mean()
             fused["trade_velocity"] = fused["Volume"] / vol_base.replace(0, pd.NA)
@@ -243,6 +251,37 @@ class DataFusionEngine:
             fused["intraday_range_pct"] = range_ / fused["Open"].replace(0, pd.NA)
             fused["close_pos_in_range"] = (fused["Close"] - fused["Low"]) / (range_.replace(0, pd.NA))
             fused = _add_candlestick_patterns(fused)
+
+        try:
+            fused = add_all_technical_features(
+                fused,
+                close_col="Close",
+                high_col="High",
+                low_col="Low",
+                open_col="Open",
+                volume_col="Volume",
+            )
+        except Exception:
+            pass
+
+        if "RSI14" not in fused.columns and "rsi_14" in fused.columns:
+            fused["RSI14"] = fused["rsi_14"]
+        if "MACD_HIST" not in fused.columns and "macd_hist" in fused.columns:
+            fused["MACD_HIST"] = fused["macd_hist"]
+        if "bollinger_pct_b" not in fused.columns and "bb_pct_b_20" in fused.columns:
+            fused["bollinger_pct_b"] = fused["bb_pct_b_20"]
+        if "ADX14" not in fused.columns and "adx_14" in fused.columns:
+            fused["ADX14"] = fused["adx_14"]
+        if "VolumeZ" not in fused.columns and "volume_zscore_20" in fused.columns:
+            fused["VolumeZ"] = fused["volume_zscore_20"]
+        if "rubber_band_index" not in fused.columns and "rubber_band_20" in fused.columns:
+            fused["rubber_band_index"] = fused["rubber_band_20"]
+        if "Momentum20" not in fused.columns and "return_20d" in fused.columns:
+            fused["Momentum20"] = fused["return_20d"]
+        if "sector_beta_60" not in fused.columns:
+            fused["sector_beta_60"] = 0.0
+        if "dividend_yield" not in fused.columns:
+            fused["dividend_yield"] = 0.0
 
         spread_pct = get_latest_bid_ask_spread_pct(self.ticker)
         if spread_pct is None:

@@ -17,6 +17,21 @@ import {
 
 import api from '../api/api';
 
+const TO_SUFFIX_SYMBOLS = new Set(
+  (process.env.REACT_APP_FORCE_TO_SUFFIX_SYMBOLS || 'TEC')
+    .split(',')
+    .map((item) => item.trim().toUpperCase())
+    .filter(Boolean)
+);
+
+const formatTicker = (symbol) => {
+  const clean = String(symbol || '').trim().toUpperCase();
+  if (!clean) return '';
+  if (clean.includes('.')) return clean;
+  if (TO_SUFFIX_SYMBOLS.has(clean)) return `${clean}.TO`;
+  return clean;
+};
+
 function PortfolioInsights() {
   const [portfolios, setPortfolios] = useState([]);
   const [selected, setSelected] = useState('');
@@ -93,15 +108,20 @@ function PortfolioInsights() {
                     {insights.rebalancing.map((r) => (
                       <TableRow key={r.symbol}>
                         <TableCell>
+                          {(() => {
+                            const displaySymbol = formatTicker(r.symbol);
+                            return (
                           <Typography
                             component="a"
-                            href={`https://finance.yahoo.com/quote/${r.symbol}`}
+                            href={`https://finance.yahoo.com/quote/${displaySymbol}`}
                             target="_blank"
                             rel="noreferrer"
                             sx={{ textDecoration: 'none', color: 'inherit', fontWeight: 600 }}
                           >
-                            {r.symbol}
+                            {displaySymbol}
                           </Typography>
+                            );
+                          })()}
                         </TableCell>
                         <TableCell align="right">
                           {(r.actual_weight * 100).toFixed(2)}%

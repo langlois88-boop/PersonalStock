@@ -77,6 +77,48 @@
         </table>
       </div>
     </div>
+
+    <div class="card mt-4">
+      <div class="card-header bg-primary text-white">🔍 Alertes Scanner - Opportunités de Rebond (.TO & .V)</div>
+      <div class="card-body">
+        {% if scanner_alerts %}
+        <div class="table-responsive">
+          <table class="table table-dark table-hover align-middle mb-0">
+            <thead>
+              <tr>
+                <th>Heure</th>
+                <th>Ticker</th>
+                <th>Chute (Dip)</th>
+                <th>Volume</th>
+                <th>Score ML</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for alert in scanner_alerts %}
+              <tr>
+                <td>{{ alert.time }}</td>
+                <td><strong>{{ alert.symbol }}</strong></td>
+                <td class="text-danger">{{ alert.dip }}</td>
+                <td>{{ alert.vol }}</td>
+                <td>
+                  <span class="badge {% if alert.score|floatformat:2 > 0.80 %}bg-success{% else %}bg-warning{% endif %}">
+                    {{ alert.score }}
+                  </span>
+                </td>
+                <td>
+                  <a href="https://ca.finance.yahoo.com/quote/{{ alert.symbol }}" target="_blank" class="btn btn-sm btn-outline-info">Voir Graphique</a>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+          <div class="text-muted">Aucune alerte scanner disponible.</div>
+        {% endif %}
+      </div>
+    </div>
   </div>
 
   <script>

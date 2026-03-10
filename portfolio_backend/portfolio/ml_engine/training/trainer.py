@@ -39,7 +39,14 @@ class Trainer:
         self.pipeline_factory = pipeline_factory
         self.n_splits = n_splits
 
-    def fit(self, X: pd.DataFrame, y: pd.Series, sample_weight: Optional[np.ndarray] = None) -> TrainResult:
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        sample_weight: Optional[np.ndarray] = None,
+        min_cv_mean: float | None = None,
+        min_wf_f1: float | None = None,
+    ) -> TrainResult:
         """Fit model with time-series cross validation.
 
         Args:
@@ -84,7 +91,7 @@ class Trainer:
 
         cv_mean = float(np.mean(cv_scores)) if cv_scores else 0.0
         wf_f1 = float(np.mean(wf_f1_scores)) if wf_f1_scores else 0.0
-        gate = validate_gate(cv_mean, wf_f1)
+        gate = validate_gate(cv_mean, wf_f1, min_cv_mean=min_cv_mean, min_wf_f1=min_wf_f1)
 
         return TrainResult(
             model=final_pipe,

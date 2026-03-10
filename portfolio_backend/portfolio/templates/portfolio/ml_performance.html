@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ML Performance</title>
+  <link
+    href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+    rel="stylesheet"
+  />
+  <style>
+    body { background: #0d1117; color: #c9d1d9; }
+    .card { background: #161b22; border: 1px solid #30363d; }
+    .table thead th { color: #8b949e; }
+    .form-select { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; }
+    .alert { background: #161b22; border: 1px solid #30363d; color: #c9d1d9; }
+  </style>
+</head>
+<body>
+  <div class="container py-4">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+      <h3 class="mb-0">Performance des Modèles ML</h3>
+    </div>
+
+    {% if error %}
+      <div class="alert">{{ error }}</div>
+    {% else %}
+      <div class="card p-3 mb-3">
+        <form method="get" class="row g-2 align-items-center">
+          <div class="col-md-4">
+            <select class="form-select" name="symbol" onchange="this.form.submit()">
+              {% for symbol in symbols %}
+                <option value="{{ symbol }}" {% if symbol == selected_symbol %}selected{% endif %}>{{ symbol }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="col-md-8 text-muted">
+            Historique des backtests (symbole sélectionné)
+          </div>
+        </form>
+      </div>
+
+      <div class="card p-3 mb-4">
+        <canvas id="performanceChart" height="120"></canvas>
+      </div>
+
+      <div class="card">
+        <div class="table-responsive">
+          <table class="table table-dark table-hover align-middle mb-0">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Symbole</th>
+                <th>Stratégie (%)</th>
+                <th>Marché (%)</th>
+                <th>MDD Strat (%)</th>
+                <th>Signaux</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in table_data %}
+              <tr>
+                <td>{{ row.date }}</td>
+                <td><strong>{{ row.symbol }}</strong></td>
+                <td class="{% if row.strat_return > 0 %}text-success{% else %}text-danger{% endif %}">
+                  {{ row.strat_return|floatformat:2 }}%
+                </td>
+                <td>{{ row.market_return|floatformat:2 }}%</td>
+                <td>{{ row.strat_mdd|floatformat:2 }}%</td>
+                <td>{{ row.buy_signals }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    {% endif %}
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    {% if not error %}
+    const ctx = document.getElementById('performanceChart').getContext('2d');
+    new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: {{ dates|safe }},
+        datasets: [
+          {
+            label: 'Rendement Stratégie (%)',
+            data: {{ strat_returns|safe }},
+            borderColor: 'rgba(75, 192, 192, 1)',
+            fill: false,
+            tension: 0.2
+          },
+          {
+            label: 'Rendement Marché (%)',
+            data: {{ market_returns|safe }},
+            borderColor: 'rgba(255, 99, 132, 1)',
+            fill: false,
+            tension: 0.2
+          }
+        ]
+      },
+      options: {
+        plugins: { legend: { labels: { color: '#c9d1d9' } } },
+        scales: {
+          x: { ticks: { color: '#8b949e' } },
+          y: { ticks: { color: '#8b949e' } }
+        }
+      }
+    });
+    {% endif %}
+  </script>
+</body>
+</html>

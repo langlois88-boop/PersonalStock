@@ -17,6 +17,7 @@ joblib
 xgboost
 skl2onnx
 onnx
+onnxruntime
 pyarrow
 optuna
 transformers
@@ -38,3 +39,4 @@ TA-Lib
 psycopg2-binary
 reportlab
 plotly
+shap

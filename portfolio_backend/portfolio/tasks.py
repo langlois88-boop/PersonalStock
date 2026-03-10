@@ -5743,6 +5743,34 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             pattern_payload = cache.get(f"pattern_scan:{symbol}") or {}
             if pattern_payload.get('hammer_support'):
                 signal = min(1.0, float(signal) * pattern_boost)
+        if signal is not None:
+            ctx_5m = None
+            ctx_15m = None
+            if use_alpaca:
+                timeframe_5m = int(os.getenv('REVERSAL_TIMEFRAME', '5'))
+                timeframe_15m = int(os.getenv('REVERSAL_TIMEFRAME_15', '15'))
+                minutes = int(os.getenv('ALPACA_INTRADAY_MINUTES', '390'))
+                rvol_window = int(os.getenv('ALPACA_RVOL_WINDOW', '20'))
+                ctx_5m = _intraday_context_for_timeframe(symbol, minutes=minutes, timeframe=timeframe_5m, rvol_window=rvol_window)
+                ctx_15m = _intraday_context_for_timeframe(symbol, minutes=minutes, timeframe=timeframe_15m, rvol_window=rvol_window)
+            from .services.signal_engine_patches import should_trade_with_mtf
+            should_trade, mtf_ctx = should_trade_with_mtf(
+                symbol=symbol,
+                daily_score=float(signal),
+                ctx_5m=ctx_5m,
+                ctx_15m=ctx_15m,
+                universe=universe,
+            )
+            if not should_trade:
+                payload['signal'] = min(payload.get('signal', 0), 0.5)
+                payload['mtf_reason'] = mtf_ctx.get('reason')
+                payload['mtf_confirmed'] = False
+                payload['composite_score'] = mtf_ctx.get('composite_score')
+                _decision_log(symbol, sandbox, 'SKIP', 'mtf_not_confirmed')
+                decision_stats['blocked_intraday'] += 1
+                continue
+            payload['mtf_confirmed'] = True
+            payload['composite_score'] = mtf_ctx.get('composite_score')
         if market_sentiment in {'BEARISH', 'CAUTION'}:
             notify_key = f"market_sentiment_block:{sandbox}:{_ny_time_now().strftime('%Y%m%d%H')}"
             if not cache.get(notify_key):
@@ -7045,13 +7073,18 @@ def bluechip_dip_scanner() -> dict[str, Any]:
         score = _canadian_boost(score, symbol)
         if score < min_score:
             continue
-        candidates.append({
+        from .ml_engine.pipeline_fixes import check_dip_health, enrich_dip_candidate
+        passes, health_meta = check_dip_health(symbol, price, score, min_score)
+        if not passes:
+            continue
+        candidate = {
             'symbol': symbol,
             'price': round(price, 2),
             'score': round(score, 4),
             'rsi': None if rsi is None else round(float(rsi), 2),
             'lower_band': None if lower is None else round(float(lower), 2),
-        })
+        }
+        candidates.append(enrich_dip_candidate(candidate, health_meta))
 
     candidates.sort(key=lambda x: x.get('score', 0), reverse=True)
     if candidates:
@@ -9608,17 +9641,17 @@ def compute_continuous_evaluation_daily(as_of: str | None = None) -> dict[str, A
             )
             if not baseline.exists():
                 continue
-            features = ['Volatility', 'Momentum20', 'RSI14']
-            psi_metrics = {}
-            feature_stats = {}
-            for feat in features:
-                expected = [float((t.entry_features or {}).get(feat, 0.0)) for t in baseline]
-                actual = [float((t.entry_features or {}).get(feat, 0.0)) for t in trades]
-                psi_metrics[feat] = _psi(expected, actual)
-                feature_stats[feat] = {
-                    'baseline_mean': float(sum(expected) / len(expected)) if expected else 0.0,
-                    'current_mean': float(sum(actual) / len(actual)) if actual else 0.0,
-                }
+            from .ml_engine.drift_monitor_v2 import compute_full_drift
+            drift_result = compute_full_drift(
+                baseline_trades=list(baseline),
+                current_trades=list(trades),
+                model_name=model_name,
+            )
+            psi_metrics = drift_result["psi_metrics"]
+            psi_metrics["_max_psi"] = drift_result["max_psi"]
+            feature_stats = drift_result["feature_stats"]
+            feature_stats["_critical_drifts"] = drift_result["critical_drifts"]
+            feature_stats["_drift_summary"] = drift_result["drift_summary"]
 
             ModelDriftDaily.objects.update_or_create(
                 as_of=as_of_date,
@@ -9704,8 +9737,9 @@ def auto_retrain_on_drift_daily() -> dict[str, Any]:
         entry = ModelDriftDaily.objects.filter(sandbox=sandbox, as_of__gte=cutoff).order_by('-as_of').first()
         if not entry or not entry.psi:
             continue
-        max_psi = max([float(v) for v in entry.psi.values()]) if entry.psi else 0.0
-        if max_psi < threshold:
+        max_psi = float(entry.psi.get('_max_psi', max(entry.psi.values(), default=0))) if entry.psi else 0.0
+        critical_drifts = (entry.feature_stats or {}).get('_critical_drifts', []) if entry.feature_stats else []
+        if max_psi < threshold and not critical_drifts:
             continue
         result = retrain_from_paper_trades_daily(sandbox_override=sandbox)
         results['retrained'].append({
@@ -12322,64 +12356,8 @@ def generate_penny_signals(days: int = 7) -> dict[str, int]:
                 'hype': count * 25,
             }
 
-    # Rank by mentions + hype
-    ranked = sorted(
-        mention_map.items(),
-        key=lambda x: (x[1]['mentions'], x[1]['hype']),
-        reverse=True,
-    )[:max_symbols]
-
-    created = 0
-    seen = 0
-    today = timezone.now().date()
-
-    for symbol, stats in ranked:
-        seen += 1
-        # Fetch recent prices
-        data = yf.Ticker(symbol).history(period=f"{days}d")
-        if data is None or data.empty or 'Close' not in data or 'Volume' not in data:
-            continue
-
-        last_price = float(data['Close'].iloc[-1])
-        if last_price > 0.5:
-            continue  # not a sub-$0.50 penny stock
-
-        avg_volume = float(data['Volume'].rolling(20).mean().iloc[-1]) if len(data) >= 20 else float(data['Volume'].mean())
-        last_volume = float(data['Volume'].iloc[-1])
-        prev_close = float(data['Close'].iloc[-2]) if len(data) > 1 else last_price
-        gap = (last_price - prev_close) / prev_close if prev_close else 0
-
-        volume_spike = (last_volume / avg_volume) if avg_volume else 0
-        pattern_score = max(0.0, min(1.0, (gap * 5) + (volume_spike / 10)))
-
-        sentiment_score = stats['sentiment'] / max(stats['mentions'], 1)
-        hype_score = min(1.0, stats['hype'] / 10000)
-        liquidity_score = min(1.0, avg_volume / 1_000_000)
-        combined = (pattern_score * 0.5) + (sentiment_score * 0.3) + (hype_score * 0.2)
-
-        _, was_created = PennySignal.objects.update_or_create(
-            symbol=symbol,
-            as_of=today,
-            defaults={
-                'pattern_score': pattern_score,
-                'sentiment_score': sentiment_score,
-                'hype_score': hype_score,
-                'liquidity_score': liquidity_score,
-                'combined_score': combined,
-                'last_price': last_price,
-                'avg_volume': avg_volume,
-                'mentions': stats['mentions'],
-                'data': {
-                    'gap': gap,
-                    'volume_spike': volume_spike,
-                },
-            },
-        )
-
-        if was_created:
-            created += 1
-
-    return {'created': created, 'seen': seen}
+    from .services.penny_signal_engine import generate_penny_signals_v2
+    return generate_penny_signals_v2(mention_map, days=days, max_symbols=max_symbols)
 
 
 @shared_task
