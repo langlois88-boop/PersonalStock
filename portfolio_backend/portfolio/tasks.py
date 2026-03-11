@@ -5687,6 +5687,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
 
     for symbol in watchlist:
         existing_trades = open_trades_by_symbol.get(symbol, [])
+        relaxed_penny = sandbox == 'AI_PENNY' and os.getenv('AI_PENNY_RELAXED_MODE', 'true').lower() in {'1', 'true', 'yes', 'y'}
         if _midday_blackout():
             _decision_log(symbol, sandbox, 'SKIP', 'midday_blackout')
             decision_stats['blocked_intraday'] += 1
@@ -5816,21 +5817,21 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         if block_new_entries:
             decision_stats['blocked_low_capital'] += 1
             continue
-        if _atr_spike(symbol, use_alpaca=use_alpaca):
+        if _atr_spike(symbol, use_alpaca=use_alpaca) and not relaxed_penny:
             _decision_log(symbol, sandbox, 'SKIP', 'atr_spike')
             continue
-        if not _btc_trend_ok(symbol):
+        if not _btc_trend_ok(symbol) and not relaxed_penny:
             _decision_log(symbol, sandbox, 'SKIP', 'btc_trend_down')
             continue
         earnings_blocked, _ = _earnings_blackout(symbol, days=2)
-        if earnings_blocked:
+        if earnings_blocked and not relaxed_penny:
             continue
         if os.getenv('MULTI_TIMEFRAME_DAILY_ENABLED', 'true').lower() in {'1', 'true', 'yes', 'y'}:
-            if not _daily_trend_ok(symbol, use_alpaca=use_alpaca):
+            if not _daily_trend_ok(symbol, use_alpaca=use_alpaca) and not relaxed_penny:
                 continue
-        if _correlation_blocked(symbol, list(open_trades_by_symbol.keys())):
+        if _correlation_blocked(symbol, list(open_trades_by_symbol.keys())) and not relaxed_penny:
             continue
-        if _spread_too_wide(symbol, max_spread_pct):
+        if _spread_too_wide(symbol, max_spread_pct) and not relaxed_penny:
             continue
         if reentry_candidate:
             if not _reentry_confirmed(intraday_ctx):
@@ -5866,10 +5867,10 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 reentry_size_factor = float(os.getenv('REENTRY_STOPLOSS_SIZE_FACTOR', '0.75'))
         if reentry_candidate:
             reentry_size_factor = float(os.getenv('REENTRY_STOPLOSS_SIZE_FACTOR', '0.75'))
-        if _loss_blacklist(symbol, sandbox):
+        if _loss_blacklist(symbol, sandbox) and not relaxed_penny:
             _decision_log(symbol, sandbox, 'SKIP', 'loss_blacklist')
             continue
-        if not _sector_trend_ok(symbol):
+        if not _sector_trend_ok(symbol) and not relaxed_penny:
             _decision_log(symbol, sandbox, 'SKIP', 'sector_trend')
             continue
         if existing_trades and signal < reinforce_min_score:
