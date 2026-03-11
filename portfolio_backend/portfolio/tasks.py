@@ -5344,8 +5344,8 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         buy_threshold = 0.55
         sell_threshold = 0.25
     if sandbox == 'AI_PENNY':
-        buy_threshold = 0.35
-        sell_threshold = 0.25
+        buy_threshold = 0.30
+        sell_threshold = 0.20
     capital = initial_capital + closed_pnl
     available = max(0.0, capital - open_value)
     min_available_capital = _env_float(prefix, 'MIN_AVAILABLE_CAPITAL', '0.0')
