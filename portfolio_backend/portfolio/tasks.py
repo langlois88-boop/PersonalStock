@@ -5707,16 +5707,17 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                     _decision_log(symbol, sandbox, 'SKIP', 'halt_or_flash')
                     continue
                 min_intraday_rvol = float(os.getenv('MIN_INTRADAY_RVOL', '0.7'))
+                skip_penny_intraday = os.getenv('AI_PENNY_SKIP_INTRADAY_FILTERS', 'true').lower() in {'1', 'true', 'yes', 'y'}
                 if sandbox == 'AI_PENNY':
                     min_intraday_rvol = min(
                         min_intraday_rvol,
                         float(os.getenv('AI_PENNY_MIN_INTRADAY_RVOL', '0.1')),
                     )
-                if rvol < min_intraday_rvol:
+                if rvol < min_intraday_rvol and not (sandbox == 'AI_PENNY' and skip_penny_intraday):
                     _decision_log(symbol, sandbox, 'SKIP', f'rvol<{min_intraday_rvol}')
                     decision_stats['blocked_intraday'] += 1
                     continue
-                if _vwap_filter_block(intraday_ctx):
+                if _vwap_filter_block(intraday_ctx) and not (sandbox == 'AI_PENNY' and skip_penny_intraday):
                     _decision_log(symbol, sandbox, 'SKIP', 'below_vwap')
                     decision_stats['blocked_intraday'] += 1
                     continue
