@@ -10,8 +10,6 @@ FIX #7  : Confirmation multi-timeframe (5m + 15m + daily)
 FIX #10 : Cache ATR/features pour éviter les refusions à chaque call
 """
 
-from __future__ import annotations
-
 import os
 import logging
 from functools import lru_cache
