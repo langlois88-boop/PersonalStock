@@ -6012,7 +6012,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         decision_stats['created'] += 1
         available = max(0.0, available - (quantity * price))
 
-    if created == 0 and decision_stats['watchlist']:
+    if created == 0:
         _system_log(
             'SYSTEM',
             'WARNING',
