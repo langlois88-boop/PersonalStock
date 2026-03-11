@@ -5896,18 +5896,19 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             breakout_score = float((signal_payload or {}).get('features', {}).get('breakout_score') or 0.0)
             high_signal_bonus = float(os.getenv('AI_PENNY_INTRADAY_OVERRIDE_BONUS', '0.12'))
             allow_intraday_override = signal is not None and float(signal) >= (buy_threshold + high_signal_bonus)
-            if (intraday_rvol < min_rvol or breakout_score < breakout_score_min) and not allow_intraday_override:
-                continue
-            if _reddit_hype_risk(symbol):
-                continue
-            sentiment_raw = float((signal_payload or {}).get('features', {}).get('finbert_sentiment') or 0.0)
-            if _pump_dump_risk(intraday_ctx, sentiment_raw):
-                continue
-            if os.getenv('ORDER_BOOK_IMBALANCE_ENABLED', 'false').lower() in {'1', 'true', 'yes', 'y'}:
-                imbalance = get_order_book_imbalance(symbol)
-                min_imbalance = float(os.getenv('ORDER_BOOK_IMBALANCE_MIN', '1.0'))
-                if imbalance is not None and imbalance < min_imbalance:
+            if not relaxed_penny:
+                if (intraday_rvol < min_rvol or breakout_score < breakout_score_min) and not allow_intraday_override:
                     continue
+                if _reddit_hype_risk(symbol):
+                    continue
+                sentiment_raw = float((signal_payload or {}).get('features', {}).get('finbert_sentiment') or 0.0)
+                if _pump_dump_risk(intraday_ctx, sentiment_raw):
+                    continue
+                if os.getenv('ORDER_BOOK_IMBALANCE_ENABLED', 'false').lower() in {'1', 'true', 'yes', 'y'}:
+                    imbalance = get_order_book_imbalance(symbol)
+                    min_imbalance = float(os.getenv('ORDER_BOOK_IMBALANCE_MIN', '1.0'))
+                    if imbalance is not None and imbalance < min_imbalance:
+                        continue
         price = _latest_price(symbol)
         if price is None:
             continue
