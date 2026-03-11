@@ -6026,6 +6026,38 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 'market_sentiment': market_sentiment,
             },
         )
+        force_trade = sandbox == 'AI_PENNY' and os.getenv('AI_PENNY_FORCE_TRADE', 'true').lower() in {'1', 'true', 'yes', 'y'}
+        if force_trade:
+            best_symbol = None
+            best_signal = 0.0
+            for symbol in watchlist:
+                payload = _model_signal(symbol, universe, model_path, use_alpaca=use_alpaca)
+                if payload and payload.get('signal') is not None:
+                    score = float(payload.get('signal') or 0.0)
+                    if score > best_signal:
+                        best_signal = score
+                        best_symbol = symbol
+            if best_symbol:
+                price = _latest_price(best_symbol)
+                if price:
+                    quantity = max(1, int(float(os.getenv('AI_PENNY_MIN_POSITION_VALUE', '50')) / price))
+                    PaperTrade.objects.create(
+                        ticker=best_symbol,
+                        sandbox=sandbox,
+                        entry_price=round(price, 2),
+                        quantity=quantity,
+                        entry_signal=best_signal,
+                        entry_features={},
+                        entry_explanations=[],
+                        model_name='FORCED_PENNY',
+                        model_version='forced',
+                        broker='SIM',
+                        stop_loss=round(price * 0.95, 2),
+                        status='OPEN',
+                        pnl=0,
+                        notes='Forced entry to bootstrap learning.',
+                    )
+                    created += 1
 
     return {
         'created': created,
