@@ -5777,15 +5777,17 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                     mtf_ctx['reason'] = 'override_high_signal'
                     should_trade = True
                 else:
-                    payload['signal'] = min(payload.get('signal', 0), 0.5)
-                    payload['mtf_reason'] = mtf_ctx.get('reason')
-                    payload['mtf_confirmed'] = False
-                    payload['composite_score'] = mtf_ctx.get('composite_score')
+                    if signal_payload is not None:
+                        signal_payload['signal'] = min(signal_payload.get('signal', 0), 0.5)
+                        signal_payload['mtf_reason'] = mtf_ctx.get('reason')
+                        signal_payload['mtf_confirmed'] = False
+                        signal_payload['composite_score'] = mtf_ctx.get('composite_score')
                     _decision_log(symbol, sandbox, 'SKIP', 'mtf_not_confirmed')
                     decision_stats['blocked_intraday'] += 1
                     continue
-            payload['mtf_confirmed'] = True
-            payload['composite_score'] = mtf_ctx.get('composite_score')
+            if signal_payload is not None:
+                signal_payload['mtf_confirmed'] = True
+                signal_payload['composite_score'] = mtf_ctx.get('composite_score')
         if market_sentiment in {'BEARISH', 'CAUTION'}:
             notify_key = f"market_sentiment_block:{sandbox}:{_ny_time_now().strftime('%Y%m%d%H')}"
             if not cache.get(notify_key):
