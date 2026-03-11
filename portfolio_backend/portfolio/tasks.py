@@ -5707,6 +5707,11 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                     _decision_log(symbol, sandbox, 'SKIP', 'halt_or_flash')
                     continue
                 min_intraday_rvol = float(os.getenv('MIN_INTRADAY_RVOL', '0.7'))
+                if sandbox == 'AI_PENNY':
+                    min_intraday_rvol = min(
+                        min_intraday_rvol,
+                        float(os.getenv('AI_PENNY_MIN_INTRADAY_RVOL', '0.4')),
+                    )
                 if rvol < min_intraday_rvol:
                     _decision_log(symbol, sandbox, 'SKIP', f'rvol<{min_intraday_rvol}')
                     decision_stats['blocked_intraday'] += 1
@@ -5762,13 +5767,23 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 universe=universe,
             )
             if not should_trade:
-                payload['signal'] = min(payload.get('signal', 0), 0.5)
-                payload['mtf_reason'] = mtf_ctx.get('reason')
-                payload['mtf_confirmed'] = False
-                payload['composite_score'] = mtf_ctx.get('composite_score')
-                _decision_log(symbol, sandbox, 'SKIP', 'mtf_not_confirmed')
-                decision_stats['blocked_intraday'] += 1
-                continue
+                mtf_override_bonus = float(os.getenv('AI_PENNY_MTF_OVERRIDE_BONUS', '0.08'))
+                allow_override = (
+                    sandbox == 'AI_PENNY'
+                    and signal is not None
+                    and float(signal) >= (buy_threshold + mtf_override_bonus)
+                )
+                if allow_override:
+                    mtf_ctx['reason'] = 'override_high_signal'
+                    should_trade = True
+                else:
+                    payload['signal'] = min(payload.get('signal', 0), 0.5)
+                    payload['mtf_reason'] = mtf_ctx.get('reason')
+                    payload['mtf_confirmed'] = False
+                    payload['composite_score'] = mtf_ctx.get('composite_score')
+                    _decision_log(symbol, sandbox, 'SKIP', 'mtf_not_confirmed')
+                    decision_stats['blocked_intraday'] += 1
+                    continue
             payload['mtf_confirmed'] = True
             payload['composite_score'] = mtf_ctx.get('composite_score')
         if market_sentiment in {'BEARISH', 'CAUTION'}:
@@ -5867,7 +5882,9 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             breakout_score_min = float(os.getenv('AI_PENNY_BREAKOUT_SCORE_MIN', '0.15'))
             intraday_rvol = float((intraday_ctx or {}).get('rvol') or 0.0)
             breakout_score = float((signal_payload or {}).get('features', {}).get('breakout_score') or 0.0)
-            if intraday_rvol < min_rvol or breakout_score < breakout_score_min:
+            high_signal_bonus = float(os.getenv('AI_PENNY_INTRADAY_OVERRIDE_BONUS', '0.12'))
+            allow_intraday_override = signal is not None and float(signal) >= (buy_threshold + high_signal_bonus)
+            if (intraday_rvol < min_rvol or breakout_score < breakout_score_min) and not allow_intraday_override:
                 continue
             if _reddit_hype_risk(symbol):
                 continue
