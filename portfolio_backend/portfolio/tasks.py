@@ -5710,7 +5710,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 if sandbox == 'AI_PENNY':
                     min_intraday_rvol = min(
                         min_intraday_rvol,
-                        float(os.getenv('AI_PENNY_MIN_INTRADAY_RVOL', '0.4')),
+                        float(os.getenv('AI_PENNY_MIN_INTRADAY_RVOL', '0.1')),
                     )
                 if rvol < min_intraday_rvol:
                     _decision_log(symbol, sandbox, 'SKIP', f'rvol<{min_intraday_rvol}')
