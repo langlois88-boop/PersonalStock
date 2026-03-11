@@ -5525,9 +5525,14 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             sentiment, _ = _finbert_recent_sentiment(symbol, days=2)
             sentiment_score = max(0.0, min(1.0, (sentiment + 1.0) / 2.0))
             rvol_score = max(0.0, min(1.0, rvol / 3.0))
-            composite = (0.1 * base_signal) + (0.9 * (
-                (0.45 * rvol_score) + (0.35 * sentiment_score) + (0.20 * breakout_score)
-            ))
+            intraday_score = (0.45 * rvol_score) + (0.35 * sentiment_score) + (0.20 * breakout_score)
+            base_weight = float(os.getenv('AI_PENNY_BASE_WEIGHT', '0.6'))
+            base_weight = max(0.0, min(1.0, base_weight))
+            intraday_weight = 1.0 - base_weight
+            if intraday_ctx is None or (rvol == 0.0 and breakout_score == 0.0):
+                composite = float(base_signal)
+            else:
+                composite = (base_weight * base_signal) + (intraday_weight * intraday_score)
             payload['signal'] = float(composite)
             payload['model_name'] = 'PENNY_RVOL_SENTIMENT'
             payload['features'] = dict(payload.get('features') or {})
