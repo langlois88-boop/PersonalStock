@@ -5923,7 +5923,12 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         exposure_pct = (open_value / capital) if capital else 1.0
         if exposure_pct >= 0.8:
             continue
-        confidence_factor = max(0.0, min(1.0, (float(signal) - 0.65) / 0.35)) if signal is not None else 0.0
+        if sandbox == 'AI_PENNY':
+            confidence_floor = float(os.getenv('AI_PENNY_CONFIDENCE_MIN', '0.35'))
+            confidence_span = max(0.05, 1.0 - confidence_floor)
+            confidence_factor = max(0.0, min(1.0, (float(signal) - confidence_floor) / confidence_span)) if signal is not None else 0.0
+        else:
+            confidence_factor = max(0.0, min(1.0, (float(signal) - 0.65) / 0.35)) if signal is not None else 0.0
         if confidence_factor <= 0:
             decision_stats['blocked_confidence'] += 1
             continue
