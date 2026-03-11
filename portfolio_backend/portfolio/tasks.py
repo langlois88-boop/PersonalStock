@@ -5944,7 +5944,12 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         position_value *= regime_risk_factor
         position_value *= confidence_factor
         position_value *= reentry_size_factor
+        if sandbox == 'AI_PENNY':
+            min_position_value = float(os.getenv('AI_PENNY_MIN_POSITION_VALUE', '50'))
+            position_value = max(position_value, min_position_value)
         quantity = int(position_value / price) if price else 0
+        if sandbox == 'AI_PENNY' and quantity <= 0 and price:
+            quantity = 1
         if quantity <= 0:
             continue
         _system_log(
