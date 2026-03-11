@@ -5529,10 +5529,11 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             base_weight = float(os.getenv('AI_PENNY_BASE_WEIGHT', '0.6'))
             base_weight = max(0.0, min(1.0, base_weight))
             intraday_weight = 1.0 - base_weight
+            weighted = (base_weight * base_signal) + (intraday_weight * intraday_score)
             if intraday_ctx is None or (rvol == 0.0 and breakout_score == 0.0):
                 composite = float(base_signal)
             else:
-                composite = (base_weight * base_signal) + (intraday_weight * intraday_score)
+                composite = max(float(base_signal), float(weighted))
             payload['signal'] = float(composite)
             payload['model_name'] = 'PENNY_RVOL_SENTIMENT'
             payload['features'] = dict(payload.get('features') or {})
