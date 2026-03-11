@@ -12,8 +12,6 @@ Ce module construit un contexte structuré que DeepSeekAdvisor reçoit
 avant de répondre, rendant les réponses pertinentes et personnalisées.
 """
 
-from __future__ import annotations
-
 import logging
 import os
 from datetime import timedelta
