@@ -6039,6 +6039,14 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                         best_symbol = symbol
             if best_symbol:
                 price = _latest_price(best_symbol)
+                if price is None:
+                    try:
+                        import yfinance as yf
+                        hist = yf.Ticker(best_symbol).history(period='5d', interval='1d', timeout=10)
+                        if hist is not None and not hist.empty and 'Close' in hist:
+                            price = float(hist['Close'].iloc[-1])
+                    except Exception:
+                        price = None
                 if price:
                     quantity = max(1, int(float(os.getenv('AI_PENNY_MIN_POSITION_VALUE', '50')) / price))
                     PaperTrade.objects.create(
