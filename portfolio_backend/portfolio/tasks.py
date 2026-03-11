@@ -6026,7 +6026,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 'market_sentiment': market_sentiment,
             },
         )
-        force_trade = sandbox == 'AI_PENNY' and os.getenv('AI_PENNY_FORCE_TRADE', 'true').lower() in {'1', 'true', 'yes', 'y'}
+        force_trade = sandbox == 'AI_PENNY' and os.getenv('AI_PENNY_FORCE_TRADE', 'false').lower() in {'1', 'true', 'yes', 'y'}
         if force_trade:
             best_symbol = None
             best_signal = 0.0
