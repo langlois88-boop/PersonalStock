@@ -125,10 +125,10 @@ def run() -> None:
     result = trainer.fit(X, y)
 
     exporter = OnnxExporter()
-    output_path = Path("/app/portfolio/ml_engine/crypto_brain_v1.onnx")
+    output_path = Path("/app/portfolio/ml_engine/models/crypto_brain_v1.onnx")
     onnx_path = exporter.export(result, output_path, "CRYPTO", expected_feature_count=len(CRYPTO_FEATURES))
 
-    registry = LocalModelRegistry(Path("/app/portfolio/ml_engine/registry"))
+    registry = LocalModelRegistry(Path("/app/portfolio/ml_engine/models/registry"))
     meta = json.loads(onnx_path.with_suffix(".json").read_text())
     registry.register("crypto", onnx_path, meta)
 

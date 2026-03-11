@@ -196,8 +196,8 @@ def run_backtest(
 
 
 if __name__ == "__main__":
-    stable_model = Path(os.getenv("STABLE_ONNX_PATH", "/app/portfolio/ml_engine/stable_brain_v1.onnx"))
-    penny_model = Path(os.getenv("PENNY_ONNX_PATH", "/app/portfolio/ml_engine/scout_brain_v1.onnx"))
+    stable_model = Path(os.getenv("STABLE_ONNX_PATH", "/app/portfolio/ml_engine/models/stable_brain_v1.onnx"))
+    penny_model = Path(os.getenv("PENNY_ONNX_PATH", "/app/portfolio/ml_engine/models/scout_brain_v1.onnx"))
 
     reports: list[dict[str, float | str]] = []
     report = run_backtest("RY.TO", stable_model, STABLE_FEATURES_CORE, days=60, mode="stable")

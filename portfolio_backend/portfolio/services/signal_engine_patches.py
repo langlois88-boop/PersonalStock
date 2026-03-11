@@ -55,8 +55,8 @@ def __init__(self) -> None:
     self.model_name = os.getenv("DANAS_MODEL", os.getenv("OLLAMA_MODEL", "deepseek-r1"))
     
     # Chargement des modèles avec chemin configurable
-    penny_path  = os.getenv("PENNY_MODEL_PATH",  "/app/portfolio/ml_engine/data_fusion_brain_penny_v1.pkl")
-    bluechip_path = os.getenv("BLUECHIP_MODEL_PATH", "/app/portfolio/ml_engine/data_fusion_brain_bluechip_v1.pkl")
+    penny_path  = os.getenv("PENNY_MODEL_PATH",  "/app/portfolio/ml_engine/models/data_fusion_brain_penny_v1.pkl")
+    bluechip_path = os.getenv("BLUECHIP_MODEL_PATH", "/app/portfolio/ml_engine/models/data_fusion_brain_bluechip_v1.pkl")
     
     self.models = {}
     for name, path in [("penny", penny_path), ("bluechip", bluechip_path)]:

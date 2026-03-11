@@ -304,10 +304,10 @@ def run() -> None:
     _write_feature_importance("STABLE", result.model.named_steps.get("classifier"), selected_features)
 
     exporter = OnnxExporter()
-    output_path = Path("/app/portfolio/ml_engine/stable_brain_v1.onnx")
+    output_path = Path("/app/portfolio/ml_engine/models/stable_brain_v1.onnx")
     onnx_path = exporter.export(result, output_path, "STABLE", expected_feature_count=len(selected_features))
 
-    registry = LocalModelRegistry(Path("/app/portfolio/ml_engine/registry"))
+    registry = LocalModelRegistry(Path("/app/portfolio/ml_engine/models/registry"))
     meta = json.loads(onnx_path.with_suffix(".json").read_text())
     registry.register("stable", onnx_path, meta)
 

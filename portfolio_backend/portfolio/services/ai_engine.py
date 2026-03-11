@@ -28,11 +28,11 @@ class DanasEngine:
         self.sessions = self._load_onnx_sessions()
 
     def _load_onnx_sessions(self) -> dict[str, rt.InferenceSession]:
-        registry_dir = Path(os.getenv("DANAS_ONNX_REGISTRY_DIR", "/app/portfolio/ml_engine/registry"))
+        registry_dir = Path(os.getenv("DANAS_ONNX_REGISTRY_DIR", "/app/portfolio/ml_engine/models/registry"))
         stable_path = Path(os.getenv("DANAS_ONNX_STABLE_PATH", ""))
         penny_path = Path(os.getenv("DANAS_ONNX_PENNY_PATH", ""))
-        fallback_stable = Path(os.getenv("STABLE_ONNX_PATH", "/app/portfolio/ml_engine/stable_brain_v1.onnx"))
-        fallback_penny = Path(os.getenv("PENNY_ONNX_PATH", "/app/portfolio/ml_engine/scout_brain_v1.onnx"))
+        fallback_stable = Path(os.getenv("STABLE_ONNX_PATH", "/app/portfolio/ml_engine/models/stable_brain_v1.onnx"))
+        fallback_penny = Path(os.getenv("PENNY_ONNX_PATH", "/app/portfolio/ml_engine/models/scout_brain_v1.onnx"))
 
         def resolve_model_path(model_key: str, override: Path, fallback: Path) -> Path:
             if override and override.exists():

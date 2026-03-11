@@ -34,8 +34,8 @@ class Command(BaseCommand):
         if limit > 0:
             symbols = symbols[:limit]
 
-        stable_session = _load_session(os.getenv("STABLE_ONNX_PATH", "/app/portfolio/ml_engine/stable_brain_v1.onnx"))
-        penny_session = _load_session(os.getenv("PENNY_ONNX_PATH", "/app/portfolio/ml_engine/scout_brain_v1.onnx"))
+        stable_session = _load_session(os.getenv("STABLE_ONNX_PATH", "/app/portfolio/ml_engine/models/stable_brain_v1.onnx"))
+        penny_session = _load_session(os.getenv("PENNY_ONNX_PATH", "/app/portfolio/ml_engine/models/scout_brain_v1.onnx"))
 
         log_path = Path(os.getenv("SCANNER_LOG_PATH", "/app/logs/market_scanner.log"))
         log_path.parent.mkdir(parents=True, exist_ok=True)
