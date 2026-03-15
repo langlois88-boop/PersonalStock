@@ -202,7 +202,7 @@ CELERY_BEAT_SCHEDULE = {
     },
     'fetch-fundamentals-12h': {
         'task': 'portfolio.tasks.fetch_fundamentals_daily',
-        'schedule': crontab(minute=10, hour='6,18'),
+        'schedule': crontab(minute=10, hour=6),
     },
     'fetch-news-daily': {
         'task': 'portfolio.tasks.fetch_news_daily',
@@ -222,7 +222,7 @@ CELERY_BEAT_SCHEDULE = {
     },
     'fetch-press-releases-hourly': {
         'task': 'portfolio.tasks.fetch_press_releases_hourly',
-        'schedule': crontab(minute=10, hour='*'),
+        'schedule': crontab(minute=10, hour='9-16', day_of_week='mon-fri'),
     },
     'calculate-drip-weekly': {
         'task': 'portfolio.tasks.calculate_drip_weekly',
@@ -234,7 +234,7 @@ CELERY_BEAT_SCHEDULE = {
     },
     'check-alerts-hourly': {
         'task': 'portfolio.tasks.check_alerts',
-        'schedule': crontab(minute=15, hour='*'),
+        'schedule': crontab(minute=15, hour='9-16', day_of_week='mon-fri'),
     },
     'weekly-ai-forecast': {
         'task': 'portfolio.tasks.weekly_ai_forecast',
@@ -305,7 +305,7 @@ CELERY_BEAT_SCHEDULE = {
     },
     'penny-ai-scout-hourly': {
         'task': 'portfolio.tasks.run_penny_ai_scout',
-        'schedule': crontab(minute=0, hour='*'),
+        'schedule': crontab(minute=0, hour='9-16', day_of_week='mon-fri'),
     },
     'backtest-retrain-guard-daily': {
         'task': 'portfolio.tasks.backtest_retrain_guard',
@@ -341,7 +341,7 @@ CELERY_BEAT_SCHEDULE = {
     },
     'paper-trades-ai-crypto-15min': {
         'task': 'portfolio.tasks.execute_paper_trades_ai_crypto',
-        'schedule': crontab(minute='*/15', hour='*'),
+        'schedule': crontab(minute='*/15', hour='9-16', day_of_week='mon-fri'),
     },
     'alpaca-paper-watchlist-1min': {
         'task': 'portfolio.tasks.execute_alpaca_paper_trades_watchlist',
@@ -357,11 +357,11 @@ CELERY_BEAT_SCHEDULE = {
     },
     'alpaca-paper-sync-5min': {
         'task': 'portfolio.tasks.sync_alpaca_paper_trades',
-        'schedule': crontab(minute='*/5', hour='*'),
+        'schedule': crontab(minute='*/5', hour='9-16', day_of_week='mon-fri'),
     },
     'crypto-scan-15min': {
         'task': 'portfolio.tasks.task_crypto_scan',
-        'schedule': crontab(minute='*/30', hour='*'),
+        'schedule': crontab(minute='*/30', hour='9-16', day_of_week='mon-fri'),
     },
     'market-scanner-5min': {
         'task': 'portfolio.tasks.market_scanner_task',
@@ -538,6 +538,39 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': crontab(minute=0, hour='10-16', day_of_week='mon-fri'),
     },
 }
+
+AFTER_HOURS_TASKS_ENABLED = os.getenv('AFTER_HOURS_TASKS_ENABLED', 'false').lower() in {
+    '1',
+    'true',
+    'yes',
+    'on',
+}
+
+if not AFTER_HOURS_TASKS_ENABLED:
+    for task_name in [
+        'deep-learning-retro-nightly',
+        'nightly-closed-market-retrain',
+        'nightly-intraday-retrain',
+        'cleanup-taskrunlog-daily',
+        'cleanup-system-logs-weekly',
+        'trading-journal-daily',
+        'daily-bot-journal-2005',
+        'sunday-evening-briefing',
+        'weekend-deep-research-sat',
+        'economic-calendar-weekly',
+        'daily-performance-report',
+        'daily-profit-tracker',
+        'paper-trade-retrain-daily',
+        'model-evaluation-daily',
+        'model-drift-check-daily',
+        'data-pipeline-daily',
+        'data-qa-daily',
+        'continuous-evaluation-daily',
+        'backtest-retrain-guard-daily',
+        'drift-retrain-daily',
+        'model-rollback-daily',
+    ]:
+        CELERY_BEAT_SCHEDULE.pop(task_name, None)
 
 # Alerting / Email (dev defaults)
 EMAIL_BACKEND = os.getenv(

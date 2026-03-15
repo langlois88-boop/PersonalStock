@@ -239,8 +239,10 @@ def train_stable_model(auto_push: bool | None = None):
     if spy is None or spy.empty or ('Close' not in spy and 'Adj Close' not in spy):
         spy = yf.Ticker('QQQ').history(period='2y', interval='1d', timeout=10)
     if spy is None or spy.empty or ('Close' not in spy and 'Adj Close' not in spy):
-        spy_close = _price_history_series('SPY') or _price_history_series('QQQ')
-        if spy_close is None:
+        spy_close = _price_history_series('SPY')
+        if spy_close is None or spy_close.empty:
+            spy_close = _price_history_series('QQQ')
+        if spy_close is None or spy_close.empty:
             return {
                 'status': 'no_index',
                 'reason': 'Index history missing (SPY/QQQ).',
@@ -467,8 +469,12 @@ def train_stable_model(auto_push: bool | None = None):
                 meta = _build_meta_from_payload(payload)
                 meta.update({'model_version': version_info.get('model_version')})
                 push_to_portfolio_app('stable', str(onnx_path), meta=meta)
-            except Exception:
-                pass
+            except Exception as e:
+                import sys
+                import traceback
+
+                print(f"[push_model] Auto-push failed: {e}", file=sys.stderr)
+                traceback.print_exc()
     print(f"[{datetime.utcnow().isoformat()}Z] Training completed")
 
     model_obj = pipeline.named_steps.get('model') if hasattr(pipeline, 'named_steps') else None
