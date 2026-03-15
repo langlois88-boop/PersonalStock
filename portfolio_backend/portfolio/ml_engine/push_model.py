@@ -72,8 +72,13 @@ def push_to_portfolio_app(
     if meta:
         files["meta"] = (None, json.dumps(meta), "application/json")
 
+    headers = {}
+    push_secret = os.getenv("ML_PUSH_SECRET", "").strip()
+    if push_secret:
+        headers["X-ML-Push-Secret"] = push_secret
+
     print(f"[push_model] Pushing '{model_name}' → {PUSH_ENDPOINT}")
-    resp = requests.post(PUSH_ENDPOINT, files=files, timeout=timeout)
+    resp = requests.post(PUSH_ENDPOINT, files=files, headers=headers, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
     print(f"[push_model] Response: {data}")
