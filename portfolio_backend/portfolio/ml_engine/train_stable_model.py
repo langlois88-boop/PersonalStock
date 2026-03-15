@@ -402,12 +402,13 @@ def train_stable_model(auto_push: bool | None = None):
         end = df['date'].max()
         if start is None or end is None:
             return reports
+        min_train = int(os.getenv('STABLE_WALK_FORWARD_MIN_TRAIN', '60'))
         test_start = start + pd.DateOffset(months=3)
         while test_start < end:
             test_end = test_start + pd.DateOffset(months=3)
             train_mask = df['date'] < test_start
             test_mask = (df['date'] >= test_start) & (df['date'] < test_end)
-            if train_mask.sum() < 60 or test_mask.sum() == 0:
+            if train_mask.sum() < min_train or test_mask.sum() == 0:
                 test_start = test_end
                 continue
             X_train = df.loc[train_mask, FEATURE_NAMES].replace([np.inf, -np.inf], np.nan).fillna(0).values
@@ -434,10 +435,12 @@ def train_stable_model(auto_push: bool | None = None):
         pipeline.fit(X, y)
     cv_mean = float(np.mean(scores)) if scores else None
     wf_f1 = float(np.mean([row.get('f1', 0.0) for row in walk_forward])) if walk_forward else 0.0
-    if cv_mean is None or cv_mean < 0.55:
-        raise ValueError(f"CV mean {cv_mean:.3f} below threshold 0.55 — not deploying")
-    if wf_f1 < 0.50:
-        raise ValueError(f"Walk-forward F1 {wf_f1:.3f} below threshold 0.50")
+    cv_min = float(os.getenv('STABLE_CV_MIN', '0.55'))
+    wf_min = float(os.getenv('STABLE_WALK_FORWARD_F1_MIN', '0.50'))
+    if cv_mean is None or cv_mean < cv_min:
+        raise ValueError(f"CV mean {cv_mean:.3f} below threshold {cv_min:.2f} — not deploying")
+    if wf_f1 < wf_min:
+        raise ValueError(f"Walk-forward F1 {wf_f1:.3f} below threshold {wf_min:.2f}")
     payload = {
         'model': pipeline,
         'features': FEATURE_NAMES,
