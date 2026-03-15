@@ -21,6 +21,8 @@ services:
       dockerfile: Dockerfile
     env_file:
       - ./deploy/.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - postgres
       - redis
@@ -41,6 +43,8 @@ services:
     command: celery -A portfolio_backend worker --loglevel=INFO --pool=solo
     env_file:
       - ./deploy/.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - postgres
       - redis
@@ -60,6 +64,8 @@ services:
     command: celery -A portfolio_backend beat --loglevel=INFO
     env_file:
       - ./deploy/.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - CELERYBEAT_SCHEDULE=/tmp/celerybeat-schedule
     depends_on:
@@ -81,6 +87,8 @@ services:
     command: python manage.py realtime_tracker
     env_file:
       - ./deploy/.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - postgres
       - redis
