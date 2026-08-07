@@ -10104,7 +10104,7 @@ def refresh_ai_bluechip_watchlist() -> dict[str, Any]:
             params={
                 'limit': limit,
                 'min_score': min_score,
-                'include_universe': 'false',
+                'include_universe': 'true',
             },
             timeout=60,
         )
