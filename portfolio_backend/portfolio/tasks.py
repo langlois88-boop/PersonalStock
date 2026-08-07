@@ -7228,6 +7228,22 @@ def bluechip_dip_scanner() -> dict[str, Any]:
     require_rsi_divergence = os.getenv('BLUECHIP_REQUIRE_RSI_DIVERGENCE', 'true').lower() in {'1', 'true', 'yes', 'y'}
 
     quotes = _fetch_yfinance_screeners(screener_ids, count=limit)
+    # Funnel counters: every symbol pulled from the screener must land in
+    # exactly one bucket, so evaluated == passed + sum(the rest) — same
+    # accounting discipline as _execute_paper_trades_for_sandbox's
+    # decision_stats (see Volet 1). Previously this scanner had no
+    # visibility at all into where candidates were actually being
+    # eliminated, only the final count.
+    funnel = {
+        'evaluated': len(quotes),
+        'failed_no_symbol_or_price': 0,
+        'failed_price_range': 0,
+        'failed_rsi_divergence': 0,
+        'failed_dip_threshold': 0,
+        'failed_health_check': 0,
+        'passed': 0,
+    }
+    mean_reversion_scores: list[float] = []
     candidates: list[dict[str, Any]] = []
     for item in quotes:
         symbol = (item.get('symbol') or '').strip().upper()
@@ -7237,8 +7253,10 @@ def bluechip_dip_scanner() -> dict[str, Any]:
         except Exception:
             price = None
         if not symbol or price is None:
+            funnel['failed_no_symbol_or_price'] += 1
             continue
         if not (min_price <= price <= max_price):
+            funnel['failed_price_range'] += 1
             continue
 
         ctx_5m = _intraday_context_for_timeframe(
@@ -7248,16 +7266,21 @@ def bluechip_dip_scanner() -> dict[str, Any]:
             rvol_window=int(os.getenv('ALPACA_RVOL_WINDOW', '20')),
         )
         if require_rsi_divergence and not _rsi_divergence(ctx_5m):
+            funnel['failed_rsi_divergence'] += 1
             continue
 
         score, rsi, lower = _mean_reversion_score(symbol)
         score = _canadian_boost(score, symbol)
+        mean_reversion_scores.append(score)
         if score < min_score:
+            funnel['failed_dip_threshold'] += 1
             continue
         from .ml_engine.pipeline_fixes import check_dip_health, enrich_dip_candidate
         passes, health_meta = check_dip_health(symbol, price, score, min_score)
         if not passes:
+            funnel['failed_health_check'] += 1
             continue
+        funnel['passed'] += 1
         candidate = {
             'symbol': symbol,
             'price': round(price, 2),
@@ -7274,8 +7297,33 @@ def bluechip_dip_scanner() -> dict[str, Any]:
             sandbox='AI_BLUECHIP',
             defaults={'symbols': [row['symbol'] for row in candidates[:25]], 'source': 'bluechip_dip_scanner'},
         )
-    _system_log('AI_BLUECHIP', 'SUCCESS', f'Dip scanner: {len(candidates)} candidates', metadata={'count': len(candidates)})
-    return {'status': 'ok', 'count': len(candidates), 'results': candidates[:10]}
+    # Score distribution among symbols that reached _mean_reversion_score
+    # (i.e. cleared price range + RSI divergence) — same rsi_score formula
+    # Volet 2 flagged for WATCHLIST's buy_threshold: max(0, min(1,
+    # (30-rsi)/30)) + up to 0.15 Bollinger bonus, so it's exactly 0.0
+    # whenever RSI >= 30 and only clears min_score (0.65 by default here,
+    # even higher than WATCHLIST's 0.55) on a genuinely severe oversold
+    # read. Logged to check that against real data instead of assuming it.
+    score_stats = None
+    if mean_reversion_scores:
+        ordered = sorted(mean_reversion_scores)
+        n = len(ordered)
+        mid = n // 2
+        score_stats = {
+            'n': n,
+            'min': round(min(ordered), 4),
+            'max': round(max(ordered), 4),
+            'mean': round(sum(ordered) / n, 4),
+            'median': round(ordered[mid] if n % 2 else (ordered[mid - 1] + ordered[mid]) / 2, 4),
+        }
+    logger.debug("bluechip_dip_scanner funnel: %s | score_distribution: %s", funnel, score_stats)
+    _system_log(
+        'AI_BLUECHIP',
+        'SUCCESS',
+        f'Dip scanner: {len(candidates)} candidates',
+        metadata={'count': len(candidates), 'funnel': funnel, 'min_score': min_score, 'score_distribution': score_stats},
+    )
+    return {'status': 'ok', 'count': len(candidates), 'results': candidates[:10], 'funnel': funnel}
 
 
 @shared_task
@@ -9936,7 +9984,20 @@ def auto_retrain_on_drift_daily() -> dict[str, Any]:
 
 @shared_task
 def refresh_ai_bluechip_watchlist() -> dict[str, Any]:
-    """Populate AI bluechip sandbox watchlist from AI opportunities endpoint."""
+    """Populate AI bluechip sandbox watchlist from AI opportunities endpoint.
+
+    NOTE for the "AI_BLUECHIP watchlist is empty" investigation: this task
+    is scheduled hourly at :05 (refresh-ai-bluechip-watchlist-hourly), while
+    bluechip_dip_scanner only runs twice a day at 9:00/13:00 — 5 minutes
+    after each dip_scanner run, whatever it just wrote to
+    SandboxWatchlist(sandbox='AI_BLUECHIP') gets unconditionally overwritten
+    by this task's result (`update_or_create` runs even when `symbols` ends
+    up empty). For most of the trading day, what's actually in that
+    watchlist is this task's output, not dip_scanner's — so if
+    /api/ai/opportunities/ is itself returning few/no results, that would
+    look identical to "the dip scanner found nothing", including on hours
+    right after dip_scanner ran. Logged below to make that distinguishable.
+    """
     if os.getenv('AI_BLUECHIP_AUTOFILL', 'true').lower() == 'false':
         return {'status': 'disabled', 'sandbox': 'AI_BLUECHIP'}
     base_url = os.getenv('BACKEND_INTERNAL_URL', 'http://backend:8000').rstrip('/')
@@ -9962,6 +10023,13 @@ def refresh_ai_bluechip_watchlist() -> dict[str, Any]:
             if isinstance(item, dict)
         ]
         symbols = [s for s in symbols if s]
+        previous = SandboxWatchlist.objects.filter(sandbox='AI_BLUECHIP').first()
+        previous_count = len(previous.symbols) if previous and previous.symbols else 0
+        logger.debug(
+            "refresh_ai_bluechip_watchlist: /api/ai/opportunities/ returned %s symbols "
+            "(min_score=%s) — overwriting previous watchlist of %s symbols (source=%s)",
+            len(symbols), min_score, previous_count, previous.source if previous else None,
+        )
         SandboxWatchlist.objects.update_or_create(
             sandbox='AI_BLUECHIP',
             defaults={'symbols': symbols, 'source': 'ai/opportunities'},
