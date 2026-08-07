@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from uuid import uuid4
 from pathlib import Path
@@ -114,6 +115,8 @@ from .ml_engine.backtester import (
     train_fusion_model_from_labels,
 )
 from .ai_advisor import DeepSeekAdvisor
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_YIELD = 0.02
@@ -4086,6 +4089,7 @@ def _earnings_blackout(symbol: str, days: int = 2) -> tuple[bool, date | None]:
     try:
         ticker = yf.Ticker(symbol)
     except Exception:
+        logger.exception("_earnings_blackout: yf.Ticker failed for %s", symbol)
         return False, None
     try:
         earnings_date = _get_earnings_date(ticker)
@@ -4094,6 +4098,7 @@ def _earnings_blackout(symbol: str, days: int = 2) -> tuple[bool, date | None]:
         cutoff = (timezone.now() + timedelta(days=days)).date()
         return earnings_date <= cutoff, earnings_date
     except Exception:
+        logger.exception("_earnings_blackout failed for %s", symbol)
         return False, None
 
 
@@ -4122,6 +4127,7 @@ def _daily_trend_ok(symbol: str, use_alpaca: bool = False) -> bool:
         slope_ok = e200_prev <= 0 or e200 >= e200_prev
         return last >= e20 and e20 >= e50 and (e200 <= 0 or e50 >= e200) and slope_ok
     except Exception:
+        logger.exception("_daily_trend_ok failed for %s", symbol)
         return True
 
 
@@ -4304,6 +4310,7 @@ def _atr_spike(symbol: str, use_alpaca: bool = False) -> bool:
         avg = float(atr.tail(10).mean()) if len(atr) >= 10 else float(atr.mean())
         return avg > 0 and latest >= avg * spike_mult
     except Exception:
+        logger.exception("_atr_spike failed for %s", symbol)
         return False
 
 
@@ -4353,6 +4360,7 @@ def _btc_trend_ok(symbol: str) -> bool:
         ema50 = close.ewm(span=ema_slow, adjust=False).mean()
         return float(ema20.iloc[-1]) >= float(ema50.iloc[-1])
     except Exception:
+        logger.exception("_btc_trend_ok failed for %s", symbol)
         return True
 
 
@@ -4805,6 +4813,7 @@ def _sector_trend_ok(symbol: str) -> bool:
         min_pct = float(os.getenv('SECTOR_TREND_MIN_PCT', '-1.0'))
         return change_pct >= min_pct
     except Exception:
+        logger.exception("_sector_trend_ok failed for %s", symbol)
         return True
 
 
@@ -4938,6 +4947,7 @@ def _model_signal(
             'model_name': universe,
         }
     except Exception:
+        logger.exception("_model_signal failed for %s (%s)", symbol, universe)
         return None
 
 
@@ -5497,15 +5507,46 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
 
     created = 0
     closed = 0
+    # Every continue/return inside the "for symbol in watchlist" loop below
+    # must increment exactly one of these — decision_stats['watchlist'] ==
+    # created + sum(every 'blocked_*' counter) is a checked invariant (see
+    # test_paper_trade_decision_stats_invariant). This used to have only 8
+    # counters for a loop with ~25 distinct exit points, so most rejections
+    # were invisible: `created` stayed 0 with no way to tell which filter(s)
+    # were actually responsible.
     decision_stats = {
         'watchlist': len(watchlist),
         'created': 0,
         'blocked_low_capital': 0,
         'blocked_market_sentiment': 0,
         'blocked_threshold': 0,
+        'blocked_no_signal': 0,
         'blocked_confidence': 0,
         'blocked_volume_z': 0,
         'blocked_intraday': 0,
+        'blocked_weak_short_sentiment': 0,
+        'blocked_halt_or_flash': 0,
+        'blocked_bearish_pattern': 0,
+        'blocked_atr_spike': 0,
+        'blocked_btc_trend': 0,
+        'blocked_earnings': 0,
+        'blocked_daily_trend': 0,
+        'blocked_correlation': 0,
+        'blocked_spread_wide': 0,
+        'blocked_reentry_unconfirmed': 0,
+        'blocked_recent_loss_reentry': 0,
+        'blocked_loss_blacklist': 0,
+        'blocked_sector_trend': 0,
+        'blocked_existing_position': 0,
+        'blocked_win_rate_gate': 0,
+        'blocked_penny_rvol_breakout': 0,
+        'blocked_reddit_hype': 0,
+        'blocked_pump_dump': 0,
+        'blocked_order_book_imbalance': 0,
+        'blocked_no_price': 0,
+        'blocked_exposure_cap': 0,
+        'blocked_zero_quantity': 0,
+        'blocked_exception': 0,
     }
 
     market_sentiment, market_meta = get_market_sentiment()
@@ -5647,6 +5688,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             if threshold is None:
                 threshold = 0.0
             if market_score is not None and market_score < float(threshold):
+                decision_stats['blocked_weak_short_sentiment'] += 1
                 continue
         intraday_ctx = None
         pattern_signal = None
@@ -5662,6 +5704,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 rvol = float(intraday_ctx.get('rvol') or 0)
                 if _is_halted(intraday_ctx) or _flash_crash(intraday_ctx):
                     _decision_log(symbol, sandbox, 'SKIP', 'halt_or_flash')
+                    decision_stats['blocked_halt_or_flash'] += 1
                     continue
                 min_intraday_rvol = float(os.getenv('MIN_INTRADAY_RVOL', '0.7'))
                 skip_penny_intraday = os.getenv('AI_PENNY_SKIP_INTRADAY_FILTERS', 'true').lower() in {'1', 'true', 'yes', 'y'}
@@ -5691,6 +5734,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             signal = float(signal) * _time_of_day_penalty()
         if pattern_signal is not None and rvol is not None:
             if pattern_signal < 0 and rvol >= 2:
+                decision_stats['blocked_bearish_pattern'] += 1
                 continue
             if signal is not None and pattern_signal > 0 and rvol >= 2:
                 signal = min(1.0, float(signal) * 1.02)
@@ -5759,7 +5803,15 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 )
             decision_stats['blocked_market_sentiment'] += 1
             continue
-        if signal is None or signal < buy_threshold:
+        if signal is None:
+            # Distinct from 'below_threshold': the model produced no signal
+            # at all (e.g. _model_signal failed — DataFusionEngine/model
+            # load/predict_proba threw, now logged via logger.exception
+            # there — or, for WATCHLIST, _mean_reversion_score had no RSI).
+            _decision_log(symbol, sandbox, 'SKIP', 'no_signal', signal)
+            decision_stats['blocked_no_signal'] += 1
+            continue
+        if signal < buy_threshold:
             _decision_log(symbol, sandbox, 'SKIP', 'below_threshold', signal)
             decision_stats['blocked_threshold'] += 1
             continue
@@ -5768,23 +5820,30 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             continue
         if _atr_spike(symbol, use_alpaca=use_alpaca) and not relaxed_penny:
             _decision_log(symbol, sandbox, 'SKIP', 'atr_spike')
+            decision_stats['blocked_atr_spike'] += 1
             continue
         if not _btc_trend_ok(symbol) and not relaxed_penny:
             _decision_log(symbol, sandbox, 'SKIP', 'btc_trend_down')
+            decision_stats['blocked_btc_trend'] += 1
             continue
         earnings_blocked, _ = _earnings_blackout(symbol, days=2)
         if earnings_blocked and not relaxed_penny:
+            decision_stats['blocked_earnings'] += 1
             continue
         if os.getenv('MULTI_TIMEFRAME_DAILY_ENABLED', 'true').lower() in {'1', 'true', 'yes', 'y'}:
             if not _daily_trend_ok(symbol, use_alpaca=use_alpaca) and not relaxed_penny:
+                decision_stats['blocked_daily_trend'] += 1
                 continue
         if _correlation_blocked(symbol, list(open_trades_by_symbol.keys())) and not relaxed_penny:
+            decision_stats['blocked_correlation'] += 1
             continue
         if _spread_too_wide(symbol, max_spread_pct) and not relaxed_penny:
+            decision_stats['blocked_spread_wide'] += 1
             continue
         if reentry_candidate:
             if not _reentry_confirmed(intraday_ctx):
                 _decision_log(symbol, sandbox, 'SKIP', 'reentry_no_vwap')
+                decision_stats['blocked_reentry_unconfirmed'] += 1
                 continue
         reentry_window = int(os.getenv('REENTRY_WINDOW_MINUTES', '30'))
         reentry_bonus = float(os.getenv('REENTRY_MIN_SIGNAL_BONUS', '0.05'))
@@ -5799,6 +5858,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 exit_date__gte=cutoff,
             ).exists()
             if recent_loss and (signal is None or signal < (buy_threshold + reentry_bonus)):
+                decision_stats['blocked_recent_loss_reentry'] += 1
                 continue
         reentry_stop_minutes = int(os.getenv('REENTRY_STOPLOSS_WINDOW_MINUTES', '120'))
         reentry_stop_min_signal = float(os.getenv('REENTRY_STOPLOSS_MIN_SIGNAL', '0.8'))
@@ -5818,13 +5878,22 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             reentry_size_factor = float(os.getenv('REENTRY_STOPLOSS_SIZE_FACTOR', '0.75'))
         if _loss_blacklist(symbol, sandbox) and not relaxed_penny:
             _decision_log(symbol, sandbox, 'SKIP', 'loss_blacklist')
+            decision_stats['blocked_loss_blacklist'] += 1
             continue
         if not _sector_trend_ok(symbol) and not relaxed_penny:
             _decision_log(symbol, sandbox, 'SKIP', 'sector_trend')
+            decision_stats['blocked_sector_trend'] += 1
             continue
         if existing_trades and signal < reinforce_min_score:
+            # Already holding this symbol and the fresh signal isn't strong
+            # enough to justify adding to the position (reinforce_min_score).
+            decision_stats['blocked_existing_position'] += 1
             continue
         if sandbox == 'AI_PENNY' and _penny_blocked():
+            # Sandbox-wide win rate below MIN_WIN_RATE — distinct from
+            # blocked_existing_position (that's per-symbol; this blocks
+            # every AI_PENNY candidate at once).
+            decision_stats['blocked_win_rate_gate'] += 1
             continue
         if sandbox != 'AI_PENNY':
             volume_z = _safe_float((signal_payload or {}).get('features', {}).get('VolumeZ'))
@@ -5847,19 +5916,24 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             allow_intraday_override = signal is not None and float(signal) >= (buy_threshold + high_signal_bonus)
             if not relaxed_penny:
                 if (intraday_rvol < min_rvol or breakout_score < breakout_score_min) and not allow_intraday_override:
+                    decision_stats['blocked_penny_rvol_breakout'] += 1
                     continue
                 if _reddit_hype_risk(symbol):
+                    decision_stats['blocked_reddit_hype'] += 1
                     continue
                 sentiment_raw = float((signal_payload or {}).get('features', {}).get('finbert_sentiment') or 0.0)
                 if _pump_dump_risk(intraday_ctx, sentiment_raw):
+                    decision_stats['blocked_pump_dump'] += 1
                     continue
                 if os.getenv('ORDER_BOOK_IMBALANCE_ENABLED', 'false').lower() in {'1', 'true', 'yes', 'y'}:
                     imbalance = get_order_book_imbalance(symbol)
                     min_imbalance = float(os.getenv('ORDER_BOOK_IMBALANCE_MIN', '1.0'))
                     if imbalance is not None and imbalance < min_imbalance:
+                        decision_stats['blocked_order_book_imbalance'] += 1
                         continue
         price = _latest_price(symbol)
         if price is None:
+            decision_stats['blocked_no_price'] += 1
             continue
         atr = _atr(symbol)
         stop_mult = _stop_loss_multiplier((signal_payload or {}).get('explanations'))
@@ -5878,6 +5952,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         position_cap = capital * position_cap_pct
         exposure_pct = (open_value / capital) if capital else 1.0
         if exposure_pct >= 0.8:
+            decision_stats['blocked_exposure_cap'] += 1
             continue
         if sandbox == 'AI_PENNY':
             confidence_floor = float(os.getenv('AI_PENNY_CONFIDENCE_MIN', '0.35'))
@@ -5902,6 +5977,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         if sandbox == 'AI_PENNY' and quantity <= 0 and price:
             quantity = 1
         if quantity <= 0:
+            decision_stats['blocked_zero_quantity'] += 1
             continue
         _system_log(
             'SYSTEM',
@@ -5928,51 +6004,68 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 'intraday_price_to_vwap': float(intraday_ctx.get('price_to_vwap') or 0),
             })
         entry_features.update(_entry_time_features(symbol))
-        PaperTrade.objects.create(
-            ticker=symbol,
-            sandbox=sandbox,
-            entry_price=round(price, 2),
-            quantity=quantity,
-            entry_signal=signal,
-            entry_features=entry_features,
-            entry_explanations=(signal_payload or {}).get('explanations'),
-            model_name=(signal_payload or {}).get('model_name', universe),
-            model_version=(signal_payload or {}).get('model_version', ''),
-            broker='SIM',
-            stop_loss=round(stop_loss, 2),
-            status='OPEN',
-            pnl=0,
-            notes=(
-                f"Signal {signal:.2f} / ATR {atr:.2f} | Mise suggérée {allocation:.0f}$ "
-                f"(Confiance {float(signal or 0) * 100:.1f}%)"
-            ),
-        )
-        if os.getenv('TRADE_REASON_ALERTS', 'false').lower() in {'1', 'true', 'yes', 'y'}:
-            reason = (signal_payload or {}).get('explanations') or []
-            AlertEvent.objects.create(
-                category='TRADE_REASON',
-                message=f"{symbol} entry: {reason}",
-                stock=Stock.objects.filter(symbol__iexact=symbol).first(),
+        try:
+            # This used to be unguarded — a NameError here (undefined
+            # `allocation` in the notes f-string, fixed above) would have
+            # propagated out of the whole loop, silently aborting every
+            # remaining candidate with no trace. Any unexpected failure at
+            # trade-creation time now gets logged and counted instead of
+            # crashing the batch.
+            PaperTrade.objects.create(
+                ticker=symbol,
+                sandbox=sandbox,
+                entry_price=round(price, 2),
+                quantity=quantity,
+                entry_signal=signal,
+                entry_features=entry_features,
+                entry_explanations=(signal_payload or {}).get('explanations'),
+                model_name=(signal_payload or {}).get('model_name', universe),
+                model_version=(signal_payload or {}).get('model_version', ''),
+                broker='SIM',
+                stop_loss=round(stop_loss, 2),
+                status='OPEN',
+                pnl=0,
+                notes=(
+                    f"Signal {signal:.2f} / ATR {atr:.2f} | Mise suggérée {position_value:.0f}$ "
+                    f"(Confiance {float(signal or 0) * 100:.1f}%)"
+                ),
             )
+            if os.getenv('TRADE_REASON_ALERTS', 'false').lower() in {'1', 'true', 'yes', 'y'}:
+                reason = (signal_payload or {}).get('explanations') or []
+                AlertEvent.objects.create(
+                    category='TRADE_REASON',
+                    message=f"{symbol} entry: {reason}",
+                    stock=Stock.objects.filter(symbol__iexact=symbol).first(),
+                )
+        except Exception:
+            logger.exception("PaperTrade creation failed for %s (%s)", symbol, sandbox)
+            decision_stats['blocked_exception'] += 1
+            continue
         _decision_log(symbol, sandbox, 'BUY', 'paper_trade_created', signal)
         created += 1
         decision_stats['created'] += 1
         available = max(0.0, available - (quantity * price))
 
+    # Logged every run now (not just when created == 0) so blocking
+    # patterns are visible even on runs that did create trades — previously
+    # this was the only place decision_stats got surfaced anywhere, and
+    # only for the zero-trade case.
+    accounted = sum(v for k, v in decision_stats.items() if k not in {'watchlist', 'created'})
+    _system_log(
+        'SYSTEM',
+        'WARNING' if created == 0 else 'INFO',
+        f"Paper trade: {created} créé(s) pour {sandbox}" if created else f"Paper trade: aucun trade pour {sandbox}",
+        metadata={
+            **decision_stats,
+            'unaccounted': decision_stats['watchlist'] - decision_stats['created'] - accounted,
+            'buy_threshold': buy_threshold,
+            'min_volume_z': min_volume_z,
+            'available_capital': round(available, 2),
+            'block_new_entries': block_new_entries,
+            'market_sentiment': market_sentiment,
+        },
+    )
     if created == 0:
-        _system_log(
-            'SYSTEM',
-            'WARNING',
-            f"Paper trade: aucun trade pour {sandbox}",
-            metadata={
-                **decision_stats,
-                'buy_threshold': buy_threshold,
-                'min_volume_z': min_volume_z,
-                'available_capital': round(available, 2),
-                'block_new_entries': block_new_entries,
-                'market_sentiment': market_sentiment,
-            },
-        )
         force_trade = sandbox == 'AI_PENNY' and os.getenv('AI_PENNY_FORCE_TRADE', 'false').lower() in {'1', 'true', 'yes', 'y'}
         if force_trade:
             best_symbol = None
@@ -5985,15 +6078,24 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                         best_signal = score
                         best_symbol = symbol
             if best_symbol:
+                # NOTE: this used to shadow the module-level `yf` (see top of
+                # file) with a local `import yfinance as yf` — Python scopes
+                # a name as local to the *whole* enclosing function the
+                # moment it's assigned anywhere in that function's body,
+                # including inside nested if-blocks, so this one `import`
+                # turned `yf` into an unbound local for every nested closure
+                # in _execute_paper_trades_for_sandbox that references it —
+                # _latest_price and _atr — for their entire duration.
+                # Concretely: for WATCHLIST (use_alpaca=False, so _latest_price
+                # always falls through to `yf.Ticker(...)`), every single
+                # price lookup raised NameError (silently caught, returned
+                # None) — not just the fallback path here, which is why
+                # WATCHLIST candidates that cleared the signal threshold were
+                # still showing up as blocked_no_price instead of ever
+                # reaching order creation. `_latest_price` already retries
+                # via the module-level `yf` on its own, so this was fully
+                # redundant even before the shadowing bug.
                 price = _latest_price(best_symbol)
-                if price is None:
-                    try:
-                        import yfinance as yf
-                        hist = yf.Ticker(best_symbol).history(period='5d', interval='1d', timeout=10)
-                        if hist is not None and not hist.empty and 'Close' in hist:
-                            price = float(hist['Close'].iloc[-1])
-                    except Exception:
-                        price = None
                 if price:
                     quantity = max(1, int(float(os.getenv('AI_PENNY_MIN_POSITION_VALUE', '50')) / price))
                     PaperTrade.objects.create(
