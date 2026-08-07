@@ -139,6 +139,12 @@ class SandboxWatchlist(models.Model):
 	sandbox = models.CharField(max_length=20, choices=SANDBOX_CHOICES, unique=True)
 	symbols = models.JSONField(default=list, blank=True)
 	source = models.CharField(max_length=100, blank=True, default='')
+	# Per-symbol provenance: {symbol: {'source': str, 'added_at': iso str,
+	# 'protect_until': iso str | absent}}. `source` above stays a coarse
+	# summary label for the whole row; this is what the AI_BLUECHIP merge
+	# logic (bluechip_dip_scanner / refresh_ai_bluechip_watchlist) actually
+	# reads to decide which symbols survive a merge.
+	symbol_sources = models.JSONField(default=dict, blank=True)
 	updated_at = models.DateTimeField(auto_now=True)
 
 	class Meta:

@@ -7210,6 +7210,83 @@ def auto_discover_top_movers(min_score: float | None = None) -> dict[str, Any]:
     return payload
 
 
+def _merge_bluechip_watchlist(
+    new_symbols: list[str],
+    new_source: str,
+    limit: int,
+    protect_hours: float | None = None,
+) -> dict[str, Any]:
+    """Merge `new_symbols` (attributed to `new_source`) into
+    SandboxWatchlist(sandbox='AI_BLUECHIP') instead of blindly overwriting
+    it — bluechip_dip_scanner and refresh_ai_bluechip_watchlist used to
+    both do unconditional `update_or_create`s on the same row, so whichever
+    ran most recently won with no coordination (see prior audit).
+
+    Any symbol already in the watchlist whose `symbol_sources` entry has a
+    `protect_until` timestamp still in the future is kept ahead of
+    `new_symbols`, up to `limit` total — this is how bluechip_dip_scanner's
+    more rigorous, less frequent signal (RSI divergence + check_dip_health)
+    survives refresh_ai_bluechip_watchlist's hourly, looser-filtered writes
+    for `protect_hours`. Pass `protect_hours=None` (refresh's case) to grant
+    the symbols being written here no such protection of their own.
+
+    Returns counts for logging: kept (still-protected survivors), added
+    (new symbols that made it in), removed (previously-listed symbols that
+    didn't survive — not protected and displaced past `limit` or absent
+    from `new_symbols`).
+    """
+    now = timezone.now()
+    existing = SandboxWatchlist.objects.filter(sandbox='AI_BLUECHIP').first()
+    existing_symbols = list(existing.symbols) if existing and existing.symbols else []
+    existing_sources = dict(existing.symbol_sources) if existing and existing.symbol_sources else {}
+
+    protected: list[str] = []
+    for symbol in existing_symbols:
+        meta = existing_sources.get(symbol) or {}
+        protect_until = meta.get('protect_until')
+        if not protect_until:
+            continue
+        try:
+            if datetime.fromisoformat(protect_until) > now:
+                protected.append(symbol)
+        except Exception:
+            continue
+
+    new_unique = [s for s in dict.fromkeys(new_symbols) if s not in protected]
+    merged = (protected + new_unique)[:max(0, limit)]
+    merged_set = set(merged)
+
+    kept = sum(1 for s in protected if s in merged_set)
+    added = sum(1 for s in new_unique if s in merged_set)
+    removed_symbols = [s for s in existing_symbols if s not in merged_set]
+
+    symbol_sources: dict[str, Any] = {}
+    for symbol in merged:
+        if symbol in protected and symbol in existing_sources:
+            symbol_sources[symbol] = existing_sources[symbol]
+            continue
+        entry: dict[str, Any] = {'source': new_source, 'added_at': now.isoformat()}
+        if protect_hours:
+            entry['protect_until'] = (now + timedelta(hours=protect_hours)).isoformat()
+        symbol_sources[symbol] = entry
+
+    SandboxWatchlist.objects.update_or_create(
+        sandbox='AI_BLUECHIP',
+        defaults={
+            'symbols': merged,
+            'source': new_source if not protected else f'{new_source}+protected',
+            'symbol_sources': symbol_sources,
+        },
+    )
+    return {
+        'kept': kept,
+        'added': added,
+        'removed': len(removed_symbols),
+        'removed_symbols': removed_symbols,
+        'total': len(merged),
+    }
+
+
 @shared_task
 def bluechip_dip_scanner() -> dict[str, Any]:
     """Find bluechips that dipped unjustly and may rebound."""
@@ -7291,11 +7368,20 @@ def bluechip_dip_scanner() -> dict[str, Any]:
         candidates.append(enrich_dip_candidate(candidate, health_meta))
 
     candidates.sort(key=lambda x: x.get('score', 0), reverse=True)
+    merge_result = None
     if candidates:
         cache.set('bluechip_dip_candidates', candidates, timeout=60 * 30)
-        SandboxWatchlist.objects.update_or_create(
-            sandbox='AI_BLUECHIP',
-            defaults={'symbols': [row['symbol'] for row in candidates[:25]], 'source': 'bluechip_dip_scanner'},
+        watchlist_limit = int(os.getenv('AI_BLUECHIP_WATCHLIST_SIZE', '25'))
+        protect_hours = float(os.getenv('BLUECHIP_DIP_PROTECT_HOURS', '4'))
+        merge_result = _merge_bluechip_watchlist(
+            [row['symbol'] for row in candidates],
+            new_source='bluechip_dip_scanner',
+            limit=watchlist_limit,
+            protect_hours=protect_hours,
+        )
+        logger.debug(
+            "bluechip_dip_scanner watchlist merge: kept=%s added=%s removed=%s (protect_hours=%s)",
+            merge_result['kept'], merge_result['added'], merge_result['removed'], protect_hours,
         )
     # Score distribution among symbols that reached _mean_reversion_score
     # (i.e. cleared price range + RSI divergence) — same rsi_score formula
@@ -7321,9 +7407,15 @@ def bluechip_dip_scanner() -> dict[str, Any]:
         'AI_BLUECHIP',
         'SUCCESS',
         f'Dip scanner: {len(candidates)} candidates',
-        metadata={'count': len(candidates), 'funnel': funnel, 'min_score': min_score, 'score_distribution': score_stats},
+        metadata={
+            'count': len(candidates),
+            'funnel': funnel,
+            'min_score': min_score,
+            'score_distribution': score_stats,
+            'watchlist_merge': merge_result,
+        },
     )
-    return {'status': 'ok', 'count': len(candidates), 'results': candidates[:10], 'funnel': funnel}
+    return {'status': 'ok', 'count': len(candidates), 'results': candidates[:10], 'funnel': funnel, 'watchlist_merge': merge_result}
 
 
 @shared_task
@@ -9986,17 +10078,20 @@ def auto_retrain_on_drift_daily() -> dict[str, Any]:
 def refresh_ai_bluechip_watchlist() -> dict[str, Any]:
     """Populate AI bluechip sandbox watchlist from AI opportunities endpoint.
 
-    NOTE for the "AI_BLUECHIP watchlist is empty" investigation: this task
-    is scheduled hourly at :05 (refresh-ai-bluechip-watchlist-hourly), while
-    bluechip_dip_scanner only runs twice a day at 9:00/13:00 — 5 minutes
-    after each dip_scanner run, whatever it just wrote to
-    SandboxWatchlist(sandbox='AI_BLUECHIP') gets unconditionally overwritten
-    by this task's result (`update_or_create` runs even when `symbols` ends
-    up empty). For most of the trading day, what's actually in that
-    watchlist is this task's output, not dip_scanner's — so if
-    /api/ai/opportunities/ is itself returning few/no results, that would
-    look identical to "the dip scanner found nothing", including on hours
-    right after dip_scanner ran. Logged below to make that distinguishable.
+    Merges into SandboxWatchlist(sandbox='AI_BLUECHIP') rather than
+    overwriting it (see _merge_bluechip_watchlist): symbols
+    bluechip_dip_scanner wrote within its BLUECHIP_DIP_PROTECT_HOURS window
+    are kept, with this task's /api/ai/opportunities/ results filling the
+    remaining slots up to AI_BLUECHIP_WATCHLIST_SIZE. This task's own
+    symbols carry no protection of their own — the next hourly run is free
+    to replace them.
+
+    This used to be an unconditional `update_or_create` — scheduled hourly
+    at :05 while bluechip_dip_scanner only runs twice a day at 9:00/13:00,
+    so 5 minutes after each dip_scanner run (and every hour in between)
+    whatever the dip scanner had just found was silently wiped, including
+    by an empty result from this task. See the AI_BLUECHIP watchlist audit
+    for the full trace.
     """
     if os.getenv('AI_BLUECHIP_AUTOFILL', 'true').lower() == 'false':
         return {'status': 'disabled', 'sandbox': 'AI_BLUECHIP'}
@@ -10023,18 +10118,16 @@ def refresh_ai_bluechip_watchlist() -> dict[str, Any]:
             if isinstance(item, dict)
         ]
         symbols = [s for s in symbols if s]
-        previous = SandboxWatchlist.objects.filter(sandbox='AI_BLUECHIP').first()
-        previous_count = len(previous.symbols) if previous and previous.symbols else 0
+        merge_result = _merge_bluechip_watchlist(
+            symbols, new_source='ai/opportunities', limit=limit, protect_hours=None,
+        )
         logger.debug(
             "refresh_ai_bluechip_watchlist: /api/ai/opportunities/ returned %s symbols "
-            "(min_score=%s) — overwriting previous watchlist of %s symbols (source=%s)",
-            len(symbols), min_score, previous_count, previous.source if previous else None,
+            "(min_score=%s) — merge kept=%s added=%s removed=%s (total=%s)",
+            len(symbols), min_score, merge_result['kept'], merge_result['added'],
+            merge_result['removed'], merge_result['total'],
         )
-        SandboxWatchlist.objects.update_or_create(
-            sandbox='AI_BLUECHIP',
-            defaults={'symbols': symbols, 'source': 'ai/opportunities'},
-        )
-        return {'status': 'ok', 'sandbox': 'AI_BLUECHIP', 'count': len(symbols)}
+        return {'status': 'ok', 'sandbox': 'AI_BLUECHIP', 'count': len(symbols), 'watchlist_merge': merge_result}
     except Exception as exc:
         return {'status': 'error', 'sandbox': 'AI_BLUECHIP', 'error': str(exc)}
 
