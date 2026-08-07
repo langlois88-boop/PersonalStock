@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
@@ -11,11 +12,15 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import balanced_accuracy_score, f1_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 
 from .feature_registry import CRYPTO_FEATURE_NAMES, FUSION_FEATURE_NAMES
+from .training.labeling import triple_barrier_labels_adaptive, universe_max_days
+from .validation import PurgedTimeSeriesSplit
+
+logger = logging.getLogger(__name__)
 
 
 MODEL_PATH = Path(__file__).resolve().parent / "data_fusion_brain_v1.pkl"
@@ -25,15 +30,14 @@ CRYPTO_MODEL_PATH = Path(__file__).resolve().parent / "crypto_brain_v1.pkl"
 FEATURE_COLUMNS = list(FUSION_FEATURE_NAMES)
 CRYPTO_FEATURE_COLUMNS = list(CRYPTO_FEATURE_NAMES)
 
-TRIPLE_BARRIER_UP_PCT = float(os.getenv("TRIPLE_BARRIER_UP_PCT", "0.05"))
-TRIPLE_BARRIER_DOWN_PCT = float(os.getenv("TRIPLE_BARRIER_DOWN_PCT", "0.03"))
-TRIPLE_BARRIER_MAX_DAYS = int(os.getenv("TRIPLE_BARRIER_MAX_DAYS", "20"))
+# Triple-barrier thresholds themselves now live in training/labeling.py
+# (single source of truth, per-universe, via *_TRIPLE_BARRIER_* env vars —
+# see `triple_barrier_labels_adaptive`). These three are kept here only
+# because `verify_model_report.py` reports them for the default (BLUECHIP)
+# universe; they read the same env vars the unified labeling function does.
 TRIPLE_BARRIER_USE_ATR = os.getenv("TRIPLE_BARRIER_USE_ATR", "true").lower() in {"1", "true", "yes", "y"}
-TRIPLE_BARRIER_ATR_MULT_UP = float(os.getenv("TRIPLE_BARRIER_ATR_MULT_UP", "1.5"))
-TRIPLE_BARRIER_ATR_MULT_DOWN = float(os.getenv("TRIPLE_BARRIER_ATR_MULT_DOWN", "1.0"))
-PENNY_TRIPLE_BARRIER_UP_PCT = float(os.getenv("PENNY_TRIPLE_BARRIER_UP_PCT", "0.03"))
-PENNY_TRIPLE_BARRIER_DOWN_PCT = float(os.getenv("PENNY_TRIPLE_BARRIER_DOWN_PCT", "0.02"))
-PENNY_TRIPLE_BARRIER_MAX_DAYS = int(os.getenv("PENNY_TRIPLE_BARRIER_MAX_DAYS", "2"))
+TRIPLE_BARRIER_ATR_MULT_UP = float(os.getenv("BLUECHIP_BARRIER_ATR_MULT_UP", "2.5"))
+TRIPLE_BARRIER_ATR_MULT_DOWN = float(os.getenv("BLUECHIP_BARRIER_ATR_MULT_DOWN", "1.5"))
 TIME_SERIES_SPLITS = int(os.getenv("TIME_SERIES_SPLITS", "4"))
 TX_COST_PCT = float(os.getenv("BACKTEST_TX_COST_PCT", "0.002"))
 SLIPPAGE_PCT = float(os.getenv("BACKTEST_SLIPPAGE_PCT", "0.001"))
@@ -228,135 +232,6 @@ def _ensure_features(df: pd.DataFrame, feature_columns: list[str] | None = None)
     return data
 
 
-def _atr_pct_series(close: pd.Series, high: pd.Series | None, low: pd.Series | None, window: int = 14) -> pd.Series:
-    if close is None or close.empty:
-        return pd.Series(dtype=float)
-    if high is None or low is None or high.empty or low.empty:
-        return pd.Series(dtype=float, index=close.index)
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.rolling(window=window, min_periods=max(2, window // 2)).mean()
-    atr_pct = atr / close.replace(0, np.nan)
-    return atr_pct.replace([np.inf, -np.inf], np.nan)
-
-
-def _resolve_barrier_pcts(
-    up_pct: float,
-    down_pct: float,
-    atr_pct: float | None,
-) -> tuple[float, float]:
-    if not TRIPLE_BARRIER_USE_ATR:
-        return up_pct, down_pct
-    if atr_pct is None or np.isnan(atr_pct) or atr_pct <= 0:
-        return up_pct, down_pct
-    atr_up = atr_pct * TRIPLE_BARRIER_ATR_MULT_UP
-    atr_down = atr_pct * TRIPLE_BARRIER_ATR_MULT_DOWN
-    return max(up_pct, atr_up), max(down_pct, atr_down)
-
-
-def _future_window_extrema(values: np.ndarray, window: int, mode: str) -> np.ndarray:
-    if values is None or len(values) == 0:
-        return np.array([])
-    series = pd.Series(values)
-    rev = series.iloc[::-1].shift(1)
-    if mode == 'max':
-        rolled = rev.rolling(window=window, min_periods=1).max()
-    else:
-        rolled = rev.rolling(window=window, min_periods=1).min()
-    return rolled.iloc[::-1].values
-
-
-def _triple_barrier_labels(close: pd.Series, atr_pct: pd.Series | None = None) -> pd.Series:
-    if close is None or close.empty:
-        return pd.Series(dtype=float)
-    prices = close.values
-    labels = np.full(len(prices), np.nan)
-    future_max = _future_window_extrema(prices, TRIPLE_BARRIER_MAX_DAYS, 'max')
-    future_min = _future_window_extrema(prices, TRIPLE_BARRIER_MAX_DAYS, 'min')
-    for i in range(len(prices) - 1):
-        entry = prices[i]
-        if entry <= 0:
-            continue
-        row_atr_pct = float(atr_pct.iloc[i]) if atr_pct is not None and i < len(atr_pct) else None
-        up_pct, down_pct = _resolve_barrier_pcts(TRIPLE_BARRIER_UP_PCT, TRIPLE_BARRIER_DOWN_PCT, row_atr_pct)
-        upper = entry * (1 + up_pct)
-        lower = entry * (1 - down_pct)
-        hit_up = future_max[i] >= upper if i < len(future_max) else False
-        hit_down = future_min[i] <= lower if i < len(future_min) else False
-        if hit_up and not hit_down:
-            labels[i] = 1
-        elif hit_down and not hit_up:
-            labels[i] = 0
-        elif not hit_up and not hit_down:
-            labels[i] = 0
-        else:
-            end = min(len(prices), i + TRIPLE_BARRIER_MAX_DAYS + 1)
-            hit = 0
-            for j in range(i + 1, end):
-                if prices[j] >= upper:
-                    hit = 1
-                    break
-                if prices[j] <= lower:
-                    hit = 0
-                    break
-            labels[i] = hit
-    return pd.Series(labels, index=close.index)
-
-
-def _triple_barrier_labels_with_bands(
-    close: pd.Series,
-    high: pd.Series | None,
-    low: pd.Series | None,
-    up_pct: float,
-    down_pct: float,
-    max_days: int,
-    atr_pct: pd.Series | None = None,
-) -> pd.Series:
-    if close is None or close.empty:
-        return pd.Series(dtype=float)
-    prices = close.values
-    highs = high.values if high is not None and not high.empty else prices
-    lows = low.values if low is not None and not low.empty else prices
-    labels = np.full(len(prices), np.nan)
-    future_max = _future_window_extrema(highs, max_days, 'max')
-    future_min = _future_window_extrema(lows, max_days, 'min')
-    for i in range(len(prices) - 1):
-        entry = prices[i]
-        if entry <= 0:
-            continue
-        row_atr_pct = float(atr_pct.iloc[i]) if atr_pct is not None and i < len(atr_pct) else None
-        resolved_up, resolved_down = _resolve_barrier_pcts(up_pct, down_pct, row_atr_pct)
-        upper = entry * (1 + resolved_up)
-        lower = entry * (1 - resolved_down)
-        hit_up = future_max[i] >= upper if i < len(future_max) else False
-        hit_down = future_min[i] <= lower if i < len(future_min) else False
-        if hit_up and not hit_down:
-            labels[i] = 1
-        elif hit_down and not hit_up:
-            labels[i] = 0
-        elif not hit_up and not hit_down:
-            labels[i] = 0
-        else:
-            end = min(len(prices), i + max_days + 1)
-            hit = 0
-            for j in range(i + 1, end):
-                if highs[j] >= upper:
-                    hit = 1
-                    break
-                if lows[j] <= lower:
-                    hit = 0
-                    break
-            labels[i] = hit
-    return pd.Series(labels, index=close.index)
-
-
 def _infer_universe(model_path: Path | None = None) -> str | None:
     if model_path is None:
         return None
@@ -374,6 +249,13 @@ def _infer_universe(model_path: Path | None = None) -> str | None:
     if resolved == crypto_path:
         return 'CRYPTO'
     return None
+
+
+def _label_max_days(universe: str | None) -> int:
+    """Triple-barrier label horizon (days) for a universe, used as the CV
+    purge window so no training fold ends within a label's forward-looking
+    window of the test fold."""
+    return universe_max_days(universe)
 
 
 def _select_features(X_df: pd.DataFrame, y: np.ndarray) -> list[str]:
@@ -406,23 +288,14 @@ def _build_training_set(df: pd.DataFrame, universe: str | None = None) -> tuple[
         return np.array([]), np.array([]), []
 
     X_df = data[feature_cols].fillna(0)
-    atr_pct = None
-    if "Close" in data.columns and "High" in data.columns and "Low" in data.columns:
-        atr_pct = _atr_pct_series(data["Close"], data.get("High"), data.get("Low"))
     if "Close" in data.columns:
-        is_penny = (universe or '').strip().upper() in {'PENNY', 'AI_PENNY'}
-        if is_penny:
-            labels = _triple_barrier_labels_with_bands(
-                data["Close"],
-                data.get("High"),
-                data.get("Low"),
-                PENNY_TRIPLE_BARRIER_UP_PCT,
-                PENNY_TRIPLE_BARRIER_DOWN_PCT,
-                PENNY_TRIPLE_BARRIER_MAX_DAYS,
-                atr_pct=atr_pct,
-            )
-        else:
-            labels = _triple_barrier_labels(data["Close"], atr_pct=atr_pct)
+        labels = triple_barrier_labels_adaptive(
+            data["Close"],
+            high=data.get("High"),
+            low=data.get("Low"),
+            universe=universe or "BLUECHIP",
+            use_atr_barriers=TRIPLE_BARRIER_USE_ATR,
+        )
     else:
         labels = (data["Returns"].shift(-1) > 0).astype(int)
     labels = labels.astype(float)
@@ -444,8 +317,15 @@ def train_fusion_model(df: pd.DataFrame, model_path: Path = MODEL_PATH) -> dict 
         return None
 
     cv_scores = []
+    cv_f1_scores = []
     if len(y) >= 20:
-        tscv = TimeSeriesSplit(n_splits=min(TIME_SERIES_SPLITS, max(2, len(y) // 20)))
+        n_splits = min(TIME_SERIES_SPLITS, max(2, len(y) // 20))
+        purge_window = int(os.getenv('FUSION_PURGE_WINDOW', str(_label_max_days(universe))))
+        tscv = PurgedTimeSeriesSplit(
+            n_splits=n_splits,
+            purge_window=purge_window,
+            embargo_pct=float(os.getenv('FUSION_EMBARGO_PCT', '0.01')),
+        )
         for train_idx, test_idx in tscv.split(X):
             model_cv = make_pipeline(
                 StandardScaler(),
@@ -458,8 +338,16 @@ def train_fusion_model(df: pd.DataFrame, model_path: Path = MODEL_PATH) -> dict 
                 ),
             )
             model_cv.fit(X[train_idx], y[train_idx])
-            score = model_cv.score(X[test_idx], y[test_idx])
-            cv_scores.append(float(score))
+            preds = model_cv.predict(X[test_idx])
+            # Balanced accuracy, not model_cv.score() (raw accuracy): a
+            # model that always predicts the majority class scores exactly
+            # 0.5 here regardless of label skew. F1 is tracked alongside it
+            # (there's no per-symbol date index left at this point to build
+            # a true walk-forward report like the other universes, so this
+            # purged time-series CV fold's F1 is used as the imbalance
+            # check instead).
+            cv_scores.append(float(balanced_accuracy_score(y[test_idx], preds)))
+            cv_f1_scores.append(float(f1_score(y[test_idx], preds, zero_division=0)))
 
     model = make_pipeline(
         StandardScaler(),
@@ -472,12 +360,33 @@ def train_fusion_model(df: pd.DataFrame, model_path: Path = MODEL_PATH) -> dict 
         ),
     )
     model.fit(X, y)
+
+    cv_mean = float(np.mean(cv_scores)) if cv_scores else None
+    cv_f1 = float(np.mean(cv_f1_scores)) if cv_f1_scores else 0.0
+    label_balance = float(np.mean(y)) if len(y) else 0.0
+    universe_key = (universe or 'FUSION').strip().upper()
+    # A majority-only model scores exactly 0.5 balanced accuracy and 0.0 F1
+    # regardless of label_balance skew, so any threshold above those floors
+    # rejects it, whichever universe (and however imbalanced its triple
+    # barrier labels are).
+    cv_min = float(os.getenv(f'{universe_key}_FUSION_CV_MIN', os.getenv('FUSION_CV_MIN', '0.55')))
+    wf_min = float(os.getenv(f'{universe_key}_FUSION_WF_F1_MIN', os.getenv('FUSION_WF_F1_MIN', '0.50')))
+    if cv_scores and (cv_mean is None or cv_mean < cv_min or cv_f1 < wf_min):
+        logger.warning(
+            "train_fusion_model: %s model failed quality gate (balanced_acc=%s < %.2f or f1=%.3f < %.2f, "
+            "label_balance=%.3f) — not deploying",
+            universe_key, cv_mean, cv_min, cv_f1, wf_min, label_balance,
+        )
+        return None
+
     payload = {
         "model": model,
         "features": selected,
         "model_version": _new_model_version(),
         "cv_scores": cv_scores,
-        "cv_mean": float(np.mean(cv_scores)) if cv_scores else None,
+        "cv_mean": cv_mean,
+        "cv_f1": cv_f1,
+        "label_balance": label_balance,
     }
     joblib.dump(payload, model_path)
     return payload

@@ -8,10 +8,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from portfolio import market_data as yf
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import yfinance as yfin
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingRegressor
+from sklearn.metrics import balanced_accuracy_score, precision_score, recall_score, f1_score, mean_absolute_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.base import clone
@@ -24,6 +23,7 @@ from portfolio.ml_engine.feature_registry import STABLE_FEATURE_NAMES
 from portfolio.ml_engine.transformers import RollingStandardScaler
 from portfolio.ml_engine.collectors.news_rss import fetch_news_sentiment
 from portfolio.ml_engine.push_model import _build_meta_from_payload, push_to_portfolio_app
+from portfolio.ml_engine.validation import PurgedTimeSeriesSplit
 
 
 
@@ -39,23 +39,6 @@ def _ensure_django() -> None:
         django.setup()
     except Exception:
         return
-
-
-SECTOR_ETF_MAP = {
-    'Technology': 'XLK',
-    'Healthcare': 'XLV',
-    'Health Care': 'XLV',
-    'Financial Services': 'XLF',
-    'Financials': 'XLF',
-    'Energy': 'XLE',
-    'Consumer Defensive': 'XLP',
-    'Consumer Cyclical': 'XLY',
-    'Industrials': 'XLI',
-    'Utilities': 'XLU',
-    'Real Estate': 'XLRE',
-    'Communication Services': 'XLC',
-    'Basic Materials': 'XLB',
-}
 
 
 def _is_valid_symbol(symbol: str) -> bool:
@@ -82,49 +65,81 @@ def _build_features(
     volume: pd.Series,
     spy_close: pd.Series,
     dividend_yield: float,
-    sector_close: pd.Series | None = None,
     sentiment_score: float = 0.0,
 ):
+    if close is None or close.empty or spy_close is None or spy_close.empty:
+        return None
     ret = close.pct_change()
     spy_ret = spy_close.pct_change()
     aligned = pd.concat([ret, spy_ret], axis=1, join='inner').dropna()
     aligned.columns = ['stock', 'spy']
-    if len(aligned) < 60 or len(close) < 60:
+    if len(close) < 60:
         return None
-
-    volume_mean_20 = volume.rolling(20).mean()
-    volume_std_20 = volume.rolling(20).std().replace(0, np.nan)
-    volume_zscore_20 = ((volume - volume_mean_20) / volume_std_20).clip(-3, 3).fillna(0)
-
-    spy_corr = ret.rolling(60).corr(spy_ret).fillna(0)
-    sector_beta = pd.Series(0.0, index=close.index)
-    if sector_close is not None and not sector_close.empty:
-        sector_ret = sector_close.pct_change()
-        aligned_sector = pd.concat([ret, sector_ret], axis=1, join='inner').dropna()
-        aligned_sector.columns = ['stock', 'sector']
-        if len(aligned_sector) >= 60:
-            sector_beta = (
-                aligned_sector['stock'].rolling(60).cov(aligned_sector['sector'])
-                / aligned_sector['sector'].rolling(60).var().replace(0, np.nan)
-            ).reindex(close.index).ffill()
 
     sma_10 = close.rolling(10).mean()
     sma_20 = close.rolling(20).mean()
-    sma_50 = close.rolling(50).mean().replace(0, np.nan)
-    sma_ratio_10_50 = (sma_10 / sma_50).replace([np.inf, -np.inf], np.nan).fillna(1.0)
-    sma_ratio_20_50 = (sma_20 / sma_50).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    sma_50 = close.rolling(50).mean()
+
+    sma_10_last = float(sma_10.iloc[-1]) if len(sma_10) else np.nan
+    sma_20_last = float(sma_20.iloc[-1]) if len(sma_20) else np.nan
+    sma_50_last = float(sma_50.iloc[-1]) if len(sma_50) else np.nan
+
+    sma_ratio_10_50 = 0.0
+    if np.isfinite(sma_10_last) and np.isfinite(sma_50_last) and sma_50_last != 0:
+        sma_ratio_10_50 = (sma_10_last / sma_50_last) - 1.0
+
+    sma_ratio_20_50 = 0.0
+    if np.isfinite(sma_20_last) and np.isfinite(sma_50_last) and sma_50_last != 0:
+        sma_ratio_20_50 = (sma_20_last / sma_50_last) - 1.0
+
+    sma_ratio_10_20 = 0.0
+    if np.isfinite(sma_10_last) and np.isfinite(sma_20_last) and sma_20_last != 0:
+        sma_ratio_10_20 = (sma_10_last / sma_20_last) - 1.0
+
+    vol_20 = float(ret.rolling(20).std().iloc[-1]) if len(ret) else np.nan
+    if not np.isfinite(vol_20):
+        vol_20 = 0.0
+
+    volume_mean_20 = volume.rolling(20).mean().iloc[-1] if len(volume) else np.nan
+    volume_std_20 = volume.rolling(20).std().iloc[-1] if len(volume) else np.nan
+    if not np.isfinite(volume_mean_20) or not np.isfinite(volume_std_20) or volume_std_20 == 0:
+        volume_zscore_20 = 0.0
+    else:
+        volume_zscore_20 = (float(volume.iloc[-1]) - float(volume_mean_20)) / float(volume_std_20)
+        volume_zscore_20 = float(np.clip(volume_zscore_20, -3.0, 3.0))
+
+    return_20d = 0.0
+    if len(close) >= 21:
+        base = float(close.iloc[-21])
+        latest = float(close.iloc[-1])
+        if base > 0 and latest > 0:
+            return_20d = float(np.log(latest / base))
+
+    if len(aligned) >= 60:
+        window = aligned.tail(60)
+        spy_correlation = float(window['stock'].corr(window['spy']))
+        spy_var = float(window['spy'].var())
+        sector_beta = float(window['stock'].cov(window['spy']) / spy_var) if spy_var > 0 else 0.0
+    else:
+        spy_correlation = 0.0
+        sector_beta = 0.0
+
+    rsi_value = float(_rsi(close, 14).iloc[-1])
+    if not np.isfinite(rsi_value):
+        rsi_value = 0.0
 
     return [
-        float(_rsi(close, 14).iloc[-1]),
-        float(sma_ratio_10_50.iloc[-1]),
-        float(sma_ratio_20_50.iloc[-1]),
-        float(ret.rolling(20).std().iloc[-1]),
-        float(volume_zscore_20.iloc[-1]),
-        float(close.pct_change(20).iloc[-1]),
-        float(spy_corr.iloc[-1]),
+        rsi_value,
+        float(sma_ratio_10_50),
+        float(sma_ratio_20_50),
+        float(vol_20),
+        float(volume_zscore_20),
+        float(return_20d),
+        float(spy_correlation),
         float(dividend_yield),
-        float(sector_beta.iloc[-1]),
+        float(sector_beta),
         float(sentiment_score),
+        float(sma_ratio_10_20),
     ]
 
 
@@ -144,10 +159,10 @@ def _price_history_series(symbol: str, days: int = 365 * 2) -> pd.Series | None:
 
 
 def _auto_push_enabled() -> bool:
-    return (
-        os.getenv('AUTO_PUSH_MODEL', '')
-        or os.getenv('AUTO_PUSH_MODELS', '')
-    ).lower() in {'1', 'true', 'yes', 'y'}
+    for value in (os.getenv('AUTO_PUSH', ''), os.getenv('AUTO_PUSH_MODEL', ''), os.getenv('AUTO_PUSH_MODELS', '')):
+        if value and value.lower() in {'1', 'true', 'yes', 'y'}:
+            return True
+    return False
 
 
 def _deepseek_enabled() -> bool:
@@ -234,51 +249,35 @@ def train_stable_model(auto_push: bool | None = None):
 
     rows = []
     targets = []
+    # Triple-barrier label horizon (days) — also used as the CV purge window
+    # so no training fold ends within a label's forward-looking window of
+    # the test fold.
+    label_max_days = int(os.getenv('STABLE_TRIPLE_BARRIER_MAX_DAYS', '20'))
 
-    spy = yf.Ticker('SPY').history(period='2y', interval='1d', timeout=10)
+    spy = yfin.Ticker('SPY').history(period='2y', interval='1d', timeout=10)
     if spy is None or spy.empty or ('Close' not in spy and 'Adj Close' not in spy):
-        spy = yf.Ticker('QQQ').history(period='2y', interval='1d', timeout=10)
+        spy = yfin.Ticker('QQQ').history(period='2y', interval='1d', timeout=10)
     if spy is None or spy.empty or ('Close' not in spy and 'Adj Close' not in spy):
-        spy_close = _price_history_series('SPY')
-        if spy_close is None or spy_close.empty:
-            spy_close = _price_history_series('QQQ')
-        if spy_close is None or spy_close.empty:
-            return {
-                'status': 'no_index',
-                'reason': 'Index history missing (SPY/QQQ).',
-            }
+        return {
+            'status': 'no_index',
+            'reason': 'Index history missing (SPY/QQQ).',
+        }
     else:
         spy_close = spy['Adj Close'] if 'Adj Close' in spy else spy['Close']
 
     for symbol in symbols:
         try:
-            data = yf.Ticker(symbol).history(period='2y', interval='1d', timeout=10)
+            data = yfin.Ticker(symbol).history(period='2y', interval='1d', timeout=10)
         except Exception:
             data = None
         if data is None or data.empty or ('Close' not in data and 'Adj Close' not in data):
-            close = _price_history_series(symbol)
-            if close is None:
-                continue
-            volume = pd.Series([0.0] * len(close), index=close.index)
-            high = close
-            low = close
-        else:
-            close = data['Adj Close'] if 'Adj Close' in data else data['Close']
-            volume = data['Volume'] if 'Volume' in data else pd.Series([0.0] * len(close), index=close.index)
-            high = data['High'] if 'High' in data else close
-            low = data['Low'] if 'Low' in data else close
+            continue
+        close = data['Adj Close'] if 'Adj Close' in data else data['Close']
+        volume = data['Volume'] if 'Volume' in data else pd.Series([0.0] * len(close), index=close.index)
+        high = data['High'] if 'High' in data else close
+        low = data['Low'] if 'Low' in data else close
         stock_row = Stock.objects.filter(symbol=symbol).values('dividend_yield', 'sector').first() or {}
         dividend_yield = float(stock_row.get('dividend_yield') or 0)
-        sector_name = stock_row.get('sector') or ''
-        sector_symbol = SECTOR_ETF_MAP.get(str(sector_name).strip(), '')
-        sector_close = None
-        if sector_symbol:
-            try:
-                sector_hist = yf.Ticker(sector_symbol).history(period='2y', interval='1d', timeout=10)
-                if sector_hist is not None and not sector_hist.empty:
-                    sector_close = sector_hist['Adj Close'] if 'Adj Close' in sector_hist else sector_hist['Close']
-            except Exception:
-                sector_close = None
 
         news_payload = fetch_news_sentiment(symbol)
         sentiment_score = float(news_payload.get('news_sentiment') or 0.0)
@@ -288,7 +287,7 @@ def train_stable_model(auto_push: bool | None = None):
             low=low,
             up_pct=float(os.getenv('STABLE_TRIPLE_BARRIER_UP_PCT', '0.15')),
             down_pct=float(os.getenv('STABLE_TRIPLE_BARRIER_DOWN_PCT', '0.07')),
-            max_days=int(os.getenv('STABLE_TRIPLE_BARRIER_MAX_DAYS', '20')),
+            max_days=label_max_days,
         )
         for i in range(60, len(close) - 20):
             if len(close.iloc[:i + 1]) < 60:
@@ -296,15 +295,15 @@ def train_stable_model(auto_push: bool | None = None):
             slice_close = close.iloc[:i + 1]
             slice_volume = volume.iloc[:i + 1]
             slice_spy = spy_close.reindex(slice_close.index).ffill()
-            slice_sector = sector_close.reindex(slice_close.index).ffill() if sector_close is not None else None
             feature_values = _build_features(
                 slice_close,
                 slice_volume,
                 slice_spy,
                 dividend_yield,
-                sector_close=slice_sector,
                 sentiment_score=sentiment_score,
             )
+            if feature_values is None:
+                continue
             if any(pd.isna(val) for val in feature_values):
                 continue
             label_value = label_series.iloc[i] if i < len(label_series) else np.nan
@@ -348,7 +347,7 @@ def train_stable_model(auto_push: bool | None = None):
                 )
                 splitter = PurgedTimeSeriesSplit(
                     n_splits=int(os.getenv('STABLE_PURGED_SPLITS', '5')),
-                    purge_window=int(os.getenv('STABLE_PURGE_WINDOW', '5')),
+                    purge_window=int(os.getenv('STABLE_PURGE_WINDOW', str(label_max_days))),
                     embargo_pct=float(os.getenv('STABLE_EMBARGO_PCT', '0.02')),
                 )
                 scores = []
@@ -377,7 +376,11 @@ def train_stable_model(auto_push: bool | None = None):
     steps.append(('model', model))
     pipeline = Pipeline(steps)
 
-    tscv = TimeSeriesSplit(n_splits=5)
+    tscv = PurgedTimeSeriesSplit(
+        n_splits=int(os.getenv('STABLE_PURGED_SPLITS', '5')),
+        purge_window=int(os.getenv('STABLE_PURGE_WINDOW', str(label_max_days))),
+        embargo_pct=float(os.getenv('STABLE_EMBARGO_PCT', '0.02')),
+    )
     scores = []
     weights = None
     if _deepseek_enabled():
@@ -392,7 +395,12 @@ def train_stable_model(auto_push: bool | None = None):
             pipeline.fit(X[train_idx], y[train_idx], model__sample_weight=weights[train_idx])
         else:
             pipeline.fit(X[train_idx], y[train_idx])
-        scores.append(float(pipeline.score(X[test_idx], y[test_idx])))
+        # Balanced accuracy, not raw accuracy/pipeline.score(): a model that
+        # always predicts the majority class scores exactly 0.5 here
+        # regardless of label skew, instead of inheriting the majority
+        # share as its "accuracy".
+        preds = pipeline.predict(X[test_idx])
+        scores.append(float(balanced_accuracy_score(y[test_idx], preds)))
 
     def _walk_forward_f1() -> list[dict[str, float | int | str]]:
         reports = []
@@ -435,6 +443,13 @@ def train_stable_model(auto_push: bool | None = None):
         pipeline.fit(X, y)
     cv_mean = float(np.mean(scores)) if scores else None
     wf_f1 = float(np.mean([row.get('f1', 0.0) for row in walk_forward])) if walk_forward else 0.0
+    label_balance = float(np.mean(y)) if len(y) else 0.0
+    # STABLE's default triple-barrier (up 15% vs. down 7% within 20 days)
+    # makes the upside barrier harder to hit, so label=1 is typically the
+    # minority class here — cv_mean is balanced accuracy (see CV loop
+    # above), which scores a majority-only ("always 0") model at exactly
+    # 0.5 no matter how skewed label_balance is, so a threshold at/above
+    # 0.55 with wf_f1 above 0.0 rejects it.
     cv_min = float(os.getenv('STABLE_CV_MIN', '0.55'))
     wf_min = float(os.getenv('STABLE_WALK_FORWARD_F1_MIN', '0.50'))
     if cv_mean is None or cv_mean < cv_min:
@@ -451,6 +466,7 @@ def train_stable_model(auto_push: bool | None = None):
         'cv_scores': scores,
         'cv_mean': cv_mean,
         'walk_forward': walk_forward,
+        'label_balance': label_balance,
     }
     version_info = save_model_with_version(payload, MODEL_PATH, 'stable', metric_name='cv_mean', metric_value=cv_mean)
     onnx_result = export_onnx_with_gatekeeper(
@@ -463,7 +479,6 @@ def train_stable_model(auto_push: bool | None = None):
     )
     if onnx_result.get('exported'):
         onnx_path = Path(onnx_result.get('onnx_path'))
-        label_balance = float(np.mean(y)) if len(y) else 0.0
         write_meta_sidecar(onnx_path, scores, FEATURE_NAMES, 'STABLE', len(y), label_balance)
         if auto_push is None:
             auto_push = _auto_push_enabled()

@@ -23,6 +23,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from portfolio.patterns import detect_bullish_engulfing, detect_hammer
+
 logger = logging.getLogger(__name__)
 
 
@@ -100,23 +102,24 @@ def _volume_zscore(volume: pd.Series, period: int = 20) -> float:
     return float(np.clip(z, -3, 3))
 
 
-def _detect_hammer(open_p: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series) -> bool:
-    """Détecte un pattern hammer/bullish engulfing sur les 2 dernières bougies."""
+def _detect_hammer_or_bullish_engulfing(open_p: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series) -> bool:
+    """Hammer OR bullish engulfing on the last candle(s), using patterns.py's
+    canonical detection logic (single source of truth — see patterns.py).
+
+    Previously reimplemented both checks locally with yet another pair of
+    divergent formulas (a wick-ratio hammer threshold no other pattern
+    detector in the codebase used, and an engulfing check that only
+    compared body sizes rather than actually verifying the current candle's
+    body contains the previous one)."""
     if len(close) < 2:
         return False
-    # Hammer : mèche basse longue, petit corps, mèche haute courte
-    body = abs(float(close.iloc[-1]) - float(open_p.iloc[-1]))
-    lower_wick = float(min(open_p.iloc[-1], close.iloc[-1])) - float(low.iloc[-1])
-    upper_wick = float(high.iloc[-1]) - float(max(open_p.iloc[-1], close.iloc[-1]))
-    total_range = float(high.iloc[-1]) - float(low.iloc[-1])
-    if total_range < 1e-8:
-        return False
-    is_hammer = (lower_wick / total_range > 0.5) and (upper_wick / total_range < 0.25)
-    # Bullish engulfing
-    prev_body = float(close.iloc[-2]) - float(open_p.iloc[-2])
-    curr_body = float(close.iloc[-1]) - float(open_p.iloc[-1])
-    is_engulfing = prev_body < 0 and curr_body > 0 and abs(curr_body) > abs(prev_body)
-    return bool(is_hammer or is_engulfing)
+    is_hammer = detect_hammer(
+        float(open_p.iloc[-1]), float(high.iloc[-1]), float(low.iloc[-1]), float(close.iloc[-1])
+    )
+    prev = {"open": float(open_p.iloc[-2]), "close": float(close.iloc[-2])}
+    curr = {"open": float(open_p.iloc[-1]), "close": float(close.iloc[-1])}
+    is_bullish_engulfing = detect_bullish_engulfing(prev, curr)
+    return is_hammer or is_bullish_engulfing
 
 
 def _altman_z(symbol: str) -> float | None:
@@ -272,7 +275,7 @@ def analyze_penny_candidate(
     atr_val = _atr(high, low, close, 14)
     vol_z = _volume_zscore(volume, 20)
     rvol = float(np.clip(last_vol / max(avg_vol, 1), 0, 10))
-    has_pattern = _detect_hammer(open_p, high, low, close)
+    has_pattern = _detect_hammer_or_bullish_engulfing(open_p, high, low, close)
 
     # ── Altman Z (optionnel, lent → timeout court)
     altman_z = None

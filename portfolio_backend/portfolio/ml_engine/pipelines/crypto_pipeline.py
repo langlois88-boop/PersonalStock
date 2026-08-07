@@ -17,19 +17,20 @@ from portfolio.ml_engine.config import config
 from portfolio.ml_engine.data.market import fetch_history
 from portfolio.ml_engine.export.onnx_exporter import OnnxExporter
 from portfolio.ml_engine.export.push_model import push_model
+from portfolio.ml_engine.feature_registry import CRYPTO_FEATURE_NAMES
 from portfolio.ml_engine.features.technical import rsi, rubber_band_index
 from portfolio.ml_engine.training.labeling import forward_return_labels
 from portfolio.ml_engine.training.trainer import Trainer
 from portfolio.ml_engine.registry.model_registry import LocalModelRegistry
 
-CRYPTO_FEATURES = [
-    "return_1",
-    "rsi_14",
-    "rubber_band_index",
-    "price_to_vwap",
-    "volatility_spike",
-    "btc_correlation",
-]
+# Single source of truth: feature_registry.py::CRYPTO_FEATURE_NAMES — also
+# used by crypto_training.py, and matches exactly what build_dataset() below
+# computes.
+CRYPTO_FEATURES = list(CRYPTO_FEATURE_NAMES)
+
+# Forward-return label horizon (hours) — also used as the CV purge window so
+# no training fold ends within a label's forward-looking window of the test fold.
+CRYPTO_LABEL_HORIZON = 8
 
 
 def _setup_logging() -> None:
@@ -97,7 +98,7 @@ def build_dataset(symbols: list[str]) -> tuple[pd.DataFrame, pd.Series]:
             "btc_correlation": btc_corr,
         }).replace([np.inf, -np.inf], np.nan).fillna(0)
 
-        labels = forward_return_labels(close, horizon=8, target_pct=0.02)
+        labels = forward_return_labels(close, horizon=CRYPTO_LABEL_HORIZON, target_pct=0.02)
         df["label"] = labels
         frames.append(df)
 
@@ -121,7 +122,7 @@ def run() -> None:
     if X.empty:
         raise RuntimeError("No training samples available for crypto pipeline")
 
-    trainer = Trainer(_pipeline_factory)
+    trainer = Trainer(_pipeline_factory, purge_window=CRYPTO_LABEL_HORIZON)
     result = trainer.fit(X, y)
 
     exporter = OnnxExporter()

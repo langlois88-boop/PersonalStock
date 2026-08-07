@@ -1,169 +1,23 @@
-from __future__ import annotations
-
 """
-pipeline_fixes.py  — FIX #4 + #9
-===================================
-
-FIX #4 : Labels penny — seuils triple-barrier irréalistes
-    AVANT : up_pct=0.15, down_pct=0.10, max_days=10
-    → 15% en 10 jours pour un penny stock : quasi jamais atteint
-    → Résultat : ~5% de labels positifs → modèle biaisé "SELL"
+pipeline_fixes.py  — FIX #9
 
 FIX #9 : _check_bluechip_health non réutilisé dans bluechip_dip_scanner
     Le scanner dip calcule le score et le RSI mais skip la vérification
     de santé fondamentale (PE ratio, cash flow, debt ratio) → faux positifs
+
+Note: the adaptive triple-barrier labeling that used to live here
+(FIX #4, `triple_barrier_labels_adaptive`) has moved to
+`portfolio.ml_engine.training.labeling` — it's the single source of truth
+for triple-barrier labeling now, also used by backtester.py. Import it from
+there.
 """
 
 from __future__ import annotations
 
-import logging
 import os
 from typing import Any
 
-import numpy as np
 import pandas as pd
-
-logger = logging.getLogger(__name__)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FIX #4 — Labels réalistes pour le penny pipeline
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _cfg(key: str, default: float) -> float:
-    try:
-        return float(os.getenv(key, str(default)))
-    except (TypeError, ValueError):
-        return default
-
-
-def triple_barrier_labels_adaptive(
-    close: pd.Series,
-    high: pd.Series | None = None,
-    low: pd.Series | None = None,
-    universe: str = "PENNY",
-    up_pct: float | None = None,
-    down_pct: float | None = None,
-    max_days: int | None = None,
-    use_atr_barriers: bool = True,
-    atr_period: int = 14,
-) -> pd.Series:
-    """
-    Labels triple-barrier adaptatifs selon l'univers.
-
-    PENNY (réaliste) :
-        up_pct=0.05, down_pct=0.03, max_days=5   ← ATR-based ou configurable
-        AVANT : up_pct=0.15, down_pct=0.10, max_days=10 → labels trop rares
-
-    BLUECHIP :
-        up_pct=0.04, down_pct=0.025, max_days=15
-
-    CRYPTO :
-        up_pct=0.08, down_pct=0.05, max_days=7
-
-    Si use_atr_barriers=True, les barrières sont calculées depuis l'ATR
-    pour s'adapter à la volatilité réelle du ticker.
-
-    Returns:
-        pd.Series avec labels 1 (UP), -1 (DOWN), 0 (NEUTRAL/TIMEOUT)
-        NaN pour les périodes sans données suffisantes
-    """
-    # Seuils par univers depuis les env vars ou valeurs par défaut réalistes
-    DEFAULTS = {
-        "PENNY": {
-            "up_pct": _cfg("PENNY_TRIPLE_BARRIER_UP_PCT", 0.05),      # était 0.15 !
-            "down_pct": _cfg("PENNY_TRIPLE_BARRIER_DOWN_PCT", 0.03),   # était 0.10 !
-            "max_days": int(_cfg("PENNY_TRIPLE_BARRIER_MAX_DAYS", 5)), # était 10 !
-            "atr_mult_up": _cfg("PENNY_BARRIER_ATR_MULT_UP", 2.0),
-            "atr_mult_down": _cfg("PENNY_BARRIER_ATR_MULT_DOWN", 1.5),
-        },
-        "BLUECHIP": {
-            "up_pct": _cfg("BLUECHIP_TRIPLE_BARRIER_UP_PCT", 0.04),
-            "down_pct": _cfg("BLUECHIP_TRIPLE_BARRIER_DOWN_PCT", 0.025),
-            "max_days": int(_cfg("BLUECHIP_TRIPLE_BARRIER_MAX_DAYS", 15)),
-            "atr_mult_up": _cfg("BLUECHIP_BARRIER_ATR_MULT_UP", 2.5),
-            "atr_mult_down": _cfg("BLUECHIP_BARRIER_ATR_MULT_DOWN", 1.5),
-        },
-        "CRYPTO": {
-            "up_pct": _cfg("CRYPTO_TRIPLE_BARRIER_UP_PCT", 0.08),
-            "down_pct": _cfg("CRYPTO_TRIPLE_BARRIER_DOWN_PCT", 0.05),
-            "max_days": int(_cfg("CRYPTO_TRIPLE_BARRIER_MAX_DAYS", 7)),
-            "atr_mult_up": _cfg("CRYPTO_BARRIER_ATR_MULT_UP", 2.0),
-            "atr_mult_down": _cfg("CRYPTO_BARRIER_ATR_MULT_DOWN", 1.5),
-        },
-    }
-
-    cfg = DEFAULTS.get(universe.upper(), DEFAULTS["PENNY"])
-    final_up = up_pct if up_pct is not None else cfg["up_pct"]
-    final_down = down_pct if down_pct is not None else cfg["down_pct"]
-    final_max_days = max_days if max_days is not None else cfg["max_days"]
-
-    close_vals = close.values.astype(float)
-    n = len(close_vals)
-    labels = np.full(n, np.nan)
-
-    # Calcul ATR si demandé
-    atr_vals = None
-    if use_atr_barriers and high is not None and low is not None:
-        try:
-            prev = close.shift(1)
-            tr = pd.concat([
-                (high - low).abs(),
-                (high - prev).abs(),
-                (low - prev).abs(),
-            ], axis=1).max(axis=1)
-            atr_series = tr.ewm(alpha=1 / atr_period, min_periods=atr_period, adjust=False).mean()
-            atr_vals = atr_series.values.astype(float)
-        except Exception:
-            atr_vals = None
-
-    for i in range(n - final_max_days):
-        entry = close_vals[i]
-        if np.isnan(entry) or entry <= 0:
-            continue
-
-        if atr_vals is not None and not np.isnan(atr_vals[i]):
-            atr = atr_vals[i]
-            up_barrier = entry + cfg["atr_mult_up"] * atr
-            down_barrier = entry - cfg["atr_mult_down"] * atr
-        else:
-            up_barrier = entry * (1 + final_up)
-            down_barrier = entry * (1 - final_down)
-
-        label = 0  # timeout par défaut
-        for j in range(i + 1, min(i + final_max_days + 1, n)):
-            future_price = close_vals[j]
-            if np.isnan(future_price):
-                continue
-            if future_price >= up_barrier:
-                label = 1
-                break
-            if future_price <= down_barrier:
-                label = -1
-                break
-
-        labels[i] = label
-
-    result = pd.Series(labels, index=close.index, name="label")
-
-    # Log de la distribution pour débogage
-    valid = result.dropna()
-    if len(valid) > 10:
-        pos_pct = (valid == 1).sum() / len(valid) * 100
-        neg_pct = (valid == -1).sum() / len(valid) * 100
-        neu_pct = (valid == 0).sum() / len(valid) * 100
-        logger.debug(
-            "Labels %s: pos=%.1f%% neg=%.1f%% neutral=%.1f%% (n=%d)",
-            universe, pos_pct, neg_pct, neu_pct, len(valid)
-        )
-        if pos_pct < 10:
-            logger.warning(
-                "⚠️ Labels très déséquilibrés pour %s: seulement %.1f%% positifs. "
-                "Considérer d'ajuster PENNY_TRIPLE_BARRIER_UP_PCT ou d'utiliser "
-                "use_atr_barriers=True.", universe, pos_pct
-            )
-
-    return result
 
 
 def validate_label_distribution(labels: pd.Series, universe: str = "PENNY") -> dict[str, Any]:

@@ -10,9 +10,9 @@ import numpy as np
 import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import precision_recall_curve, f1_score
-from sklearn.model_selection import TimeSeriesSplit
 
 from .model import FEATURE_COLUMNS, build_model
+from .validation import PurgedTimeSeriesSplit
 from ..models import Stock, PriceHistory
 
 RECOMMENDER_MODEL_PATH = Path(__file__).resolve().parent / 'recommender_brain_v1.pkl'
@@ -108,7 +108,13 @@ def train_recommender_model() -> dict[str, object]:
     X = dataset[FEATURE_COLUMNS].values
     y = dataset['label'].values
 
-    splitter = TimeSeriesSplit(n_splits=5)
+    # Purge window matches the forward-return label horizon so no training
+    # fold ends within a label's forward-looking window of the test fold.
+    splitter = PurgedTimeSeriesSplit(
+        n_splits=int(os.getenv('RECOMMENDER_PURGED_SPLITS', '5')),
+        purge_window=int(os.getenv('RECOMMENDER_PURGE_WINDOW', str(horizon))),
+        embargo_pct=float(os.getenv('RECOMMENDER_EMBARGO_PCT', '0.01')),
+    )
     oof_probs = np.full(len(y), np.nan)
     for train_idx, test_idx in splitter.split(X):
         base = build_model()

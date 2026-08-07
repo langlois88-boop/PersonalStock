@@ -2095,6 +2095,7 @@ class AlpacaIntradayView(APIView):
 				'ema20': _safe_number(row.get('ema20')),
 				'ema50': _safe_number(row.get('ema50')),
 				'rsi14': _safe_number(row.get('rsi14')),
+				'macd_hist': _safe_number(row.get('macd_hist')),
 				'patterns': _normalize_patterns(row.get('patterns') or []),
 			})
 
@@ -2153,6 +2154,7 @@ class AlpacaIntradayView(APIView):
 			'rsi14': _safe_number(latest.get('rsi14')),
 			'ema20': _safe_number(latest.get('ema20')),
 			'ema50': _safe_number(latest.get('ema50')),
+			'macd_hist': _safe_number(latest.get('macd_hist')),
 			'probability': _safe_number(round(float(probability), 4)),
 			'support': _safe_number(support, default=0.0),
 			'resistance': _safe_number(resistance, default=0.0),
@@ -2810,6 +2812,20 @@ class PortfolioDashboardView(APIView):
 							'reason': 'Divergence Volume/Prix + Baisse du score IA.',
 						}
 
+			if rsi is None:
+				rsi = self._rsi_from_history(stock) or 50.0
+			if not rsi_history and rsi is not None:
+				rsi_history = [rsi]
+			if ai_score is None:
+				ai_score = 50.0
+
+			if rsi is None:
+				rsi = self._rsi_from_history(stock) or 50.0
+			if not rsi_history and rsi is not None:
+				rsi_history = [rsi]
+			if ai_score is None:
+				ai_score = 50.0
+
 			items.append({
 				'ticker': stock.symbol,
 				'name': stock.name,
@@ -2943,6 +2959,7 @@ def _retro_feature_row(symbol: str) -> tuple[dict[str, Any], pd.Series] | None:
 			'pattern_doji': bool(row.get('pattern_doji')),
 			'pattern_hammer': bool(row.get('pattern_hammer')),
 			'pattern_engulfing': bool(row.get('pattern_engulfing')),
+			'pattern_bearish_engulfing': bool(row.get('pattern_bearish_engulfing')),
 			'pattern_morning_star': bool(row.get('pattern_morning_star')),
 			'pattern_success_3d': False,
 			'rsi14': float(row.get('rsi14') or 0),

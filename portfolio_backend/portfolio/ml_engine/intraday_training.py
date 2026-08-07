@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.model_selection import TimeSeriesSplit
@@ -31,6 +31,35 @@ class IntradayModelResult:
     features: list[str]
     scores: list[float]
     importances: list[tuple[str, float]]
+
+
+@dataclass
+class PreFittedVotingEnsemble:
+    """Soft-voting ensemble over estimators that are already fit on their own
+    (possibly disjoint) training data — unlike sklearn's ``VotingClassifier``,
+    which always re-clones and re-fits every estimator on whatever single
+    ``X, y`` is passed to ``.fit()``. Keeping each expert's own fit intact is
+    what preserves per-universe specialization (e.g. a bluechip expert fit
+    only on bluechip bars, a penny expert fit only on penny bars)."""
+
+    estimators: list[tuple[str, object]]
+    weights: list[float]
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        total_weight = float(sum(self.weights)) or 1.0
+        probs = None
+        for (_, estimator), weight in zip(self.estimators, self.weights):
+            weighted = estimator.predict_proba(X) * weight
+            probs = weighted if probs is None else probs + weighted
+        return probs / total_weight
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        probs = self.predict_proba(X)
+        return (probs[:, 1] >= 0.5).astype(int)
+
+    @property
+    def classes_(self) -> np.ndarray:
+        return self.estimators[0][1].classes_
 
 
 def _zscore(series: pd.Series) -> pd.Series:
@@ -237,15 +266,6 @@ def train_voting_ensemble(
         except Exception:
             weights = None
 
-    ensemble = VotingClassifier(
-        estimators=[
-            ('bluechip_expert', blue_model),
-            ('penny_expert', penny_model),
-        ],
-        voting='soft',
-        weights=weights,
-    )
-
     X_blue = blue_df[feature_cols]
     y_blue = blue_y.values
     X_penny = penny_df[feature_cols]
@@ -264,27 +284,36 @@ def train_voting_ensemble(
         blue_score = _cv_score(X_blue, y_blue, blue_model)
         penny_score = _cv_score(X_penny, y_penny, penny_model)
         weights = [max(blue_score, 0.1), max(penny_score, 0.1)]
-        ensemble.set_params(weights=weights)
 
-    volume_cols = [col for col in ['rvol', 'volatility'] if col in feature_cols]
-    base_cols = [col for col in feature_cols if col not in volume_cols]
-    scaler = ColumnTransformer(
-        transformers=[
-            ('volume', RobustScaler(), volume_cols),
-            ('base', RobustScaler(), base_cols),
+    def _make_scaler() -> ColumnTransformer:
+        volume_cols = [col for col in ['rvol', 'volatility'] if col in feature_cols]
+        base_cols = [col for col in feature_cols if col not in volume_cols]
+        return ColumnTransformer(
+            transformers=[
+                ('volume', RobustScaler(), volume_cols),
+                ('base', RobustScaler(), base_cols),
+            ],
+            remainder='drop',
+        )
+
+    # Each expert is fit on its own universe only, so specialization survives
+    # assembly — sklearn's VotingClassifier would instead re-clone and
+    # re-fit both estimators on whatever single X/y it receives, erasing it.
+    blue_pipeline = Pipeline([('scaler', _make_scaler()), ('model', blue_model)])
+    blue_pipeline.fit(X_blue, y_blue)
+
+    penny_pipeline = Pipeline([('scaler', _make_scaler()), ('model', penny_model)])
+    penny_pipeline.fit(X_penny, y_penny)
+
+    ensemble = PreFittedVotingEnsemble(
+        estimators=[
+            ('bluechip_expert', blue_pipeline),
+            ('penny_expert', penny_pipeline),
         ],
-        remainder='drop',
+        weights=weights,
     )
-    X_all = pd.concat([X_blue, X_penny], ignore_index=True)
-    y_all = np.concatenate([y_blue, y_penny])
 
-    pipeline = Pipeline([
-        ('scaler', scaler),
-        ('model', ensemble),
-    ])
-    pipeline.fit(X_all, y_all)
-
-    return IntradayModelResult(model=pipeline, features=feature_cols, scores=[], importances=[])
+    return IntradayModelResult(model=ensemble, features=feature_cols, scores=[], importances=[])
 
 
 def save_intraday_model(result: IntradayModelResult, name: str) -> str:

@@ -99,7 +99,7 @@ from .alpaca_data import (
     get_trading_client,
     get_tradable_symbols,
 )
-from .patterns import enrich_bars_with_patterns
+from .patterns import add_pattern_columns, enrich_bars_with_patterns
 from .crypto_processor import scan_crypto_drip
 from .ml_engine.engine.data_fusion import DataFusionEngine
 from .ml_engine.backtester import (
@@ -4961,75 +4961,22 @@ def _stop_loss_multiplier(explanations: list[dict[str, Any]] | None) -> float:
 
 
 def _add_candlestick_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Thin wrapper over patterns.py::add_pattern_columns — kept under this
+    name since it's imported elsewhere (views.py). Candlestick pattern
+    detection is consolidated there now (single source of truth); this used
+    to be its own pandas_ta-then-hand-rolled-fallback implementation that
+    only ever captured the bullish CDL_ENGULFING case."""
     if frame is None or frame.empty:
         return pd.DataFrame()
-    df = frame.copy()
     for col in ['open', 'high', 'low', 'close']:
-        if col not in df.columns:
+        if col not in frame.columns:
             return pd.DataFrame()
+    df = frame.copy()
     df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].apply(pd.to_numeric, errors='coerce')
     df = df.dropna(subset=['open', 'high', 'low', 'close'])
     if df.empty:
         return pd.DataFrame()
-
-    df['pattern_doji'] = False
-    df['pattern_hammer'] = False
-    df['pattern_engulfing'] = False
-    df['pattern_morning_star'] = False
-
-    try:
-        import pandas_ta as ta
-        patterns = ta.cdl_pattern(
-            open_=df['open'],
-            high=df['high'],
-            low=df['low'],
-            close=df['close'],
-            name=["doji", "hammer", "engulfing", "morningstar"],
-        )
-        if patterns is not None and not patterns.empty:
-            if 'CDL_DOJI' in patterns:
-                df['pattern_doji'] = patterns['CDL_DOJI'] != 0
-            if 'CDL_HAMMER' in patterns:
-                df['pattern_hammer'] = patterns['CDL_HAMMER'] != 0
-            if 'CDL_ENGULFING' in patterns:
-                df['pattern_engulfing'] = patterns['CDL_ENGULFING'] > 0
-            if 'CDL_MORNINGSTAR' in patterns:
-                df['pattern_morning_star'] = patterns['CDL_MORNINGSTAR'] != 0
-            return df
-    except Exception:
-        pass
-
-    for idx in range(len(df)):
-        row = df.iloc[idx]
-        prev = df.iloc[idx - 1] if idx > 0 else None
-        prev2 = df.iloc[idx - 2] if idx > 1 else None
-
-        body = abs(float(row['close']) - float(row['open']))
-        candle_range = max(float(row['high']) - float(row['low']), 0)
-        lower_shadow = min(float(row['open']), float(row['close'])) - float(row['low'])
-        upper_shadow = float(row['high']) - max(float(row['open']), float(row['close']))
-        if candle_range > 0 and body <= candle_range * 0.1:
-            df.at[df.index[idx], 'pattern_doji'] = True
-        if body > 0 and lower_shadow >= 2 * body and upper_shadow <= body * 0.5:
-            df.at[df.index[idx], 'pattern_hammer'] = True
-        if prev is not None:
-            prev_red = float(prev['close']) < float(prev['open'])
-            curr_green = float(row['close']) > float(row['open'])
-            engulfs = float(row['close']) >= float(prev['open']) and float(row['open']) <= float(prev['close'])
-            if prev_red and curr_green and engulfs:
-                df.at[df.index[idx], 'pattern_engulfing'] = True
-        if prev is not None and prev2 is not None:
-            prev2_red = float(prev2['close']) < float(prev2['open'])
-            prev_small = abs(float(prev['close']) - float(prev['open'])) <= (
-                max(float(prev['high']) - float(prev['low']), 0.0) * 0.3
-            )
-            curr_green = float(row['close']) > float(row['open'])
-            gap_down = float(prev['close']) < float(prev2['close'])
-            recover = float(row['close']) >= (float(prev2['open']) + float(prev2['close'])) / 2
-            if prev2_red and prev_small and curr_green and gap_down and recover:
-                df.at[df.index[idx], 'pattern_morning_star'] = True
-
-    return df
+    return add_pattern_columns(df)
 
 
 def _pattern_success_3d(frame: pd.DataFrame, target_pct: float = 0.05) -> pd.Series:
@@ -10689,6 +10636,21 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
             return {'error': f"Données introuvables pour {symbol}"}
         last_price = float(close_series.iloc[-1])
 
+        rsi14 = _compute_rsi(close_series, 14)
+        if rsi14 is None:
+            rsi14 = 50.0
+        try:
+            ema20_val = float(close_series.ewm(span=20, adjust=False).mean().iloc[-1])
+        except Exception:
+            ema20_val = last_price
+        try:
+            ema50_val = float(close_series.ewm(span=50, adjust=False).mean().iloc[-1])
+        except Exception:
+            ema50_val = last_price
+        _, _, macd_hist = _compute_macd(close_series)
+        if macd_hist is None:
+            macd_hist = 0.0
+
         is_bluechip = last_price >= 5
         universe = 'BLUECHIP' if is_bluechip else 'PENNY'
         model_path = get_model_path(universe)
@@ -10833,6 +10795,10 @@ def analyze_ticker_for_ui(symbol: str) -> dict[str, Any]:
             'news_titles': titles[:5],
             'universe': universe,
             'sandbox': 'AI_PENNY' if universe == 'PENNY' else 'AI_BLUECHIP',
+            'rsi14': round(float(rsi14), 2),
+            'ema20': round(float(ema20_val), 4),
+            'ema50': round(float(ema50_val), 4),
+            'macd_hist': round(float(macd_hist), 4),
         }
         cache.set(f"ai_analysis:{symbol}", result, timeout=60 * 10)
         return result

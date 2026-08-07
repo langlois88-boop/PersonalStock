@@ -10,14 +10,14 @@ import numpy as np
 import pandas as pd
 import yfinance as yfin
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import f1_score
+from sklearn.metrics import balanced_accuracy_score, f1_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler
 
 from portfolio.ml_engine.export_utils import export_onnx_with_gatekeeper, save_model_with_version, write_meta_sidecar
 from portfolio.ml_engine.feature_registry import CRYPTO_FEATURE_NAMES
 from portfolio.ml_engine.push_model import _build_meta_from_payload, push_to_portfolio_app
+from portfolio.ml_engine.validation import PurgedTimeSeriesSplit
 def _ensure_django() -> None:
     if not os.getenv('DJANGO_SETTINGS_MODULE'):
         os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'portfolio_backend.settings')
@@ -188,11 +188,22 @@ def train_crypto_model(
         ('model', model),
     ])
 
-    splits = TimeSeriesSplit(n_splits=5)
+    # Purge window matches the forward-return label horizon so no training
+    # fold ends within a label's forward-looking window of the test fold.
+    splits = PurgedTimeSeriesSplit(
+        n_splits=int(os.getenv('CRYPTO_PURGED_SPLITS', '5')),
+        purge_window=int(os.getenv('CRYPTO_PURGE_WINDOW', str(horizon))),
+        embargo_pct=float(os.getenv('CRYPTO_EMBARGO_PCT', '0.01')),
+    )
     scores = []
     for train_idx, test_idx in splits.split(X):
         pipeline.fit(X.iloc[train_idx], y[train_idx])
-        scores.append(float(pipeline.score(X.iloc[test_idx], y[test_idx])))
+        # Balanced accuracy, not pipeline.score() (raw accuracy): a model
+        # that always predicts the majority class scores exactly 0.5 here
+        # regardless of label skew, instead of inheriting the majority
+        # share as its "accuracy".
+        preds = pipeline.predict(X.iloc[test_idx])
+        scores.append(float(balanced_accuracy_score(y[test_idx], preds)))
 
     def _walk_forward_f1(window_months: int = 3, min_train: int = 60) -> list[dict[str, float | int | str]]:
         reports = []
@@ -269,10 +280,17 @@ def save_crypto_model(payload: dict, output_path: Path | None = None, auto_push:
     cv_scores = payload.get('cv_scores') or []
     cv_mean = payload.get('cv_mean')
     wf_f1 = float(np.mean([row.get('f1', 0.0) for row in (payload.get('walk_forward') or [])]))
-    if cv_mean is None or cv_mean < 0.55:
-        raise ValueError(f"CV mean {cv_mean:.3f} below threshold 0.55 — not deploying")
-    if wf_f1 < 0.50:
-        raise ValueError(f"Walk-forward F1 {wf_f1:.3f} below threshold 0.50")
+    # CRYPTO's label balance (target_pct within horizon periods) can swing
+    # either way with market regime, unlike the other universes' more
+    # predictably-skewed triple-barrier setups — cv_mean is balanced
+    # accuracy (see train_crypto_model), which scores a majority-only model
+    # at exactly 0.5 regardless of which class is actually the majority.
+    cv_min = float(os.getenv('CRYPTO_CV_MIN', '0.55'))
+    wf_min = float(os.getenv('CRYPTO_WALK_FORWARD_F1_MIN', '0.50'))
+    if cv_mean is None or cv_mean < cv_min:
+        raise ValueError(f"CV mean {cv_mean:.3f} below threshold {cv_min:.2f} — not deploying")
+    if wf_f1 < wf_min:
+        raise ValueError(f"Walk-forward F1 {wf_f1:.3f} below threshold {wf_min:.2f}")
     version_info = save_model_with_version(payload, path, 'crypto', metric_name='cv_mean', metric_value=payload.get('cv_mean'))
     onnx_result = export_onnx_with_gatekeeper(
         payload=payload,

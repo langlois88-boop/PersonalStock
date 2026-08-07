@@ -364,8 +364,8 @@ Réponds UNIQUEMENT avec ce JSON (pas de texte hors JSON) :
     except Exception as exc:
         logger.warning("DipAnalysis: dataclass build failed: %s", exc)
         return None
-    try:
-        result = SwingLevels(
+
+
 # ─── 2. Swing trading penny stock ─────────────────────────────────────────────
 
 def analyze_penny_swing(
@@ -375,10 +375,6 @@ def analyze_penny_swing(
     rsi: float,
     rubber_band_index: float,   # distance normalisée de la SMA20 (ex: -1.8 = très oversold)
     volume_z: float,
-        min_rr = float(os.getenv("DEEPSEEK_SWING_MIN_RR", "2.0"))
-        if result.risk_reward < min_rr:
-            return None
-        return result
     rvol: float,
     macd_hist: float,
     support_levels: list[float],
@@ -462,7 +458,7 @@ Réponds UNIQUEMENT avec ce JSON :
         target = float(data.get("target", target_default))
         stop = float(data.get("stop_loss", stop_default))
         rr = round((target - entry) / max(entry - stop, 1e-6), 2)
-        return SwingLevels(
+        result = SwingLevels(
             entry=entry,
             target=target,
             stop_loss=stop,
@@ -472,6 +468,10 @@ Réponds UNIQUEMENT avec ce JSON :
             reasoning=str(data.get("reasoning", "")),
             horizon_days=int(data.get("horizon_days", 5)),
         )
+        min_rr = float(os.getenv("DEEPSEEK_SWING_MIN_RR", "2.0"))
+        if result.risk_reward < min_rr:
+            return None
+        return result
     except Exception as exc:
         logger.warning("SwingLevels: dataclass build failed: %s", exc)
         return None

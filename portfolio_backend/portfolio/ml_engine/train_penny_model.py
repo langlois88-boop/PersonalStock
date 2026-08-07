@@ -12,8 +12,7 @@ import pandas as pd
 from portfolio import market_data as yf
 import requests
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import classification_report, accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import classification_report, accuracy_score, balanced_accuracy_score, precision_score, recall_score, f1_score
 from sklearn.ensemble import StackingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
@@ -302,6 +301,10 @@ def _deepseek_confidence(symbol: str, date_value: str, features: dict[str, float
 def train_model(output_path: Path, auto_push: bool | None = None) -> None:
     _ensure_django()
     print(f"[{datetime.utcnow().isoformat()}Z] Training started")
+    # Triple-barrier label horizon (days) — also used as the CV purge window
+    # so no training fold ends within a label's forward-looking window of
+    # the test fold.
+    label_max_days = int(os.getenv('PENNY_TRIPLE_BARRIER_MAX_DAYS', '10'))
     symbols = _get_symbols()
     X, y = build_dataset(symbols)
     feature_names = list(PENNY_FEATURE_NAMES)
@@ -357,13 +360,17 @@ def train_model(output_path: Path, auto_push: bool | None = None) -> None:
                 yv = y.values
                 splitter = PurgedTimeSeriesSplit(
                     n_splits=int(os.getenv('PENNY_PURGED_SPLITS', '5')),
-                    purge_window=int(os.getenv('PENNY_PURGE_WINDOW', '5')),
+                    purge_window=int(os.getenv('PENNY_PURGE_WINDOW', str(label_max_days))),
                     embargo_pct=float(os.getenv('PENNY_EMBARGO_PCT', '0.02')),
                 )
                 scores = []
                 for tr, te in splitter.split(Xv):
                     clf.fit(Xv[tr], yv[tr])
-                    scores.append(float(clf.score(Xv[te], yv[te])))
+                    # Balanced accuracy, not clf.score() (raw accuracy): a
+                    # majority-only model scores exactly 0.5 here regardless
+                    # of label skew, so Optuna can't be led to "optimal"
+                    # hyperparameters that just exploit the imbalance.
+                    scores.append(float(balanced_accuracy_score(yv[te], clf.predict(Xv[te]))))
                 return float(np.mean(scores)) if scores else 0.0
 
             study = optuna.create_study(direction='maximize')
@@ -406,7 +413,11 @@ def train_model(output_path: Path, auto_push: bool | None = None) -> None:
     steps.append(('model', model))
     pipeline = Pipeline(steps)
 
-    splits = TimeSeriesSplit(n_splits=5)
+    splits = PurgedTimeSeriesSplit(
+        n_splits=int(os.getenv('PENNY_PURGED_SPLITS', '5')),
+        purge_window=int(os.getenv('PENNY_PURGE_WINDOW', str(label_max_days))),
+        embargo_pct=float(os.getenv('PENNY_EMBARGO_PCT', '0.02')),
+    )
     cv_scores: list[float] = []
     last_test_idx = None
     for train_idx, test_idx in splits.split(X):
@@ -414,7 +425,12 @@ def train_model(output_path: Path, auto_push: bool | None = None) -> None:
             pipeline.fit(X.iloc[train_idx], y.iloc[train_idx], model__sample_weight=weights[train_idx])
         else:
             pipeline.fit(X.iloc[train_idx], y.iloc[train_idx])
-        cv_scores.append(float(pipeline.score(X.iloc[test_idx], y.iloc[test_idx])))
+        # Balanced accuracy, not pipeline.score() (raw accuracy): a model
+        # that always predicts the majority class scores exactly 0.5 here
+        # regardless of label skew, instead of inheriting the majority
+        # share as its "accuracy".
+        cv_preds = pipeline.predict(X.iloc[test_idx])
+        cv_scores.append(float(balanced_accuracy_score(y.iloc[test_idx], cv_preds)))
         last_test_idx = test_idx
 
     if weights is not None:
@@ -422,7 +438,7 @@ def train_model(output_path: Path, auto_push: bool | None = None) -> None:
     else:
         pipeline.fit(X, y)
     walk_forward = _walk_forward_report(X, y, pipeline)
-    print('TimeSeriesSplit scores:', cv_scores)
+    print('PurgedTimeSeriesSplit scores:', cv_scores)
     if walk_forward:
         print('Walk-forward report (3-month windows):')
         for row in walk_forward:
@@ -435,10 +451,18 @@ def train_model(output_path: Path, auto_push: bool | None = None) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cv_mean = float(np.mean(cv_scores)) if cv_scores else None
     wf_f1 = float(np.mean([row.get('f1', 0.0) for row in walk_forward])) if walk_forward else 0.0
-    if cv_mean is None or cv_mean < 0.55:
-        raise ValueError(f"CV mean {cv_mean:.3f} below threshold 0.55 — not deploying")
-    if wf_f1 < 0.50:
-        raise ValueError(f"Walk-forward F1 {wf_f1:.3f} below threshold 0.50")
+    label_balance = float(y.mean()) if len(y) else 0.0
+    # PENNY's default triple-barrier (up 15% within 10 days vs. down 10%) is
+    # a demanding target, so label=1 is typically the minority class here —
+    # cv_mean is balanced accuracy (see above), which scores a majority-only
+    # ("always 0") model at exactly 0.5 no matter how skewed label_balance
+    # is, so a threshold at/above 0.55 with wf_f1 above 0.0 rejects it.
+    cv_min = float(os.getenv('PENNY_CV_MIN', '0.55'))
+    wf_min = float(os.getenv('PENNY_WALK_FORWARD_F1_MIN', '0.50'))
+    if cv_mean is None or cv_mean < cv_min:
+        raise ValueError(f"CV mean {cv_mean:.3f} below threshold {cv_min:.2f} — not deploying")
+    if wf_f1 < wf_min:
+        raise ValueError(f"Walk-forward F1 {wf_f1:.3f} below threshold {wf_min:.2f}")
     payload = {
         'model': pipeline,
         'features': feature_names,
@@ -449,6 +473,7 @@ def train_model(output_path: Path, auto_push: bool | None = None) -> None:
         'cv_scores': cv_scores,
         'cv_mean': cv_mean,
         'walk_forward': walk_forward,
+        'label_balance': label_balance,
     }
     version_info = save_model_with_version(payload, output_path, 'penny', metric_name='cv_mean', metric_value=cv_mean)
     onnx_result = export_onnx_with_gatekeeper(
@@ -462,7 +487,6 @@ def train_model(output_path: Path, auto_push: bool | None = None) -> None:
     print(f"Saved model to {output_path}")
     if onnx_result.get('exported'):
         onnx_path = Path(onnx_result.get('onnx_path'))
-        label_balance = float(y.mean()) if len(y) else 0.0
         write_meta_sidecar(onnx_path, cv_scores, feature_names, 'PENNY', len(y), label_balance)
         print(f"Exported ONNX to {onnx_path}")
         if auto_push is None:

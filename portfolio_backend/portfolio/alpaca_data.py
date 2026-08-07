@@ -485,6 +485,7 @@ def get_intraday_context(symbol: str, minutes: int = 390, rvol_window: int = 20)
         'rsi14': float(last.get('rsi14') or 0.0),
         'ema20': float(last.get('ema20') or 0.0),
         'ema50': float(last.get('ema50') or 0.0),
+        'macd_hist': float(last.get('macd_hist') or 0.0),
         'vwap': float(last.get('vwap') or 0.0),
         'price_to_vwap': float(last.get('price_to_vwap') or 0.0),
         'last_close': float(last.get('close') or 0.0),

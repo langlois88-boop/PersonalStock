@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 
@@ -45,6 +46,95 @@ def detect_bearish_engulfing(prev: dict[str, float], curr: dict[str, float]) -> 
     return prev_green and curr_red and engulfs
 
 
+def detect_morning_star(prev2: dict[str, float], prev: dict[str, float], curr: dict[str, float]) -> bool:
+    """3-candle bullish reversal: a down day, a small-bodied day that gaps
+    down, then an up day that recovers back above the first candle's
+    midpoint."""
+    prev2_red = prev2['close'] < prev2['open']
+    prev_range = max(prev['high'] - prev['low'], 0.0)
+    prev_small = abs(prev['close'] - prev['open']) <= prev_range * 0.3
+    curr_green = curr['close'] > curr['open']
+    gap_down = prev['close'] < prev2['close']
+    recover = curr['close'] >= (prev2['open'] + prev2['close']) / 2
+    return prev2_red and prev_small and curr_green and gap_down and recover
+
+
+def add_pattern_columns(
+    df: pd.DataFrame,
+    open_col: str = 'open',
+    high_col: str = 'high',
+    low_col: str = 'low',
+    close_col: str = 'close',
+) -> pd.DataFrame:
+    """Add per-row candlestick pattern indicator columns to a copy of `df`,
+    using this module's canonical detection logic — single source of truth
+    for pattern features. Previously duplicated (with divergent formulas —
+    a pandas_ta fast path in some places, hand-rolled fallbacks that didn't
+    quite agree with each other or with this module's scalar detect_*
+    functions in others) across `ml_engine/engine/data_fusion.py` and
+    `tasks.py::_add_candlestick_features`; both now call this instead.
+
+    Adds:
+    - ``pattern_doji``, ``pattern_hammer``, ``pattern_morning_star`` (0/1)
+    - ``pattern_bullish_engulfing``, ``pattern_bearish_engulfing`` (0/1)
+    - ``pattern_engulfing`` — alias for ``pattern_bullish_engulfing``, kept
+      for backward compatibility with existing consumers (this is what the
+      name always meant here: the old CDL_ENGULFING-based code only ever
+      captured the bullish case under it, silently losing the bearish one —
+      use ``pattern_bearish_engulfing`` to not lose that signal).
+
+    Returns `df` unchanged if the required OHLC columns aren't present.
+    """
+    if df is None or df.empty:
+        return df
+    required = {open_col, high_col, low_col, close_col}
+    if not required.issubset(df.columns):
+        return df
+
+    out = df.copy()
+    o = pd.to_numeric(out[open_col], errors='coerce').to_numpy(dtype=float)
+    h = pd.to_numeric(out[high_col], errors='coerce').to_numpy(dtype=float)
+    lo = pd.to_numeric(out[low_col], errors='coerce').to_numpy(dtype=float)
+    c = pd.to_numeric(out[close_col], errors='coerce').to_numpy(dtype=float)
+
+    body = np.abs(c - o)
+    candle_range = np.maximum(h - lo, 0.0)
+    lower_shadow = np.minimum(o, c) - lo
+    upper_shadow = h - np.maximum(o, c)
+
+    doji = (candle_range > 0) & (body <= candle_range * 0.1)
+    hammer = (body > 0) & (lower_shadow >= 2 * body) & (upper_shadow <= body * 0.5)
+
+    prev_o, prev_c = np.roll(o, 1), np.roll(c, 1)
+    prev_h, prev_lo = np.roll(h, 1), np.roll(lo, 1)
+    prev_o[0] = prev_c[0] = prev_h[0] = prev_lo[0] = np.nan
+    prev_red = prev_c < prev_o
+    prev_green = prev_c > prev_o
+    curr_green = c > o
+    curr_red = c < o
+    engulfs_up = (c >= prev_o) & (o <= prev_c)
+    engulfs_down = (o >= prev_c) & (c <= prev_o)
+    bullish_engulfing = prev_red & curr_green & engulfs_up
+    bearish_engulfing = prev_green & curr_red & engulfs_down
+
+    prev2_o, prev2_c = np.roll(o, 2), np.roll(c, 2)
+    prev2_o[:2] = prev2_c[:2] = np.nan
+    prev2_red = prev2_c < prev2_o
+    prev_range = np.maximum(prev_h - prev_lo, 0.0)
+    prev_small = np.abs(prev_c - prev_o) <= prev_range * 0.3
+    gap_down = prev_c < prev2_c
+    recover = c >= (prev2_o + prev2_c) / 2
+    morning_star = prev2_red & prev_small & curr_green & gap_down & recover
+
+    out['pattern_doji'] = doji.astype(int)
+    out['pattern_hammer'] = hammer.astype(int)
+    out['pattern_bullish_engulfing'] = bullish_engulfing.astype(int)
+    out['pattern_bearish_engulfing'] = bearish_engulfing.astype(int)
+    out['pattern_engulfing'] = out['pattern_bullish_engulfing']
+    out['pattern_morning_star'] = morning_star.astype(int)
+    return out
+
+
 def enrich_bars_with_patterns(frame: pd.DataFrame, rvol_window: int = 20) -> pd.DataFrame:
     if frame is None or frame.empty:
         return pd.DataFrame()
@@ -70,6 +160,11 @@ def enrich_bars_with_patterns(frame: pd.DataFrame, rvol_window: int = 20) -> pd.
     vol_series = returns.rolling(20).std().fillna(0.0)
     ema20 = df['close'].ewm(span=20, adjust=False).mean()
     ema50 = df['close'].ewm(span=50, adjust=False).mean()
+    ema_fast = df['close'].ewm(span=12, adjust=False).mean()
+    ema_slow = df['close'].ewm(span=26, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    macd_hist = macd_line - signal_line
     delta = df['close'].diff().fillna(0.0)
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
@@ -135,6 +230,7 @@ def enrich_bars_with_patterns(frame: pd.DataFrame, rvol_window: int = 20) -> pd.
     df['ema20'] = ema20
     df['ema50'] = ema50
     df['rsi14'] = rsi.fillna(0.0)
+    df['macd_hist'] = macd_hist.fillna(0.0)
     df['vwap'] = vwap_series
     try:
         df['price_to_vwap'] = (df['close'] - df['vwap']) / df['vwap']

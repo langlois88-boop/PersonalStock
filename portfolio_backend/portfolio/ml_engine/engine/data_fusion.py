@@ -10,6 +10,7 @@ import requests
 from ... import market_data as yf
 
 from ...alpaca_data import get_daily_bars, get_latest_bid_ask_spread_pct, get_order_book_imbalance
+from ...patterns import add_pattern_columns
 from ..feature_engineering import fractional_diff_series
 from ..features.technical import add_all_technical_features
 
@@ -250,7 +251,7 @@ class DataFusionEngine:
             fused["gap_pct"] = (fused["Open"] - prev_close) / prev_close.replace(0, pd.NA)
             fused["intraday_range_pct"] = range_ / fused["Open"].replace(0, pd.NA)
             fused["close_pos_in_range"] = (fused["Close"] - fused["Low"]) / (range_.replace(0, pd.NA))
-            fused = _add_candlestick_patterns(fused)
+            fused = add_pattern_columns(fused, open_col="Open", high_col="High", low_col="Low", close_col="Close")
 
         try:
             fused = add_all_technical_features(
@@ -455,84 +456,10 @@ def _fallback_bid_ask_spread_pct(symbol: str) -> float | None:
         return None
 
 
-def _add_candlestick_patterns(frame: pd.DataFrame) -> pd.DataFrame:
-    if frame is None or frame.empty:
-        return frame
-    if not {"Open", "High", "Low", "Close"}.issubset(frame.columns):
-        return frame
-    df = frame.copy()
-    df[["Open", "High", "Low", "Close"]] = df[["Open", "High", "Low", "Close"]].apply(
-        pd.to_numeric, errors="coerce"
-    )
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
-    if df.empty:
-        return frame
-
-    df["pattern_doji"] = 0
-    df["pattern_hammer"] = 0
-    df["pattern_engulfing"] = 0
-    df["pattern_morning_star"] = 0
-
-    try:
-        import pandas_ta as ta
-
-        patterns = ta.cdl_pattern(
-            open_=df["Open"],
-            high=df["High"],
-            low=df["Low"],
-            close=df["Close"],
-            name=["doji", "hammer", "engulfing", "morningstar"],
-        )
-        if patterns is not None and not patterns.empty:
-            if "CDL_DOJI" in patterns:
-                df["pattern_doji"] = (patterns["CDL_DOJI"] != 0).astype(int)
-            if "CDL_HAMMER" in patterns:
-                df["pattern_hammer"] = (patterns["CDL_HAMMER"] != 0).astype(int)
-            if "CDL_ENGULFING" in patterns:
-                df["pattern_engulfing"] = (patterns["CDL_ENGULFING"] > 0).astype(int)
-            if "CDL_MORNINGSTAR" in patterns:
-                df["pattern_morning_star"] = (patterns["CDL_MORNINGSTAR"] != 0).astype(int)
-            return frame.join(df[["pattern_doji", "pattern_hammer", "pattern_engulfing", "pattern_morning_star"]])
-    except Exception:
-        pass
-
-    open_arr = df["Open"].to_numpy(dtype=float)
-    high_arr = df["High"].to_numpy(dtype=float)
-    low_arr = df["Low"].to_numpy(dtype=float)
-    close_arr = df["Close"].to_numpy(dtype=float)
-    body = np.abs(close_arr - open_arr)
-    candle_range = np.maximum(high_arr - low_arr, 0.0)
-    lower_shadow = np.minimum(open_arr, close_arr) - low_arr
-    upper_shadow = high_arr - np.maximum(open_arr, close_arr)
-
-    doji = (candle_range > 0) & (body <= candle_range * 0.1)
-    hammer = (body > 0) & (lower_shadow >= 2 * body) & (upper_shadow <= body * 0.5)
-
-    prev_open = np.roll(open_arr, 1)
-    prev_close = np.roll(close_arr, 1)
-    prev_high = np.roll(high_arr, 1)
-    prev_low = np.roll(low_arr, 1)
-    prev_open[0] = prev_close[0] = prev_high[0] = prev_low[0] = np.nan
-    prev_red = prev_close < prev_open
-    curr_green = close_arr > open_arr
-    engulfs = (close_arr >= prev_open) & (open_arr <= prev_close)
-    engulfing = prev_red & curr_green & engulfs
-
-    prev2_open = np.roll(open_arr, 2)
-    prev2_close = np.roll(close_arr, 2)
-    prev2_high = np.roll(high_arr, 2)
-    prev2_low = np.roll(low_arr, 2)
-    prev2_open[:2] = prev2_close[:2] = prev2_high[:2] = prev2_low[:2] = np.nan
-    prev2_red = prev2_close < prev2_open
-    prev_range = np.maximum(prev_high - prev_low, 0.0)
-    prev_small = np.abs(prev_close - prev_open) <= (prev_range * 0.3)
-    gap_down = prev_close < prev2_close
-    recover = close_arr >= (prev2_open + prev2_close) / 2
-    morning_star = prev2_red & prev_small & curr_green & gap_down & recover
-
-    df["pattern_doji"] = doji.astype(int)
-    df["pattern_hammer"] = hammer.astype(int)
-    df["pattern_engulfing"] = engulfing.astype(int)
-    df["pattern_morning_star"] = morning_star.astype(int)
-
-    return frame.join(df[["pattern_doji", "pattern_hammer", "pattern_engulfing", "pattern_morning_star"]])
+# Candlestick pattern detection lives in patterns.py::add_pattern_columns
+# now — single source of truth (see call site above). This used to be its
+# own implementation here, forked between a pandas_ta fast path and a
+# hand-rolled numpy fallback that (a) used `np` without ever importing it
+# in this file — a latent NameError if pandas_ta ever failed — and (b)
+# only captured the bullish CDL_ENGULFING case, silently losing bearish
+# engulfing entirely.

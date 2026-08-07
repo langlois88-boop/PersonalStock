@@ -22,6 +22,16 @@ Nouvelles features v2 :
 from typing import Dict, List
 
 # ─── Features stables (recommender/ancienne version) ──────────────────────────
+#
+# NOTE : ceci est le set de features du pipeline legacy (train_stable_model.py,
+# lu positionnellement — l'ordre de cette liste doit rester synchronisé avec
+# l'ordre de retour de train_stable_model.py::_build_features). Le pipeline
+# plus récent pipelines/stable_pipeline.py calcule un set VOLONTAIREMENT
+# différent (10 features, sans sma_ratio_10_20, sous le nom local
+# STABLE_FEATURES) — ce n'est pas une duplication accidentelle à fusionner,
+# les deux pipelines ont évolué séparément et ne calculent pas les mêmes
+# colonnes ; importer cette liste-ci dans stable_pipeline.py ferait planter
+# X[STABLE_FEATURES] (colonne manquante).
 
 STABLE_FEATURE_NAMES: List[str] = [
     "rsi_14",
@@ -30,45 +40,42 @@ STABLE_FEATURE_NAMES: List[str] = [
     "volatility_20",
     "volume_zscore_20",
     "return_20d",
-    "spy_corr_60",          # renommé depuis spy_correlation
+    "spy_correlation",
     "dividend_yield",
-    "sector_beta_60",       # renommé depuis sector_beta
+    "sector_beta",
     "sentiment_score",
+    "sma_ratio_10_20",
 ]
 
 # ─── Features penny v2 ────────────────────────────────────────────────────────
+#
+# Corrigé pour matcher exactement ce que train_penny_model.py::_build_features
+# ET pipelines/penny_pipeline.py::build_dataset calculent réellement (les deux
+# calculent le même set de 7 features). Cette liste listait auparavant 20
+# noms — 13 d'entre eux (rsi_7, stoch_k_14, williams_r_14, macd_hist,
+# atr_pct_14, bb_pct_b_20, rubber_band_20, obv_zscore, mom_zscore_20,
+# linear_slope_20, donchian_pct_20, fib_distance_50, close_pos_in_range)
+# n'étaient jamais calculés par train_penny_model.py, qui les remplaçait
+# silencieusement par des zéros constants (`if col not in X.columns: X[col]
+# = 0.0`) — 13 features mortes diluant le modèle PENNY sans lever d'erreur.
 
 PENNY_FEATURE_NAMES: List[str] = [
-    # Momentum oscillateurs
     "rsi_14",
-    "rsi_7",
-    "stoch_k_14",
-    "williams_r_14",
-    # Tendance
     "sma_ratio_10_20",
-    "macd_hist",
-    # Volatilité & range
     "volatility_20",
-    "atr_pct_14",
-    "bb_pct_b_20",
-    "rubber_band_20",        # ← clé pour snapback penny
-    # Volume
     "volume_zscore_20",
     "rvol_20",
-    "obv_zscore",
-    # Momentum prix
     "return_5d",
-    "mom_zscore_20",
-    "linear_slope_20",
-    # Structure de prix
-    "donchian_pct_20",
-    "fib_distance_50",
-    "close_pos_in_range",
-    # Contexte
     "sentiment_score",
 ]
 
 # ─── Features bluechip v2 ─────────────────────────────────────────────────────
+#
+# NOTE : aucun pipeline n'importe cette liste actuellement (ni le legacy ni
+# pipelines/, qui n'a pas d'équivalent "BLUECHIP" — stable_pipeline.py couvre
+# ce rôle sous le nom "STABLE", voir plus haut). Gardée telle quelle comme set
+# de features cible/aspirationnel plutôt que supprimée, faute d'implémentation
+# réelle à comparer.
 
 BLUECHIP_FEATURE_NAMES: List[str] = [
     # Momentum oscillateurs
@@ -109,18 +116,24 @@ BLUECHIP_FEATURE_NAMES: List[str] = [
 ]
 
 # ─── Features crypto ──────────────────────────────────────────────────────────
+#
+# Corrigé pour matcher ce que crypto_training.py::_build_crypto_features ET
+# pipelines/crypto_pipeline.py::build_dataset calculent réellement (même set
+# de 6 features dans les deux). Cette liste renommait auparavant deux colonnes
+# (rubber_band_20/price_to_vwap_20 "pour cohérence de nommage") sans jamais
+# renommer les colonnes réellement produites (toujours rubber_band_index /
+# price_to_vwap) et ajoutait 4 indicateurs jamais calculés (macd_hist,
+# bb_pct_b_20, stoch_k_14, obv_zscore) — crypto_training.py::build_crypto_dataset
+# faisait alors `dataset.dropna(subset=feature_cols + ['label'])` avec des noms
+# de colonnes inexistants, ce qui lève un KeyError garanti au premier run réel.
 
 CRYPTO_FEATURE_NAMES: List[str] = [
     "return_1",
     "rsi_14",
-    "rubber_band_20",        # remplace rubber_band_index pour cohérence de nommage
-    "price_to_vwap_20",
-    "volume_zscore_20",      # remplace volatility_spike pour plus de robustesse
+    "rubber_band_index",
+    "price_to_vwap",
+    "volatility_spike",
     "btc_correlation",
-    "macd_hist",
-    "bb_pct_b_20",
-    "stoch_k_14",
-    "obv_zscore",
 ]
 
 # ─── Features fusion complètes (modèle principal) ────────────────────────────

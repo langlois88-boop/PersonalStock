@@ -9,10 +9,10 @@ from typing import Optional, Callable
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
-from sklearn.metrics import f1_score, accuracy_score
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import f1_score, balanced_accuracy_score
 
 from portfolio.ml_engine.training.validation import validate_gate
+from portfolio.ml_engine.validation import PurgedTimeSeriesSplit
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +35,29 @@ class TrainResult:
 class Trainer:
     """Generic walk-forward trainer for any sklearn pipeline."""
 
-    def __init__(self, pipeline_factory: Callable[[], object], n_splits: int = 5) -> None:
+    def __init__(
+        self,
+        pipeline_factory: Callable[[], object],
+        n_splits: int = 5,
+        purge_window: int = 0,
+        embargo_pct: float = 0.01,
+    ) -> None:
+        """
+        Args:
+            pipeline_factory: Factory returning a fresh sklearn pipeline.
+            n_splits: Number of CV folds.
+            purge_window: Samples dropped from the end of each training fold,
+                immediately before the test fold, to prevent label leakage.
+                Should match (or exceed) the max holding horizon of the
+                triple-barrier label used to build ``y`` — e.g. pass the
+                universe's ``*_TRIPLE_BARRIER_MAX_DAYS`` so that no training
+                sample's label window overlaps the test fold.
+            embargo_pct: Fraction of samples embargoed after each test fold.
+        """
         self.pipeline_factory = pipeline_factory
         self.n_splits = n_splits
+        self.purge_window = purge_window
+        self.embargo_pct = embargo_pct
 
     def fit(
         self,
@@ -62,7 +82,11 @@ class Trainer:
         if len(y) < 50:
             raise ValueError(f"Too few samples: {len(y)}. Minimum 50 required.")
 
-        tscv = TimeSeriesSplit(n_splits=self.n_splits)
+        tscv = PurgedTimeSeriesSplit(
+            n_splits=self.n_splits,
+            purge_window=self.purge_window,
+            embargo_pct=self.embargo_pct,
+        )
         cv_scores: list[float] = []
         wf_f1_scores: list[float] = []
 
@@ -78,10 +102,14 @@ class Trainer:
 
             pipe.fit(X_tr, y_tr, **fit_params)
             preds = pipe.predict(X_te)
-            cv_scores.append(float(accuracy_score(y_te, preds)))
+            # Balanced accuracy, not raw accuracy: a model that always
+            # predicts the majority class scores exactly 0.5 here regardless
+            # of label skew, instead of silently inheriting the majority
+            # share as its "accuracy".
+            cv_scores.append(float(balanced_accuracy_score(y_te, preds)))
             wf_f1_scores.append(float(f1_score(y_te, preds, zero_division=0)))
 
-            logger.info("Fold %s/%s: acc=%.3f f1=%.3f", fold + 1, self.n_splits, cv_scores[-1], wf_f1_scores[-1])
+            logger.info("Fold %s/%s: bal_acc=%.3f f1=%.3f", fold + 1, self.n_splits, cv_scores[-1], wf_f1_scores[-1])
 
         final_pipe = self.pipeline_factory()
         final_fit_params = {}

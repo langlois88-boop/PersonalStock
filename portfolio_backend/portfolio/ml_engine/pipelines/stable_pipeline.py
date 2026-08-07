@@ -24,6 +24,12 @@ from portfolio.ml_engine.training.trainer import Trainer
 from portfolio.ml_engine.training.deepseek_weighter import build_sample_weights
 from portfolio.ml_engine.registry.model_registry import LocalModelRegistry
 
+# NOT imported from feature_registry.py::STABLE_FEATURE_NAMES on purpose:
+# that list serves the legacy train_stable_model.py (read positionally, 11
+# features including sma_ratio_10_20) and doesn't match what build_dataset()
+# below actually computes (10 features, no sma_ratio_10_20) — the two
+# pipelines evolved separately. Importing it here would KeyError on
+# X[STABLE_FEATURES].
 STABLE_FEATURES = [
     "rsi_14",
     "sma_ratio_10_50",
@@ -291,7 +297,10 @@ def run() -> None:
     if selected_features != base_features:
         logging.info("Using %s features after selection", len(selected_features))
 
-    trainer = Trainer(_pipeline_factory)
+    # Purge window matches the triple-barrier label horizon so no training
+    # fold ends within a label's forward-looking window of the test fold.
+    purge_window = int(os.getenv("STABLE_TRIPLE_BARRIER_MAX_DAYS", "20"))
+    trainer = Trainer(_pipeline_factory, purge_window=purge_window)
     weights = build_sample_weights(sample_symbols, sample_dates, X.to_dict("records"), y.tolist())
     min_cv = float(config.model.min_cv_mean)
     min_f1 = float(config.model.min_wf_f1)
