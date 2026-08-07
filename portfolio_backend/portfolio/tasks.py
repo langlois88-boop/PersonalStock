@@ -5428,6 +5428,14 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             'model_version': '',
             'model_name': universe,
         }
+        # Always stashed, regardless of sandbox, purely for diagnostics
+        # (signal_distribution below) — for WATCHLIST specifically this is
+        # NOT what actually gates the buy decision: payload['signal'] gets
+        # fully overridden by _mean_reversion_score just below, and
+        # base_signal (the trained model's predict_proba output) is
+        # discarded. Kept here so that distinction is visible in logs
+        # instead of silently assumed.
+        payload['base_model_signal'] = base_signal if base_payload else None
 
         if sandbox == 'WATCHLIST':
             score, rsi, lower_band = _mean_reversion_score(symbol)
@@ -5548,6 +5556,12 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         'blocked_zero_quantity': 0,
         'blocked_exception': 0,
     }
+    # Every computed signal for this run's watchlist, for signal_distribution
+    # below — the actual value each candidate was gated on (mean-reversion
+    # score for WATCHLIST, composite for AI_BLUECHIP/AI_PENNY), plus the raw
+    # predict_proba output separately where it differs from that (WATCHLIST).
+    final_signal_samples: list[float] = []
+    base_model_signal_samples: list[float] = []
 
     market_sentiment, market_meta = get_market_sentiment()
     market_score = _market_sentiment_score()
@@ -5730,6 +5744,10 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                     continue
         signal_payload = _signal(symbol, intraday_ctx=intraday_ctx)
         signal = signal_payload['signal'] if signal_payload else None
+        if signal is not None:
+            final_signal_samples.append(float(signal))
+        if signal_payload is not None and signal_payload.get('base_model_signal') is not None:
+            base_model_signal_samples.append(float(signal_payload['base_model_signal']))
         if signal is not None:
             signal = float(signal) * _time_of_day_penalty()
         if pattern_signal is not None and rvol is not None:
@@ -6051,6 +6069,36 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     # this was the only place decision_stats got surfaced anywhere, and
     # only for the zero-trade case.
     accounted = sum(v for k, v in decision_stats.items() if k not in {'watchlist', 'created'})
+
+    def _distribution(values: list[float]) -> dict[str, float | int | None]:
+        if not values:
+            return {'n': 0, 'min': None, 'max': None, 'mean': None, 'median': None}
+        ordered = sorted(values)
+        n = len(ordered)
+        mid = n // 2
+        median = ordered[mid] if n % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+        return {
+            'n': n,
+            'min': round(min(ordered), 4),
+            'max': round(max(ordered), 4),
+            'mean': round(sum(ordered) / n, 4),
+            'median': round(median, 4),
+        }
+
+    signal_distribution = {
+        # What actually gates the buy decision for this sandbox (mean
+        # reversion score for WATCHLIST, composite for AI_BLUECHIP/AI_PENNY).
+        'final': _distribution(final_signal_samples),
+        # Raw _model_signal (predict_proba) output — same as 'final' for
+        # AI_PENNY/AI_BLUECHIP's base component, but for WATCHLIST this is
+        # NOT what buy_threshold is compared against (see _signal): tracked
+        # separately so a "signals are too low" diagnosis doesn't
+        # accidentally conflate the trained model's output with
+        # _mean_reversion_score's, which are different numbers gated by a
+        # shared threshold only for non-WATCHLIST sandboxes.
+        'base_model_signal': _distribution(base_model_signal_samples),
+    }
+    logger.debug("Paper trade signal distribution for %s: %s", sandbox, signal_distribution)
     _system_log(
         'SYSTEM',
         'WARNING' if created == 0 else 'INFO',
@@ -6063,6 +6111,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             'available_capital': round(available, 2),
             'block_new_entries': block_new_entries,
             'market_sentiment': market_sentiment,
+            'signal_distribution': signal_distribution,
         },
     )
     if created == 0:
