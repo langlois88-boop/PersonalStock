@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 import { cachedGet } from '../api/cachedApi';
+import { Term } from './ui/Tooltip';
+import { GLOSSARY } from '../glossary';
 
 function LivePaperTrading() {
   const [summary, setSummary] = useState(null);
@@ -110,7 +112,7 @@ function LivePaperTrading() {
           <p className="mt-1 text-xs text-rose-400">Total Risk: ${summary.total_risk ?? 0}</p>
         </div>
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
-          <p className="text-xs text-slate-400 uppercase tracking-[0.2em]">P&L réalisé</p>
+          <p className="text-xs text-slate-400 uppercase tracking-[0.2em]"><Term text={GLOSSARY.pnlRealized}>P&L réalisé</Term></p>
           <p className={`text-2xl font-semibold ${summary.closed_pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
             ${summary.closed_pnl}
           </p>
@@ -226,7 +228,7 @@ function LivePaperTrading() {
             </div>
 
             <div className="mt-5">
-              <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Top explications</p>
+              <p className="text-xs uppercase tracking-[0.2em] text-slate-400"><Term text={GLOSSARY.topExplanations}>Top explications</Term></p>
               <div className="mt-2 space-y-2">
                 {(selectedTrade.entry_explanations || []).length ? (
                   selectedTrade.entry_explanations.map((item) => (
@@ -242,7 +244,7 @@ function LivePaperTrading() {
             </div>
 
             <div className="mt-5">
-              <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Features (snapshot)</p>
+              <p className="text-xs uppercase tracking-[0.2em] text-slate-400"><Term text={GLOSSARY.featuresSnapshot}>Features (snapshot)</Term></p>
               <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-300">
                 {selectedTrade.entry_features ? (
                   Object.entries(selectedTrade.entry_features).map(([key, value]) => (

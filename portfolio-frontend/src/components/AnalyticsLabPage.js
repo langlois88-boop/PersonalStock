@@ -14,6 +14,8 @@ import {
 import { cachedGet, invalidateCache } from '../api/cachedApi';
 import html2canvas from 'html2canvas';
 import jsPDF from 'jspdf';
+import { Term } from './ui/Tooltip';
+import { GLOSSARY } from '../glossary';
 
 const formatPct = (value, digits = 2) => {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
@@ -468,11 +470,11 @@ function AnalyticsLabPage() {
                     {sandboxLabels[stat.sandbox] || stat.sandbox}
                   </p>
                   <div className="mt-3 space-y-2 text-sm text-slate-200">
-                    <div className="flex justify-between"><span>Win Rate</span><span>{formatPct(stat.win_rate, 2)}</span></div>
-                    <div className="flex justify-between"><span>Total Return</span><span>{formatPct(stat.total_return_pct, 2)}</span></div>
-                    <div className="flex justify-between"><span>Sharpe Ratio</span><span>{formatNumber(stat.sharpe_ratio, 3)}</span></div>
-                    <div className="flex justify-between"><span>Max Drawdown</span><span>{formatPct(stat.max_drawdown, 2)}</span></div>
-                    <div className="flex justify-between"><span>Final Balance</span><span>{formatMoney(stat.final_balance)}</span></div>
+                    <div className="flex justify-between"><Term text={GLOSSARY.winRate}><span>Win Rate</span></Term><span>{formatPct(stat.win_rate, 2)}</span></div>
+                    <div className="flex justify-between"><Term text={GLOSSARY.totalReturn}><span>Total Return</span></Term><span>{formatPct(stat.total_return_pct, 2)}</span></div>
+                    <div className="flex justify-between"><Term text={GLOSSARY.sharpeRatio}><span>Sharpe Ratio</span></Term><span>{formatNumber(stat.sharpe_ratio, 3)}</span></div>
+                    <div className="flex justify-between"><Term text={GLOSSARY.maxDrawdown}><span>Max Drawdown</span></Term><span>{formatPct(stat.max_drawdown, 2)}</span></div>
+                    <div className="flex justify-between"><Term text={GLOSSARY.finalBalance}><span>Final Balance</span></Term><span>{formatMoney(stat.final_balance)}</span></div>
                   </div>
                 </div>
               ))}
@@ -496,11 +498,11 @@ function AnalyticsLabPage() {
                     {sandboxLabels[stat.sandbox] || stat.sandbox}
                   </p>
                   <div className="mt-3 space-y-2 text-sm text-slate-200">
-                    <div className="flex justify-between"><span>Win Rate</span><span>{formatPct(stat.win_rate, 2)}</span></div>
-                    <div className="flex justify-between"><span>Total Return</span><span>{formatPct(stat.total_return_pct, 2)}</span></div>
-                    <div className="flex justify-between"><span>Sharpe Ratio</span><span>{formatNumber(stat.sharpe_ratio, 3)}</span></div>
-                    <div className="flex justify-between"><span>Max Drawdown</span><span>{formatPct(stat.max_drawdown, 2)}</span></div>
-                    <div className="flex justify-between"><span>Final Balance</span><span>{formatMoney(stat.final_balance)}</span></div>
+                    <div className="flex justify-between"><Term text={GLOSSARY.winRate}><span>Win Rate</span></Term><span>{formatPct(stat.win_rate, 2)}</span></div>
+                    <div className="flex justify-between"><Term text={GLOSSARY.totalReturn}><span>Total Return</span></Term><span>{formatPct(stat.total_return_pct, 2)}</span></div>
+                    <div className="flex justify-between"><Term text={GLOSSARY.sharpeRatio}><span>Sharpe Ratio</span></Term><span>{formatNumber(stat.sharpe_ratio, 3)}</span></div>
+                    <div className="flex justify-between"><Term text={GLOSSARY.maxDrawdown}><span>Max Drawdown</span></Term><span>{formatPct(stat.max_drawdown, 2)}</span></div>
+                    <div className="flex justify-between"><Term text={GLOSSARY.finalBalance}><span>Final Balance</span></Term><span>{formatMoney(stat.final_balance)}</span></div>
                   </div>
                 </div>
               ))}
@@ -510,13 +512,7 @@ function AnalyticsLabPage() {
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 h-72">
           <div className="mb-4">
             <p className="text-white font-semibold">
-              Feature Importance
-              <span
-                className="ml-2 text-xs text-slate-400 cursor-help"
-                title="VolumeZ est le signal dominant pour éviter d'acheter quand le volume est faible."
-              >
-                ⓘ
-              </span>
+              <Term text={GLOSSARY.featureImportance}>Feature Importance</Term>
             </p>
             <p className="text-xs text-slate-400 mt-1">{calibrationSummary}</p>
           </div>
@@ -564,9 +560,9 @@ function AnalyticsLabPage() {
                 <thead className="text-slate-400">
                   <tr className="border-b border-slate-800">
                     <th className="px-2 py-2 text-left">Symbol</th>
-                    <th className="px-2 py-2">Confidence</th>
-                    <th className="px-2 py-2">Sentiment</th>
-                    <th className="px-2 py-2">Imbalance</th>
+                    <th className="px-2 py-2"><Term text={GLOSSARY.confidence}>Confidence</Term></th>
+                    <th className="px-2 py-2"><Term text={GLOSSARY.sentiment}>Sentiment</Term></th>
+                    <th className="px-2 py-2"><Term text={GLOSSARY.imbalance}>Imbalance</Term></th>
                     <th className="px-2 py-2">Spread+Fees</th>
                   </tr>
                 </thead>

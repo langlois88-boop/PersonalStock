@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Gauge, ShieldCheck, TrendingDown } from 'lucide-react';
 import api from '../api/api';
+import { Term } from './ui/Tooltip';
+import { GLOSSARY } from '../glossary';
 
 const STORAGE_KEY = 'risk-control-settings';
 
@@ -85,7 +87,7 @@ function RiskControlCenter() {
         <div className="rounded-2xl bg-slate-900/70 p-5 border border-slate-800">
           <div className="flex items-center gap-2 text-slate-200">
             <TrendingDown size={18} />
-            <span className="text-sm font-semibold">Daily stop-loss</span>
+            <Term text={GLOSSARY.dailyStopLoss}><span className="text-sm font-semibold">Daily stop-loss</span></Term>
           </div>
           <p className="mt-3 text-3xl font-semibold text-red-300">{settings.maxDrawdown}%</p>
           <p className="text-xs text-slate-400">Objectif de perte max journalier.</p>
@@ -101,12 +103,14 @@ function RiskControlCenter() {
               key: 'confidenceThreshold',
               min: 60,
               max: 95,
+              tooltip: GLOSSARY.confidence,
             },
             {
               label: 'Max Drawdown (%)',
               key: 'maxDrawdown',
               min: 3,
               max: 15,
+              tooltip: GLOSSARY.maxDrawdown,
             },
             {
               label: 'Mise standard ($)',
@@ -123,7 +127,7 @@ function RiskControlCenter() {
           ].map((slider) => (
             <div key={slider.key} className="space-y-2">
               <div className="flex items-center justify-between text-xs text-slate-400">
-                <span>{slider.label}</span>
+                <Term text={slider.tooltip}><span>{slider.label}</span></Term>
                 <span className="text-slate-200 font-semibold">{settings[slider.key]}</span>
               </div>
               <input
@@ -144,7 +148,9 @@ function RiskControlCenter() {
         </section>
 
         <section className="rounded-2xl bg-slate-900/70 p-5 border border-slate-800 space-y-4">
-          <h3 className="text-sm font-semibold text-slate-200">Historique confidence vs P&L</h3>
+          <h3 className="text-sm font-semibold text-slate-200">
+            <Term text={`${GLOSSARY.confidence} • ${GLOSSARY.pnlRealized}`}>Historique confidence vs P&L</Term>
+          </h3>
           {recentTrades.length === 0 ? (
             <p className="text-sm text-slate-400">Pas encore de trades à afficher.</p>
           ) : (

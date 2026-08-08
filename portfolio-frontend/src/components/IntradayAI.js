@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { createChart } from 'lightweight-charts';
 import api from '../api/api';
 import MarketScannerPanel from './MarketScannerPanel';
+import { Term } from './ui/Tooltip';
+import { GLOSSARY } from '../glossary';
 
 const defaultSymbol = 'ONCY';
 
@@ -179,11 +181,11 @@ function IntradayAI() {
             <p className="text-lg font-semibold">{stats.last_close?.toFixed?.(4) ?? stats.last_close}</p>
           </div>
           <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
-            <p className="text-xs uppercase text-slate-500">Pattern Signal</p>
+            <p className="text-xs uppercase text-slate-500"><Term text={GLOSSARY.patternSignal}>Pattern Signal</Term></p>
             <p className="text-lg font-semibold">{stats.pattern_signal?.toFixed?.(2) ?? stats.pattern_signal}</p>
           </div>
           <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
-            <p className="text-xs uppercase text-slate-500">RVOL</p>
+            <p className="text-xs uppercase text-slate-500"><Term text={GLOSSARY.rvol}>RVOL</Term></p>
             <p className="text-lg font-semibold">{stats.rvol?.toFixed?.(2) ?? stats.rvol}</p>
           </div>
           <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
@@ -191,19 +193,19 @@ function IntradayAI() {
             <p className="text-lg font-semibold">{stats.volatility?.toFixed?.(4) ?? stats.volatility}</p>
           </div>
           <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
-            <p className="text-xs uppercase text-slate-500">Probabilité IA</p>
+            <p className="text-xs uppercase text-slate-500"><Term text={GLOSSARY.confidence}>Probabilité IA</Term></p>
             <p className="text-lg font-semibold">
               {stats.probability != null ? `${(stats.probability * 100).toFixed(1)}%` : 'n/a'}
             </p>
           </div>
           <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
-            <p className="text-xs uppercase text-slate-500">Stop-Loss suggéré</p>
+            <p className="text-xs uppercase text-slate-500"><Term text={GLOSSARY.stopLossSuggested}>Stop-Loss suggéré</Term></p>
             <p className="text-lg font-semibold">
               {stats.suggested_stop?.toFixed?.(4) ?? stats.suggested_stop}
             </p>
           </div>
           <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
-            <p className="text-xs uppercase text-slate-500">Target suggérée</p>
+            <p className="text-xs uppercase text-slate-500"><Term text={GLOSSARY.targetSuggested}>Target suggérée</Term></p>
             <p className="text-lg font-semibold">
               {stats.suggested_target?.toFixed?.(4) ?? stats.suggested_target}
             </p>
@@ -216,7 +218,7 @@ function IntradayAI() {
           </div>
           {gemini && (
             <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
-              <p className="text-xs uppercase text-slate-500">Score Gemini</p>
+              <p className="text-xs uppercase text-slate-500"><Term text={GLOSSARY.scoreGemini}>Score Gemini</Term></p>
               <p className="text-lg font-semibold">
                 {gemini.score != null ? `${Number(gemini.score).toFixed(0)}%` : 'n/a'}
               </p>
