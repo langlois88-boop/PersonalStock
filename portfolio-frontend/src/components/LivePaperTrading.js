@@ -99,10 +99,19 @@ function LivePaperTrading() {
     );
   }
 
+  const unrealizedPnl = (summary.open_positions || []).reduce(
+    (sum, pos) => sum + (Number.isFinite(pos.unrealized_pnl) ? pos.unrealized_pnl : 0),
+    0
+  );
+  const totalValue = Number(summary.initial_capital || 0) + Number(summary.closed_pnl || 0) + unrealizedPnl;
+  const totalGainPct = summary.initial_capital
+    ? ((totalValue - summary.initial_capital) / summary.initial_capital) * 100
+    : 0;
+
   return (
     <>
       <div className="space-y-6">
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-4">
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
           <p className="text-xs text-slate-400 uppercase tracking-[0.2em]">Capital initial</p>
           <p className="text-2xl text-white font-semibold">${summary.initial_capital}</p>
@@ -113,9 +122,23 @@ function LivePaperTrading() {
           <p className="mt-1 text-xs text-rose-400">Total Risk: ${summary.total_risk ?? 0}</p>
         </div>
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+          <p className="text-xs text-slate-400 uppercase tracking-[0.2em]">Total investi (positions ouvertes)</p>
+          <p className="text-2xl text-white font-semibold">${Number(summary.open_value ?? 0).toFixed(2)}</p>
+          <p className="mt-1 text-xs text-slate-500">Coût d'entrée des positions ouvertes, pas leur valeur au marché.</p>
+        </div>
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
           <p className="text-xs text-slate-400 uppercase tracking-[0.2em]"><Term text={GLOSSARY.pnlRealized}>P&L réalisé</Term></p>
           <p className={`text-2xl font-semibold ${summary.closed_pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
             ${summary.closed_pnl}
+          </p>
+        </div>
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+          <p className="text-xs text-slate-400 uppercase tracking-[0.2em]">Valeur totale (avec profit)</p>
+          <p className={`text-2xl font-semibold ${totalValue >= summary.initial_capital ? 'text-emerald-400' : 'text-red-400'}`}>
+            ${totalValue.toFixed(2)}
+          </p>
+          <p className={`mt-1 text-xs ${totalGainPct >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+            {totalGainPct >= 0 ? '+' : ''}{totalGainPct.toFixed(2)}% depuis le départ
           </p>
         </div>
       </div>
