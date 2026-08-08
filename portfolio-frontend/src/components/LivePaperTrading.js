@@ -18,6 +18,19 @@ function LivePaperTrading() {
       .join(' · ');
   };
 
+  // Le backend écrit la raison de sortie (stop-loss touché, signal IA,
+  // sortie temps, circuit breaker...) directement dans le champ `notes`,
+  // séparée par ' | '. On la nettoie pour l'afficher clairement.
+  const formatExitReason = (notes) => {
+    if (!notes) return null;
+    const cleaned = String(notes)
+      .split('|')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .join(' · ');
+    return cleaned || null;
+  };
+
   const formatValue = (value) => {
     if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
     return Number(value).toFixed(4);
@@ -218,6 +231,11 @@ function LivePaperTrading() {
                 <div className="text-xs text-slate-400">
                   Explications: {formatExplanation(trade.entry_explanations)}
                 </div>
+                {formatExitReason(trade.notes) && (
+                  <div className="text-xs text-amber-300/90">
+                    Pourquoi vendu : {formatExitReason(trade.notes)}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -248,7 +266,7 @@ function LivePaperTrading() {
               <div>Entrée: ${selectedTrade.entry_price}</div>
               <div>Stop: ${selectedTrade.stop_loss}</div>
               <div>Qté: {selectedTrade.quantity}</div>
-              <div>Notes: {selectedTrade.notes || '—'}</div>
+              <div>Pourquoi vendu : {formatExitReason(selectedTrade.notes) || (selectedTrade.status === 'CLOSED' ? 'Aucune information enregistrée.' : '—')}</div>
             </div>
 
             <div className="mt-5">
