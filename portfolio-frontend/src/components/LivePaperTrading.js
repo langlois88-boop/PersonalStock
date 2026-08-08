@@ -36,6 +36,17 @@ function LivePaperTrading() {
     return Number(value).toFixed(4);
   };
 
+  const formatMoney = (value) => {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
+    return `$${Number(value).toFixed(2)}`;
+  };
+
+  // Coût total = ce qui a été payé à l'achat (entrée × quantité).
+  const tradeCost = (trade) => Number(trade.entry_price || 0) * Number(trade.quantity || 0);
+  // Valeur de revente = ce que la vente a rapporté (sortie × quantité).
+  const tradeResaleValue = (trade) =>
+    trade.exit_price != null ? Number(trade.exit_price) * Number(trade.quantity || 0) : null;
+
   useEffect(() => {
     let active = true;
     const load = async () => {
@@ -229,6 +240,11 @@ function LivePaperTrading() {
                   </button>
                 </div>
                 <div className="text-xs text-slate-400">
+                  Coût total {formatMoney(tradeCost(trade))} ({trade.quantity} × ${trade.entry_price})
+                  {' · '}
+                  Valeur de revente {formatMoney(tradeResaleValue(trade))}
+                </div>
+                <div className="text-xs text-slate-400">
                   Explications: {formatExplanation(trade.entry_explanations)}
                 </div>
                 {formatExitReason(trade.notes) && (
@@ -266,7 +282,9 @@ function LivePaperTrading() {
               <div>Entrée: ${selectedTrade.entry_price}</div>
               <div>Stop: ${selectedTrade.stop_loss}</div>
               <div>Qté: {selectedTrade.quantity}</div>
-              <div>Pourquoi vendu : {formatExitReason(selectedTrade.notes) || (selectedTrade.status === 'CLOSED' ? 'Aucune information enregistrée.' : '—')}</div>
+              <div>Coût total : {formatMoney(tradeCost(selectedTrade))} ({selectedTrade.quantity} × ${selectedTrade.entry_price})</div>
+              <div>Valeur de revente : {formatMoney(tradeResaleValue(selectedTrade))}</div>
+              <div className="col-span-2">Pourquoi vendu : {formatExitReason(selectedTrade.notes) || (selectedTrade.status === 'CLOSED' ? 'Aucune information enregistrée.' : '—')}</div>
             </div>
 
             <div className="mt-5">
