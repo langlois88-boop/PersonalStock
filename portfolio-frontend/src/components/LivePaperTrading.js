@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { cachedGet } from '../api/cachedApi';
 import { Term } from './ui/Tooltip';
 import { GLOSSARY } from '../glossary';
+import { getFeatureExplanation } from '../featureGlossary';
 
 function LivePaperTrading() {
   const [summary, setSummary] = useState(null);
@@ -233,7 +234,7 @@ function LivePaperTrading() {
                 {(selectedTrade.entry_explanations || []).length ? (
                   selectedTrade.entry_explanations.map((item) => (
                     <div key={item.feature} className="flex items-center justify-between text-sm text-slate-200">
-                      <span>{item.feature}</span>
+                      <Term text={getFeatureExplanation(item.feature)}><span>{item.feature}</span></Term>
                       <span>{Number(item.contribution || 0).toFixed(2)}%</span>
                     </div>
                   ))
@@ -249,7 +250,7 @@ function LivePaperTrading() {
                 {selectedTrade.entry_features ? (
                   Object.entries(selectedTrade.entry_features).map(([key, value]) => (
                     <div key={key} className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950/60 px-2 py-1">
-                      <span>{key}</span>
+                      <Term text={getFeatureExplanation(key)}><span>{key}</span></Term>
                       <span>{formatValue(value)}</span>
                     </div>
                   ))
