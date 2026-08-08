@@ -2,6 +2,7 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-d
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
 import './App.css';
+import DashboardPage from './components/DashboardPage';
 import AnalyticsLabPage from './components/AnalyticsLabPage';
 import LivePaperTrading from './components/LivePaperTrading';
 import IntradayAI from './components/IntradayAI';
@@ -25,7 +26,7 @@ function App() {
       <Router>
         <MainLayout>
           <Routes>
-            <Route path="/" element={<Navigate to="/lab" replace />} />
+            <Route path="/" element={<DashboardPage />} />
             <Route path="/lab" element={<AnalyticsLabPage />} />
             <Route path="/paper" element={<LivePaperTrading />} />
             <Route path="/intraday" element={<IntradayAI />} />
