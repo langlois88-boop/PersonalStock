@@ -69,11 +69,16 @@ def _get_universe(universe_source: str) -> list:
 
 def _get_benchmark_price(symbol: str = "^GSPTSE") -> Decimal:
     """
-    Prix du benchmark TSX. Passe par portfolio.market_data (pas yfinance
-    direct) : ^GSPTSE n'est pas fiable/tradable via ce wrapper, donc
-    SYMBOL_ALIASES le mappe déjà vers XIU.TO (ETF TSX 60) — même benchmark
-    que le reste du pipeline utilise pour ce marché, pas besoin de
-    réinventer un choix d'équivalent TSX ici.
+    Niveau du benchmark TSX, via portfolio.market_data.Ticker (pas yfinance
+    direct, cohérent avec le reste du module). Vérifié par un scan à blanc :
+    Ticker.info ne résout SYMBOL_ALIASES (^GSPTSE -> XIU.TO) que pour le
+    fallback prix Alpaca (get_latest_trade_price sur le symbole mappé) —
+    Alpaca n'a pas de données pour un titre coté TSX, donc cette branche ne
+    matche jamais ici et .info retombe sur yfinance brut avec le symbole
+    d'origine, qui renvoie le niveau de l'indice ^GSPTSE (points, pas $).
+    Sans incidence sur l'alpha calculé plus loin (return_pct/benchmark_return_pct
+    sont des variations en %, peu importe l'unité, tant que la même source
+    est utilisée à chaque appel — ce qui est le cas ici).
     """
     try:
         price = market_data.Ticker(symbol).info.get("regularMarketPrice")
@@ -233,6 +238,12 @@ def _create_lab_position(scan_result: ScanResult, preset: ScreenerPreset, benchm
             quantity=quantity,
             stop_loss=stop_loss,
             entry_signal=scan_result.quant_score,
+            # model_name par défaut sur PaperTrade est 'BLUECHIP' (valeur du
+            # champ) — ce pick vient du screener d'analyse fondamentale, pas
+            # du modèle ML BLUECHIP ; explicite ici pour ne jamais être
+            # confondu avec ce modèle dans une future requête qui grouperait
+            # par model_name sans regarder le sandbox.
+            model_name="FUNDAMENTAL_LAB",
             broker="SIM",
             notes=f"Analyse fondamentale — verdict {scan_result.final_verdict}, preset {preset.slug}",
         )

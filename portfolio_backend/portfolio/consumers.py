@@ -13,7 +13,11 @@ from . import market_data as yf
 
 @sync_to_async
 def _build_payload() -> dict:
-	open_trades = list(PaperTrade.objects.filter(status='OPEN').order_by('-entry_date')[:50])
+	# Flux temps réel du paper trading ML — FUNDAMENTAL_LAB (picks du screener
+	# d'analyse fondamentale, pas de signal ML) n'y appartient pas.
+	open_trades = list(
+		PaperTrade.objects.filter(status='OPEN').exclude(sandbox='FUNDAMENTAL_LAB').order_by('-entry_date')[:50]
+	)
 	tickers = list({t.ticker for t in open_trades if t.ticker})
 	stocks = Stock.objects.filter(symbol__in=tickers)
 	price_map = {s.symbol: float(s.latest_price or 0) for s in stocks}

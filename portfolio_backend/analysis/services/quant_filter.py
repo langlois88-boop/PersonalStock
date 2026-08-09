@@ -86,7 +86,12 @@ def _fetch_margin_trend(ticker: str) -> list:
                 rev = revenue.get(col)
                 gp = gross_profit.get(col)
                 if rev and gp and rev != 0:
-                    margin_trend.append(round(gp / rev * 100, 2))
+                    # pandas .loc[...] renvoie des scalaires numpy (float64) —
+                    # cast en float natif tout de suite, sinon les comparaisons
+                    # dans _detect_margin_inflection produisent un numpy.bool_
+                    # (pas un bool Python), que JSONField/json.dumps refuse de
+                    # sérialiser au moment de sauvegarder ScanResult.quant_details.
+                    margin_trend.append(round(float(gp) / float(rev) * 100, 2))
         except KeyError:
             pass  # certains tickers n'ont pas ces lignes exactement nommées
     return list(reversed(margin_trend))  # ordre chronologique

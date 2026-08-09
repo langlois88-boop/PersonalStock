@@ -1078,6 +1078,13 @@ class PaperTradeViewSet(viewsets.ReadOnlyModelViewSet):
 			if sandbox not in {'WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY', 'AI_CRYPTO'}:
 				raise ValidationError({'sandbox': 'Invalid sandbox.'})
 			queryset = queryset.filter(sandbox=sandbox)
+		else:
+			# Ce viewset ne connaît que les 4 sandboxes ML ci-dessus (voir whitelist
+			# plus haut) — FUNDAMENTAL_LAB (module Analyse fondamentale, picks
+			# manuels/screener, pas de signal ML) n'y est pas éligible même en
+			# filtre explicite, donc on l'exclut aussi de la vue "tout" par défaut
+			# plutôt que de la laisser s'y glisser silencieusement.
+			queryset = queryset.exclude(sandbox='FUNDAMENTAL_LAB')
 		if ticker:
 			queryset = queryset.filter(ticker__iexact=ticker)
 		if model_name:
@@ -1202,6 +1209,13 @@ class PaperTradeSummaryView(APIView):
 			if sandbox:
 				open_trades = open_trades.filter(sandbox=sandbox)
 				closed_trades = closed_trades.filter(sandbox=sandbox)
+			else:
+				# Résumé "toutes sandboxes" implicite = pipeline ML seulement.
+				# FUNDAMENTAL_LAB (picks du screener d'analyse fondamentale,
+				# hors ML) a son propre dashboard (analysis/lab/performance/) —
+				# l'exclure ici pour ne pas fausser ce résumé/le Risk Control Center.
+				open_trades = open_trades.exclude(sandbox='FUNDAMENTAL_LAB')
+				closed_trades = closed_trades.exclude(sandbox='FUNDAMENTAL_LAB')
 
 			closed_pnl = float(sum([float(t.pnl or 0) for t in closed_trades]))
 			open_value = 0.0
@@ -1517,6 +1531,11 @@ class PaperTradeExplanationLogView(APIView):
 		qs = PaperTrade.objects.all().order_by('-entry_date')
 		if sandbox:
 			qs = qs.filter(sandbox=sandbox)
+		else:
+			# Journal d'explicabilité ML — FUNDAMENTAL_LAB n'a pas d'entry_features/
+			# entry_explanations ML (ce n'est pas un pick basé sur un signal), donc
+			# rien à expliquer ici ; exclu par défaut plutôt que mélangé sans raison.
+			qs = qs.exclude(sandbox='FUNDAMENTAL_LAB')
 		if status:
 			qs = qs.filter(status=status)
 		total = qs.count()
@@ -2367,7 +2386,13 @@ class PortfolioDashboardView(APIView):
 			min_volume_z = float(os.getenv('CONFIDENCE_VOLUME_Z_MIN', '0.5'))
 			max_vol_regime = float(os.getenv('CONFIDENCE_VOL_REGIME_MAX', '1.6'))
 			note = None
-			recent_closed = list(PaperTrade.objects.filter(status='CLOSED').order_by('-exit_date')[:3])
+			# Heuristique de confiance ML (3 dernières pertes -> réduit ai_score) :
+			# exclut FUNDAMENTAL_LAB, une stratégie d'analyste indépendante du
+			# signal ML, pour ne pas fausser la confiance ML sur une série de
+			# pertes qui n'a rien à voir avec ce modèle.
+			recent_closed = list(
+				PaperTrade.objects.filter(status='CLOSED').exclude(sandbox='FUNDAMENTAL_LAB').order_by('-exit_date')[:3]
+			)
 			if len(recent_closed) == 3 and all(t.outcome == 'LOSS' for t in recent_closed):
 				ai_score = max(0.0, ai_score - 10)
 				note = 'Le marché a changé de régime (Volatilité haute), réduisez la taille de vos positions.'
@@ -3328,7 +3353,13 @@ def _gemini_macro_ok(symbol: str, sector: str, news_titles: list[str]) -> bool:
 			min_volume_z = float(os.getenv('CONFIDENCE_VOLUME_Z_MIN', '0.5'))
 			max_vol_regime = float(os.getenv('CONFIDENCE_VOL_REGIME_MAX', '1.6'))
 			note = None
-			recent_closed = list(PaperTrade.objects.filter(status='CLOSED').order_by('-exit_date')[:3])
+			# Heuristique de confiance ML (3 dernières pertes -> réduit ai_score) :
+			# exclut FUNDAMENTAL_LAB, une stratégie d'analyste indépendante du
+			# signal ML, pour ne pas fausser la confiance ML sur une série de
+			# pertes qui n'a rien à voir avec ce modèle.
+			recent_closed = list(
+				PaperTrade.objects.filter(status='CLOSED').exclude(sandbox='FUNDAMENTAL_LAB').order_by('-exit_date')[:3]
+			)
 			if len(recent_closed) == 3 and all(t.outcome == 'LOSS' for t in recent_closed):
 				ai_score = max(0.0, ai_score - 10)
 				note = 'Le marché a changé de régime (Volatilité haute), réduisez la taille de vos positions.'
@@ -6722,7 +6753,9 @@ class AIBacktesterView(APIView):
 		portfolio_snapshot = _portfolio_return_snapshot()
 		paper_stats = None
 		try:
-			closed = PaperTrade.objects.filter(status='CLOSED')
+			# Stats paper trading globales pour le backtest IA — même logique
+			# qu'ailleurs : FUNDAMENTAL_LAB (analyste, pas ML) n'y appartient pas.
+			closed = PaperTrade.objects.filter(status='CLOSED').exclude(sandbox='FUNDAMENTAL_LAB')
 			trades = closed.count()
 			wins = closed.filter(outcome='WIN').count()
 			win_rate = (wins / trades) * 100 if trades else 0.0

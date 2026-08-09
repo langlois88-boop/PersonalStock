@@ -1,6 +1,8 @@
+import json
 from decimal import Decimal
 from unittest.mock import patch
 
+import pandas as pd
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
@@ -11,6 +13,7 @@ from .models import (
     RejectionLog, RejectionOutcome,
 )
 from . import tasks
+from .services import quant_filter
 from .services.deepseek_triage import DeepSeekResult
 from .services.claude_verifier import ClaudeResult
 from .services.quant_filter import QuantResult
@@ -101,6 +104,10 @@ class CreateLabPositionTests(APITestCase):
         self.assertEqual(trade.ticker, "WINW")
         self.assertGreater(trade.quantity, 0)
         self.assertLess(float(trade.stop_loss), float(trade.entry_price))
+        # Ne doit jamais hériter du défaut 'BLUECHIP' du champ model_name —
+        # sinon un futur groupby par model_name (sans regarder le sandbox)
+        # pourrait le confondre avec le vrai modèle ML BLUECHIP.
+        self.assertEqual(trade.model_name, "FUNDAMENTAL_LAB")
 
     def test_invalid_price_keeps_lab_position_without_paper_trade(self):
         """
@@ -283,3 +290,62 @@ class ScreenerApiTests(APITestCase):
         inactive = _make_preset(slug="value-catalyst", name="Value + Catalyst", is_active=False)
         response = self.client.post(f"/api/analysis/screener/{inactive.slug}/run/")
         self.assertEqual(response.status_code, 404)
+
+
+class QuantFilterMarginTrendTests(APITestCase):
+    """
+    Régression trouvée lors d'un scan à blanc (avant push) : pandas .loc[...]
+    renvoie des scalaires numpy (float64), donc les comparaisons chaînées
+    dans _detect_margin_inflection produisaient un numpy.bool_ plutôt qu'un
+    bool Python — invisible dans les tests mockés au niveau réseau, mais
+    ScanResult.quant_details (JSONField) refusait de le sérialiser dès qu'un
+    vrai ticker avec quarterly_financials passait par evaluate_ticker().
+    """
+
+    def _quarterly_financials_with_inflection(self):
+        # yfinance ordonne les colonnes du plus récent au plus ancien ; le code
+        # les relit dans cet ordre puis les inverse pour obtenir la chronologie.
+        # Colonnes Q1(récent)..Q4(ancien) avec marges 42%,32%,30%,40% -> une fois
+        # inversé (chronologique) : [40,30,32,42] -> creux à 30 puis 32 puis 42,
+        # ce qui déclenche bien _detect_margin_inflection (et donc le chemin
+        # numpy.bool_ qu'on veut exercer).
+        return pd.DataFrame(
+            {
+                "Q1": [1000.0, 420.0],
+                "Q2": [1000.0, 320.0],
+                "Q3": [1000.0, 300.0],
+                "Q4": [1000.0, 400.0],
+            },
+            index=["Total Revenue", "Gross Profit"],
+        )
+
+    def test_margin_trend_values_are_native_python_floats(self):
+        with patch.object(quant_filter.yf, "Ticker") as MockYfTicker:
+            MockYfTicker.return_value.quarterly_financials = self._quarterly_financials_with_inflection()
+            trend = quant_filter._fetch_margin_trend("AAPL")
+
+        self.assertTrue(len(trend) > 0)
+        for value in trend:
+            self.assertIs(type(value), float)  # pas numpy.float64
+
+    def test_evaluate_ticker_details_are_json_serializable(self):
+        with patch.object(quant_filter, "market_data") as mock_market_data, \
+                patch.object(quant_filter.yf, "Ticker") as mock_yf_ticker:
+            mock_market_data.Ticker.return_value.info = {
+                "regularMarketPrice": 12.5,
+                "sector": "Technology",
+                "trailingPE": 8.2,
+                "returnOnEquity": 0.18,
+                "totalDebt": 100.0,
+                "ebitda": 200.0,
+                "numberOfAnalystOpinions": 3,
+            }
+            mock_yf_ticker.return_value.quarterly_financials = self._quarterly_financials_with_inflection()
+
+            result = quant_filter.evaluate_ticker("AAPL", preset_thresholds={})
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.details.get("margin_inflection_detected"))
+        # Ne doit jamais planter — c'est exactement ce que ScanResult.objects.create()
+        # fait via le JSONField quant_details.
+        json.dumps(result.details)

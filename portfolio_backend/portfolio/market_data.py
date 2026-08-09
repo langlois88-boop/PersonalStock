@@ -7,6 +7,8 @@ from typing import Any, Iterable
 
 import pandas as pd
 
+from .alpaca_data import get_latest_trade_price
+
 try:
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
