@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom';
-import { LayoutDashboard, BarChart3, Activity, TrendingUp, Shield, ClipboardList, LineChart } from 'lucide-react';
+import { LayoutDashboard, BarChart3, Activity, TrendingUp, Shield, ClipboardList, LineChart, Microscope } from 'lucide-react';
 
 const backendBase = (() => {
   const host = window.location.hostname;
@@ -13,6 +13,7 @@ const backendBase = (() => {
 const navItems = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, to: '/' },
   { id: 'lab', label: 'Analytics & ML Lab', icon: BarChart3, to: '/lab' },
+  { id: 'analysis', label: 'Screener fondamental', icon: Microscope, to: '/analysis' },
   { id: 'paper', label: 'Live Paper Trading', icon: Activity, to: '/paper' },
   { id: 'intraday', label: 'Intraday AI Guide', icon: TrendingUp, to: '/intraday' },
   { id: 'risk', label: 'Risk Control Center', icon: Shield, to: '/risk' },

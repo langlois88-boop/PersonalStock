@@ -91,6 +91,9 @@ class PaperTrade(models.Model):
 		('AI_BLUECHIP', 'AI_BLUECHIP'),
 		('AI_PENNY', 'AI_PENNY'),
 		('AI_CRYPTO', 'AI_CRYPTO'),
+		# Module Analyse fondamentale (analysis app) : picks confirmed/uncertain
+		# du screener, jamais alimenté par le pipeline ML de signal existant.
+		('FUNDAMENTAL_LAB', 'FUNDAMENTAL_LAB'),
 	)
 
 	ticker = models.CharField(max_length=10)

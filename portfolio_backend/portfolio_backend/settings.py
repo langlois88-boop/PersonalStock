@@ -57,6 +57,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'corsheaders',
     'portfolio',
+    'analysis',
 ]
 
 MIDDLEWARE = [
@@ -536,6 +537,16 @@ CELERY_BEAT_SCHEDULE = {
     'market-scan-hourly': {
         'task': 'portfolio.tasks.scan_market_for_opportunities',
         'schedule': crontab(minute=0, hour='10-16', day_of_week='mon-fri'),
+    },
+    # Module Analyse fondamentale (app 'analysis') — tables et sandbox
+    # ('FUNDAMENTAL_LAB') dédiées, aucun chevauchement avec les jobs ci-dessus.
+    'daily-fundamental-scan': {
+        'task': 'analysis.tasks.run_daily_scan',
+        'schedule': crontab(hour=16, minute=30, day_of_week='mon-fri'),  # fermeture ET, un seul scan/jour
+    },
+    'weekly-rejection-outcome-check': {
+        'task': 'analysis.tasks.check_rejection_outcomes',
+        'schedule': crontab(hour=6, minute=0, day_of_week='mon'),
     },
 }
 

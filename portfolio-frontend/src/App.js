@@ -8,6 +8,7 @@ import LivePaperTrading from './components/LivePaperTrading';
 import IntradayAI from './components/IntradayAI';
 import RiskControlCenter from './components/RiskControlCenter';
 import LogsCenterPage from './components/LogsCenterPage';
+import AnalysisScreener from './components/AnalysisScreener';
 import MainLayout from './components/layout/MainLayout';
 
 const queryClient = new QueryClient({
@@ -28,6 +29,7 @@ function App() {
           <Routes>
             <Route path="/" element={<DashboardPage />} />
             <Route path="/lab" element={<AnalyticsLabPage />} />
+            <Route path="/analysis" element={<AnalysisScreener />} />
             <Route path="/paper" element={<LivePaperTrading />} />
             <Route path="/intraday" element={<IntradayAI />} />
             <Route path="/risk" element={<RiskControlCenter />} />

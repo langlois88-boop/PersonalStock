@@ -32,6 +32,7 @@ newsapi-python
 python-dotenv
 prophet
 openai
+anthropic
 google-genai
 google-generativeai
 pandas_ta
