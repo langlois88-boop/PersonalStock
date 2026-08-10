@@ -284,3 +284,77 @@ chemin de code que tout le reste, ce qui sort du cadre "additif sans
 risque" fixé pour ce soir. À reprendre avec la même rigueur que le
 reste (tests, vérification qu'aucune tâche ne dépend d'un comportement
 d'écriture systématique) lors du chantier Celery plus large (item 5).
+
+---
+
+## 7. [PRIORITÉ ÉLEVÉE, découvert le 2026-08-10 ~21h35 UTC] Beat déclenche plusieurs tâches en rafale toutes les ~3-3.5h — pré-existant, pas causé par les changements de ce soir
+
+**Statut : diagnostiqué, cause probable identifiée mais PAS confirmée,
+volontairement PAS touché ce soir (bug plus profond que prévu — arrêt
+et documentation, comme convenu).**
+
+**Découvert en vérifiant** pourquoi `monitor_active_trade` apparaissait
+~12 fois à la même seconde dans les logs. En creusant sur une fenêtre de
+40 min : **520 exécutions au lieu des ~20 attendues** (cycle configuré
+120s), avec une rafale de **372 exécutions en 9 secondes** (21h23:24-
+21h23:33 UTC), 100% `monitor_active_trade`, aucune autre tâche mêlée.
+
+**Confirmé pré-existant, pas lié à mes redémarrages de `celery_beat` ce
+soir** : le même pattern de rafales (~90-100 exécutions en 30-60s)
+apparaît à **03h28, 07h04, et 10h16 UTC** aujourd'hui — sur une période
+où le conteneur `celery_beat` tournait sans interruption depuis 04h05
+(donc *avant* même son propre premier démarrage pour 03h28, ce qui
+suggère que le pattern existait déjà la veille aussi, pas vérifié plus
+loin).
+
+**Ça ne touche pas qu'une seule tâche** : `send_morning_log_email`
+(censée tourner 1×/jour à 8h05 ET) et `nightly_summary_report` (1×/jour
+à 8h00 UTC) se sont déclenchées **7 et 9 fois en 48h respectivement**, à
+des horaires qui collent exactement aux mêmes créneaux de rafale
+(03h29, 07h05, 10h17, 14h5x, 18h0x, 21h2x UTC) — pas du tout leurs
+heures configurées. C'est donc un dysfonctionnement de Beat qui affecte
+plusieurs entrées de `CELERY_BEAT_SCHEDULE` simultanément (au moins un
+`timedelta` et deux `crontab`), pas un bug spécifique à une tâche.
+
+**Hypothèse la plus probable (pas confirmée)** : le message `BDB0210
+celerybeat-schedule.db: metadata page checksum error`, observé à chaque
+redémarrage de `celery_beat` ce soir et noté hier comme "probablement
+bénin" (item 5, section Suite) — ne l'est vraisemblablement **pas**.
+Le fichier de planning persistant (backend BerkeleyDB/shelve) semble se
+corrompre ou perdre son état périodiquement (~toutes les 3-3.5h, cause
+du cycle exacte inconnue), ce qui ferait "oublier" à Beat le
+`last_run_at` de plusieurs entrées à la fois et les redéclare toutes
+"dues" en même temps — sans que le conteneur lui-même redémarre (les
+rafales de 07h04/10h16 ont eu lieu sans aucun restart du conteneur).
+
+**Impact potentiel** : si ce pattern se répète ~7-8×/jour sur
+plusieurs tâches haute-fréquence (`tsx-guardian-30s` notamment, qui n'a
+aucune restriction horaire dans Beat et peut donc rafaler 24h/24),
+c'est un contributeur plausible et significatif au backlog de ~26 000
+messages Redis documenté dans l'item 5 — potentiellement plus important
+que le simple volume de dispatch normal des tâches haute-fréquence.
+
+**Pourquoi ce n'est PAS corrigé ce soir** : la cause exacte n'est pas
+confirmée (juste une forte corrélation temporelle avec le message
+checksum, pas une preuve). Toucher au mécanisme de persistance de Beat
+sans diagnostic confirmé risquerait d'affecter le scheduler partagé par
+l'ensemble du pipeline de trading — exactement le genre de changement
+qui demande le même niveau de rigueur que le reste de la session,
+pas une correction à l'aveugle en fin de soirée.
+
+**À faire pour la prochaine session dédiée à ce sujet** :
+1. Confirmer si le fichier `celerybeat-schedule` (backend shelve/bsddb,
+   éphémère — pas sur un volume Docker persistant, voir item 5) est la
+   vraie cause, ou si c'est autre chose (charge mémoire, comportement du
+   `PersistentScheduler` avec beaucoup d'entrées, etc.).
+2. Vérifier si passer à un scheduler différent (ex. sans état persisté
+   sur disque, ou avec un volume Docker dédié pour que l'état survive
+   aux redémarrages) résout le problème.
+3. Une fois la vraie cause confirmée, mesurer l'impact réel sur le
+   volume de la queue par défaut avant de décider si ça mérite d'être
+   traité en priorité par rapport au chantier plus large de l'item 5
+   (concurrence du worker principal).
+4. **Ne pas resserrer les horaires des tâches individuelles
+   (`tsx-guardian-30s` y compris) tant que ce point n'est pas
+   clarifié** — un resserrement d'horaire masquerait le symptôme sans
+   corriger la cause, et compliquerait le diagnostic futur.
