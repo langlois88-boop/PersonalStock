@@ -51,4 +51,5 @@ class TimeframeFromIntervalTests(TestCase):
 
     def test_default_falls_back_to_day(self):
         tf = _timeframe_from_interval(None)
-        self.assertIs(tf, TimeFrame.Day)
+        self.assertEqual(tf.amount, 1)
+        self.assertEqual(tf.unit, TimeFrameUnit.Day)
