@@ -127,6 +127,13 @@ def _timeframe_from_interval(interval: str | None) -> Any:
         amount = int(interval[:-1] or 1)
         if TimeFrameUnit is None:
             return TimeFrame.Minute
+        # Alpaca's TimeFrame rejects Minute/Second units above 59
+        # ("Second or Minute units can only be used with amounts
+        # between 1-59", confirmed live against the real SDK) -- a
+        # clean multiple of 60 minutes must be expressed in hours
+        # instead, same as the 'h' branch below already does.
+        if amount >= 60 and amount % 60 == 0:
+            return TimeFrame(amount // 60, TimeFrameUnit.Hour)
         return TimeFrame(amount, TimeFrameUnit.Minute)
     if interval.endswith('h'):
         amount = int(interval[:-1] or 1)
