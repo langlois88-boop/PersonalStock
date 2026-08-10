@@ -11942,9 +11942,15 @@ def monitor_hive_trade() -> dict[str, Any]:
 
         latest_price = get_latest_trade_price(symbol)
         if latest_price is None:
-            latest_price = yf.Ticker(symbol).history(period='1d', interval='1m')
-            if latest_price is not None and not latest_price.empty:
-                latest_price = float(_extract_close_series(latest_price).iloc[-1])
+            # Variable distincte pour le DataFrame yfinance : le réutiliser
+            # comme `latest_price` faisait qu'un DataFrame vide (hist.empty)
+            # y restait au lieu de retomber sur None, et plus loin
+            # `latest_price >= limit_price` sur un DataFrame levait
+            # "The truth value of a DataFrame is ambiguous" au lieu du
+            # early-exit 'no_price' attendu.
+            hist_1m = yf.Ticker(symbol).history(period='1d', interval='1m')
+            if hist_1m is not None and not hist_1m.empty:
+                latest_price = float(_extract_close_series(hist_1m).iloc[-1])
 
         if latest_price is None:
             _task_log_finish(log, 'SUCCESS', {'status': 'no_price'})
