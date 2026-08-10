@@ -140,6 +140,63 @@ termine sans être bloqué par le backlog du worker principal — c'est la
 vraie validation en conditions réelles (Beat, pas un déclenchement
 manuel).
 
+### Suite (même soir, ~21h05-21h12 UTC) : `celery_beat` n'avait pas été redémarré
+
+**Bug réel trouvé en vérifiant le scan de fermeture (16h30 ET) du jour
+même** : le conteneur `celery_beat` tournait depuis 04h05 UTC (avant le
+changement de `settings.py`) et n'avait **jamais été recréé**. Vérifié
+directement en interrogeant ses settings en mémoire :
+`CELERY_TASK_ROUTES` → `MISSING`. Conséquence concrète : **ni le scan
+du matin (9h45 ET) ni celui de fermeture (16h30 ET) de ce jour n'ont
+utilisé `analysis_queue`** — les deux ont été publiés sur la queue par
+défaut (`celery`) et sont restés coincés derrière le backlog, exactement
+comme avant le fix de ce soir. Retrouvés dans Redis : 3× message
+`run_daily_scan` (2 avec `kwargs={}`, signature exacte d'un dispatch
+Beat — très probablement les scans 9h45 et 16h30 d'aujourd'hui) + 1×
+`check_rejection_outcomes`, tous coincés dans la queue `celery`
+(~26 100 messages).
+
+**Correctif** : `docker compose up -d --force-recreate celery_beat`
+(le même piège que pour le frontend plus tôt cette session : `--build`
+seul ne recrée pas le conteneur avec cette version de Docker Compose —
+`up -d --build` avait "buildé" la nouvelle image sans recréer le
+conteneur, `--force-recreate` était nécessaire). Vérifié après coup :
+nouvelle image chargée, `CELERY_TASK_ROUTES` bien présent, Beat a
+recommencé à dispatcher normalement (`Sending due task tsx-guardian-30s`
+confirmé ~2 min après le redémarrage). Worker principal non affecté
+(uptime continu 17h+, aucune tâche haute-fréquence interrompue).
+
+**Message bénin observé au redémarrage** : `BDB0210
+celerybeat-schedule.db: metadata page checksum error` au démarrage —
+pas de crash, pas de boucle de redémarrage (`RestartCount=0`),
+processus actif (CPU non nul). Piste : un fichier
+`portfolio_backend/celerybeat-schedule.db` non versionné (16 384
+octets, daté du 23 février) traîne dans le contexte de build sur le NAS
+et se fait copier dans chaque image via `COPY . /app` — il n'est pas le
+fichier réellement utilisé par Celery (qui écrit/lit
+`celerybeat-schedule` sans extension, recréé à chaque démarrage), donc
+probablement un résidu mort et inoffensif plutôt que la cause du
+message. Pas creusé plus loin — à surveiller si le message réapparaît
+ou si un vrai souci de planification est observé.
+
+**Non traité, laissé tel quel** : les 4 messages déjà coincés dans la
+queue `celery` par défaut (voir ci-dessus) n'ont **pas** été extraits ou
+redirigés manuellement — manipuler des messages Redis au milieu de
+~26 000 messages du pipeline trading sort du cadre "additif sans
+risque" de ce soir. Ils finiront par être traités (en retard) par le
+worker principal, ou resteront en attente indéfiniment si jamais
+purgés/expirés — sans impact connu au-delà du délai, puisque le scan de
+fermeture d'aujourd'hui a de toute façon déjà un résultat complet et à
+jour via le déclenchement manuel de ce soir (`ScanRun id=3`,
+6/6 candidats traités avec succès).
+
+**Validation réelle qui reste à faire** : la vraie preuve que le
+routage fonctionne de bout en bout en conditions Beat n'arrivera qu'au
+prochain déclenchement programmé — `morning-fundamental-scan` demain
+9h45 ET. Ce soir on a confirmé que Beat a la bonne config chargée et
+dispatche à nouveau normalement, pas encore qu'un scan analysis complet
+transite par ce chemin exact depuis Beat.
+
 **Chantier plus large, toujours différé** (ne pas faire sans le même
 niveau de rigueur que le reste de la session) : le worker principal
 lui-même reste mono-thread (`--pool=solo`) et le backlog sur la queue
