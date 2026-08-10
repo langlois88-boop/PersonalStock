@@ -14,6 +14,7 @@ externe de credentials -- rien à tester ici, aucune ligne de code n'était
 en cause.)
 """
 
+import os
 from unittest.mock import MagicMock, patch
 
 from django.test import SimpleTestCase, TestCase
@@ -183,6 +184,13 @@ class ClaudeVerifierToolUseTests(TestCase):
         patcher = patch.object(claude_verifier, "fetch_recent_news", return_value=[])
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Isole ces tests du vote majoritaire (CLAUDE_VOTE_CALLS=3 par
+        # défaut depuis le 2026-08-10) -- ils testent la mécanique d'un
+        # seul appel, pas l'agrégation. Voir ClaudeMajorityVoteTests pour
+        # le vote lui-même.
+        vote_patcher = patch.object(claude_verifier, "CLAUDE_VOTE_CALLS", 1)
+        vote_patcher.start()
+        self.addCleanup(vote_patcher.stop)
 
     def _fake_tool_use_response(self, verdict="confirmed", reasoning="ok", confidence="high",
                                  input_tokens=100, output_tokens=50):
@@ -294,3 +302,102 @@ class ClaudeVerifierToolUseTests(TestCase):
             claude_verifier.verify_ticker("AAPL", {"pe_ratio": 15})
 
         self.assertGreaterEqual(fake_client.messages.create.call_args[1]["max_tokens"], 2000)
+
+
+class ClaudeMajorityVoteTests(TestCase):
+    """Ajouté le 2026-08-10, en réponse directe à la variance observée en
+    prod le 2026-08-09 (temperature indisponible sur ce modèle, cf.
+    docstring de claude_verifier.py) : CLAUDE_VOTE_CALLS appels par
+    ticker, majorité stricte -> verdict_source='llm_consensus', pas de
+    majorité -> 'uncertain' + verdict_source='llm_disagreement'."""
+
+    def setUp(self):
+        patcher = patch.object(claude_verifier, "fetch_recent_news", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _tool_use_response(verdict, reasoning="r", confidence="high", tokens=100):
+        block = MagicMock()
+        block.type = "tool_use"
+        block.input = {"verdict": verdict, "reasoning": reasoning, "confidence": confidence}
+        response = MagicMock()
+        response.content = [block]
+        response.stop_reason = "tool_use"
+        response.usage.input_tokens = tokens
+        response.usage.output_tokens = 0
+        return response
+
+    def test_three_way_agreement_is_consensus(self):
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [
+            self._tool_use_response("rejected", reasoning="raison A", tokens=100),
+            self._tool_use_response("rejected", reasoning="raison B", tokens=100),
+            self._tool_use_response("rejected", reasoning="raison C", tokens=100),
+        ]
+        with patch.object(claude_verifier, "ANTHROPIC_API_KEY", "sk-ant-fake"), \
+                patch.object(claude_verifier, "CLAUDE_VOTE_CALLS", 3), \
+                patch.object(claude_verifier.anthropic, "Anthropic", return_value=fake_client):
+            result = claude_verifier.verify_ticker("NVDA", {"pe_ratio": 45})
+
+        self.assertEqual(fake_client.messages.create.call_count, 3)
+        self.assertEqual(result.verdict, "rejected")
+        self.assertEqual(result.verdict_source, "llm_consensus")
+        self.assertEqual(result.tokens_used, 300)  # somme des 3 appels
+
+    def test_two_of_three_is_still_consensus(self):
+        """Majorité stricte (2/3), pas besoin d'unanimité."""
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [
+            self._tool_use_response("confirmed"),
+            self._tool_use_response("uncertain"),
+            self._tool_use_response("confirmed"),
+        ]
+        with patch.object(claude_verifier, "ANTHROPIC_API_KEY", "sk-ant-fake"), \
+                patch.object(claude_verifier, "CLAUDE_VOTE_CALLS", 3), \
+                patch.object(claude_verifier.anthropic, "Anthropic", return_value=fake_client):
+            result = claude_verifier.verify_ticker("AAPL", {"pe_ratio": 15})
+
+        self.assertEqual(result.verdict, "confirmed")
+        self.assertEqual(result.verdict_source, "llm_consensus")
+
+    def test_three_way_disagreement_falls_back_to_uncertain(self):
+        """Reproduit le cas 1-1-1 (aucune majorité) -- doit se distinguer
+        d'un simple 'uncertain' par manque d'info via verdict_source."""
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [
+            self._tool_use_response("confirmed"),
+            self._tool_use_response("rejected"),
+            self._tool_use_response("uncertain"),
+        ]
+        with patch.object(claude_verifier, "ANTHROPIC_API_KEY", "sk-ant-fake"), \
+                patch.object(claude_verifier, "CLAUDE_VOTE_CALLS", 3), \
+                patch.object(claude_verifier.anthropic, "Anthropic", return_value=fake_client):
+            result = claude_verifier.verify_ticker("AAPL", {"pe_ratio": 15})
+
+        self.assertEqual(result.verdict, "uncertain")
+        self.assertEqual(result.verdict_source, "llm_disagreement")
+        self.assertIn("Désaccord", result.reasoning)
+
+    def test_claude_vote_calls_1_disables_voting(self):
+        """CLAUDE_VOTE_CALLS=1 -- comportement d'origine, un seul appel
+        API, verdict_source='single_call'."""
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = self._tool_use_response("confirmed")
+        with patch.object(claude_verifier, "ANTHROPIC_API_KEY", "sk-ant-fake"), \
+                patch.object(claude_verifier, "CLAUDE_VOTE_CALLS", 1), \
+                patch.object(claude_verifier.anthropic, "Anthropic", return_value=fake_client):
+            result = claude_verifier.verify_ticker("AAPL", {"pe_ratio": 15})
+
+        self.assertEqual(fake_client.messages.create.call_count, 1)
+        self.assertEqual(result.verdict_source, "single_call")
+
+    def test_vote_calls_floor_prevents_full_disable(self):
+        """CLAUDE_VOTE_CALLS a un plancher de 1 (une valeur <=0 ne doit
+        jamais désactiver complètement l'étape 3). Teste directement la
+        formule de parsing du module (pas de reload -- un reload
+        module-level romprait les patch.object() des autres tests qui
+        partagent le même process de test)."""
+        with patch.dict(os.environ, {"CLAUDE_VOTE_CALLS": "0"}):
+            computed = max(1, int(os.environ.get("CLAUDE_VOTE_CALLS", "3")))
+        self.assertEqual(computed, 1)

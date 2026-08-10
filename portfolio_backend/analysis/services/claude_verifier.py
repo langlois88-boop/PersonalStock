@@ -7,27 +7,22 @@ IMPORTANT : nécessite un compte séparé sur console.anthropic.com avec
 billing configuré — un abonnement Claude Pro ne donne PAS accès à l'API.
 Voir ANTHROPIC_API_KEY dans les variables d'environnement.
 
-LIMITATION CONNUE (2026-08-09) : un seul appel Claude par ticker, pas de
-vote majoritaire. temperature=0 n'est pas disponible sur ce modèle
+VOTE MAJORITAIRE (ajouté le 2026-08-10, après le déploiement des 6 fixes
+du 2026-08-09) : temperature=0 n'est pas disponible sur ce modèle
 (déprécié par l'API, confirmé contre la doc officielle) et n'aurait de
 toute façon jamais garanti un déterminisme parfait même sur les anciens
-modèles -- la variance entre appels identiques est donc un fait à gérer,
-pas un bug à éliminer par ce biais. Le tool use forcé (voir VERDICT_TOOL
-ci-dessous) a déjà réduit la variance observée en pratique (3/3 verdicts
-convergents sur un cas test, contre un mélange confirmed/rejected/
-uncertain avec l'ancienne approche JSON en texte libre), mais reste un
-seul échantillon. Amélioration identifiée pour plus tard, pas ce soir :
-faire 2-3 appels sur les tickers qui atteignent cette étape, ne garder
-un verdict confiant que si les appels convergent, sinon 'uncertain' avec
-un champ distinct (ex: verdict_source='llm_disagreement') pour le
-distinguer d'un 'uncertain' qui vient d'un manque d'information. Coût
-estimé : x2-x3 sur cette étape seulement, toujours dans le budget
-mensuel visé. Nécessiterait une migration (nouveau champ sur ScanResult)
--- à faire avec la même rigueur que les migrations de ce soir, pas en
-urgence un soir de déploiement.
+modèles -- la variance entre appels identiques est donc traitée comme un
+fait à gérer, pas un bug à éliminer. CLAUDE_VOTE_CALLS (défaut 3) appels
+sont faits par ticker ; si une majorité stricte se dégage, son verdict
+est utilisé (verdict_source='llm_consensus') ; sinon le verdict retombe
+sur 'uncertain' avec verdict_source='llm_disagreement', distinct d'un
+'uncertain' qui viendrait d'un manque d'information. CLAUDE_VOTE_CALLS=1
+désactive le vote (verdict_source='single_call', comportement
+d'origine) -- utile pour limiter le coût si besoin.
 """
 
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from typing import Literal
 import logging
 import os
@@ -40,8 +35,10 @@ logger = logging.getLogger(__name__)
 
 CLAUDE_MODEL = os.environ.get("CLAUDE_ANALYSIS_MODEL", "claude-sonnet-5")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+CLAUDE_VOTE_CALLS = max(1, int(os.environ.get("CLAUDE_VOTE_CALLS", "3")))
 
 ClaudeVerdict = Literal["confirmed", "uncertain", "rejected"]
+VerdictSource = Literal["single_call", "llm_consensus", "llm_disagreement"]
 
 # Sortie structurée forcée via tool use plutôt que JSON en texte libre --
 # élimine à la racine le bug "JSON enveloppé en ```json" trouvé le
@@ -86,6 +83,11 @@ class ClaudeResult:
     reasoning: str
     confidence: str = "low"
     tokens_used: int = 0
+    verdict_source: VerdictSource = "single_call"
+    # Verdicts individuels avant vote, pour audit/debug (vide en mode
+    # single_call). Pas persisté tel quel en DB -- ScanResult ne garde que
+    # le résultat agrégé, mais utile en log/tests.
+    raw_votes: list = field(default_factory=list)
 
 
 def _get_client() -> "anthropic.Anthropic":
@@ -97,30 +99,13 @@ def _get_client() -> "anthropic.Anthropic":
     return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
-def verify_ticker(ticker: str, quant_details: dict, deepseek_reasoning: str = "") -> ClaudeResult:
+def _call_claude_once(client: "anthropic.Anthropic", ticker: str, user_message: str) -> ClaudeResult:
     """
-    Appel Claude pour le verdict final. En cas d'erreur API, retourne
+    Un seul appel Claude pour le verdict. En cas d'erreur API, retourne
     'uncertain' par défaut plutôt que de faire planter le scan complet —
-    un seul ticker en échec ne doit pas bloquer le reste du run.
+    un ticker/appel en échec ne doit pas bloquer le reste du run ni du vote.
     """
-    news_items = fetch_recent_news(ticker, days_back=60)
-    news_text = format_news_for_prompt(news_items)
-
-    ratios_summary = (
-        f"P/E: {quant_details.get('pe_ratio')}, PEG: {quant_details.get('peg_ratio')}, "
-        f"ROE: {quant_details.get('roe')}%, Dette/EBITDA: {quant_details.get('debt_to_ebitda')}x, "
-        f"FCF Yield: {quant_details.get('fcf_yield')}%, Secteur: {quant_details.get('sector')}"
-    )
-
-    user_message = (
-        f"Ticker: {ticker}\n\n"
-        f"Ratios fondamentaux: {ratios_summary}\n\n"
-        f"Verdict du premier tri automatique: {deepseek_reasoning or 'N/A'}\n\n"
-        f"News récentes (60 derniers jours):\n{news_text}"
-    )
-
     try:
-        client = _get_client()
         # Historique des tentatives précédentes (2026-08-09) :
         # - préremplissage (message assistant "{") : rejeté par l'API,
         #   "This model does not support assistant message prefill".
@@ -138,10 +123,8 @@ def verify_ticker(ticker: str, quant_details: dict, deepseek_reasoning: str = ""
         # entre appels identiques, mais rejeté par l'API : "`temperature`
         # is deprecated for this model." -- confirmé en direct, pas juste
         # en théorie, sur claude-sonnet-5. Pas de levier de déterminisme
-        # disponible ici ; le tool use forcé réduit déjà la variance
-        # observée en pratique (3/3 verdicts convergents sur NVDA en test,
-        # contre un mélange confirmed/rejected/uncertain avec l'ancienne
-        # approche JSON en texte libre).
+        # disponible ici ; voir verify_ticker() pour la gestion de la
+        # variance résiduelle via vote majoritaire.
         response = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=2000,
@@ -173,8 +156,8 @@ def verify_ticker(ticker: str, quant_details: dict, deepseek_reasoning: str = ""
         # vérifier la consommation réelle contre la grille tarifaire
         # actuelle sur console.anthropic.com.
         logger.info(
-            "Claude verify_ticker(%s): %d input + %d output = %d tokens",
-            ticker, input_tokens, output_tokens, tokens_used,
+            "Claude _call_claude_once(%s): %d input + %d output = %d tokens -> %s",
+            ticker, input_tokens, output_tokens, tokens_used, verdict,
         )
 
         return ClaudeResult(
@@ -190,3 +173,85 @@ def verify_ticker(ticker: str, quant_details: dict, deepseek_reasoning: str = ""
             reasoning=f"Erreur technique lors de l'appel Claude : {e}",
             confidence="low",
         )
+
+
+def _majority_vote(results: list[ClaudeResult]) -> ClaudeResult:
+    """
+    Agrège N ClaudeResult (déjà obtenus) en un seul verdict.
+
+    Majorité stricte (> moitié des appels) sur le même verdict -> ce
+    verdict, verdict_source='llm_consensus', reasoning/confidence pris du
+    premier appel qui matche le verdict majoritaire. Sinon (aucune
+    majorité stricte, ex: 1-1-1 sur 3 appels) -> 'uncertain',
+    verdict_source='llm_disagreement', reasoning résume le désaccord.
+    tokens_used = somme des tokens de tous les appels (coût réel de
+    l'étape pour ce ticker).
+    """
+    total_tokens = sum(r.tokens_used for r in results)
+    verdicts = [r.verdict for r in results]
+    counts = Counter(verdicts)
+    top_verdict, top_count = counts.most_common(1)[0]
+
+    if top_count > len(results) / 2:
+        agreeing = next(r for r in results if r.verdict == top_verdict)
+        return ClaudeResult(
+            verdict=top_verdict,
+            reasoning=agreeing.reasoning,
+            confidence=agreeing.confidence,
+            tokens_used=total_tokens,
+            verdict_source="llm_consensus",
+            raw_votes=verdicts,
+        )
+
+    summary = ", ".join(f"{v}={c}" for v, c in counts.most_common())
+    return ClaudeResult(
+        verdict="uncertain",
+        reasoning=f"Désaccord entre {len(results)} appels Claude ({summary}) -- aucune majorité claire.",
+        confidence="low",
+        tokens_used=total_tokens,
+        verdict_source="llm_disagreement",
+        raw_votes=verdicts,
+    )
+
+
+def verify_ticker(ticker: str, quant_details: dict, deepseek_reasoning: str = "") -> ClaudeResult:
+    """
+    Verdict final via Claude, avec vote majoritaire sur CLAUDE_VOTE_CALLS
+    appels (défaut 3, CLAUDE_VOTE_CALLS=1 désactive le vote). Le message
+    utilisateur est construit une seule fois -- même contenu envoyé à
+    chaque appel, seul le résultat du modèle peut varier.
+    """
+    news_items = fetch_recent_news(ticker, days_back=60)
+    news_text = format_news_for_prompt(news_items)
+
+    ratios_summary = (
+        f"P/E: {quant_details.get('pe_ratio')}, PEG: {quant_details.get('peg_ratio')}, "
+        f"ROE: {quant_details.get('roe')}%, Dette/EBITDA: {quant_details.get('debt_to_ebitda')}x, "
+        f"FCF Yield: {quant_details.get('fcf_yield')}%, Secteur: {quant_details.get('sector')}"
+    )
+
+    user_message = (
+        f"Ticker: {ticker}\n\n"
+        f"Ratios fondamentaux: {ratios_summary}\n\n"
+        f"Verdict du premier tri automatique: {deepseek_reasoning or 'N/A'}\n\n"
+        f"News récentes (60 derniers jours):\n{news_text}"
+    )
+
+    try:
+        client = _get_client()
+    except RuntimeError as e:
+        logger.exception("Erreur vérification Claude pour %s", ticker)
+        return ClaudeResult(
+            verdict="uncertain",
+            reasoning=f"Erreur technique lors de l'appel Claude : {e}",
+            confidence="low",
+        )
+
+    results = [_call_claude_once(client, ticker, user_message) for _ in range(CLAUDE_VOTE_CALLS)]
+
+    if CLAUDE_VOTE_CALLS == 1:
+        result = results[0]
+        result.verdict_source = "single_call"
+        return result
+
+    return _majority_vote(results)

@@ -74,6 +74,20 @@ class ScanResult(models.Model):
     claude_reasoning = models.TextField(blank=True, default='')
     claude_tokens_used = models.IntegerField(default=0)
 
+    VERDICT_SOURCE_CHOICES = (
+        # Un seul appel Claude (CLAUDE_VOTE_CALLS<=1) -- comportement
+        # d'origine, avant le vote majoritaire du 2026-08-09.
+        ('single_call', 'single_call'),
+        # Plusieurs appels, verdicts convergents -- claude_verdict reflète
+        # le consensus.
+        ('llm_consensus', 'llm_consensus'),
+        # Plusieurs appels, verdicts divergents -- claude_verdict forcé à
+        # 'uncertain', distinct d'un uncertain qui viendrait d'un manque
+        # d'info (voir claude_verifier.py::verify_ticker).
+        ('llm_disagreement', 'llm_disagreement'),
+    )
+    verdict_source = models.CharField(max_length=20, choices=VERDICT_SOURCE_CHOICES, blank=True, default='single_call')
+
     final_verdict = models.CharField(max_length=20, choices=VERDICT_CHOICES, db_index=True)
 
     # Réservé à l'intégration future du module de patterns de chandeliers

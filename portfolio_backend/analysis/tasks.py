@@ -177,11 +177,16 @@ def _process_candidate(scan_run: ScanRun, preset: ScreenerPreset, quant_result, 
         return
 
     # --- Étape 3 : Claude (seulement si DeepSeek n'a pas rejeté) ---
+    # verify_ticker() fait un vote majoritaire sur CLAUDE_VOTE_CALLS appels
+    # (défaut 3) -- claude_result.verdict_source distingue un verdict
+    # confiant ('llm_consensus'/'single_call') d'un désaccord entre appels
+    # ('llm_disagreement', voir analysis/models.py::ScanResult.VERDICT_SOURCE_CHOICES).
     claude_result = verify_ticker(ticker, quant_result.details, deepseek_result.reasoning)
     scan_result.claude_verdict = claude_result.verdict
     scan_result.claude_reasoning = claude_result.reasoning
     scan_result.claude_tokens_used = claude_result.tokens_used
-    scan_result.save(update_fields=["claude_verdict", "claude_reasoning", "claude_tokens_used"])
+    scan_result.verdict_source = claude_result.verdict_source
+    scan_result.save(update_fields=["claude_verdict", "claude_reasoning", "claude_tokens_used", "verdict_source"])
 
     if claude_result.verdict == "rejected":
         scan_result.final_verdict = "rejected_claude"
