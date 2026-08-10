@@ -9722,7 +9722,13 @@ def compute_model_evaluation_daily(as_of: str | None = None) -> dict[str, Any]:
     else:
         as_of_date = timezone.now().date()
 
-    closed_today = PaperTrade.objects.filter(status='CLOSED', exit_date__date=as_of_date)
+    # Même isolation que partout ailleurs : FUNDAMENTAL_LAB (screener d'analyse
+    # fondamentale, hors ML) ne doit jamais faire apparaître une catégorie
+    # model_name/sandbox inattendue dans ModelEvaluationDaily / les dashboards
+    # de performance ML qui le lisent (ModelMonitoringSummaryView et consorts).
+    closed_today = PaperTrade.objects.filter(status='CLOSED', exit_date__date=as_of_date).exclude(
+        sandbox='FUNDAMENTAL_LAB'
+    )
     if not closed_today.exists():
         payload = {'status': 'no_trades', 'as_of': str(as_of_date)}
         _task_log_finish(log, 'SUCCESS', payload)
