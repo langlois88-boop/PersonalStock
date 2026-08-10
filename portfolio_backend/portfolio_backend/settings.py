@@ -579,12 +579,16 @@ AFTER_HOURS_TASKS_ENABLED = os.getenv('AFTER_HOURS_TASKS_ENABLED', 'false').lowe
 }
 
 if not AFTER_HOURS_TASKS_ENABLED:
+    # cleanup-taskrunlog-daily et cleanup-system-logs-weekly sont sortis de
+    # cette liste (2026-08-10) : pur ménage de logs (DELETE sur de vieilles
+    # lignes), aucun impact sur le trading live, contrairement au reste de ce
+    # lot (retraining/rollback de modèles notamment) qui reste désactivé par
+    # défaut ici. Ils tournent maintenant indépendamment de
+    # AFTER_HOURS_TASKS_ENABLED -- voir docs/TECH_DEBT_NOTES.md item 6.
     for task_name in [
         'deep-learning-retro-nightly',
         'nightly-closed-market-retrain',
         'nightly-intraday-retrain',
-        'cleanup-taskrunlog-daily',
-        'cleanup-system-logs-weekly',
         'trading-journal-daily',
         'daily-bot-journal-2005',
         'sunday-evening-briefing',
