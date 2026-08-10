@@ -269,21 +269,47 @@ routage du worker principal seulement après la fenêtre d'observation
 
 ---
 
-## 6. Volume `TaskRunLog` — rétention déjà en place, verbosité pas touchée ce soir
-**Statut : évalué, PAS implémenté (portée trop large pour ce soir).**
+## 6. [CORRIGÉ le 2026-08-10 ~22h20 UTC] Volume `TaskRunLog` — élagage des succès rapides
+**Statut : fermé. Commit `78a94d6d`, déployé, testé, vérifié en conditions
+réelles sur le NAS (10 306 lignes élaguées lors du premier run manuel).**
 
-**Rétention** : vérifiée, existe déjà — `cleanup_task_run_logs`
-(`portfolio/tasks.py:2140`), planifiée tous les jours à 2h15
-(`cleanup-taskrunlog-daily` dans `CELERY_BEAT_SCHEDULE`), purge tout ce
-qui a plus de `TASKRUNLOG_RETENTION_DAYS` (défaut 30j, configurable via
-env var). Rien à faire ici — pas de purge illimitée comme supposé au
-départ.
+**Plan initial révisé avant d'implémenter** : l'idée d'hier (sauter/
+supprimer l'écriture `TaskRunLog` pour les succès <1s directement dans
+`_task_log_finish`) aurait cassé le dashboard de statut système
+(`portfolio/views.py` ~8804, `.order_by('-started_at').first()` par
+tâche) — vérifié avec les vraies durées avant de coder : 5 des 11
+tâches surveillées sont dominées par des exécutions <1s
+(`fetch_finnhub_news_daily` avg 5.6ms/182 runs, etc.), donc tout
+supprimer aurait fait passer leur carte de statut à `UNKNOWN`.
 
-**Verbosité** : mesurée, pas corrigée. Au 2026-08-10 20h55 ET :
-213 348 lignes au total, 8 044 sur les dernières 24h, dont **39.8%
-(3 202) sont des succès triviaux <1s**. La rétention 30j empêche une
-croissance illimitée, mais le volume quotidien reste élevé pour un
-diagnostic manuel (ce qui a effectivement ralenti l'audit de ce soir).
+**Design retenu** : `_prune_fast_success_task_run_logs()`, appelée
+depuis le job de nettoyage quotidien existant (`cleanup_task_run_logs`),
+PAS depuis le chemin chaud partagé par ~50 tâches. Garde les
+`TASKRUNLOG_FAST_SUCCESS_KEEP_RECENT` (défaut 3) lignes les plus
+récentes par tâche parmi les succès `< TASKRUNLOG_FAST_SUCCESS_MS`
+(défaut 1000ms) ; les échecs et tâches lentes ne sont jamais touchés.
+5 tests de régression, vérifiés en échouant contre le code d'avant
+(`AttributeError`, fonction inexistante) avant de confirmer le fix.
+
+**Découverte en vérifiant en conditions réelles (pas un bug introduit
+ce soir)** : en déclenchant `cleanup_task_run_logs()` manuellement sur
+le NAS pour valider, la rétention 30j *déjà existante* (jamais touchée
+ce soir) a supprimé 193 569 lignes d'un coup — signe qu'elle n'avait
+probablement jamais tourné via Beat. Cause trouvée : `settings.py`
+ligne 581, `if not AFTER_HOURS_TASKS_ENABLED:` retire
+`cleanup-taskrunlog-daily` (et 19 autres tâches : retraining nocturne,
+rollback modèle, rapports hebdo...) de `CELERY_BEAT_SCHEDULE`.
+`AFTER_HOURS_TASKS_ENABLED` n'est pas défini dans `deploy/.env` sur le
+NAS → reste à `false` par défaut → ce lot de 20 tâches est désactivé
+**depuis toujours** sur cette instance, pas cassé par du travail
+récent. Le fix de ce soir est déployé et fonctionne (vérifié par
+déclenchement manuel), mais **ne tournera pas tout seul** tant que ce
+flag reste à `false` ou qu'une entrée de planning dédiée n'est pas
+créée en dehors de ce bloc conditionnel — à décider : activer tout le
+lot (retraining ML compris, pas juste le nettoyage de logs) ou sortir
+`cleanup-taskrunlog-daily` de la liste conditionnelle pour qu'il tourne
+indépendamment. Pas fait ce soir, hors périmètre de la demande initiale
+(volume de logs).
 
 Piste identifiée mais **pas implémentée** : `_task_log_start`/
 `_task_log_finish` (`portfolio/tasks.py:2122-2136`) sont les 2 fonctions
