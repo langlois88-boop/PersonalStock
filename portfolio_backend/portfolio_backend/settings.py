@@ -540,9 +540,16 @@ CELERY_BEAT_SCHEDULE = {
     },
     # Module Analyse fondamentale (app 'analysis') — tables et sandbox
     # ('FUNDAMENTAL_LAB') dédiées, aucun chevauchement avec les jobs ci-dessus.
+    # Deux scans/jour (2026-08-10) : ouverture + fermeture ET. CELERY_TIMEZONE
+    # = 'America/New_York' (vrai fuseau IANA, pas un offset fixe) donc le
+    # passage EST/EDT est géré automatiquement, aucun ajustement manuel requis.
+    'morning-fundamental-scan': {
+        'task': 'analysis.tasks.run_daily_scan',
+        'schedule': crontab(hour=9, minute=45, day_of_week='mon-fri'),  # 15 min après l'ouverture ET
+    },
     'daily-fundamental-scan': {
         'task': 'analysis.tasks.run_daily_scan',
-        'schedule': crontab(hour=16, minute=30, day_of_week='mon-fri'),  # fermeture ET, un seul scan/jour
+        'schedule': crontab(hour=16, minute=30, day_of_week='mon-fri'),  # 30 min après la fermeture ET
     },
     'weekly-rejection-outcome-check': {
         'task': 'analysis.tasks.check_rejection_outcomes',
