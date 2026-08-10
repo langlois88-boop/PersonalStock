@@ -97,9 +97,20 @@ def verify_ticker(ticker: str, quant_details: dict, deepseek_reasoning: str = ""
         # On garde donc un seul message utilisateur, et on compte
         # uniquement sur extract_json_object() pour nettoyer un éventuel
         # bloc ```json ... ``` dans la réponse.
+        # max_tokens=400 (valeur d'origine) s'est révélé insuffisant en prod
+        # le 2026-08-09 : claude-sonnet-5 déclenche parfois un raisonnement
+        # étendu (bloc "thinking", visible dans response.content) selon la
+        # complexité du contenu -- plus fréquent avec de vraies news
+        # volumineuses qu'avec un prompt court/vide. Le budget de thinking
+        # partage le même plafond max_tokens que la réponse finale : si le
+        # modèle épuise les 400 tokens en pur raisonnement, il est coupé
+        # avant même d'écrire le JSON (stop_reason='max_tokens', aucun bloc
+        # texte du tout -- confirmé reproduit sur NVDA, 1 échec sur 4 essais
+        # avec du contenu réel). Marge large pour couvrir raisonnement +
+        # réponse structurée.
         response = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=400,
+            max_tokens=2000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],
         )

@@ -248,3 +248,40 @@ class ClaudeVerifierJsonParsingTests(TestCase):
 
         self.assertEqual(result.verdict, "uncertain")
         self.assertIn("Erreur technique", result.reasoning)
+
+    def test_thinking_only_response_max_tokens_hit_degrades_gracefully(self):
+        """Reproduit précisément le bug trouvé en prod sur NVDA le
+        2026-08-09 (1 échec sur 4 essais avec du vrai contenu de news) :
+        le modèle épuise tout son budget max_tokens en raisonnement
+        ("thinking") avant d'écrire la moindre réponse -- content ne
+        contient alors qu'un ThinkingBlock, aucun bloc texte. Doit
+        dégrader proprement, pas planter."""
+        thinking_block = MagicMock()
+        thinking_block.type = "thinking"
+        response = MagicMock()
+        response.content = [thinking_block]  # aucun bloc "text"
+        response.usage.input_tokens = 500
+        response.usage.output_tokens = 400
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = response
+        with patch.object(claude_verifier, "ANTHROPIC_API_KEY", "sk-ant-fake"), \
+                patch.object(claude_verifier.anthropic, "Anthropic", return_value=fake_client):
+            result = claude_verifier.verify_ticker("NVDA", {"pe_ratio": 45})
+
+        self.assertEqual(result.verdict, "uncertain")
+        self.assertIn("Erreur technique", result.reasoning)
+
+    def test_max_tokens_has_headroom_for_thinking_plus_answer(self):
+        """Non-régression sur la valeur elle-même : 400 s'est révélé
+        insuffisant en prod (voir test ci-dessus). Verrouille qu'on ne
+        revienne pas accidentellement à une valeur trop basse."""
+        fake_response = self._fake_anthropic_response(
+            '{"verdict": "uncertain", "reasoning": "x", "confidence": "low"}'
+        )
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = fake_response
+        with patch.object(claude_verifier, "ANTHROPIC_API_KEY", "sk-ant-fake"), \
+                patch.object(claude_verifier.anthropic, "Anthropic", return_value=fake_client):
+            claude_verifier.verify_ticker("AAPL", {"pe_ratio": 15})
+
+        self.assertGreaterEqual(fake_client.messages.create.call_args[1]["max_tokens"], 2000)
