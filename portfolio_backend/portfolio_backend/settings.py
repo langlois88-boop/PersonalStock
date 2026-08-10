@@ -569,6 +569,16 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'analysis.tasks.check_rejection_outcomes',
         'schedule': crontab(hour=6, minute=0, day_of_week='mon'),
     },
+    # TEMPORAIRE (2026-08-10, ~21h13 UTC) : créneau de test pour valider que
+    # CELERY_TASK_ROUTES est bien appliqué quand la tâche est déclenchée par
+    # Beat lui-même (pas par un .delay() manuel) -- suite à la découverte que
+    # celery_beat tournait sur l'ancienne image et ratait le routage vers
+    # analysis_queue pour les scans 9h45/16h30 d'aujourd'hui. À RETIRER dès
+    # que le test est confirmé, remplacé par le vrai planning ci-dessus.
+    'TEMPORARY-test-analysis-queue-routing': {
+        'task': 'analysis.tasks.run_daily_scan',
+        'schedule': crontab(hour=17, minute=25, day_of_week='mon-fri'),
+    },
 }
 
 AFTER_HOURS_TASKS_ENABLED = os.getenv('AFTER_HOURS_TASKS_ENABLED', 'false').lower() in {
