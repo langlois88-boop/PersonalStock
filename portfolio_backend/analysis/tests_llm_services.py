@@ -136,21 +136,24 @@ class ClaudeVerifierJsonParsingTests(TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _fake_anthropic_response(self, text_after_prefill: str, input_tokens=100, output_tokens=50):
+    def _fake_anthropic_response(self, raw_text: str, input_tokens=100, output_tokens=50):
         block = MagicMock()
         block.type = "text"
-        block.text = text_after_prefill
+        block.text = raw_text
         response = MagicMock()
         response.content = [block]
         response.usage.input_tokens = input_tokens
         response.usage.output_tokens = output_tokens
         return response
 
-    def test_prefill_message_is_sent(self):
-        """Le message assistant "{" doit bien partir dans la requête --
-        c'est ce qui empêche Claude de commencer par un bloc markdown."""
+    def test_no_assistant_prefill_message_sent(self):
+        """Non-régression : claude-sonnet-5 rejette le préremplissage
+        ('This model does not support assistant message prefill') --
+        confirmé en prod le 2026-08-09 après une première tentative de fix.
+        La conversation doit se terminer par un message user, un seul
+        message au total."""
         fake_response = self._fake_anthropic_response(
-            '\n  "verdict": "confirmed",\n  "reasoning": "ok",\n  "confidence": "high"\n}'
+            '{"verdict": "confirmed", "reasoning": "ok", "confidence": "high"}'
         )
         fake_client = MagicMock()
         fake_client.messages.create.return_value = fake_response
@@ -159,15 +162,18 @@ class ClaudeVerifierJsonParsingTests(TestCase):
             result = claude_verifier.verify_ticker("AAPL", {"pe_ratio": 15})
 
         messages_sent = fake_client.messages.create.call_args[1]["messages"]
-        self.assertEqual(messages_sent[-1], {"role": "assistant", "content": "{"})
+        self.assertEqual(len(messages_sent), 1)
+        self.assertEqual(messages_sent[0]["role"], "user")
         self.assertEqual(result.verdict, "confirmed")
         self.assertEqual(result.reasoning, "ok")
 
-    def test_response_without_fence_still_works_after_prefill(self):
-        """Cas le plus courant avec le préremplissage : Claude continue
-        juste après le "{" sans jamais introduire de bloc markdown."""
+    def test_markdown_fenced_response_is_parsed_correctly(self):
+        """Reproduit exactement la forme observée en prod sur BRCC le
+        2026-08-09 : Claude enveloppe sa réponse dans ```json malgré
+        l'instruction. C'est le vrai bug -- ce test doit échouer sans le
+        fix (extract_json_object)."""
         fake_response = self._fake_anthropic_response(
-            '\n  "verdict": "rejected",\n  "reasoning": "raison trouvée",\n  "confidence": "medium"\n}'
+            '```json\n{\n  "verdict": "rejected",\n  "reasoning": "raison trouvée",\n  "confidence": "medium"\n}\n```'
         )
         fake_client = MagicMock()
         fake_client.messages.create.return_value = fake_response
@@ -176,13 +182,11 @@ class ClaudeVerifierJsonParsingTests(TestCase):
             result = claude_verifier.verify_ticker("AAPL", {"pe_ratio": 15})
 
         self.assertEqual(result.verdict, "rejected")
+        self.assertEqual(result.reasoning, "raison trouvée")
 
-    def test_defensive_fence_stripping_even_with_prefill(self):
-        """Ceinture et bretelles : même si le modèle réintroduit quand même
-        une balise de fermeture ``` après le préremplissage, le parsing
-        ne doit pas planter."""
+    def test_plain_json_without_fence_still_works(self):
         fake_response = self._fake_anthropic_response(
-            '\n  "verdict": "uncertain",\n  "reasoning": "x",\n  "confidence": "low"\n}\n```'
+            '{"verdict": "uncertain", "reasoning": "x", "confidence": "low"}'
         )
         fake_client = MagicMock()
         fake_client.messages.create.return_value = fake_response
@@ -193,8 +197,8 @@ class ClaudeVerifierJsonParsingTests(TestCase):
         self.assertEqual(result.verdict, "uncertain")
 
     def test_genuinely_malformed_response_degrades_to_uncertain_not_crash(self):
-        """Reproduit exactement le symptôme observé en prod sur BRCC avant
-        le fix (texte vide/inexploitable après le prefill)."""
+        """Reproduit le cas texte vide/inexploitable -- ne doit jamais
+        planter le pipeline."""
         fake_response = self._fake_anthropic_response("")
         fake_client = MagicMock()
         fake_client.messages.create.return_value = fake_response

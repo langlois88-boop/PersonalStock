@@ -88,27 +88,24 @@ def verify_ticker(ticker: str, quant_details: dict, deepseek_reasoning: str = ""
 
     try:
         client = _get_client()
+        # NOTE : la technique de préremplissage (message assistant "{" pour
+        # forcer une continuation JSON directe) a été essayée le 2026-08-09
+        # mais rejetée par l'API : "This model does not support assistant
+        # message prefill. The conversation must end with a user message."
+        # (confirmé en prod avec claude-sonnet-5, pas juste en théorie —
+        # certains modèles à raisonnement étendu désactivent le prefill).
+        # On garde donc un seul message utilisateur, et on compte
+        # uniquement sur extract_json_object() pour nettoyer un éventuel
+        # bloc ```json ... ``` dans la réponse.
         response = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=400,
             system=SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": user_message},
-                # Préremplissage : force Claude à continuer directement en JSON
-                # plutôt que d'envelopper la réponse dans un bloc ```json ...```
-                # (comportement observé en prod le 2026-08-09 malgré l'instruction
-                # "réponds UNIQUEMENT en JSON" dans le system prompt — Claude ne
-                # répète pas ce préfixe dans response.content, il faut le
-                # rajouter nous-mêmes avant de parser).
-                {"role": "assistant", "content": "{"},
-            ],
+            messages=[{"role": "user", "content": user_message}],
         )
-        raw_text = "{" + "".join(
+        raw_text = "".join(
             block.text for block in response.content if block.type == "text"
         )
-        # extract_json_object reste défensif même avec le préremplissage
-        # (ceinture et bretelles : au cas où le modèle ajoute quand même du
-        # texte après le JSON, ou une fermeture ```).
         parsed = extract_json_object(raw_text)
 
         verdict = parsed.get("verdict", "uncertain")
