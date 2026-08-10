@@ -2142,9 +2142,47 @@ def cleanup_task_run_logs() -> dict[str, Any]:
     retention_days = int(os.getenv('TASKRUNLOG_RETENTION_DAYS', '30'))
     cutoff = timezone.now() - timedelta(days=retention_days)
     deleted, _ = TaskRunLog.objects.filter(started_at__lt=cutoff).delete()
-    result = {'deleted': deleted, 'retention_days': retention_days}
+    pruned_fast_successes = _prune_fast_success_task_run_logs()
+    result = {
+        'deleted': deleted,
+        'retention_days': retention_days,
+        'pruned_fast_successes': pruned_fast_successes,
+    }
     _task_log_finish(log, 'SUCCESS', result)
     return result
+
+
+def _prune_fast_success_task_run_logs() -> int:
+    """Élague les succès rapides et routiniers (durée < seuil) en ne gardant
+    que les N plus récents par tâche -- pour garder TaskRunLog navigable sans
+    perdre la visibilité "dernière exécution" utilisée par les dashboards de
+    statut (TaskRunLogDataView, et les vues qui font
+    `.filter(task_name=...).order_by('-started_at').first()`).
+
+    N'écrit jamais dans le chemin chaud (_task_log_start/_task_log_finish,
+    partagé par ~50 tâches) -- ne tourne qu'ici, dans le job de nettoyage
+    quotidien déjà existant. Les échecs et les tâches lentes ne sont jamais
+    touchés par cette fonction ; seule la rétention 30j de
+    cleanup_task_run_logs s'applique à eux.
+    """
+    threshold_ms = int(os.getenv('TASKRUNLOG_FAST_SUCCESS_MS', '1000'))
+    keep_recent = int(os.getenv('TASKRUNLOG_FAST_SUCCESS_KEEP_RECENT', '3'))
+    if threshold_ms <= 0 or keep_recent <= 0:
+        return 0
+
+    fast_success_qs = TaskRunLog.objects.filter(status='SUCCESS', duration_ms__lt=threshold_ms)
+    task_names = fast_success_qs.values_list('task_name', flat=True).distinct()
+
+    pruned = 0
+    for name in task_names:
+        ids_to_keep = list(
+            fast_success_qs.filter(task_name=name)
+            .order_by('-started_at')
+            .values_list('id', flat=True)[:keep_recent]
+        )
+        n, _ = fast_success_qs.filter(task_name=name).exclude(id__in=ids_to_keep).delete()
+        pruned += n
+    return pruned
 
 
 @shared_task
