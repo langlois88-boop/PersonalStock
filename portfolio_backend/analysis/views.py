@@ -142,7 +142,14 @@ class LabPositionMarkManualView(APIView):
             return Response({"error": "Position introuvable."}, status=status.HTTP_404_NOT_FOUND)
 
         position.manually_selected = True
-        position.manual_note = request.data.get("note", "")
+        # Ne remplace la note existante que si une nouvelle note non vide est
+        # fournie -- sinon un ré-appel (ex. re-cliquer "Je crois en celle-là")
+        # sans texte écrasait silencieusement une note de traçabilité déjà
+        # présente (ex. celles posées lors du nettoyage des positions de test
+        # buguées le 2026-08-09).
+        new_note = (request.data.get("note") or "").strip()
+        if new_note:
+            position.manual_note = new_note
         position.save(update_fields=["manually_selected", "manual_note"])
         return Response({"status": "ok"})
 

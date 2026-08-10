@@ -282,6 +282,28 @@ class ScreenerApiTests(APITestCase):
         self.assertTrue(self.lab_position.manually_selected)
         self.assertEqual(self.lab_position.manual_note, "J'y crois")
 
+    def test_mark_manual_endpoint_keeps_existing_note_when_none_provided(self):
+        # Régression : un ré-appel sans "note" (ou avec une note vide/blanche)
+        # écrasait silencieusement une note de traçabilité déjà posée.
+        self.lab_position.manual_note = "Note de nettoyage à ne pas perdre"
+        self.lab_position.save(update_fields=["manual_note"])
+
+        response = self.client.post(
+            f"/api/analysis/lab/{self.lab_position.id}/mark-manual/", {}, format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.lab_position.refresh_from_db()
+        self.assertTrue(self.lab_position.manually_selected)
+        self.assertEqual(self.lab_position.manual_note, "Note de nettoyage à ne pas perdre")
+
+        # Une note blanche (espaces seulement) ne doit pas non plus écraser.
+        response = self.client.post(
+            f"/api/analysis/lab/{self.lab_position.id}/mark-manual/", {"note": "   "}, format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.lab_position.refresh_from_db()
+        self.assertEqual(self.lab_position.manual_note, "Note de nettoyage à ne pas perdre")
+
     def test_mark_manual_unknown_position_404(self):
         response = self.client.post("/api/analysis/lab/999999/mark-manual/", {}, format="json")
         self.assertEqual(response.status_code, 404)
