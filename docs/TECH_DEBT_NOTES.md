@@ -7,92 +7,106 @@ qu'on suppose (hypothèse), et ce qui reste à faire.
 
 ---
 
-## 1. `LabPositionMarkManualView` écrase `manual_note` sans garde
-**Statut : ouvert, déféré au 2026-08-10 (soir précédent), toujours pas corrigé.**
+## 1. [CORRIGÉ le 2026-08-10 ~21h40 UTC] `LabPositionMarkManualView` écrase `manual_note` sans garde
+**Statut : fermé. Commit `4547f7c6`, déployé, testé, 0 régression.**
 
-`position.manual_note = request.data.get("note", "")` est inconditionnel.
-Cliquer "Je crois en celle-là" sur une position qui a déjà une note de
+`position.manual_note = request.data.get("note", "")` était inconditionnel.
+Cliquer "Je crois en celle-là" sur une position qui avait déjà une note de
 traçabilité (ex. les 4 positions BRCC/BTO.TO/NVDA/SLQT nettoyées après le
-bug du scan bugué du 2026-08-09) écrase silencieusement cette note.
-Pas de dommage financier (`is_open`/`PaperTrade` non touchés par cet
-endpoint), mais perte de traçabilité pour un futur post-mortem.
+bug du scan bugué du 2026-08-09) écrasait silencieusement cette note.
 
-**À faire** : garder l'ancienne note si la nouvelle est vide, ou
-concaténer avec un séparateur/horodatage plutôt qu'écraser.
+**Fix** : ne remplace `manual_note` que si une nouvelle note non vide
+(après `.strip()`) est fournie ; sinon la note existante est conservée.
+2 tests de régression ajoutés (`analysis/tests.py`) : ré-appel sans
+`"note"`, et avec une note blanche (espaces seulement) — les deux
+préservent la note existante. Suite complète (`manage.py test`) : 0
+régression, seulement les 4 erreurs pytest préexistantes et sans
+rapport (`ml_engine`, module jamais installé).
 
 Fichier : `portfolio_backend/analysis/views.py` (classe `LabPositionMarkManualView`).
 
 ---
 
-## 2. `monitor_my_portfolio` échoue à 100% depuis au moins ce soir
-**Statut : ouvert, découvert 2026-08-10 ~20h50 ET pendant l'audit Celery.**
+## 2. [CORRIGÉ le 2026-08-10 ~22h00 UTC] `monitor_my_portfolio` échouait à 100%
+**Statut : fermé. Cause confirmée en direct contre le vrai SDK, pas
+supposée. Commits `e1fa9f45` + `e6cf3a45` (fix test), déployé, 0 régression.**
 
-**Vérifié** (TaskRunLog, 10 dernières exécutions consécutives, toutes
-entre 16h50 et 20h37 ET aujourd'hui) : **échec systématique, message
-identique à chaque fois** :
-```
-Second or Minute units can only be used with amounts between 1-59.
-```
-
-**Vérifié — ce n'est PAS le crontab Beat** (hypothèse initiale écartée) :
-`settings.py` ligne ~497, entrée `'monitor-my-portfolio-hourly'` :
+Cause réelle, reproduite en isolant l'appel fautif (`docker compose exec
+backend python manage.py shell`) contre le **vrai SDK Alpaca**, pas
+juste par lecture de code :
 ```python
-'schedule': crontab(minute=0, hour='9-16', day_of_week='mon-fri'),
+>>> from portfolio.market_data import _timeframe_from_interval
+>>> _timeframe_from_interval('60m')
+ValueError: Second or Minute units can only be used with amounts between 1-59.
 ```
-Syntaxe parfaitement valide (`minute=0`, pas de valeur hors 1-59). Le
-crash a donc lieu **pendant l'exécution de la tâche**, pas au niveau de
-sa planification.
+Message identique caractère pour caractère à celui de `TaskRunLog`.
+**Ce n'était pas yfinance** (l'hypothèse d'hier pointait dans la bonne
+direction sur `'60m'` mais visait la mauvaise librairie) : `monitor_my_
+portfolio` utilise le wrapper `portfolio.market_data.Ticker` (aliasé
+`yf` dans `tasks.py`), qui construit un `TimeFrame(60, TimeFrameUnit.
+Minute)` pour l'API Alpaca — rejeté par construction, l'unité Minute
+n'acceptant que 1-59. La ligne `interval = '60m' if is_core else '15m'`
+(tasks.py ~12561) était bien le déclencheur, mais le vrai bug était dans
+`_timeframe_from_interval()` (`market_data.py:122`), qui ne gérait pas
+le cas 60 minutes = 1 heure — contrairement à la branche `'h'` juste en
+dessous qui gère déjà les heures correctement.
 
-**Hypothèse non vérifiée (piste à suivre demain)** : dans
-`portfolio_backend/portfolio/tasks.py`, fonction `monitor_my_portfolio`
-(~ligne 12542), la ligne :
-```python
-interval = '60m' if is_core else '15m'
-...
-hist = yf.Ticker(symbol).history(period=period, interval=interval)
-```
-`'60m'` est un interval yfinance documenté comme valide, mais le message
-d'erreur ressemble à une validation interne pandas/yfinance sur un
-offset `Minute`/`Second` — pas confirmé, pas de traceback complet stocké
-dans `TaskRunLog.error` (seulement le message, pas la stack). À
-reproduire en isolant l'appel `yf.Ticker(...).history(interval='60m')`
-pour un symbole `is_core` avant de toucher au code.
+**Fix** : quand le nombre de minutes est un multiple propre de 60,
+`_timeframe_from_interval` retourne `TimeFrame(N // 60, TimeFrameUnit.
+Hour)` au lieu de `TimeFrame(N, TimeFrameUnit.Minute)`. Grep sur tout le
+fichier : `'60m'` n'a qu'un seul site d'appel (`monitor_my_portfolio`)
+et `_timeframe_from_interval` qu'un seul appelant — fix contenu, pas de
+risque sur d'autres usages (1m/5m/15m/30m/1h/2h non affectés, testés).
 
-**Ne pas corriger sans reproduire** — le message pourrait aussi venir
-d'ailleurs dans la fonction (ex. un des indicateurs `_compute_*` plus
-loin, ou `_portfolio_news_sentiment`), le `interval='60m'` n'est qu'une
-suspicion basée sur la proximité du message pandas connu.
+5 tests de régression (`tests_market_data_timeframe.py`) : `60m`→1h,
+`120m`→2h, intervalles minute/heure ordinaires inchangés, défaut→Day.
+Vérifié rigoureusement que ces tests échouent contre l'ancien code avec
+la traceback exacte de production (`alpaca/data/timeframe.py:86
+validate_timeframe`) avant de confirmer le fix.
 
 ---
 
-## 3. `monitor_hive_trade` — crash DataFrame ambigu, semble résolu de lui-même
-**Statut : probablement clos, à surveiller, pas d'action immédiate.**
+## 3. [CORRIGÉ le 2026-08-10 ~21h50 UTC] `monitor_hive_trade` — crash DataFrame ambigu
+**Statut : fermé. Commit `1a71df9e`, déployé, testé, 0 régression.**
 
-**Vérifié** : ~10 échecs en rafale entre 19h58:34 et 19h59:32 UTC
-(15h58-15h59 ET) aujourd'hui, message :
-```
-The truth value of a DataFrame is ambiguous. Use a.empty, a.bool(),
-a.item(), a.any() or a.all().
-```
-Signature classique d'un `if df:` (ou équivalent) au lieu de
-`if not df.empty:`/`if df is not None and not df.empty:` quelque part
-dans le code de la tâche.
+Cause confirmée par lecture directe du code (pas une hypothèse) :
+`latest_price` était réutilisée pour porter à la fois le DataFrame
+intermédiaire de `yf.Ticker(...).history(...)` et le prix final (float).
+Quand `get_latest_trade_price()` renvoyait `None` ET que le DataFrame
+yfinance était vide, `latest_price` restait un DataFrame vide au lieu de
+retomber sur `None` — le check `if latest_price is None:` ne l'attrapait
+donc pas, et plus loin `latest_price >= limit_price` levait "The truth
+value of a DataFrame is ambiguous" (message identique à celui vu en
+rafale le 2026-08-10 entre 19h58:34-19h59:32 UTC, puis plus revu — cause
+de l'intermittence : ne se déclenche que quand Alpaca ET yfinance
+échouent tous les deux pour le même appel).
 
-**Vérifié** : depuis 19h59:32 UTC, **20+ exécutions consécutives en
-SUCCESS**, aucune récidive au moment de la rédaction (20h51 ET). Semble
-intermittent et lié à des données spécifiques à un ticker/moment
-(ex. DataFrame vide ou multi-colonnes retourné pour un cas particulier)
-plutôt qu'à un bug systématique — mais pas creusé plus loin, comme
-convenu.
+**Fix** : variable dédiée (`hist_1m`) pour le DataFrame intermédiaire,
+`latest_price` ne finit plus jamais que comme float ou `None`. Grep sur
+tout le fichier : aucun autre site avec ce pattern de réutilisation de
+variable, ni aucun autre test booléen direct sur un DataFrame sans
+`.empty`/`is None` — cas isolé, pas copié-collé ailleurs.
 
-**À faire (si ça revient)** : chercher un test booléen direct sur un
-DataFrame dans `portfolio.tasks.monitor_hive_trade` et le remplacer par
-un test explicite sur `.empty`.
+2 tests de régression (`tests_monitor_hive_trade.py`) : DataFrame vide
+→ `'no_price'` (au lieu du crash), DataFrame non vide → prix extrait
+normalement. Vérifié rigoureusement que ces tests échouent contre
+l'ancien code (`status='failed'` au lieu de `'no_price'`) avant de
+confirmer le fix.
 
 ---
 
 ## 4. `tsx-guardian-30s` — nom trompeur, tourne 24/7 pas juste en heures de marché
-**Statut : noté en passant, pas prioritaire, pas vérifié en détail.**
+**Statut : diagnostiqué (voir item 7), correction EXPLICITEMENT mise en
+pause — ne pas resserrer l'horaire ni renommer avant que l'item 7 soit
+clarifié.**
+
+Mise à jour 2026-08-10 ~21h35 UTC : en creusant ce point (via un
+diagnostic hors-marché plus large sur `penny_sniper_alert`/
+`monitor_active_trade`/`monitor_hive_trade`), découverte d'un bug bien
+plus profond et pré-existant touchant `monitor_active_trade` (et
+d'autres tâches) — voir **item 7**. Un simple resserrement d'horaire ou
+renommage ici masquerait le symptôme sans corriger la cause, donc
+explicitement pas fait tant que l'item 7 n'est pas clarifié.
 
 `settings.py` ligne ~375 :
 ```python
