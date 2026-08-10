@@ -308,8 +308,44 @@ flag reste à `false` ou qu'une entrée de planning dédiée n'est pas
 créée en dehors de ce bloc conditionnel — à décider : activer tout le
 lot (retraining ML compris, pas juste le nettoyage de logs) ou sortir
 `cleanup-taskrunlog-daily` de la liste conditionnelle pour qu'il tourne
-indépendamment. Pas fait ce soir, hors périmètre de la demande initiale
-(volume de logs).
+indépendamment.
+
+### Suite (même soir, ~22h20-22h27 UTC) : décision prise, `cleanup-taskrunlog-daily` + `cleanup-system-logs-weekly` sortis du flag
+
+**Décision explicite** : ne pas activer `AFTER_HOURS_TASKS_ENABLED` en
+bloc. En listant les 21 tâches derrière ce flag pour éclairer la
+décision, la répartition réelle est apparue :
+- **Ménage/logs** (aucun impact trading) : `cleanup_task_run_logs`,
+  `cleanup_system_logs` — juste des `DELETE` sur de vieilles lignes.
+- **Rapports/notifications** (informationnel, Telegram/PDF/email) :
+  journal quotidien, briefing dominical, calendrier économique, etc.
+- **Gouvernance des modèles ML** (impact réel sur le trading live) :
+  `auto_rollback_models_daily` (revient à une version antérieure du
+  modèle), `auto_retrain_on_drift_daily` / `backtest_retrain_guard` /
+  `retrain_from_paper_trades_daily` (peuvent promouvoir un nouveau
+  modèle). Activer le flag en bloc aurait réveillé tout un système
+  autonome de retraining/rollback dormant depuis toujours sur cette
+  instance — pas un simple "activer le nettoyage de logs".
+
+**Bug trouvé en chemin, noté mais PAS corrigé** : `detect_model_drift`
+(`model-drift-check-daily`) est définie **imbriquée à l'intérieur de
+`_alpaca_position_avg_price`** (`portfolio/tasks.py:6225-6280`,
+copier-coller mal indenté) au lieu d'être une fonction de niveau
+module. Son enregistrement Celery dépend de si `_alpaca_position_avg_
+price` a déjà été appelée dans le worker avant que Beat ne dispatche
+la tâche — fragile indépendamment du flag. Laissé tel quel, décision
+explicite de ne toucher que le carve-out du ménage ce soir.
+
+**Fait** : `cleanup-taskrunlog-daily` et `cleanup-system-logs-weekly`
+sortis de la liste conditionnelle dans `settings.py` (commit
+`e8034210`), tournent maintenant indépendamment du flag. Le reste des
+19 tâches (rapports + gouvernance ML) reste désactivé, inchangé.
+Déployé avec `--force-recreate` sur `backend`+`celery_worker`+
+`celery_beat` (les 3 en ont besoin : Beat pour le nouveau planning, le
+worker pour exécuter le code, backend pour cohérence). Vérifié dans le
+conteneur `celery_beat` lui-même : les 2 tâches de ménage présentes,
+`model-rollback-daily` bien absent. 2 tests de régression
+(`tests_after_hours_schedule_gate.py`).
 
 Piste identifiée mais **pas implémentée** : `_task_log_start`/
 `_task_log_finish` (`portfolio/tasks.py:2122-2136`) sont les 2 fonctions
