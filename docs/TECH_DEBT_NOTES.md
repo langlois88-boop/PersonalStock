@@ -434,3 +434,88 @@ pas une correction à l'aveugle en fin de soirée.
    (`tsx-guardian-30s` y compris) tant que ce point n'est pas
    clarifié** — un resserrement d'horaire masquerait le symptôme sans
    corriger la cause, et compliquerait le diagnostic futur.
+
+---
+
+## 8. `_create_lab_position` ne vérifie jamais une position déjà ouverte pour le même ticker
+**Statut : ouvert, découvert le 2026-08-10 ~22h40 UTC. Symptôme
+nettoyé, cause PAS corrigée (décision explicite de l'utilisateur).**
+
+**Confirmé** (`analysis/tasks.py:203`, fonction `_create_lab_position`) :
+aucun check `FundamentalLabPosition.objects.filter(ticker=..., preset=...,
+is_open=True).exists()` avant de créer une nouvelle position + un nouveau
+`PaperTrade`. Chaque appel de `run_daily_scan` qui reconfirme un ticker
+déjà détenu crée une position **en plus**, pas une mise à jour/renfort de
+l'existante.
+
+**Découvert concrètement** : 3 scans manuels lancés le même soir (20h26,
+20h59, 21h28 UTC — tests de validation du routage Celery Beat, voir
+item 5) ont chacun re-confirmé BTO.TO, créant 3 `FundamentalLabPosition`
++ 3 `PaperTrade` OPEN distincts (14 actions @ 7.04$ chacun) au lieu d'une
+seule — ~296$ de capital papier engagé au lieu de ~99$ prévus
+(`FUNDAMENTAL_LAB_POSITION_SIZE=100` par défaut).
+
+**Nettoyé** (pas la cause, juste le symptôme, sur décision explicite) :
+les 2 positions en trop (`PaperTrade` id 16 et 19, `FundamentalLabPosition`
+id 7 et 10) fermées à prix plat (pnl=0, outcome=None) avec note de
+traçabilité expliquant l'origine. La position réelle conservée :
+`PaperTrade` id=22 / `FundamentalLabPosition` id=13.
+
+**Portée réelle du bug, au-delà de ce soir** : ce n'est pas spécifique
+aux tests de ce soir — n'importe quel jour où `run_daily_scan` tourne
+plus d'une fois (Beat matin + Beat fermeture, tous les deux configurés
+sur `analysis.tasks.run_daily_scan` sans argument, donc TOUS les
+presets actifs à chaque fois) et qu'un même ticker reste "confirmed"
+d'un scan à l'autre, une nouvelle position se crée. Avec les 2 scans/
+jour actuels (9h45 + 16h30 ET), c'est un risque quotidien, pas un cas
+isolé de test.
+
+**À faire** : dans `_create_lab_position` (ou juste avant l'appel),
+vérifier s'il existe déjà une `FundamentalLabPosition` ouverte pour ce
+`ticker` + `preset` avant de créer une nouvelle ; si oui, soit ignorer
+(pas de doublon), soit lier le nouveau `ScanResult` à la position
+existante comme reconfirmation plutôt que d'ouvrir un nouvel ordre.
+Décision de design à prendre avec l'utilisateur (quel comportement
+voulu exactement) avant de coder.
+
+---
+
+## 9. Circuit breaker (`_daily_equity_circuit_breaker`) utilise le cache Django par défaut (non persistant, pas Redis)
+**Statut : ouvert, découvert le 2026-08-10 ~22h30 UTC. Faux positif
+confirmé ce soir, déjà résolu tout seul (pas d'action urgente), cause
+structurelle pas corrigée.**
+
+**Confirmé** : pas de bloc `CACHES` dans `settings.py` → Django utilise
+`LocMemCache` par défaut (cache en mémoire du process, PAS Redis) pour
+`_daily_equity_circuit_breaker` (`portfolio/tasks.py:4575`), qui stocke
+la référence d'équité du jour (`daily_equity_base:{sandbox}:{date}`) et
+l'état de déclenchement (`daily_equity_trip:{sandbox}:{date}`) dans ce
+cache. **Tout redémarrage du worker efface cet état.**
+
+**Incident concret** : "Circuit breaker triggered for AI_BLUECHIP" à
+22h21:25 UTC ce soir, capital loggé = 23803.36$. Recalculé la formule
+exacte (`initial_capital + closed_pnl`) au moment de la vérification :
+résultat identique, 23803.36$ — le capital n'avait **pas bougé** (0
+position ouverte, 0 trade fermé dans la fenêtre). Le déclenchement
+vient donc d'une référence de départ (`baseline`) incorrecte, capturée
+juste après mon redémarrage de `celery_worker` à 21h59:35 UTC (~22 min
+avant le déclenchement) — cause exacte de la valeur erronée pas
+investiguée plus loin (hypothèse : lecture transitoire pendant le
+redémarrage du process). Un second redémarrage (22h27 UTC, pour un
+changement de schedule sans rapport) a effacé le cache et donc annulé
+le déclenchement de lui-même — pas d'action correctrice nécessaire ce
+soir, mais **coup de chance**, pas une vraie résolution.
+
+**Risque réel** : ce mécanisme de sécurité (censé arrêter les nouvelles
+entrées d'un sandbox après -3% de drawdown journalier) peut se
+déclencher faussement (comme ce soir) OU se réinitialiser silencieusement
+(perdant la protection pour le reste de la journée) à chaque fois qu'un
+worker redémarre pendant les heures de marché — que ce soit pour un
+déploiement de code normal ou un crash/restart automatique.
+
+**À faire** : migrer ce cache (et tout autre état journalier critique
+au risque similaire — à auditer) vers le backend Redis déjà utilisé
+comme broker Celery, pour qu'il survive aux redémarrages de worker.
+Chantier de fond, pas une urgence puisque le vrai déclenchement de
+ce soir n'a eu aucun effet durable, mais à traiter avant le prochain
+déploiement en pleine séance de marché.
