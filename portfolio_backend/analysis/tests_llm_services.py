@@ -165,68 +165,89 @@ class DeepSeekTriageEndpointRoutingTests(TestCase):
         self.assertEqual(result.verdict, "uncertain")
 
 
-class ClaudeVerifierJsonParsingTests(TestCase):
-    """Bug #2 : confirme que verify_ticker() parse correctement une
-    réponse Claude enveloppée en ```json, comme observé en prod sur BRCC,
-    ET confirme le mécanisme de préremplissage (le message assistant
-    "{" doit être envoyé, et réinjecté avant le texte de la réponse)."""
+class ClaudeVerifierToolUseTests(TestCase):
+    """Historique des 3 approches essayées le 2026-08-09 pour éviter le
+    JSON malformé (bug initial trouvé sur BRCC) :
+    1. JSON en texte libre + extract_json_object() -- fonctionnait mais
+       fragile (```json fences, ou max_tokens épuisé par le raisonnement
+       étendu avant d'écrire le JSON).
+    2. Préremplissage (message assistant "{") -- rejeté par l'API,
+       "This model does not support assistant message prefill".
+    3. Tool use forcé (tool_choice) -- solution retenue : Claude ne peut
+       littéralement répondre que dans le schéma défini, réponse déjà
+       parsée en dict par le SDK (.input), pas de conflit avec le
+       raisonnement étendu. Confirmé en direct : 3/3 essais réussis sur
+       NVDA (contre 3/4 avec l'approche JSON texte libre)."""
 
     def setUp(self):
         patcher = patch.object(claude_verifier, "fetch_recent_news", return_value=[])
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _fake_anthropic_response(self, raw_text: str, input_tokens=100, output_tokens=50):
+    def _fake_tool_use_response(self, verdict="confirmed", reasoning="ok", confidence="high",
+                                 input_tokens=100, output_tokens=50):
         block = MagicMock()
-        block.type = "text"
-        block.text = raw_text
+        block.type = "tool_use"
+        block.input = {"verdict": verdict, "reasoning": reasoning, "confidence": confidence}
         response = MagicMock()
         response.content = [block]
+        response.stop_reason = "tool_use"
         response.usage.input_tokens = input_tokens
         response.usage.output_tokens = output_tokens
         return response
 
-    def test_no_assistant_prefill_message_sent(self):
-        """Non-régression : claude-sonnet-5 rejette le préremplissage
-        ('This model does not support assistant message prefill') --
-        confirmé en prod le 2026-08-09 après une première tentative de fix.
-        La conversation doit se terminer par un message user, un seul
-        message au total."""
-        fake_response = self._fake_anthropic_response(
-            '{"verdict": "confirmed", "reasoning": "ok", "confidence": "high"}'
-        )
+    def test_tool_choice_forces_submit_verdict(self):
+        """Le coeur du fix : Claude doit être forcé à utiliser l'outil
+        submit_verdict, pas juste invité à répondre en JSON."""
+        fake_response = self._fake_tool_use_response(verdict="rejected", reasoning="raison trouvée")
         fake_client = MagicMock()
         fake_client.messages.create.return_value = fake_response
         with patch.object(claude_verifier, "ANTHROPIC_API_KEY", "sk-ant-fake"), \
                 patch.object(claude_verifier.anthropic, "Anthropic", return_value=fake_client):
             result = claude_verifier.verify_ticker("AAPL", {"pe_ratio": 15})
+
+        call_kwargs = fake_client.messages.create.call_args[1]
+        self.assertEqual(call_kwargs["tool_choice"], {"type": "tool", "name": "submit_verdict"})
+        self.assertEqual(call_kwargs["tools"][0]["name"], "submit_verdict")
+        self.assertEqual(result.verdict, "rejected")
+        self.assertEqual(result.reasoning, "raison trouvée")
+
+    def test_no_temperature_param_sent(self):
+        """Non-régression : `temperature` est déprécié pour ce modèle
+        ('`temperature` is deprecated for this model.') -- confirmé en
+        prod le 2026-08-09 après une tentative de fix pour réduire la
+        variance entre appels. Ne doit plus jamais être envoyé."""
+        fake_response = self._fake_tool_use_response()
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = fake_response
+        with patch.object(claude_verifier, "ANTHROPIC_API_KEY", "sk-ant-fake"), \
+                patch.object(claude_verifier.anthropic, "Anthropic", return_value=fake_client):
+            claude_verifier.verify_ticker("AAPL", {"pe_ratio": 15})
+
+        self.assertNotIn("temperature", fake_client.messages.create.call_args[1])
+
+    def test_no_assistant_prefill_message_sent(self):
+        """Non-régression : claude-sonnet-5 rejette le préremplissage
+        ('This model does not support assistant message prefill') --
+        confirmé en prod le 2026-08-09. Un seul message, role=user."""
+        fake_response = self._fake_tool_use_response()
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = fake_response
+        with patch.object(claude_verifier, "ANTHROPIC_API_KEY", "sk-ant-fake"), \
+                patch.object(claude_verifier.anthropic, "Anthropic", return_value=fake_client):
+            claude_verifier.verify_ticker("AAPL", {"pe_ratio": 15})
 
         messages_sent = fake_client.messages.create.call_args[1]["messages"]
         self.assertEqual(len(messages_sent), 1)
         self.assertEqual(messages_sent[0]["role"], "user")
-        self.assertEqual(result.verdict, "confirmed")
-        self.assertEqual(result.reasoning, "ok")
 
-    def test_markdown_fenced_response_is_parsed_correctly(self):
-        """Reproduit exactement la forme observée en prod sur BRCC le
-        2026-08-09 : Claude enveloppe sa réponse dans ```json malgré
-        l'instruction. C'est le vrai bug -- ce test doit échouer sans le
-        fix (extract_json_object)."""
-        fake_response = self._fake_anthropic_response(
-            '```json\n{\n  "verdict": "rejected",\n  "reasoning": "raison trouvée",\n  "confidence": "medium"\n}\n```'
-        )
-        fake_client = MagicMock()
-        fake_client.messages.create.return_value = fake_response
-        with patch.object(claude_verifier, "ANTHROPIC_API_KEY", "sk-ant-fake"), \
-                patch.object(claude_verifier.anthropic, "Anthropic", return_value=fake_client):
-            result = claude_verifier.verify_ticker("AAPL", {"pe_ratio": 15})
-
-        self.assertEqual(result.verdict, "rejected")
-        self.assertEqual(result.reasoning, "raison trouvée")
-
-    def test_plain_json_without_fence_still_works(self):
-        fake_response = self._fake_anthropic_response(
-            '{"verdict": "uncertain", "reasoning": "x", "confidence": "low"}'
+    def test_tool_input_is_used_directly_no_json_parsing_needed(self):
+        """block.input est déjà un dict fourni par le SDK -- confirme
+        qu'on ne fait plus de json.loads()/extract_json_object() dessus
+        (donc plus aucun risque de JSON malformé, le bug d'origine)."""
+        fake_response = self._fake_tool_use_response(
+            verdict="uncertain", reasoning="signal mixte", confidence="low",
+            input_tokens=1543, output_tokens=267,
         )
         fake_client = MagicMock()
         fake_client.messages.create.return_value = fake_response
@@ -235,33 +256,22 @@ class ClaudeVerifierJsonParsingTests(TestCase):
             result = claude_verifier.verify_ticker("AAPL", {"pe_ratio": 15})
 
         self.assertEqual(result.verdict, "uncertain")
+        self.assertEqual(result.reasoning, "signal mixte")
+        self.assertEqual(result.confidence, "low")
+        self.assertEqual(result.tokens_used, 1543 + 267)
 
-    def test_genuinely_malformed_response_degrades_to_uncertain_not_crash(self):
-        """Reproduit le cas texte vide/inexploitable -- ne doit jamais
-        planter le pipeline."""
-        fake_response = self._fake_anthropic_response("")
-        fake_client = MagicMock()
-        fake_client.messages.create.return_value = fake_response
-        with patch.object(claude_verifier, "ANTHROPIC_API_KEY", "sk-ant-fake"), \
-                patch.object(claude_verifier.anthropic, "Anthropic", return_value=fake_client):
-            result = claude_verifier.verify_ticker("AAPL", {"pe_ratio": 15})
-
-        self.assertEqual(result.verdict, "uncertain")
-        self.assertIn("Erreur technique", result.reasoning)
-
-    def test_thinking_only_response_max_tokens_hit_degrades_gracefully(self):
-        """Reproduit précisément le bug trouvé en prod sur NVDA le
-        2026-08-09 (1 échec sur 4 essais avec du vrai contenu de news) :
-        le modèle épuise tout son budget max_tokens en raisonnement
-        ("thinking") avant d'écrire la moindre réponse -- content ne
-        contient alors qu'un ThinkingBlock, aucun bloc texte. Doit
-        dégrader proprement, pas planter."""
+    def test_missing_tool_use_block_degrades_to_uncertain_not_crash(self):
+        """Défensif : même avec tool_choice forcé, si jamais aucun bloc
+        tool_use n'apparaît (ex: réponse tronquée par max_tokens avant
+        l'appel d'outil, cas analogue au bug NVDA du 2026-08-09 avec
+        l'ancienne approche texte), le pipeline ne doit jamais planter."""
         thinking_block = MagicMock()
         thinking_block.type = "thinking"
         response = MagicMock()
-        response.content = [thinking_block]  # aucun bloc "text"
+        response.content = [thinking_block]  # aucun bloc "tool_use"
+        response.stop_reason = "max_tokens"
         response.usage.input_tokens = 500
-        response.usage.output_tokens = 400
+        response.usage.output_tokens = 2000
         fake_client = MagicMock()
         fake_client.messages.create.return_value = response
         with patch.object(claude_verifier, "ANTHROPIC_API_KEY", "sk-ant-fake"), \
@@ -272,12 +282,11 @@ class ClaudeVerifierJsonParsingTests(TestCase):
         self.assertIn("Erreur technique", result.reasoning)
 
     def test_max_tokens_has_headroom_for_thinking_plus_answer(self):
-        """Non-régression sur la valeur elle-même : 400 s'est révélé
-        insuffisant en prod (voir test ci-dessus). Verrouille qu'on ne
-        revienne pas accidentellement à une valeur trop basse."""
-        fake_response = self._fake_anthropic_response(
-            '{"verdict": "uncertain", "reasoning": "x", "confidence": "low"}'
-        )
+        """Non-régression sur la valeur : 400 (originale) s'est révélé
+        insuffisant en prod le 2026-08-09 (raisonnement étendu épuisant
+        le budget avant la réponse). Verrouille qu'on ne redescend pas
+        accidentellement en dessous."""
+        fake_response = self._fake_tool_use_response()
         fake_client = MagicMock()
         fake_client.messages.create.return_value = fake_response
         with patch.object(claude_verifier, "ANTHROPIC_API_KEY", "sk-ant-fake"), \
