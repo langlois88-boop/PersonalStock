@@ -196,6 +196,20 @@ CHANNEL_LAYERS = {
     },
 }
 
+# Routage explicite : le scan fondamental (analysis) et son check hebdo
+# vont dans une queue dédiée ('analysis_queue'), consommée par un worker
+# séparé (celery-worker-analysis, voir docker-compose.yml). Objectif :
+# ces tâches basse-fréquence ne restent plus jamais coincées derrière le
+# flot de tâches haute-fréquence (penny_sniper_alert, monitor_hive_trade,
+# monitor_active_trade, etc.) sur le worker principal --pool=solo
+# mono-thread. Additif pur : aucune tâche existante n'est reroutée, tout
+# ce qui n'est pas listé ici continue d'aller sur la queue par défaut
+# ('celery'), consommée par le worker existant comme avant.
+CELERY_TASK_ROUTES = {
+    'analysis.tasks.run_daily_scan': {'queue': 'analysis_queue'},
+    'analysis.tasks.check_rejection_outcomes': {'queue': 'analysis_queue'},
+}
+
 CELERY_BEAT_SCHEDULE = {
     'fetch-prices-2min': {
         'task': 'portfolio.tasks.fetch_prices_hourly',
