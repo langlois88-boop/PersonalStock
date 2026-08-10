@@ -73,15 +73,30 @@ class DeepSeekTriageEndpointRoutingTests(TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_chat_mode_enabled_uses_v1_chat_completions(self):
-        """Reproduit la config réelle du NAS (OLLAMA_CHAT_MODE=1) -- avant
-        le fix, ce test aurait appelé /api/generate et wouldn't have called
-        the mocked /chat/completions endpoint at all."""
+    @staticmethod
+    def _fake_sse_response(full_text: str):
+        """Simule une réponse streaming SSE comme celle réellement servie
+        par LocalAI (confirmé par curl direct le 2026-08-09 : stream=False
+        ne répond jamais sur cette instance, seul stream=True fonctionne).
+        Découpe le texte en 2 chunks pour vérifier que la concaténation
+        fonctionne, pas juste un chunk unique par accident."""
+        import json as _json
+        mid = max(1, len(full_text) // 2)
+        lines = [
+            f"data: {_json.dumps({'choices': [{'delta': {'content': full_text[:mid]}}]})}",
+            f"data: {_json.dumps({'choices': [{'delta': {'content': full_text[mid:]}}]})}",
+            "data: [DONE]",
+        ]
         fake_response = MagicMock()
         fake_response.raise_for_status.return_value = None
-        fake_response.json.return_value = {
-            "choices": [{"message": {"content": '{"verdict": "no_reason", "reasoning": "rien"}'}}]
-        }
+        fake_response.iter_lines.return_value = iter(lines)
+        return fake_response
+
+    def test_chat_mode_enabled_uses_v1_chat_completions(self):
+        """Reproduit la config réelle du NAS (OLLAMA_CHAT_MODE=1) -- avant
+        le fix, ce test aurait appelé /api/generate, pas le
+        /chat/completions moqué ici."""
+        fake_response = self._fake_sse_response('{"verdict": "no_reason", "reasoning": "rien"}')
         with patch.object(deepseek_triage, "OLLAMA_CHAT_MODE", True), \
                 patch.object(deepseek_triage, "OLLAMA_CHAT_BASE_URL", "http://fake-nas:8090/v1"), \
                 patch.object(deepseek_triage, "OLLAMA_BASE_URL", "http://fake-nas:11434"), \
@@ -91,7 +106,25 @@ class DeepSeekTriageEndpointRoutingTests(TestCase):
         called_url = mock_post.call_args[0][0]
         self.assertEqual(called_url, "http://fake-nas:8090/v1/chat/completions")
         self.assertIn("messages", mock_post.call_args[1]["json"])
+        self.assertTrue(mock_post.call_args[1]["json"]["stream"])
+        self.assertTrue(mock_post.call_args[1].get("stream"))
         self.assertEqual(result.verdict, "no_reason")
+
+    def test_chat_mode_response_is_consumed_as_sse_stream_not_json(self):
+        """Non-régression directe du bug de timeout trouvé le 2026-08-09
+        après le premier fix : stream=False hangait sur cette instance
+        LocalAI (HTTP 000 après 15s en curl direct). Confirme que le code
+        lit bien resp.iter_lines(), pas resp.json()."""
+        fake_response = self._fake_sse_response('{"verdict": "uncertain", "reasoning": "test stream"}')
+        with patch.object(deepseek_triage, "OLLAMA_CHAT_MODE", True), \
+                patch.object(deepseek_triage, "OLLAMA_CHAT_BASE_URL", "http://fake-nas:8090/v1"), \
+                patch.object(deepseek_triage, "OLLAMA_BASE_URL", "http://fake-nas:11434"), \
+                patch.object(deepseek_triage.requests, "post", return_value=fake_response):
+            result = deepseek_triage.triage_ticker("AAPL")
+
+        fake_response.iter_lines.assert_called_once()
+        fake_response.json.assert_not_called()
+        self.assertEqual(result.reasoning, "test stream")
 
     def test_chat_mode_disabled_uses_native_api_generate(self):
         """Le chemin legacy (Ollama natif, sans LocalAI) doit continuer à

@@ -21,6 +21,7 @@ DeepSeekAdvisor.stream_answer utilise déjà (voir ai_advisor.py:233-234).
 
 from dataclasses import dataclass
 from typing import Literal
+import json
 import logging
 import os
 
@@ -80,6 +81,13 @@ def triage_ticker(ticker: str) -> DeepSeekResult:
 
     try:
         if OLLAMA_CHAT_MODE or "/v1" in OLLAMA_CHAT_BASE_URL:
+            # stream=False ne répond jamais sur cette instance LocalAI
+            # (confirmé en prod le 2026-08-09 : HTTP 000 après 15s en curl
+            # direct, alors que stream=True répond immédiatement). On suit
+            # donc le même chemin que ai_advisor.py::DeepSeekAdvisor.stream_answer
+            # (déjà en stream=True), en consommant tout le flux SSE d'un
+            # coup plutôt qu'en l'affichant au fur et à mesure — ici on n'a
+            # besoin que du texte final, pas d'un affichage temps réel.
             resp = requests.post(
                 f"{OLLAMA_CHAT_BASE_URL}/chat/completions",
                 json={
@@ -88,13 +96,25 @@ def triage_ticker(ticker: str) -> DeepSeekResult:
                         {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": f"Ticker: {ticker}\n\nNews récentes:\n{news_text}"},
                     ],
-                    "stream": False,
+                    "stream": True,
                 },
+                stream=True,
                 timeout=OLLAMA_TIMEOUT,
             )
             resp.raise_for_status()
-            choices = resp.json().get("choices") or [{}]
-            raw = (choices[0].get("message") or {}).get("content") or ""
+            chunks = []
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    delta = (json.loads(data).get("choices") or [{}])[0].get("delta") or {}
+                except ValueError:
+                    continue
+                chunks.append(delta.get("content") or "")
+            raw = "".join(chunks)
         else:
             prompt = f"{SYSTEM_PROMPT}\n\nTicker: {ticker}\n\nNews récentes:\n{news_text}"
             resp = requests.post(
