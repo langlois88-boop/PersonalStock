@@ -114,13 +114,20 @@ class DeepSeekTriageEndpointRoutingTests(TestCase):
         """Non-régression directe du bug de timeout trouvé le 2026-08-09
         après le premier fix : stream=False hangait sur cette instance
         LocalAI (HTTP 000 après 15s en curl direct). Confirme que le code
-        lit bien resp.iter_lines(), pas resp.json()."""
+        lit bien resp.iter_lines(), pas resp.json() -- et que l'encodage
+        est forcé en UTF-8 avant lecture (sinon les accents se corrompent
+        en Ã©-style mojibake, confirmé en prod le 2026-08-09 sur GOOGL :
+        LocalAI ne renvoie pas de charset explicite pour
+        text/event-stream, requests devine ISO-8859-1 sans ce réglage —
+        voir ai_advisor.py::stream_answer qui fait déjà ce même réglage)."""
         fake_response = self._fake_sse_response('{"verdict": "uncertain", "reasoning": "test stream"}')
         with patch.object(deepseek_triage, "OLLAMA_CHAT_MODE", True), \
                 patch.object(deepseek_triage, "OLLAMA_CHAT_BASE_URL", "http://fake-nas:8090/v1"), \
                 patch.object(deepseek_triage, "OLLAMA_BASE_URL", "http://fake-nas:11434"), \
                 patch.object(deepseek_triage.requests, "post", return_value=fake_response):
             result = deepseek_triage.triage_ticker("AAPL")
+
+        self.assertEqual(fake_response.encoding, "utf-8")
 
         fake_response.iter_lines.assert_called_once()
         fake_response.json.assert_not_called()

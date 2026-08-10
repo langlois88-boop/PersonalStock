@@ -102,6 +102,13 @@ def triage_ticker(ticker: str) -> DeepSeekResult:
                 timeout=OLLAMA_TIMEOUT,
             )
             resp.raise_for_status()
+            # Sans ça, requests devine l'encodage (souvent ISO-8859-1 faute
+            # de charset explicite dans le Content-Type de LocalAI pour
+            # text/event-stream) et decode_unicode=True corrompt tous les
+            # accents (ex: "récente" -> "rÃ©cente", confirmé en prod le
+            # 2026-08-09). Voir ai_advisor.py::stream_answer qui fait déjà
+            # ce même réglage pour ce même serveur.
+            resp.encoding = "utf-8"
             chunks = []
             for line in resp.iter_lines(decode_unicode=True):
                 if not line or not line.startswith("data:"):
