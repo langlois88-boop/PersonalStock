@@ -112,8 +112,9 @@ relevée en marge de l'audit du 2026-08-10.
 
 ---
 
-## 5. [FAIT le 2026-08-10] Queue Celery dédiée pour le module analysis
-**Statut : implémenté et déployé ce soir, à confirmer demain 9h45 ET.**
+## 5. [FAIT ET VALIDÉ le 2026-08-10] Queue Celery dédiée pour le module analysis
+**Statut : implémenté, corrigé (voir "Suite"), et testé en conditions Beat
+réelles (voir "Validation finale" tout en bas) — plus rien d'ouvert ici.**
 
 Contexte : `run_daily_scan` risquait de rester coincé indéfiniment
 derrière le flot de tâches haute-fréquence (penny_sniper_alert,
@@ -190,12 +191,58 @@ fermeture d'aujourd'hui a de toute façon déjà un résultat complet et à
 jour via le déclenchement manuel de ce soir (`ScanRun id=3`,
 6/6 candidats traités avec succès).
 
-**Validation réelle qui reste à faire** : la vraie preuve que le
-routage fonctionne de bout en bout en conditions Beat n'arrivera qu'au
-prochain déclenchement programmé — `morning-fundamental-scan` demain
-9h45 ET. Ce soir on a confirmé que Beat a la bonne config chargée et
-dispatche à nouveau normalement, pas encore qu'un scan analysis complet
-transite par ce chemin exact depuis Beat.
+### Validation finale (même soir, 21h13-21h27 UTC) : test via un vrai déclenchement Beat, pas un `.delay()` manuel
+
+**Pourquoi ce test était nécessaire** : tout ce qui précède prouvait que
+Beat *avait la bonne config chargée*, pas qu'un scan déclenché *par Beat
+lui-même* passait réellement par `analysis_queue` — la distinction
+compte, puisque c'est exactement ce qui avait été raté deux fois de
+suite le même jour (voir "Suite" ci-dessus).
+
+**Méthode** : ajout d'un créneau `CELERY_BEAT_SCHEDULE` temporaire,
+clairement marqué `TEMPORARY-test-analysis-queue-routing` dans le code
+et le message de commit, fixé à 17h25 ET (~11 min dans le futur au
+moment du commit, le temps de rebuild+déployer) :
+- Commit d'ajout : `ac8bb493`
+- Déployé avec `docker compose up -d --force-recreate celery_beat`
+  (confirmé cette fois : `Container ... Recreate/Recreated` dans les
+  logs, pas juste `Built`)
+- Baseline avant déclenchement : `LLEN analysis_queue` = 0,
+  `ScanRun` max id = 3, worker principal `Up 17 hours`.
+
+**Résultat, chronométré à la seconde près** :
+| Horodatage (UTC) | Événement |
+|---|---|
+| 21:25:00,000 | `celery_beat` : `Scheduler: Sending due task TEMPORARY-test-analysis-queue-routing` |
+| 21:25:00,004 | `celery_worker_analysis` : `Task analysis.tasks.run_daily_scan[d5711eba-...] received` |
+| 21:25:00,019 | Nouveau `ScanRun` id=4 créé en base |
+
+Vérifications croisées :
+- Worker principal (`celery_worker`) : **0 occurrence** de la tâche
+  dans ses logs sur la fenêtre du test — jamais reçue.
+- Queue par défaut (`celery`) : toujours 3 messages `run_daily_scan`
+  résiduels (les mêmes qu'avant, voir "Suite" ci-dessus) — aucun
+  nouveau message n'y a atterri, la tâche est bien passée par
+  `analysis_queue` de bout en bout.
+
+**Nettoyage** : créneau temporaire retiré immédiatement après
+confirmation, planning remis à l'état réel (`morning-fundamental-scan`
+9h45 ET, `daily-fundamental-scan` 16h30 ET, `weekly-rejection-
+outcome-check` lundi 6h00) — commit de retrait : `1b60142d`. Redéployé
+avec `--force-recreate` explicite (re-vérifié via `docker inspect` :
+nouveau `StartedAt`, nouvelle image) pour repartir sur une base propre
+avant le vrai scan de demain.
+
+**À retenir si un problème similaire ressurgit** : après tout changement
+touchant `CELERY_TASK_ROUTES` ou `CELERY_BEAT_SCHEDULE`, la première
+chose à vérifier n'est pas "le code est-il correct" (il l'était dès le
+départ ici) mais **"quel conteneur a réellement rechargé cette
+config ?"** — interroger `settings.CELERY_TASK_ROUTES` directement
+depuis l'intérieur de `celery_beat` (pas juste `celery_worker`) et
+vérifier `docker inspect --format '{{.State.StartedAt}}'` contre l'heure
+du dernier commit pertinent. Un `.delay()` manuel ou un test depuis le
+worker ne suffit pas à couvrir ce cas — seul un vrai déclenchement Beat
+(même via un créneau temporaire jetable comme ici) le prouve.
 
 **Chantier plus large, toujours différé** (ne pas faire sans le même
 niveau de rigueur que le reste de la session) : le worker principal
