@@ -10,12 +10,12 @@ Voir ANTHROPIC_API_KEY dans les variables d'environnement.
 
 from dataclasses import dataclass
 from typing import Literal
-import json
 import logging
 import os
 
 import anthropic
 
+from .llm_json import extract_json_object
 from .news import fetch_recent_news, format_news_for_prompt
 
 logger = logging.getLogger(__name__)
@@ -92,12 +92,24 @@ def verify_ticker(ticker: str, quant_details: dict, deepseek_reasoning: str = ""
             model=CLAUDE_MODEL,
             max_tokens=400,
             system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
+            messages=[
+                {"role": "user", "content": user_message},
+                # Préremplissage : force Claude à continuer directement en JSON
+                # plutôt que d'envelopper la réponse dans un bloc ```json ...```
+                # (comportement observé en prod le 2026-08-09 malgré l'instruction
+                # "réponds UNIQUEMENT en JSON" dans le system prompt — Claude ne
+                # répète pas ce préfixe dans response.content, il faut le
+                # rajouter nous-mêmes avant de parser).
+                {"role": "assistant", "content": "{"},
+            ],
         )
-        raw_text = "".join(
+        raw_text = "{" + "".join(
             block.text for block in response.content if block.type == "text"
         )
-        parsed = json.loads(raw_text)
+        # extract_json_object reste défensif même avec le préremplissage
+        # (ceinture et bretelles : au cas où le modèle ajoute quand même du
+        # texte après le JSON, ou une fermeture ```).
+        parsed = extract_json_object(raw_text)
 
         verdict = parsed.get("verdict", "uncertain")
         if verdict not in ("confirmed", "uncertain", "rejected"):
@@ -111,7 +123,7 @@ def verify_ticker(ticker: str, quant_details: dict, deepseek_reasoning: str = ""
             confidence=parsed.get("confidence", "low"),
             tokens_used=tokens_used,
         )
-    except (anthropic.APIError, json.JSONDecodeError, RuntimeError) as e:
+    except (anthropic.APIError, ValueError, RuntimeError) as e:
         logger.exception("Erreur vérification Claude pour %s", ticker)
         return ClaudeResult(
             verdict="uncertain",
