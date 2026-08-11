@@ -244,16 +244,23 @@ def _margin_stable_or_growing(trend: Optional[list]) -> bool:
     return all(trend[i] >= trend[i - 1] - 0.5 for i in range(1, len(trend)))
 
 
-def evaluate_ticker_strict(ticker: str, sector_avg_pe: Optional[float] = None) -> StrictResult:
+def evaluate_ticker_strict(ticker: str, sector_avg_pe: Optional[float] = None, data: Optional[dict] = None) -> StrictResult:
     """
     Applique TOUS les garde-fous stricts (ET, pas OU) -- voir le docstring
     du module. `sector_avg_pe` est calculé par l'appelant (run_broad_index_
     scan) en agrégeant sur le lot en cours de scan, pas recalculé par
     ticker (éviterait un balayage en O(n²) sur les appels API).
+
+    `data` : résultat déjà obtenu de quant_filter.fetch_ticker_data(ticker),
+    pour éviter un second appel réseau identique si l'appelant l'a déjà
+    récupéré pour sa première passe (calcul de sector_avg_pe notamment).
+    Fetché ici seulement si non fourni (garde la fonction utilisable seule,
+    ex. pour la validation manuelle faite avant l'écriture de la tâche).
     """
     from .quant_filter import fetch_ticker_data  # import tardif, évite un cycle avec quant_filter
 
-    data = fetch_ticker_data(ticker)
+    if data is None:
+        data = fetch_ticker_data(ticker)
     if data is None:
         return StrictResult(ticker=ticker, passed=False, reasons_failed=["Données de base indisponibles."])
 

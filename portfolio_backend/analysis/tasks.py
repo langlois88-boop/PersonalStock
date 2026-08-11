@@ -32,19 +32,50 @@ from portfolio.models import PaperTrade, SandboxWatchlist
 
 from .models import (
     ScreenerPreset, ScanRun, ScanResult, FundamentalLabPosition,
-    RejectionLog, RejectionOutcome,
+    RejectionLog, RejectionOutcome, CustomWatchlistTicker,
 )
-from .services.quant_filter import run_quant_filter
+from .services.quant_filter import run_quant_filter, fetch_ticker_data
 from .services.deepseek_triage import triage_ticker
 from .services.claude_verifier import verify_ticker
+from .services.broad_scan_filter import evaluate_ticker_strict
 
 logger = logging.getLogger(__name__)
 
 MISSED_WINNER_ALPHA_THRESHOLD = 15.0  # %, cf. discussion "occasion manquée"
 
-# Univers de départ V1 : sandboxes existants uniquement (pas d'ajout de
-# tickers custom ni d'élargissement pour l'instant, cf. brief).
+# univers_source == "sandboxes" : V1, WATCHLIST/AI_BLUECHIP/AI_PENNY
+# uniquement. "combined" (2026-08-11) y ajoute les survivants du balayage
+# large hebdomadaire (CustomWatchlistTicker, voir run_broad_index_scan) --
+# voir docs/TECH_DEBT_NOTES.md pour la condition d'activation (pas avant
+# qu'un premier cycle réel ait tourné et produit des résultats sensés).
 SANDBOX_UNIVERSE_SOURCES = ["WATCHLIST", "AI_BLUECHIP", "AI_PENNY"]
+
+# Au-delà de ce nombre de tickers dans l'univers combiné, le budget Claude
+# mensuel ($4-6/mois validé, cf. claude_verifier.py) risque d'être dépassé
+# significativement. Warning informatif ici (ne devrait normalement jamais
+# se déclencher : run_broad_index_scan applique un plafond DUR sur ce même
+# nombre, voir MAX_ACTIVE_CUSTOM_TICKERS -- ce warning reste un filet de
+# sécurité si CustomWatchlistTicker est modifié manuellement en dehors du
+# scan hebdomadaire).
+COMBINED_UNIVERSE_WARNING_THRESHOLD = 50
+
+# Plafond DUR (pas un simple log) sur le nombre de tickers actifs dans
+# CustomWatchlistTicker, appliqué à la fin de run_broad_index_scan. Un
+# warning seul risquerait de passer inaperçu pendant des semaines pour
+# quelqu'un qui vérifie les logs manuellement (revue du 2026-08-11) --
+# au-delà de ce nombre, seuls les N meilleurs par score composite restent
+# actifs, les autres sont désactivés (is_active=False, jamais supprimés).
+MAX_ACTIVE_CUSTOM_TICKERS = 50
+
+# Couverture minimale (fraction de l'univers pour laquelle les données de
+# base ont été obtenues avec succès) en dessous de laquelle un cycle de
+# run_broad_index_scan est considéré DÉGRADÉ. Sous ce seuil, la décroissance
+# (consecutive_weeks_missed) est sautée entièrement pour ce cycle : un run
+# dégradé (panne réseau, yfinance temporairement bloqué, etc.) ne doit
+# jamais pénaliser un ticker comme s'il avait légitimement échoué les
+# seuils -- bug identifié en revue le 2026-08-11 (rien ne distinguait avant
+# "absent car recalé" de "absent car le scan a planté avant de l'évaluer").
+MIN_SCAN_COVERAGE_RATIO = 0.7
 
 
 def _get_universe(universe_source: str) -> list:
@@ -63,6 +94,18 @@ def _get_universe(universe_source: str) -> list:
             for symbol in (row.symbols or []):
                 if symbol:
                     tickers.add(str(symbol).strip().upper())
+        return sorted(tickers)
+    if universe_source == "combined":
+        tickers = set(_get_universe("sandboxes"))
+        custom = CustomWatchlistTicker.objects.filter(is_active=True).values_list("ticker", flat=True)
+        tickers.update(str(t).strip().upper() for t in custom if t)
+        if len(tickers) > COMBINED_UNIVERSE_WARNING_THRESHOLD:
+            logger.warning(
+                "Univers combiné = %d tickers (> %d) -- risque de dépasser le "
+                "budget Claude mensuel validé ($4-6/mois). Pas bloquant, juste "
+                "un signal à surveiller.",
+                len(tickers), COMBINED_UNIVERSE_WARNING_THRESHOLD,
+            )
         return sorted(tickers)
     return []
 
@@ -360,3 +403,178 @@ def _check_single_outcome(log: RejectionLog, days_target: int, benchmark_price_n
         )
     except Exception:
         logger.exception("Erreur calcul outcome pour rejet %s (%s)", log.ticker, log.id)
+
+
+def _custom_ticker_composite_score(piotroski, altman) -> float:
+    """
+    Score composite simple pour CLASSER des tickers qui ont déjà TOUS passé
+    les mêmes seuils stricts obligatoires (sert uniquement au plafond dur,
+    pas une mesure de qualité absolue). Piotroski (0-9) et Altman Z (marge
+    de sécurité au-dessus du seuil de faillite 3.0) sont les 2 champs déjà
+    stockés sur CustomWatchlistTicker -- utilisables aussi bien pour un
+    survivant frais de la semaine que pour un holdover non réévalué.
+    """
+    return (piotroski or 0) + (altman or 0)
+
+
+@shared_task(bind=True, max_retries=1)
+def run_broad_index_scan(self) -> dict:
+    """
+    Balayage hebdomadaire large : S&P 500 + TSX Composite, garde-fous
+    stricts (voir services/broad_scan_filter.py). Alimente
+    CustomWatchlistTicker -- ne touche PAS directement à l'univers quotidien
+    (_get_universe('combined') lit cette table séparément, activé seulement
+    après confirmation manuelle qu'un cycle a produit des résultats sensés,
+    voir docs/TECH_DEBT_NOTES.md).
+
+    Durée attendue LONGUE (potentiellement plusieurs heures pour ~700+
+    tickers, chaque évaluation stricte nécessitant plusieurs appels
+    yfinance -- balance_sheet/financials/cashflow n'ont pas d'équivalent
+    batch comme yf.download() pour les prix). Volontairement pas optimisé
+    plus loin pour cette itération (planifié hors marché, sur la queue
+    dédiée analysis_queue -- voir TECH_DEBT_NOTES.md item 5 -- donc ne
+    bloque ni le pipeline de trading ni le scan quotidien même si ça prend
+    longtemps).
+
+    Deux garde-fous ajoutés en revue le 2026-08-11 (voir docs/TECH_DEBT_NOTES.md) :
+    - la décroissance (consecutive_weeks_missed) est sautée entièrement si le
+      cycle est DÉGRADÉ (couverture de données < MIN_SCAN_COVERAGE_RATIO) --
+      sinon une panne réseau mi-scan pénaliserait des tickers qui n'ont
+      simplement jamais été évalués cette semaine, pas légitimement échoué.
+    - plafond DUR (pas un simple warning) sur le nombre de tickers actifs,
+      voir MAX_ACTIVE_CUSTOM_TICKERS.
+    """
+    from portfolio.tasks import _fetch_sp500_symbols, _fetch_tsx_symbols
+
+    sp500 = _fetch_sp500_symbols(limit=500)
+    tsx = _fetch_tsx_symbols(limit=300)
+    universe = sorted(set(sp500) | set(tsx))
+
+    if not universe:
+        logger.error(
+            "run_broad_index_scan: univers vide (échec des 2 sources SP500/TSX), scan annulé -- "
+            "aucune modification apportée à CustomWatchlistTicker."
+        )
+        return {"status": "empty_universe", "sp500_count": len(sp500), "tsx_count": len(tsx)}
+
+    logger.info("run_broad_index_scan: univers de %d tickers (%d SP500 + %d TSX).", len(universe), len(sp500), len(tsx))
+
+    # Première passe : données de base pour tout le monde, sert à la fois de
+    # pré-filtre implicite (fetch_ticker_data échoue proprement -> ticker
+    # exclu) et à calculer la moyenne P/E par secteur pour la 2e passe.
+    basic_data: dict[str, dict] = {}
+    sector_pes: dict[str, list] = {}
+    for ticker in universe:
+        try:
+            data = fetch_ticker_data(ticker)
+        except Exception:
+            logger.exception("run_broad_index_scan: échec fetch_ticker_data pour %s, ticker exclu.", ticker)
+            data = None
+        if data is None:
+            continue
+        basic_data[ticker] = data
+        pe = data.get("pe_ratio")
+        sector = data.get("sector") or "DEFAULT"
+        if pe and pe > 0:
+            sector_pes.setdefault(sector, []).append(pe)
+
+    sector_avg_pe = {s: round(sum(v) / len(v), 2) for s, v in sector_pes.items() if v}
+    coverage_ratio = len(basic_data) / len(universe)
+    scan_degraded = coverage_ratio < MIN_SCAN_COVERAGE_RATIO
+    logger.info(
+        "run_broad_index_scan: données de base obtenues pour %d/%d tickers (couverture %.0f%%)%s.",
+        len(basic_data), len(universe), coverage_ratio * 100,
+        " -- CYCLE DÉGRADÉ, décroissance sautée" if scan_degraded else "",
+    )
+    if scan_degraded:
+        logger.error(
+            "run_broad_index_scan: couverture %.0f%% < seuil %.0f%% -- run considéré DÉGRADÉ "
+            "(panne réseau/yfinance probable sur une bonne partie de l'univers). Les survivants "
+            "trouvés seront quand même enregistrés (information positive individuellement "
+            "fiable), mais AUCUNE décroissance (consecutive_weeks_missed) n'est appliquée ce "
+            "cycle -- un ticker absent d'un run dégradé n'a pas nécessairement échoué les seuils.",
+            coverage_ratio * 100, MIN_SCAN_COVERAGE_RATIO * 100,
+        )
+
+    survivors = []
+    for ticker, data in basic_data.items():
+        sector = data.get("sector") or "DEFAULT"
+        try:
+            result = evaluate_ticker_strict(ticker, sector_avg_pe=sector_avg_pe.get(sector), data=data)
+        except Exception:
+            logger.exception("run_broad_index_scan: échec evaluate_ticker_strict pour %s, ticker exclu.", ticker)
+            continue
+        if result.passed:
+            survivors.append(result)
+
+    survivor_tickers = set()
+    for r in survivors:
+        source_index = "TSX" if r.ticker.endswith(".TO") else "SP500"
+        obj, created = CustomWatchlistTicker.objects.get_or_create(
+            ticker=r.ticker, defaults={"source_index": source_index},
+        )
+        obj.piotroski_score = r.piotroski_score
+        obj.altman_z_score = r.altman_z_score
+        obj.consecutive_weeks_missed = 0
+        obj.is_active = True
+        obj.save(update_fields=["piotroski_score", "altman_z_score", "consecutive_weeks_missed", "is_active", "last_confirmed"])
+        survivor_tickers.add(r.ticker)
+
+    # Tickers déjà suivis mais absents des survivants cette semaine --
+    # sortie progressive sur 3 semaines manquées, pas un retrait immédiat
+    # (cf. docstring du modèle). SAUTÉ entièrement si le cycle est dégradé :
+    # voir docstring de la tâche.
+    newly_deactivated_by_miss = 0
+    if scan_degraded:
+        skipped_count = CustomWatchlistTicker.objects.filter(is_active=True).exclude(ticker__in=survivor_tickers).count()
+        logger.warning(
+            "run_broad_index_scan: décroissance sautée (cycle dégradé) -- %d tickers actifs "
+            "non re-confirmés cette semaine laissés tels quels (consecutive_weeks_missed inchangé).",
+            skipped_count,
+        )
+    else:
+        missed_qs = CustomWatchlistTicker.objects.filter(is_active=True).exclude(ticker__in=survivor_tickers)
+        for m in missed_qs:
+            m.consecutive_weeks_missed += 1
+            if m.consecutive_weeks_missed >= 3:
+                m.is_active = False
+                newly_deactivated_by_miss += 1
+            m.save(update_fields=["consecutive_weeks_missed", "is_active"])
+
+    # Plafond DUR : classe tous les tickers actuellement actifs par score
+    # composite (Piotroski + Altman Z, déjà stockés -- fonctionne aussi
+    # pour un holdover non réévalué cette semaine) et désactive la queue
+    # au-delà de MAX_ACTIVE_CUSTOM_TICKERS. Jamais de suppression (cf.
+    # principe "no silent disappearance" du projet).
+    newly_deactivated_by_cap = 0
+    active_rows = list(CustomWatchlistTicker.objects.filter(is_active=True))
+    if len(active_rows) > MAX_ACTIVE_CUSTOM_TICKERS:
+        ranked = sorted(
+            active_rows,
+            key=lambda t: _custom_ticker_composite_score(t.piotroski_score, t.altman_z_score),
+            reverse=True,
+        )
+        capped_out = ranked[MAX_ACTIVE_CUSTOM_TICKERS:]
+        capped_tickers = [t.ticker for t in capped_out]
+        CustomWatchlistTicker.objects.filter(ticker__in=capped_tickers).update(is_active=False)
+        newly_deactivated_by_cap = len(capped_out)
+        logger.warning(
+            "run_broad_index_scan: plafond dur atteint (%d actifs > %d) -- %d tickers désactivés "
+            "(score composite le plus faible, jamais supprimés) : %s",
+            len(active_rows), MAX_ACTIVE_CUSTOM_TICKERS, newly_deactivated_by_cap, capped_tickers,
+        )
+
+    total_active = CustomWatchlistTicker.objects.filter(is_active=True).count()
+
+    result = {
+        "status": "degraded" if scan_degraded else "ok",
+        "universe_scanned": len(universe),
+        "basic_data_ok": len(basic_data),
+        "coverage_ratio": round(coverage_ratio, 3),
+        "survivors_this_week": len(survivors),
+        "total_active_now": total_active,
+        "newly_deactivated_by_miss": newly_deactivated_by_miss,
+        "newly_deactivated_by_cap": newly_deactivated_by_cap,
+    }
+    logger.info("run_broad_index_scan terminé: %s", result)
+    return result

@@ -208,6 +208,7 @@ CHANNEL_LAYERS = {
 CELERY_TASK_ROUTES = {
     'analysis.tasks.run_daily_scan': {'queue': 'analysis_queue'},
     'analysis.tasks.check_rejection_outcomes': {'queue': 'analysis_queue'},
+    'analysis.tasks.run_broad_index_scan': {'queue': 'analysis_queue'},
 }
 
 CELERY_BEAT_SCHEDULE = {
@@ -568,6 +569,18 @@ CELERY_BEAT_SCHEDULE = {
     'weekly-rejection-outcome-check': {
         'task': 'analysis.tasks.check_rejection_outcomes',
         'schedule': crontab(hour=6, minute=0, day_of_week='mon'),
+    },
+    # Balayage large hebdomadaire S&P 500 + TSX Composite (2026-08-11) --
+    # alimente CustomWatchlistTicker, PAS l'univers quotidien tant que
+    # universe_source='combined' n'est pas activé sur un preset (voir
+    # docs/TECH_DEBT_NOTES.md). Dimanche soir, largement hors marché --
+    # tourne potentiellement plusieurs heures (700+ tickers, plusieurs
+    # appels yfinance chacun), aucune urgence de timing donc pas de souci
+    # avec la durée. N'ajoute pas au "burst" du item 7 (Beat) puisque
+    # c'est le seul job à cet horaire précis.
+    'weekly-broad-index-scan': {
+        'task': 'analysis.tasks.run_broad_index_scan',
+        'schedule': crontab(hour=20, minute=0, day_of_week='sun'),
     },
 }
 
