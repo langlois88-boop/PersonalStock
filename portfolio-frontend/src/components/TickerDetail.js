@@ -56,56 +56,35 @@ function describeRatio(key, value, thresholds = {}) {
   switch (key) {
     case 'pe': {
       const level = v <= 0 ? 'bad' : v < 15 ? 'good' : v <= 30 ? 'neutral' : 'bad';
-      return {
-        level,
-        text: `P/E (Price/Earnings) = prix de l'action ÷ bénéfice par action. Sous 15x, l'action se paie relativement peu cher par rapport à ses profits (bon signe, mais vérifie pourquoi -- ça peut aussi signaler un risque perçu par le marché). Entre 15x et 30x : valorisation dans la moyenne. Au-dessus de 30x : le marché paie cher pour chaque dollar de profit, ce qui suppose une forte croissance future pour se justifier. Ici : ${formatNumber(v)}x.`,
-      };
+      return { level, text: 'Prix ÷ bénéfice par action. Sous 15x : peu cher vs les profits. Au-dessus de 30x : suppose une forte croissance future.' };
     }
     case 'peg': {
       const max = thresholds.peg_max || 1.5;
       const level = v < 1 ? 'good' : v <= max ? 'neutral' : 'bad';
-      return {
-        level,
-        text: `PEG = P/E ÷ taux de croissance des bénéfices attendu. Corrige le P/E pour tenir compte de la croissance : sous 1, l'action est potentiellement sous-évaluée par rapport à sa croissance. Entre 1 et ${formatNumber(max, 1)} (seuil utilisé par le screener pour ce titre) : raisonnable. Au-dessus : cher par rapport à la croissance anticipée. Ici : ${formatNumber(v)}.`,
-      };
+      return { level, text: `P/E ajusté pour la croissance. Sous 1 : possiblement sous-évalué. Au-dessus de ${formatNumber(max, 1)} (seuil du screener) : cher vs la croissance.` };
     }
     case 'pb': {
       const max = thresholds.pb_max || 3;
       const level = v < 1 ? 'good' : v <= max ? 'neutral' : 'bad';
-      return {
-        level,
-        text: `P/B (Price/Book) = prix de l'action ÷ valeur comptable par action. Sous 1x, l'action se négocie en dessous de la valeur nette de ses actifs selon les livres comptables. Jusqu'à ${formatNumber(max, 1)}x (seuil du screener ici) : normal pour la plupart des secteurs. Au-dessus : le marché valorise l'entreprise bien au-delà de ses actifs nets (courant pour les entreprises à forte marge/actifs immatériels, à surveiller sinon). Ici : ${formatNumber(v)}x.`,
-      };
+      return { level, text: `Prix ÷ valeur comptable. Sous 1x : se négocie sous la valeur des actifs nets. Au-dessus de ${formatNumber(max, 1)}x (seuil du screener) : valorisé bien au-delà.` };
     }
     case 'ev_ebitda': {
       const level = v < 10 ? 'good' : v <= 15 ? 'neutral' : 'bad';
-      return {
-        level,
-        text: `EV/EBITDA = valeur d'entreprise (capitalisation + dette - trésorerie) ÷ EBITDA. Permet de comparer des entreprises avec des structures de dette différentes, contrairement au P/E. Sous 10x : valorisation attractive. 10x-15x : dans la norme. Au-dessus de 15x : cher par rapport aux profits d'exploitation générés. Ici : ${formatNumber(v)}x.`,
-      };
+      return { level, text: 'Valeur d\'entreprise ÷ EBITDA -- comparable même entre entreprises endettées différemment. Sous 10x : attractif. Au-dessus de 15x : cher.' };
     }
     case 'roe': {
       const min = thresholds.roe_min || 12;
       const level = v < 0 ? 'bad' : v < min ? 'neutral' : v < min * 2.5 ? 'good' : 'neutral';
-      return {
-        level,
-        text: `ROE (Return on Equity) = bénéfice net ÷ capitaux propres. Mesure l'efficacité avec laquelle l'entreprise génère du profit à partir de l'argent des actionnaires. Le screener exige au moins ${formatNumber(min, 1)}% pour ce titre. Un ROE très élevé (>35-40%) peut aussi signaler un fort endettement plutôt qu'une vraie efficacité -- à croiser avec Dette/EBITDA. Ici : ${formatNumber(v, 1)}%.`,
-      };
+      return { level, text: `Bénéfice net ÷ capitaux propres. Le screener exige ≥${formatNumber(min, 1)}% ici. Très élevé (>35-40%) peut aussi signaler un fort endettement.` };
     }
     case 'debt_ebitda': {
       const max = thresholds.debt_ebitda_max || 3;
       const level = v <= max * 0.5 ? 'good' : v <= max ? 'neutral' : 'bad';
-      return {
-        level,
-        text: `Dette/EBITDA = dette totale ÷ EBITDA -- combien d'années de profits d'exploitation seraient nécessaires pour rembourser toute la dette. Le screener exige que ce soit sous ${formatNumber(max, 1)}x pour ce titre. Plus c'est bas, moins l'entreprise est vulnérable à une hausse des taux d'intérêt ou un ralentissement. Au-dessus du seuil : endettement jugé trop lourd par le filtre. Ici : ${formatNumber(v)}x.`,
-      };
+      return { level, text: `Années de profits pour rembourser la dette. Le screener exige <${formatNumber(max, 1)}x ici. Plus bas = moins vulnérable aux taux/ralentissements.` };
     }
     case 'fcf_yield': {
       const level = v >= 5 ? 'good' : v >= 2 ? 'neutral' : 'bad';
-      return {
-        level,
-        text: `FCF Yield = flux de trésorerie libre ÷ capitalisation boursière. Indique combien de cash réel l'entreprise génère chaque année par rapport à son prix -- contrairement au bénéfice comptable, plus difficile à manipuler. Au-dessus de 5% : généreux, l'entreprise génère beaucoup de cash par rapport à son prix. Sous 2% : faible génération de cash relative au prix payé. Ici : ${formatNumber(v)}%.`,
-      };
+      return { level, text: 'Cash généré ÷ capitalisation -- plus dur à manipuler que le bénéfice comptable. Au-dessus de 5% : généreux. Sous 2% : faible.' };
     }
     default:
       return { level: 'unknown', text: '' };
@@ -385,7 +364,7 @@ function TickerDetail() {
           <Ratio
             label="Analystes"
             value={data.num_analysts ?? '—'}
-            verdict={{ level: 'unknown', text: "Nombre d'analystes qui suivent activement ce titre. Peu de couverture (0-2) veut dire moins d'yeux sur l'entreprise et potentiellement plus d'inefficience de marché -- dans un sens comme dans l'autre." }}
+            verdict={{ level: 'unknown', text: "Nombre d'analystes qui suivent ce titre. Peu de couverture (0-2) = moins d'yeux sur l'entreprise." }}
           />
         </div>
       </div>
