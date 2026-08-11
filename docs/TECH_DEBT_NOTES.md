@@ -616,3 +616,89 @@ trading), pas une simulation en base comme avant.
 4. Tests + vérification manuelle en dry-run avant tout déploiement réel
    — même rigueur que tout le reste de cette session (backup, dry-run,
    vérification avant/après).
+
+## 11. [FAIT le 2026-08-11] Partie A du balayage large S&P500+TSX — implémentation + revue + corrections
+
+**Contexte** : demande explicite de l'utilisateur (2026-08-10 soir) —
+balayage hebdomadaire strict (ROE/ROIC/Dette-EBITDA/marge/P/E/PEG/FCF
+Yield/Piotroski/Altman, tous obligatoires) sur S&P500+TSX, alimentant
+un nouveau modèle `CustomWatchlistTicker`, avec une option
+`universe_source="combined"` sur le screener quotidien — explicitement
+PAS activée avant un premier cycle réel validé. Voir aussi [[10]] pour
+le contexte stratégique complet (comparabilité avec les modèles ML,
+signal futur).
+
+**A1-A3** (2026-08-10/11) : source SP500/TSX réparée (3 bugs en chaîne —
+`lxml` manquant, Wikipedia 403 sans User-Agent, `pd.read_html` sur
+string brut ambigu avec un chemin de fichier — voir requirements.txt et
+`portfolio/tasks.py::_read_wikipedia_tables`), 500 SP500 + 221 TSX
+réels ; modèle `CustomWatchlistTicker` + migration appliquée ; filtre
+strict (`analysis/services/broad_scan_filter.py`) avec Piotroski
+F-Score et Altman Z-Score formules standard (1968/2000, pas improvisées).
+
+**A4** : tâche `run_broad_index_scan` (`analysis/tasks.py`), Beat
+hebdomadaire dimanche 20h ET (`weekly-broad-index-scan`, queue
+`analysis_queue`).
+
+**Revue externe avant premier déploiement (2026-08-11)** — 6 points
+soulevés, traités comme suit :
+
+1. **Contention de capital sur un compte Alpaca partagé** — non
+   applicable : voir [[10]], FUNDAMENTAL_LAB aura son propre compte
+   Alpaca dédié (`ALPACA_API_KEY_FUNDAMENTAL_LAB`, déjà reçu et validé,
+   `account_number=PA34ZP3JNN2T`), complètement séparé du compte
+   partagé WATCHLIST/AI_BLUECHIP/AI_PENNY. Ce point du prompt original
+   était déjà résolu par une décision d'architecture antérieure, pas un
+   trou dans le plan de ce soir.
+2. **CORRIGÉ** : `consecutive_weeks_missed` s'incrémentait pour tout
+   ticker absent des survivants, sans distinguer "recalé légitimement"
+   de "scan planté/dégradé avant évaluation". Ajout de
+   `MIN_SCAN_COVERAGE_RATIO=0.7` : sous ce seuil de couverture, le run
+   est marqué `status='degraded'` et la décroissance entière est sautée
+   pour ce cycle (les survivants trouvés sont quand même enregistrés —
+   information positive individuellement fiable même sur un run
+   dégradé).
+3. **CORRIGÉ** : le garde-fou budget (>50 tickers actifs) n'était qu'un
+   `logger.warning`, jamais bloquant. Remplacé par un plafond DUR
+   (`MAX_ACTIVE_CUSTOM_TICKERS=50`) : au-delà, seuls les 50 meilleurs
+   par score composite (Piotroski + Altman Z) restent actifs, le reste
+   désactivé (`is_active=False`, jamais supprimé).
+4. **Noté, non corrigé (pas urgent)** : redondance — un survivant du
+   filtre strict repasse ensuite par `evaluate_ticker` (seuils plus
+   souples) une fois dans l'univers combiné quotidien. Double sécurité
+   intentionnelle, coût réseau/calcul en double mais pas incohérent.
+5. **Validé** : Piotroski/Altman comparés à GuruFocus (2026-08-11).
+   AAPL : Piotroski calculé=8 (réf. 9), Altman Z calculé=11.62 (réf.
+   13.87) — même zone qualitative ("excellent" 7-9, très au-dessus de
+   3.0). Ford : Altman Z calculé=0.80 (réf. 0.88) — même zone
+   "détresse" (<1.8). Écarts expliqués par données annuelles
+   fiscal-year-end (yfinance) vs mix trimestriel plus récent chez
+   GuruFocus, et différences mineures de définition de lignes entre
+   fournisseurs (normal pour ces 2 ratios, documenté dans la
+   littérature) — classification qualitative correcte dans les 2 cas
+   testés (extrême haut et extrême bas), pas une correspondance exacte
+   au chiffre près.
+6. **À reconfirmer avant Partie B** (voir aussi [[10]]) : maintenant que
+   Partie B connecte FUNDAMENTAL_LAB à du vrai capital paper Alpaca (pas
+   juste une ligne DB), vaut la peine de reconfirmer avec l'utilisateur
+   si un plafond sur le nombre de positions ouvertes automatiquement par
+   semaine est souhaité, en connaissance de cause de ce changement de
+   nature (simulation → exécution réelle même en paper).
+
+**Déploiement** : `docker compose build` + `--force-recreate` sur
+`backend`, `celery_worker_analysis`, `celery_beat`, `celery_worker`
+(les 4 partagent le même Dockerfile/contexte mais des images taguées
+séparément — rebuilder seulement `backend` ne suffit PAS, leçon déjà
+documentée ailleurs dans ce fichier, reconfirmée ce soir : le premier
+`.delay()` de test a été rejeté par `celery_worker_analysis` avec
+`KeyError` / "Received unregistered task" car son image n'avait pas
+encore été reconstruite).
+
+**A-test (déclenchement manuel réel)** : lancé le 2026-08-11 ~22h06 UTC
+sur le NAS (`run_broad_index_scan.delay()`), univers confirmé = 720
+tickers (500 SP500 + 221 TSX). Résultat en attente (tâche longue,
+potentiellement plusieurs heures — voir mise à jour ci-dessous une fois
+terminée).
+
+`universe_source="combined"` reste **NON activé** sur aucun preset
+jusqu'à validation du résultat de ce cycle.
