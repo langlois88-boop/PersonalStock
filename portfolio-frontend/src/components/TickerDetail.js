@@ -5,6 +5,7 @@ import {
   LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer,
 } from 'recharts';
 import { cachedGet } from '../api/cachedApi';
+import { InfoTooltip } from './ui/Tooltip';
 
 const VERDICT_BADGES = {
   confirmed: { icon: '✅', label: 'Confirmé', className: 'bg-emerald-500/15 text-emerald-200 border-emerald-500/30' },
@@ -19,6 +20,97 @@ const formatNumber = (value, digits = 2) => {
 };
 
 const clamp = (value, min = 0, max = 100) => Math.max(min, Math.min(max, value));
+
+const RATIO_LEVEL_STYLES = {
+  good: 'border-emerald-500/40 bg-emerald-500/5',
+  neutral: 'border-amber-500/40 bg-amber-500/5',
+  bad: 'border-rose-500/40 bg-rose-500/5',
+  unknown: 'border-slate-800',
+};
+const RATIO_VALUE_COLOR = {
+  good: 'text-emerald-300',
+  neutral: 'text-amber-300',
+  bad: 'text-rose-300',
+  unknown: 'text-slate-200',
+};
+
+// Explication + verdict par ratio, avec seuils dynamiques : réutilise
+// thresholds_used renvoyé par l'API quand disponible (les vrais seuils
+// utilisés par le screener pour CE ticker précis, ex. roe_min=10 pour
+// BTO.TO vs 15 pour AAPL) plutôt que des bandes fixes arbitraires -- reste
+// cohérent avec le verdict confirmed/rejected déjà affiché sur la page.
+// Retombe sur des bandes par défaut raisonnables quand l'API ne fournit
+// pas de seuil précis pour ce ratio (ex. FCF Yield).
+function describeRatio(key, value, thresholds = {}) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    const na = {
+      pe: "P/E non disponible -- généralement le signe de bénéfices négatifs ou trop instables pour calculer un ratio prix/bénéfices significatif.",
+      peg: "PEG non disponible -- nécessite un P/E ET une prévision de croissance des bénéfices ; l'un des deux manque.",
+      pb: "P/B non disponible.",
+      ev_ebitda: "EV/EBITDA non disponible -- souvent le cas si l'EBITDA est négatif ou proche de zéro.",
+      fcf_yield: "FCF Yield non disponible -- flux de trésorerie libre ou capitalisation manquants pour ce calcul.",
+    }[key] || 'Donnée non disponible.';
+    return { level: 'unknown', text: na };
+  }
+  const v = Number(value);
+  switch (key) {
+    case 'pe': {
+      const level = v <= 0 ? 'bad' : v < 15 ? 'good' : v <= 30 ? 'neutral' : 'bad';
+      return {
+        level,
+        text: `P/E (Price/Earnings) = prix de l'action ÷ bénéfice par action. Sous 15x, l'action se paie relativement peu cher par rapport à ses profits (bon signe, mais vérifie pourquoi -- ça peut aussi signaler un risque perçu par le marché). Entre 15x et 30x : valorisation dans la moyenne. Au-dessus de 30x : le marché paie cher pour chaque dollar de profit, ce qui suppose une forte croissance future pour se justifier. Ici : ${formatNumber(v)}x.`,
+      };
+    }
+    case 'peg': {
+      const max = thresholds.peg_max || 1.5;
+      const level = v < 1 ? 'good' : v <= max ? 'neutral' : 'bad';
+      return {
+        level,
+        text: `PEG = P/E ÷ taux de croissance des bénéfices attendu. Corrige le P/E pour tenir compte de la croissance : sous 1, l'action est potentiellement sous-évaluée par rapport à sa croissance. Entre 1 et ${formatNumber(max, 1)} (seuil utilisé par le screener pour ce titre) : raisonnable. Au-dessus : cher par rapport à la croissance anticipée. Ici : ${formatNumber(v)}.`,
+      };
+    }
+    case 'pb': {
+      const max = thresholds.pb_max || 3;
+      const level = v < 1 ? 'good' : v <= max ? 'neutral' : 'bad';
+      return {
+        level,
+        text: `P/B (Price/Book) = prix de l'action ÷ valeur comptable par action. Sous 1x, l'action se négocie en dessous de la valeur nette de ses actifs selon les livres comptables. Jusqu'à ${formatNumber(max, 1)}x (seuil du screener ici) : normal pour la plupart des secteurs. Au-dessus : le marché valorise l'entreprise bien au-delà de ses actifs nets (courant pour les entreprises à forte marge/actifs immatériels, à surveiller sinon). Ici : ${formatNumber(v)}x.`,
+      };
+    }
+    case 'ev_ebitda': {
+      const level = v < 10 ? 'good' : v <= 15 ? 'neutral' : 'bad';
+      return {
+        level,
+        text: `EV/EBITDA = valeur d'entreprise (capitalisation + dette - trésorerie) ÷ EBITDA. Permet de comparer des entreprises avec des structures de dette différentes, contrairement au P/E. Sous 10x : valorisation attractive. 10x-15x : dans la norme. Au-dessus de 15x : cher par rapport aux profits d'exploitation générés. Ici : ${formatNumber(v)}x.`,
+      };
+    }
+    case 'roe': {
+      const min = thresholds.roe_min || 12;
+      const level = v < 0 ? 'bad' : v < min ? 'neutral' : v < min * 2.5 ? 'good' : 'neutral';
+      return {
+        level,
+        text: `ROE (Return on Equity) = bénéfice net ÷ capitaux propres. Mesure l'efficacité avec laquelle l'entreprise génère du profit à partir de l'argent des actionnaires. Le screener exige au moins ${formatNumber(min, 1)}% pour ce titre. Un ROE très élevé (>35-40%) peut aussi signaler un fort endettement plutôt qu'une vraie efficacité -- à croiser avec Dette/EBITDA. Ici : ${formatNumber(v, 1)}%.`,
+      };
+    }
+    case 'debt_ebitda': {
+      const max = thresholds.debt_ebitda_max || 3;
+      const level = v <= max * 0.5 ? 'good' : v <= max ? 'neutral' : 'bad';
+      return {
+        level,
+        text: `Dette/EBITDA = dette totale ÷ EBITDA -- combien d'années de profits d'exploitation seraient nécessaires pour rembourser toute la dette. Le screener exige que ce soit sous ${formatNumber(max, 1)}x pour ce titre. Plus c'est bas, moins l'entreprise est vulnérable à une hausse des taux d'intérêt ou un ralentissement. Au-dessus du seuil : endettement jugé trop lourd par le filtre. Ici : ${formatNumber(v)}x.`,
+      };
+    }
+    case 'fcf_yield': {
+      const level = v >= 5 ? 'good' : v >= 2 ? 'neutral' : 'bad';
+      return {
+        level,
+        text: `FCF Yield = flux de trésorerie libre ÷ capitalisation boursière. Indique combien de cash réel l'entreprise génère chaque année par rapport à son prix -- contrairement au bénéfice comptable, plus difficile à manipuler. Au-dessus de 5% : généreux, l'entreprise génère beaucoup de cash par rapport à son prix. Sous 2% : faible génération de cash relative au prix payé. Ici : ${formatNumber(v)}%.`,
+      };
+    }
+    default:
+      return { level: 'unknown', text: '' };
+  }
+}
 
 // Mappe current_data sur 5 catégories (Croissance/Valeur/Revenus/Qualité/
 // Momentum). Chaque score est 0-100, calculé uniquement à partir de champs
@@ -267,27 +359,49 @@ function TickerDetail() {
 
       {/* Ratios détaillés */}
       <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
-        <p className="text-white font-semibold mb-3">Ratios fondamentaux</p>
+        <p className="text-white font-semibold mb-1">Ratios fondamentaux</p>
+        <p className="text-xs text-slate-500 mb-3">
+          <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 mr-1" /> favorable
+          <span className="inline-block w-2 h-2 rounded-full bg-amber-400 ml-3 mr-1" /> neutre
+          <span className="inline-block w-2 h-2 rounded-full bg-rose-400 ml-3 mr-1" /> défavorable
+          <span className="ml-3">Survole (i) pour l'explication</span>
+        </p>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
-          <Ratio label="P/E" value={formatNumber(data.pe_ratio)} />
-          <Ratio label="PEG" value={formatNumber(data.peg_ratio)} />
-          <Ratio label="P/B" value={formatNumber(data.pb_ratio)} />
-          <Ratio label="EV/EBITDA" value={formatNumber(data.ev_ebitda)} />
-          <Ratio label="ROE" value={data.roe !== null && data.roe !== undefined ? `${formatNumber(data.roe, 1)}%` : '—'} />
-          <Ratio label="Dette/EBITDA" value={formatNumber(data.debt_to_ebitda)} />
-          <Ratio label="FCF Yield" value={data.fcf_yield !== null && data.fcf_yield !== undefined ? `${formatNumber(data.fcf_yield, 2)}%` : '—'} />
-          <Ratio label="Analystes" value={data.num_analysts ?? '—'} />
+          <Ratio label="P/E" value={formatNumber(data.pe_ratio)} verdict={describeRatio('pe', data.pe_ratio, data.thresholds_used)} />
+          <Ratio label="PEG" value={formatNumber(data.peg_ratio)} verdict={describeRatio('peg', data.peg_ratio, data.thresholds_used)} />
+          <Ratio label="P/B" value={formatNumber(data.pb_ratio)} verdict={describeRatio('pb', data.pb_ratio, data.thresholds_used)} />
+          <Ratio label="EV/EBITDA" value={formatNumber(data.ev_ebitda)} verdict={describeRatio('ev_ebitda', data.ev_ebitda, data.thresholds_used)} />
+          <Ratio
+            label="ROE"
+            value={data.roe !== null && data.roe !== undefined ? `${formatNumber(data.roe, 1)}%` : '—'}
+            verdict={describeRatio('roe', data.roe, data.thresholds_used)}
+          />
+          <Ratio label="Dette/EBITDA" value={formatNumber(data.debt_to_ebitda)} verdict={describeRatio('debt_ebitda', data.debt_to_ebitda, data.thresholds_used)} />
+          <Ratio
+            label="FCF Yield"
+            value={data.fcf_yield !== null && data.fcf_yield !== undefined ? `${formatNumber(data.fcf_yield, 2)}%` : '—'}
+            verdict={describeRatio('fcf_yield', data.fcf_yield, data.thresholds_used)}
+          />
+          <Ratio
+            label="Analystes"
+            value={data.num_analysts ?? '—'}
+            verdict={{ level: 'unknown', text: "Nombre d'analystes qui suivent activement ce titre. Peu de couverture (0-2) veut dire moins d'yeux sur l'entreprise et potentiellement plus d'inefficience de marché -- dans un sens comme dans l'autre." }}
+          />
         </div>
       </div>
     </div>
   );
 }
 
-function Ratio({ label, value }) {
+function Ratio({ label, value, verdict }) {
+  const level = verdict?.level || 'unknown';
   return (
-    <div className="bg-slate-950/60 border border-slate-800 rounded-lg px-3 py-2">
-      <p className="text-xs text-slate-500">{label}</p>
-      <p className="text-slate-200 font-medium">{value}</p>
+    <div className={`border rounded-lg px-3 py-2 ${RATIO_LEVEL_STYLES[level]}`}>
+      <p className="text-xs text-slate-500 flex items-center">
+        {label}
+        {verdict?.text && <InfoTooltip text={verdict.text} />}
+      </p>
+      <p className={`font-medium ${RATIO_VALUE_COLOR[level]}`}>{value}</p>
     </div>
   );
 }
