@@ -516,4 +516,3 @@ class TickerChartViewTests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["period"], "3mo")
-        json.dumps(result.details)
