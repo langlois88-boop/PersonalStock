@@ -134,6 +134,62 @@ class CreateLabPositionTests(APITestCase):
         self.assertIsNone(lab_position.paper_trade_id)
         mock_create.assert_called_once()
 
+    def test_reconfirming_ticker_with_open_position_does_not_duplicate(self):
+        """
+        Régression : 3 scans le même soir (2026-08-10, 20h26/20h59/21h28
+        UTC) ont chacun créé une nouvelle FundamentalLabPosition + un
+        nouveau PaperTrade pour BTO.TO, faute de vérifier une position déjà
+        ouverte -- ~296$ engagés au lieu de ~99$. Un ScanResult qui
+        reconfirme un ticker déjà en position ouverte ne doit plus créer de
+        doublon.
+        """
+        first_scan_result = self._make_scan_result()
+        tasks._create_lab_position(first_scan_result, self.preset, Decimal("21500.00"))
+        self.assertEqual(FundamentalLabPosition.objects.filter(ticker="WINW").count(), 1)
+        self.assertEqual(PaperTrade.objects.filter(sandbox="FUNDAMENTAL_LAB").count(), 1)
+
+        second_scan_result = ScanResult.objects.create(
+            scan_run=self.scan_run, ticker="WINW", sector="Technology",
+            quant_score=3.4, price_at_scan=Decimal("12.6000"), final_verdict="confirmed",
+        )
+        tasks._create_lab_position(second_scan_result, self.preset, Decimal("21500.00"))
+
+        # Toujours une seule position/ordre -- le 2e scan n'a rien créé.
+        self.assertEqual(FundamentalLabPosition.objects.filter(ticker="WINW").count(), 1)
+        self.assertEqual(PaperTrade.objects.filter(sandbox="FUNDAMENTAL_LAB").count(), 1)
+        self.assertFalse(FundamentalLabPosition.objects.filter(scan_result=second_scan_result).exists())
+
+    def test_reconfirming_ticker_after_position_closed_allows_new_entry(self):
+        """Une position déjà fermée (is_open=False) n'empêche pas une nouvelle entrée."""
+        first_scan_result = self._make_scan_result()
+        tasks._create_lab_position(first_scan_result, self.preset, Decimal("21500.00"))
+        FundamentalLabPosition.objects.filter(scan_result=first_scan_result).update(is_open=False)
+
+        second_scan_result = ScanResult.objects.create(
+            scan_run=self.scan_run, ticker="WINW", sector="Technology",
+            quant_score=3.4, price_at_scan=Decimal("12.6000"), final_verdict="confirmed",
+        )
+        tasks._create_lab_position(second_scan_result, self.preset, Decimal("21500.00"))
+
+        self.assertEqual(FundamentalLabPosition.objects.filter(ticker="WINW").count(), 2)
+        self.assertTrue(FundamentalLabPosition.objects.filter(scan_result=second_scan_result).exists())
+
+    def test_same_ticker_different_preset_is_not_deduplicated(self):
+        """Le dédoublonnage est scopé par ticker+preset, pas juste par ticker."""
+        first_scan_result = self._make_scan_result()
+        tasks._create_lab_position(first_scan_result, self.preset, Decimal("21500.00"))
+
+        other_preset = _make_preset(slug="value-catalyst-other", name="Autre preset")
+        other_scan_run = ScanRun.objects.create(preset=other_preset, universe_source="sandboxes")
+        second_scan_result = ScanResult.objects.create(
+            scan_run=other_scan_run, ticker="WINW", sector="Technology",
+            quant_score=3.4, price_at_scan=Decimal("12.6000"), final_verdict="confirmed",
+        )
+        tasks._create_lab_position(second_scan_result, other_preset, Decimal("21500.00"))
+
+        self.assertEqual(FundamentalLabPosition.objects.filter(ticker="WINW").count(), 2)
+        self.assertTrue(FundamentalLabPosition.objects.filter(scan_result=second_scan_result).exists())
+
 
 class RejectionOutcomeBenchmarkTests(APITestCase):
     """

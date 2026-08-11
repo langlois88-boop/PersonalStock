@@ -211,7 +211,25 @@ def _create_lab_position(scan_result: ScanResult, preset: ScreenerPreset, benchm
     d'échec silencieux que ce projet a déjà dû diagnostiquer une fois
     (cf. incident "zéro trade", commit 3c01b62). L'échec est loggé
     explicitement et n'interrompt pas le scan des autres candidats.
+
+    Ne crée jamais de doublon : si une position est déjà ouverte pour ce
+    ticker+preset, le pick d'aujourd'hui est une reconfirmation (déjà
+    visible via son propre ScanResult), pas une nouvelle position/ordre.
+    Bug trouvé le 2026-08-10 : 3 scans le même soir ont créé 3 positions
+    distinctes pour BTO.TO (~296$ engagés au lieu de ~99$) faute de ce
+    check — voir docs/TECH_DEBT_NOTES.md item 8.
     """
+    already_open = FundamentalLabPosition.objects.filter(
+        ticker=scan_result.ticker, preset=preset, is_open=True,
+    ).exists()
+    if already_open:
+        logger.info(
+            "%s a déjà une position ouverte pour le preset %s -- scan_result=%s "
+            "reconfirme le pick, aucune nouvelle position/ordre créé.",
+            scan_result.ticker, preset.slug, scan_result.id,
+        )
+        return
+
     lab_position = FundamentalLabPosition.objects.create(
         scan_result=scan_result,
         ticker=scan_result.ticker,
