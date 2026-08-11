@@ -774,3 +774,79 @@ justement d'observer plusieurs semaines avant de faire confiance à la
 liste) -- à réévaluer après 2-3 cycles hebdomadaires réels (donc pas
 avant début septembre 2026, le prochain tournant dimanche prochain
 avec le fix TSX inclus).
+
+## 12. [FAIT le 2026-08-11] Partie B — FUNDAMENTAL_LAB connecté à un vrai compte Alpaca paper dédié
+
+**B1 — Diagnostic (aucun changement de code)** : code d'ordre existant
+lu en détail (`_execute_alpaca_paper_trades_for_sandbox`,
+`sync_alpaca_paper_trades`, `_journal_paper_trades`,
+`portfolio/alpaca_data.py`). Confirmé : `_alpaca_trading_client()` et
+toutes les fonctions qui en dépendent sont câblées en dur sur
+`ALPACA_API_KEY`/`ALPACA_SECRET_KEY` (compte partagé), sans paramètre,
+impossible à réutiliser tel quel pour un second compte.
+
+Risque réel confirmé (précisément celui suspecté par l'utilisateur, via
+un mécanisme différent de celui deviné) : `sync_alpaca_paper_trades` et
+`_journal_paper_trades` filtrent `PaperTrade.objects.filter(broker='ALPACA', ...)`
+**sans jamais scoper par sandbox**. Si FUNDAMENTAL_LAB avait réutilisé
+`broker='ALPACA'`, `sync_alpaca_paper_trades` aurait tenté de
+synchroniser ses lignes via le mauvais client (compte partagé) ->
+`get_order_by_id` toujours `None` sur le mauvais compte -> ces lignes ne
+se seraient **jamais synchronisées** (statut/PnL figés pour toujours,
+silencieusement). `monitor_hive_trade`/`monitor_active_trade` vérifiés
+spécifiquement (nommés dans l'inquiétude initiale) : **pas concernés du
+tout**, aucun des deux ne touche `PaperTrade`/`broker`.
+
+Grep complet du repo (pas juste les 2 call sites de B1) fait avant B2 :
+5 autres occurrences dans `portfolio/views.py`, **toutes déjà protégées**
+(whitelist de sandboxes n'incluant jamais FUNDAMENTAL_LAB, ou
+`.exclude(sandbox='FUNDAMENTAL_LAB')` explicite déjà présent avant ce
+soir). Confirmé : seuls les 2 call sites de B1 sont un vrai risque.
+
+**Découverte additionnelle en cours de B1/B2** : aucun mécanisme de
+sortie n'existait pour FUNDAMENTAL_LAB, ni automatique ni manuel
+(`LabPositionMarkManualView` ne fait que poser un flag "j'y crois",
+jamais fermer). Acceptable en pure simulation DB, plus une fois du vrai
+capital paper engagé -- décision utilisateur : ajouter un stop-loss
+minimal (voir `monitor_lab_positions` ci-dessous) avant tout ordre réel.
+
+**B2 — Implémentation** :
+- `PaperTrade.BROKER_CHOICES` : nouvelle valeur `'ALPACA_LAB'`, distincte
+  de `'ALPACA'` par construction -- élimine le risque à la source plutôt
+  que de dépendre d'un filtre sandbox ajouté (et à retenir) dans 2
+  fonctions partagées. Migration `0036_alter_papertrade_broker`
+  (choix Python seulement, SQL confirmé no-op via `sqlmigrate`), backup
+  pg_dump avant application, comme toujours sur ce projet.
+- `portfolio/alpaca_data_lab.py` (nouveau fichier, aucune modification de
+  `alpaca_data.py`) : client Alpaca séparé lisant
+  `ALPACA_API_KEY_FUNDAMENTAL_LAB`/`ALPACA_SECRET_KEY_FUNDAMENTAL_LAB`.
+  Fonctions nommées explicitement (`_alpaca_lab_trading_client`,
+  `submit_lab_market_order`, etc.) pour qu'un futur copier-coller ne
+  réintroduise jamais la confusion entre les deux comptes. Vérifié en
+  direct sur le NAS : `account_number=PA34ZP3JNN2T`,
+  `equity=buying_power=$50 000`.
+- `_create_lab_position` (`analysis/tasks.py`) : tickers TSX (`.TO`)
+  restent en simulation pure (`broker='SIM'`) -- Alpaca est un courtier
+  américain, ne peut pas trader ces titres, pas d'appel API inutile sur
+  un échec prévisible. Tickers US : ordre marché réel via
+  `submit_lab_market_order`. Échec de l'ordre -> aucun PaperTrade créé
+  (même garde-fou que pour toute autre erreur, `lab_position` conservée
+  sans ordre attaché, jamais de position fabriquée pour un ordre qui
+  n'existe pas).
+- `monitor_lab_positions` (nouvelle tâche, Beat `*/10min` heures de
+  marché ET, queue `analysis_queue`) : stop-loss minimal, uniquement sur
+  `broker='ALPACA_LAB'` (jamais sur les positions SIM/TSX/échec-d'ordre).
+  Vend au marché via le même client dédié si le prix casse
+  `PaperTrade.stop_loss` (déjà calculé à l'entrée, jamais utilisé avant
+  ce soir). Volontairement minimal : pas de take-profit, pas de
+  trailing stop.
+
+Déployé sur le NAS (backend + celery_worker_analysis + celery_beat +
+celery_worker reconstruits et recréés, migration appliquée, imports +
+Beat schedule + connexion compte vérifiés en direct avant recréation
+des containers en prod).
+
+**Pas encore fait (B3, prochaine étape)** : aucun ordre réel n'a encore
+été placé -- besoin d'un dry-run contrôlé, confirmé directement sur le
+dashboard Alpaca (pas seulement en DB), avant de considérer B2 comme
+validé en conditions réelles.
