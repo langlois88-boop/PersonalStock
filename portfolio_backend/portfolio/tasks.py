@@ -6223,54 +6223,6 @@ def _alpaca_position_qty(position: Any | None) -> float:
 
 
 def _alpaca_position_avg_price(position: Any | None) -> float:
-    
-    @shared_task
-    def detect_model_drift() -> dict[str, Any]:
-        threshold_pct = float(os.getenv('MODEL_DRIFT_WINRATE_PCT', '10'))
-        lookback_days = int(os.getenv('MODEL_DRIFT_LOOKBACK_DAYS', '14'))
-        cutoff = timezone.now() - timedelta(days=lookback_days)
-        results: list[dict[str, Any]] = []
-
-        sandbox_map = {
-            'AI_BLUECHIP': 'BLUECHIP',
-            'AI_PENNY': 'PENNY',
-        }
-
-        for sandbox, model_name in sandbox_map.items():
-            closed = PaperTrade.objects.filter(status='CLOSED', sandbox=sandbox, exit_date__gte=cutoff)
-            trades = closed.count()
-            wins = closed.filter(outcome='WIN').count()
-            if wins == 0 and trades:
-                wins = sum([1 for t in closed if float(t.pnl or 0) > 0])
-            paper_win_rate = (wins / trades) * 100 if trades else 0.0
-
-            registry = ModelRegistry.objects.filter(model_name=model_name, status='ACTIVE').order_by('-trained_at').first()
-            baseline = float(registry.backtest_win_rate or 0) if registry else 0.0
-            delta = paper_win_rate - baseline
-            drift = baseline > 0 and delta <= -abs(threshold_pct)
-
-            results.append({
-                'sandbox': sandbox,
-                'model_name': model_name,
-                'paper_win_rate': round(paper_win_rate, 2),
-                'baseline_win_rate': round(baseline, 2),
-                'delta': round(delta, 2),
-                'drift': drift,
-            })
-
-            if drift:
-                _send_telegram_alert(
-                    "\n".join([
-                        f"⚠️ Drift détecté: {model_name}",
-                        f"Paper win: {paper_win_rate:.2f}%",
-                        f"Baseline: {baseline:.2f}%",
-                        f"Δ: {delta:.2f}%",
-                    ]),
-                    allow_during_blackout=True,
-                    category='mlops',
-                )
-
-        return {'status': 'ok', 'results': results}
     if position is None:
         return 0.0
     price = getattr(position, 'avg_entry_price', None) or getattr(position, 'average_entry_price', None)
@@ -6278,6 +6230,64 @@ def _alpaca_position_avg_price(position: Any | None) -> float:
         return float(price)
     except Exception:
         return 0.0
+
+
+@shared_task
+def detect_model_drift() -> dict[str, Any]:
+    # Cette fonction était accidentellement imbriquée à l'intérieur de
+    # _alpaca_position_avg_price (indentation erronée, probablement un
+    # copier-coller mal placé). _alpaca_position_avg_price n'est appelée
+    # nulle part dans ce code -- donc @shared_task ne s'exécutait jamais et
+    # Celery n'a jamais enregistré 'portfolio.tasks.detect_model_drift',
+    # indépendamment du flag AFTER_HOURS_TASKS_ENABLED qui la désactive par
+    # ailleurs (voir docs/TECH_DEBT_NOTES.md items 6/9 pour ce flag).
+    # Sortie ici au niveau module le 2026-08-10 pour qu'elle s'enregistre
+    # normalement comme toute autre tâche.
+    threshold_pct = float(os.getenv('MODEL_DRIFT_WINRATE_PCT', '10'))
+    lookback_days = int(os.getenv('MODEL_DRIFT_LOOKBACK_DAYS', '14'))
+    cutoff = timezone.now() - timedelta(days=lookback_days)
+    results: list[dict[str, Any]] = []
+
+    sandbox_map = {
+        'AI_BLUECHIP': 'BLUECHIP',
+        'AI_PENNY': 'PENNY',
+    }
+
+    for sandbox, model_name in sandbox_map.items():
+        closed = PaperTrade.objects.filter(status='CLOSED', sandbox=sandbox, exit_date__gte=cutoff)
+        trades = closed.count()
+        wins = closed.filter(outcome='WIN').count()
+        if wins == 0 and trades:
+            wins = sum([1 for t in closed if float(t.pnl or 0) > 0])
+        paper_win_rate = (wins / trades) * 100 if trades else 0.0
+
+        registry = ModelRegistry.objects.filter(model_name=model_name, status='ACTIVE').order_by('-trained_at').first()
+        baseline = float(registry.backtest_win_rate or 0) if registry else 0.0
+        delta = paper_win_rate - baseline
+        drift = baseline > 0 and delta <= -abs(threshold_pct)
+
+        results.append({
+            'sandbox': sandbox,
+            'model_name': model_name,
+            'paper_win_rate': round(paper_win_rate, 2),
+            'baseline_win_rate': round(baseline, 2),
+            'delta': round(delta, 2),
+            'drift': drift,
+        })
+
+        if drift:
+            _send_telegram_alert(
+                "\n".join([
+                    f"⚠️ Drift détecté: {model_name}",
+                    f"Paper win: {paper_win_rate:.2f}%",
+                    f"Baseline: {baseline:.2f}%",
+                    f"Δ: {delta:.2f}%",
+                ]),
+                allow_during_blackout=True,
+                category='mlops',
+            )
+
+    return {'status': 'ok', 'results': results}
 
 
 def _alpaca_buying_power() -> float:
