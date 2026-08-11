@@ -29,6 +29,7 @@ from django.utils import timezone
 
 from portfolio import market_data
 from portfolio.models import PaperTrade, SandboxWatchlist
+from portfolio.alpaca_data_lab import submit_lab_market_order
 
 from .models import (
     ScreenerPreset, ScanRun, ScanResult, FundamentalLabPosition,
@@ -246,14 +247,25 @@ def _process_candidate(scan_run: ScanRun, preset: ScreenerPreset, quant_result, 
 def _create_lab_position(scan_result: ScanResult, preset: ScreenerPreset, benchmark_price: Decimal):
     """
     Crée l'enregistrement FundamentalLabPosition puis l'ordre paper trade
-    Alpaca réel correspondant (portfolio.PaperTrade, sandbox='FUNDAMENTAL_LAB').
+    correspondant (portfolio.PaperTrade, sandbox='FUNDAMENTAL_LAB').
+
+    Depuis le 2026-08-11 (Partie B), un vrai ordre Alpaca est envoyé sur le
+    compte paper DÉDIÉ à FUNDAMENTAL_LAB (portfolio.alpaca_data_lab, séparé
+    du compte partagé WATCHLIST/AI_BLUECHIP/AI_PENNY — voir
+    docs/TECH_DEBT_NOTES.md item 11) -- SAUF pour les tickers TSX ('.TO'),
+    qu'Alpaca (courtier américain) ne peut pas trader du tout : ceux-là
+    restent en simulation pure (broker='SIM'), comme avant, sans même
+    tenter l'appel API (échec prévisible, pas la peine de le déclencher).
 
     La position lab est toujours créée en premier et conservée même si la
     création du PaperTrade échoue plus loin — sinon un pick confirmé
     disparaîtrait sans laisser de trace, ce qui est exactement le genre
     d'échec silencieux que ce projet a déjà dû diagnostiquer une fois
-    (cf. incident "zéro trade", commit 3c01b62). L'échec est loggé
-    explicitement et n'interrompt pas le scan des autres candidats.
+    (cf. incident "zéro trade", commit 3c01b62). L'échec (order API ou
+    autre) est loggé explicitement et n'interrompt pas le scan des autres
+    candidats -- si l'ordre réel échoue, aucun PaperTrade n'est créé
+    (jamais de position fabriquée pour un ordre qui n'existe pas), la
+    lab_position reste visible sans ordre attaché, à examiner.
 
     Ne crée jamais de doublon : si une position est déjà ouverte pour ce
     ticker+preset, le pick d'aujourd'hui est une reconfirmation (déjà
@@ -296,6 +308,35 @@ def _create_lab_position(scan_result: ScanResult, preset: ScreenerPreset, benchm
 
         quantity = max(1, int(position_size / entry_price))
         stop_loss = round(entry_price * (1 - stop_pct), 2)
+        is_tsx = scan_result.ticker.strip().upper().endswith(".TO")
+
+        if is_tsx:
+            paper_trade = PaperTrade.objects.create(
+                ticker=scan_result.ticker,
+                sandbox="FUNDAMENTAL_LAB",
+                entry_price=round(entry_price, 4),
+                quantity=quantity,
+                stop_loss=stop_loss,
+                entry_signal=scan_result.quant_score,
+                model_name="FUNDAMENTAL_LAB",
+                broker="SIM",
+                notes=(
+                    f"Analyse fondamentale — verdict {scan_result.final_verdict}, preset {preset.slug}. "
+                    "Simulation pure : ticker TSX, hors périmètre Alpaca (courtier américain)."
+                ),
+            )
+            lab_position.paper_trade = paper_trade
+            lab_position.save(update_fields=["paper_trade"])
+            return
+
+        order = submit_lab_market_order(scan_result.ticker, quantity, "buy")
+        if order is None:
+            logger.error(
+                "Échec de l'ordre Alpaca réel (compte FUNDAMENTAL_LAB) pour %s qty=%d — "
+                "aucun PaperTrade créé, lab_position=%s conservée sans ordre, à examiner.",
+                scan_result.ticker, quantity, lab_position.id,
+            )
+            return
 
         paper_trade = PaperTrade.objects.create(
             ticker=scan_result.ticker,
@@ -310,8 +351,12 @@ def _create_lab_position(scan_result: ScanResult, preset: ScreenerPreset, benchm
             # confondu avec ce modèle dans une future requête qui grouperait
             # par model_name sans regarder le sandbox.
             model_name="FUNDAMENTAL_LAB",
-            broker="SIM",
-            notes=f"Analyse fondamentale — verdict {scan_result.final_verdict}, preset {preset.slug}",
+            broker="ALPACA_LAB",
+            broker_order_id=str(getattr(order, "id", "") or ""),
+            broker_status=str(getattr(order, "status", "") or ""),
+            broker_side="BUY",
+            broker_updated_at=timezone.now(),
+            notes=f"Analyse fondamentale — verdict {scan_result.final_verdict}, preset {preset.slug}. Ordre Alpaca réel (compte FUNDAMENTAL_LAB dédié).",
         )
         lab_position.paper_trade = paper_trade
         lab_position.save(update_fields=["paper_trade"])
@@ -577,4 +622,86 @@ def run_broad_index_scan(self) -> dict:
         "newly_deactivated_by_cap": newly_deactivated_by_cap,
     }
     logger.info("run_broad_index_scan terminé: %s", result)
+    return result
+
+
+@shared_task(bind=True, max_retries=1)
+def monitor_lab_positions(self) -> dict:
+    """
+    Stop-loss minimal pour les positions FUNDAMENTAL_LAB à ordre RÉEL
+    (broker='ALPACA_LAB' uniquement -- les positions SIM (tickers TSX,
+    échecs d'ordre) ne sont pas concernées, aucun capital réel à protéger
+    pour elles). Ajouté le 2026-08-11 (Partie B) suite à une découverte en
+    revue : aucun mécanisme de sortie n'existait pour FUNDAMENTAL_LAB avant
+    ce soir, ni automatique ni manuel (LabPositionMarkManualView ne fait que
+    poser un flag "j'y crois", jamais fermer quoi que ce soit). Acceptable
+    en pure simulation DB (aucune conséquence), plus une fois du vrai
+    capital paper engagé -- voir docs/TECH_DEBT_NOTES.md item 11.
+
+    Volontairement minimal : vend au marché si le prix casse le stop_loss
+    déjà calculé à l'entrée (PaperTrade.stop_loss, stocké mais jamais
+    utilisé avant ce soir) -- pas de take-profit, pas de trailing stop.
+    Objectif : fermer la faille de capital avant d'aller plus loin, pas
+    répliquer toute la sophistication des sandboxes ML existants.
+    """
+    trades = PaperTrade.objects.filter(sandbox="FUNDAMENTAL_LAB", broker="ALPACA_LAB", status="OPEN")
+    checked = 0
+    closed = 0
+    for trade in trades:
+        checked += 1
+        if not trade.stop_loss:
+            continue
+        try:
+            data = fetch_ticker_data(trade.ticker)
+        except Exception:
+            logger.exception("monitor_lab_positions: échec fetch_ticker_data pour %s, stop-loss non vérifié ce cycle.", trade.ticker)
+            continue
+        price = data.get("price") if data else None
+        if price is None or price <= 0:
+            logger.warning("monitor_lab_positions: prix indisponible pour %s, stop-loss non vérifié ce cycle.", trade.ticker)
+            continue
+        if float(price) > float(trade.stop_loss):
+            continue
+
+        order = submit_lab_market_order(trade.ticker, int(trade.quantity), "sell")
+        if order is None:
+            logger.error(
+                "monitor_lab_positions: stop-loss cassé pour %s (prix=%.4f <= stop=%.4f) mais l'ordre de "
+                "vente réel a ÉCHOUÉ -- position reste OPEN, capital réel toujours exposé, à vérifier "
+                "manuellement sur le dashboard Alpaca (compte FUNDAMENTAL_LAB).",
+                trade.ticker, float(price), float(trade.stop_loss),
+            )
+            continue
+
+        trade.status = "CLOSED"
+        trade.exit_price = round(float(price), 4)
+        trade.exit_date = timezone.now()
+        trade.pnl = round((float(trade.exit_price) - float(trade.entry_price)) * float(trade.quantity), 2)
+        trade.outcome = "WIN" if float(trade.pnl) > 0 else "LOSS"
+        trade.broker_status = str(getattr(order, "status", "") or "")
+        trade.broker_side = "SELL"
+        trade.broker_updated_at = timezone.now()
+        trade.notes = (
+            f"{trade.notes} | Stop-loss déclenché ({float(price):.4f} <= {float(trade.stop_loss):.4f}), "
+            f"ordre de vente réel {getattr(order, 'id', '')}."
+        )
+        trade.save(update_fields=[
+            "status", "exit_price", "exit_date", "pnl", "outcome",
+            "broker_status", "broker_side", "broker_updated_at", "notes",
+        ])
+
+        lab_position = FundamentalLabPosition.objects.filter(paper_trade=trade).first()
+        if lab_position:
+            lab_position.is_open = False
+            lab_position.save(update_fields=["is_open"])
+        else:
+            logger.warning(
+                "monitor_lab_positions: PaperTrade %s fermé (stop-loss) mais aucune FundamentalLabPosition "
+                "liée trouvée -- vérifier la cohérence des données.",
+                trade.id,
+            )
+        closed += 1
+
+    result = {"checked": checked, "closed": closed}
+    logger.info("monitor_lab_positions terminé: %s", result)
     return result

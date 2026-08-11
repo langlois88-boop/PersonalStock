@@ -85,6 +85,14 @@ class PaperTrade(models.Model):
 		('SIM', 'SIM'),
 		('ALPACA', 'ALPACA'),
 		('SHADOW', 'SHADOW'),
+		# Compte Alpaca paper DÉDIÉ à FUNDAMENTAL_LAB (2026-08-11), séparé du
+		# compte partagé WATCHLIST/AI_BLUECHIP/AI_PENNY -- valeur distincte de
+		# 'ALPACA' par construction, pour qu'aucune requête existante filtrant
+		# sur broker='ALPACA' sans scope sandbox (sync_alpaca_paper_trades,
+		# _journal_paper_trades, voir docs/TECH_DEBT_NOTES.md) ne puisse jamais
+		# ramasser ces lignes par erreur -- pas une convention à respecter,
+		# une garantie structurelle.
+		('ALPACA_LAB', 'ALPACA_LAB'),
 	)
 	SANDBOX_CHOICES = (
 		('WATCHLIST', 'WATCHLIST'),

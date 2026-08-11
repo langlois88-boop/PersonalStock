@@ -209,6 +209,7 @@ CELERY_TASK_ROUTES = {
     'analysis.tasks.run_daily_scan': {'queue': 'analysis_queue'},
     'analysis.tasks.check_rejection_outcomes': {'queue': 'analysis_queue'},
     'analysis.tasks.run_broad_index_scan': {'queue': 'analysis_queue'},
+    'analysis.tasks.monitor_lab_positions': {'queue': 'analysis_queue'},
 }
 
 CELERY_BEAT_SCHEDULE = {
@@ -581,6 +582,15 @@ CELERY_BEAT_SCHEDULE = {
     'weekly-broad-index-scan': {
         'task': 'analysis.tasks.run_broad_index_scan',
         'schedule': crontab(hour=20, minute=0, day_of_week='sun'),
+    },
+    # Stop-loss minimal pour les positions FUNDAMENTAL_LAB à ordre Alpaca
+    # réel (broker='ALPACA_LAB', voir docs/TECH_DEBT_NOTES.md item 11,
+    # Partie B 2026-08-11) -- aucun mécanisme de sortie n'existait avant ça.
+    # */10 pendant les heures de marché ET, cohérent avec les autres tâches
+    # de surveillance de ce fichier.
+    'monitor-lab-positions': {
+        'task': 'analysis.tasks.monitor_lab_positions',
+        'schedule': crontab(minute='*/10', hour='9-16', day_of_week='mon-fri'),
     },
 }
 
