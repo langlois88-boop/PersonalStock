@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import logging
 import os
 from uuid import uuid4
@@ -10475,14 +10476,18 @@ def _read_wikipedia_tables(url: str) -> list:
     Forbidden" -- confirmé en direct le 2026-08-11 (urllib.request.urlopen
     interne à pandas n'envoie pas de User-Agent, Wikipedia rejette les
     requêtes qui ressemblent à un bot nu). Fetch via `requests` (déjà une
-    dépendance du projet) avec un User-Agent standard, puis on donne le HTML
-    déjà téléchargé à pd.read_html() -- celui-ci sait très bien parser une
-    chaîne HTML directement, il n'a besoin d'ouvrir l'URL lui-même que dans
-    le cas d'usage par défaut.
+    dépendance du projet) avec un User-Agent standard.
+
+    pd.read_html(resp.text) seul ne suffit pas non plus -- confirmé en
+    direct : donner une chaîne brute le laisse ambigu entre "chemin de
+    fichier" et "contenu HTML littéral", et lxml tente de l'ouvrir comme un
+    nom de fichier (OSError: Error reading file '<!DOCTYPE html>...').
+    io.StringIO() lève l'ambiguïté en le présentant comme un objet
+    fichier-like, seule façon fiable de passer du HTML déjà en mémoire.
     """
     resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; PersonalStock/1.0)'}, timeout=15)
     resp.raise_for_status()
-    return pd.read_html(resp.text)
+    return pd.read_html(io.StringIO(resp.text))
 
 
 def _fetch_sp500_symbols(limit: int = 50) -> list[str]:
