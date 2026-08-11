@@ -549,8 +549,19 @@ un vrai drawdown pendant les heures de marché.
 ---
 
 ## 10. Demande : FUNDAMENTAL_LAB avec son propre compte Alpaca (pas juste son propre sandbox interne)
-**Statut : ouvert, bloqué sur une action de l'utilisateur (créer le
-compte Alpaca), discuté le 2026-08-11 ~02h15 UTC.**
+**Statut : clés reçues et validées le 2026-08-11 ~20h UTC (plus bloqué
+sur ce point), implémentation toujours pas commencée.**
+
+**Clés stockées** : `ALPACA_API_KEY_FUNDAMENTAL_LAB` /
+`ALPACA_SECRET_KEY_FUNDAMENTAL_LAB` ajoutées dans `deploy/.env` sur le
+NAS uniquement (jamais commitées, `deploy/.env` confirmé dans
+`.gitignore`). Vérifiées en direct contre le vrai SDK Alpaca :
+compte paper actif (`account_number=PA34ZP3JNN2T`), $50 000 de capital
+de départ, complètement séparé du compte partagé existant
+(`ALPACA_API_KEY`/`ALPACA_SECRET_KEY`, utilisé par WATCHLIST/AI_
+BLUECHIP/AI_PENNY). Rien câblé dans le code encore — reste tel que
+décrit ci-dessous, à faire lors d'une session dédiée avec la même
+rigueur que le reste.
 
 **Ce qui existe déjà** : `FUNDAMENTAL_LAB` a déjà son propre sandbox
 (`PaperTrade.sandbox='FUNDAMENTAL_LAB'`, isolé des autres en base), mais
