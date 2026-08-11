@@ -3,6 +3,9 @@ Endpoints DRF pour le module Analyse. Enregistrés via analysis/urls.py,
 inclus depuis portfolio_backend/urls.py sous 'api/analysis/'.
 """
 
+import logging
+
+import pandas as pd
 from django.db.models import Avg, Count
 from rest_framework import serializers, status
 from rest_framework.response import Response
@@ -13,6 +16,8 @@ from .models import (
     RejectionLog, RejectionOutcome,
 )
 from .tasks import run_daily_scan
+
+logger = logging.getLogger(__name__)
 
 
 # --- Serializers ---
@@ -130,6 +135,124 @@ class TickerDetailView(APIView):
                 "deepseek": latest_result.deepseek_reasoning if latest_result else None,
             },
             "score_history": list(history),
+        })
+
+
+class TickerChartView(APIView):
+    """
+    GET : bougies OHLC + EMA20/EMA50 + patterns chandeliers détectés, pour
+    le graphique de prix de la fiche ticker. `?period=1d|5d|1mo|3mo|1y|5y`.
+
+    Réutilise portfolio.patterns (add_pattern_columns/enrich_bars_with_
+    patterns/build_pattern_annotations) — même détection de patterns
+    (hammer, doji, bullish/bearish engulfing, morning star) que le reste
+    du pipeline (scan_candlestick_patterns), pas une réimplémentation.
+    """
+
+    PERIOD_MAP = {
+        "1d": ("1d", "5m"),
+        "5d": ("5d", "15m"),
+        "1mo": ("1mo", "1d"),
+        "3mo": ("3mo", "1d"),
+        "1y": ("1y", "1d"),
+        "5y": ("5y", "1wk"),
+    }
+
+    def get(self, request, ticker):
+        from portfolio import market_data
+        from portfolio.patterns import enrich_bars_with_patterns, build_pattern_annotations
+
+        ticker = ticker.upper()
+        period = request.query_params.get("period", "3mo")
+        if period not in self.PERIOD_MAP:
+            period = "3mo"
+        yf_period, yf_interval = self.PERIOD_MAP[period]
+
+        empty = {
+            "ticker": ticker, "period": period, "candles": [],
+            "ema20": [], "ema50": [], "patterns": [], "crossovers": [],
+        }
+
+        try:
+            hist = market_data.Ticker(ticker).history(period=yf_period, interval=yf_interval)
+        except Exception:
+            logger.exception("Échec de récupération de l'historique de prix pour %s (period=%s)", ticker, period)
+            return Response(empty)
+
+        if hist is None or hist.empty or not {"Open", "High", "Low", "Close"}.issubset(hist.columns):
+            return Response(empty)
+
+        df = hist.reset_index()
+        date_col = df.columns[0]  # 'Date' (intervalles quotidiens+) ou 'Datetime' (intraday)
+        df = df.rename(columns={
+            date_col: "timestamp", "Open": "open", "High": "high",
+            "Low": "low", "Close": "close", "Volume": "volume",
+        })
+        if "volume" not in df.columns:
+            df["volume"] = 0.0
+        df = df[["timestamp", "open", "high", "low", "close", "volume"]].dropna(
+            subset=["open", "high", "low", "close"]
+        )
+        if df.empty:
+            return Response(empty)
+
+        enriched = enrich_bars_with_patterns(df)
+        annotations = build_pattern_annotations(enriched)
+
+        def _time_val(ts):
+            try:
+                return int(pd.Timestamp(ts).timestamp())
+            except Exception:
+                return None
+
+        candles = []
+        ema20_series = []
+        ema50_series = []
+        for _, row in enriched.iterrows():
+            t = _time_val(row.get("timestamp"))
+            if t is None:
+                continue
+            candles.append({
+                "time": t,
+                "open": round(float(row["open"]), 4),
+                "high": round(float(row["high"]), 4),
+                "low": round(float(row["low"]), 4),
+                "close": round(float(row["close"]), 4),
+                "volume": float(row.get("volume") or 0),
+            })
+            ema20_val = row.get("ema20")
+            ema50_val = row.get("ema50")
+            if pd.notna(ema20_val):
+                ema20_series.append({"time": t, "value": round(float(ema20_val), 4)})
+            if pd.notna(ema50_val):
+                ema50_series.append({"time": t, "value": round(float(ema50_val), 4)})
+
+        # Croisements EMA20/EMA50 (golden/death cross) sur la fenêtre visible.
+        crossovers = []
+        ema20_col = enriched.get("ema20")
+        ema50_col = enriched.get("ema50")
+        if ema20_col is not None and ema50_col is not None:
+            diff = ema20_col - ema50_col
+            for i in range(1, len(diff)):
+                prev, curr = diff.iloc[i - 1], diff.iloc[i]
+                if pd.isna(prev) or pd.isna(curr):
+                    continue
+                t = _time_val(enriched.iloc[i].get("timestamp"))
+                if t is None:
+                    continue
+                if prev <= 0 < curr:
+                    crossovers.append({"time": t, "type": "golden_cross"})
+                elif prev >= 0 > curr:
+                    crossovers.append({"time": t, "type": "death_cross"})
+
+        return Response({
+            "ticker": ticker,
+            "period": period,
+            "candles": candles,
+            "ema20": ema20_series,
+            "ema50": ema50_series,
+            "patterns": annotations,
+            "crossovers": crossovers,
         })
 
 
