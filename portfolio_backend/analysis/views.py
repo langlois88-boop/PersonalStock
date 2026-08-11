@@ -179,7 +179,18 @@ class TickerChartView(APIView):
             logger.exception("Échec de récupération de l'historique de prix pour %s (period=%s)", ticker, period)
             return Response(empty)
 
-        if hist is None or hist.empty or not {"Open", "High", "Low", "Close"}.issubset(hist.columns):
+        if hist is None or hist.empty:
+            return Response(empty)
+        # market_data.Ticker.history() renvoie parfois des colonnes en
+        # MultiIndex (ex. ('BTO.TO', 'Open')) plutôt que 'Open' simple --
+        # confirmé en direct pour ce endpoint, même comportement déjà géré
+        # ailleurs dans le code pour la même raison (voir
+        # portfolio/tasks.py::_extract_close_series). On aplatit sur le
+        # dernier niveau (le nom du champ) avant de continuer.
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist = hist.copy()
+            hist.columns = hist.columns.get_level_values(-1)
+        if not {"Open", "High", "Low", "Close"}.issubset(hist.columns):
             return Response(empty)
 
         df = hist.reset_index()
