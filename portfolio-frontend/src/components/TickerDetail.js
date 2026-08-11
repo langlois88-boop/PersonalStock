@@ -74,7 +74,15 @@ function computeRadarFactors(data) {
 }
 
 function TickerDetail() {
-  const { ticker } = useParams();
+  // useParams() ne décode PAS automatiquement les séquences %XX (vérifié
+  // directement avec matchPath de react-router avant d'écrire ce code) --
+  // rawTicker peut donc contenir "%2E" à la place d'un point littéral (voir
+  // AnalysisScreener.js::encodeTickerForUrl, contournement d'un filtre
+  // réseau qui bloque/altère les URL contenant ".to"). On garde la forme
+  // encodée pour l'appel API (pour ne jamais envoyer ".to" en clair sur le
+  // réseau non plus) et on décode uniquement pour l'affichage.
+  const { ticker: rawTicker } = useParams();
+  const ticker = decodeURIComponent(rawTicker || '');
   const navigate = useNavigate();
   const [payload, setPayload] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -84,14 +92,14 @@ function TickerDetail() {
     setLoading(true);
     setError(null);
     try {
-      const data = await cachedGet(`analysis/ticker/${encodeURIComponent(ticker)}/`, {}, 30000);
+      const data = await cachedGet(`analysis/ticker/${rawTicker}/`, {}, 30000);
       setPayload(data);
     } catch (e) {
       setError(e.message || "Échec de la récupération de la fiche.");
     } finally {
       setLoading(false);
     }
-  }, [ticker]);
+  }, [rawTicker]);
 
   useEffect(() => {
     fetchDetail();
