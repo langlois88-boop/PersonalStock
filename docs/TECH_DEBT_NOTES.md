@@ -545,3 +545,63 @@ comme broker Celery, pour qu'il survive aux redémarrages ET à l'éviction
 est vraiment nécessaire. Pas une urgence pour ce soir (aucun trade réel
 en jeu), mais à traiter avant que ce mécanisme ait besoin de protéger
 un vrai drawdown pendant les heures de marché.
+
+---
+
+## 10. Demande : FUNDAMENTAL_LAB avec son propre compte Alpaca (pas juste son propre sandbox interne)
+**Statut : ouvert, bloqué sur une action de l'utilisateur (créer le
+compte Alpaca), discuté le 2026-08-11 ~02h15 UTC.**
+
+**Ce qui existe déjà** : `FUNDAMENTAL_LAB` a déjà son propre sandbox
+(`PaperTrade.sandbox='FUNDAMENTAL_LAB'`, isolé des autres en base), mais
+**aucun sandbox du projet n'a de compte Alpaca séparé** — `WATCHLIST`,
+`AI_BLUECHIP`, `AI_PENNY`, et `FUNDAMENTAL_LAB` (s'il y allait) partagent
+tous la même paire `ALPACA_API_KEY`/`ALPACA_SECRET_KEY`
+(`portfolio/alpaca_data.py::_alpaca_trading_client()`, lit ces 2 env
+vars sans jamais de variante par sandbox). Actuellement,
+`FUNDAMENTAL_LAB` ne va même pas jusqu'à Alpaca du tout : `_create_lab_
+position` (`analysis/tasks.py:203`) fixe `broker="SIM"` en dur —
+positions purement simulées en base, jamais d'ordre réel envoyé (voir
+aussi la note sur le commentaire trompeur à ce sujet, discuté juste
+avant ce soir).
+
+**Objectif réel de la demande (le "pourquoi", important pour la suite)** :
+pas juste isoler `FUNDAMENTAL_LAB` pour isoler — l'objectif est de le
+rendre **directement comparable** aux modèles ML qui tradent déjà
+(BLUECHIP/PENNY), avec le même genre de suivi réel (compte Alpaca
+dédié, comme les autres sandboxes actifs) plutôt qu'une simulation
+séparée. À terme (pas pour cette itération), l'idée est aussi
+d'utiliser ce que l'analyse fondamentale (Claude/DeepSeek) détecte
+comme **signal supplémentaire pour les modèles ML eux-mêmes** — le but
+final étant de rendre les modèles ML "plus intelligents", pas juste
+d'avoir un screener fondamental à côté. Phrase de l'utilisateur coupée
+en fin de message ("...peut-être même un jour ajouter des...") — à
+clarifier/compléter à la reprise, ne pas supposer le détail exact.
+
+**Ce qui bloque pour commencer** : l'utilisateur doit d'abord créer un
+**second compte/environnement paper trading Alpaca** sur son dashboard
+(possible d'avoir plusieurs comptes paper sous un même login, ou un
+second signup) et récupérer la nouvelle paire de clés — impossible pour
+moi de créer ce compte. Décidé explicitement de ne pas commencer
+l'implémentation avant d'avoir ces clés en main, et même une fois
+prêtes, de le faire "à tête reposée" (pas en fin de très longue
+session) vu que ça touche l'exécution d'ordres réels (même en paper
+trading), pas une simulation en base comme avant.
+
+**Ce qu'il faudra faire une fois les clés en main** (esquisse, à affiner
+à la reprise) :
+1. Nouvelles env vars pour la paire de clés dédiée (ex.
+   `ALPACA_API_KEY_FUNDAMENTAL_LAB` / `ALPACA_SECRET_KEY_FUNDAMENTAL_LAB`),
+   sans toucher aux env vars partagées existantes.
+2. Un client Alpaca séparé (pattern à ajouter dans
+   `portfolio/alpaca_data.py`, ou un module dédié) instancié avec ces
+   clés, distinct de `_alpaca_trading_client()` partagé.
+3. Remplacer (ou compléter, à décider) le `broker="SIM"` codé en dur
+   dans `_create_lab_position` par un vrai envoi d'ordre via ce nouveau
+   client, en suivant le pattern déjà existant pour WATCHLIST/AI_
+   BLUECHIP/AI_PENNY (`_execute_alpaca_paper_trades_for_sandbox`,
+   `portfolio/tasks.py:~7100`) plutôt que d'inventer un nouveau
+   mécanisme de synchronisation d'ordres.
+4. Tests + vérification manuelle en dry-run avant tout déploiement réel
+   — même rigueur que tout le reste de cette session (backup, dry-run,
+   vérification avant/après).
