@@ -204,3 +204,37 @@ class RejectionOutcome(models.Model):
 
     def __str__(self) -> str:
         return f"{self.rejection_log.ticker} +{self.days_since_rejection}j alpha={self.alpha}"
+
+
+class CustomWatchlistTicker(models.Model):
+    """
+    Survivants du balayage large hebdomadaire (S&P 500 + TSX Composite,
+    seuils quantitatifs stricts -- voir analysis/services/broad_scan_filter.py)
+    -- alimente l'univers quotidien du screener (`_get_universe`,
+    universe_source='combined') une fois qu'un premier cycle a produit des
+    résultats sensés. `consecutive_weeks_missed` implémente une sortie
+    progressive plutôt qu'un retrait immédiat : un titre qui ne repasse pas
+    les seuils une semaine donnée n'est pas forcément un faux positif
+    ponctuel (données manquantes, volatilité passagère d'un ratio) --
+    is_active ne bascule à False qu'après 3 semaines manquées d'affilée.
+    """
+
+    SOURCE_CHOICES = (
+        ('SP500', 'SP500'),
+        ('TSX', 'TSX'),
+    )
+
+    ticker = models.CharField(max_length=20, unique=True, db_index=True)
+    source_index = models.CharField(max_length=20, choices=SOURCE_CHOICES)
+    first_seen = models.DateTimeField(auto_now_add=True)
+    last_confirmed = models.DateTimeField(auto_now=True)
+    consecutive_weeks_missed = models.IntegerField(default=0)
+    piotroski_score = models.IntegerField(null=True, blank=True)
+    altman_z_score = models.FloatField(null=True, blank=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        ordering = ['-last_confirmed']
+
+    def __str__(self) -> str:
+        return f"{self.ticker} ({self.source_index}) active={self.is_active}"
