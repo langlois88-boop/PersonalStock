@@ -10502,6 +10502,30 @@ def _fetch_sp500_symbols(limit: int = 50) -> list[str]:
         return fallback[:limit]
 
 
+def _fetch_tsx_symbols(limit: int = 300) -> list[str]:
+    """
+    Composition du S&P/TSX Composite via Wikipedia (même mécanisme que
+    _fetch_sp500_symbols, voir _read_wikipedia_tables). Recherche la table
+    par la présence d'une colonne 'Ticker' plutôt qu'un index numérique fixe
+    (ex. tables[3]) -- confirmé en direct que Wikipedia a plusieurs tables
+    sur cette page (highs historiques, indices apparentés...), un index en
+    dur casserait silencieusement si leur ordre change lors d'une future
+    édition de la page. Les tickers TSX sur Wikipedia sont bruts (ex. "AEM"),
+    sans le suffixe ".TO" qu'utilise le reste de ce projet pour les titres
+    canadiens (cf. TSX_LEADER_SYMBOL='AEM.TO' plus haut dans ce fichier).
+    """
+    try:
+        tables = _read_wikipedia_tables('https://en.wikipedia.org/wiki/S%26P/TSX_Composite_Index')
+        frame = next((t for t in tables if 'Ticker' in t.columns), None)
+        if frame is None:
+            raise ValueError("Aucune table avec une colonne 'Ticker' trouvée sur la page TSX Composite.")
+        symbols = [f"{str(s).strip().upper()}.TO" for s in frame['Ticker'].tolist() if str(s).strip()]
+        return symbols[:limit]
+    except Exception:
+        logger.warning("Échec _fetch_tsx_symbols (scrape Wikipedia), pas de fallback statique pour le TSX.", exc_info=True)
+        return []
+
+
 def _analyze_penny_breakouts() -> dict[str, Any]:
     quotes = _fetch_yahoo_screener('most_actives', count=400)
     candidates: list[dict[str, Any]] = []
