@@ -481,41 +481,67 @@ voulu exactement) avant de coder.
 ---
 
 ## 9. Circuit breaker (`_daily_equity_circuit_breaker`) utilise le cache Django par défaut (non persistant, pas Redis)
-**Statut : ouvert, découvert le 2026-08-10 ~22h30 UTC. Faux positif
-confirmé ce soir, déjà résolu tout seul (pas d'action urgente), cause
-structurelle pas corrigée.**
+**Statut : ouvert, deux faux déclenchements confirmés ce soir (un 3e
+touchant AI_PENNY en plus d'AI_BLUECHIP), cause structurelle toujours
+pas corrigée, portée revue à la hausse après le 2e épisode.**
 
 **Confirmé** : pas de bloc `CACHES` dans `settings.py` → Django utilise
 `LocMemCache` par défaut (cache en mémoire du process, PAS Redis) pour
 `_daily_equity_circuit_breaker` (`portfolio/tasks.py:4575`), qui stocke
 la référence d'équité du jour (`daily_equity_base:{sandbox}:{date}`) et
 l'état de déclenchement (`daily_equity_trip:{sandbox}:{date}`) dans ce
-cache. **Tout redémarrage du worker efface cet état.**
+cache.
 
-**Incident concret** : "Circuit breaker triggered for AI_BLUECHIP" à
-22h21:25 UTC ce soir, capital loggé = 23803.36$. Recalculé la formule
-exacte (`initial_capital + closed_pnl`) au moment de la vérification :
-résultat identique, 23803.36$ — le capital n'avait **pas bougé** (0
-position ouverte, 0 trade fermé dans la fenêtre). Le déclenchement
-vient donc d'une référence de départ (`baseline`) incorrecte, capturée
-juste après mon redémarrage de `celery_worker` à 21h59:35 UTC (~22 min
-avant le déclenchement) — cause exacte de la valeur erronée pas
-investiguée plus loin (hypothèse : lecture transitoire pendant le
-redémarrage du process). Un second redémarrage (22h27 UTC, pour un
-changement de schedule sans rapport) a effacé le cache et donc annulé
-le déclenchement de lui-même — pas d'action correctrice nécessaire ce
-soir, mais **coup de chance**, pas une vraie résolution.
+**Épisode 1** : "Circuit breaker triggered for AI_BLUECHIP" à 22h21:25
+UTC, capital loggé = 23803.36$. Recalculé la formule exacte
+(`initial_capital + closed_pnl`) : résultat identique — le capital
+n'avait pas bougé (0 position ouverte, 0 trade fermé). Coïncide avec
+mon redémarrage de `celery_worker` à 21h59:35 UTC (~22 min avant).
+Hypothèse initiale : lecture transitoire pendant le redémarrage du
+process.
 
-**Risque réel** : ce mécanisme de sécurité (censé arrêter les nouvelles
-entrées d'un sandbox après -3% de drawdown journalier) peut se
-déclencher faussement (comme ce soir) OU se réinitialiser silencieusement
-(perdant la protection pour le reste de la journée) à chaque fois qu'un
-worker redémarre pendant les heures de marché — que ce soit pour un
-déploiement de code normal ou un crash/restart automatique.
+**Épisode 2, ~18 min plus tard** : "Circuit breaker triggered for
+AI_BLUECHIP" (encore, 22h39:52 UTC, même capital 23803.36$) **et**
+"Circuit breaker triggered for AI_PENNY" (22h40:14 UTC, capital
+10038.11$). Recalculé les deux : identiques aux valeurs loguées, 0
+position ouverte dans les deux sandboxes — encore un faux positif
+confirmé. **Important : `docker inspect` confirme qu'aucun redémarrage
+de `celery_worker` n'a eu lieu entre les deux épisodes** (`RestartCount:
+0`, `StartedAt` inchangé depuis 22h27:17 UTC) — donc l'hypothèse
+"uniquement causé par un redémarrage" de l'épisode 1 est **incomplète**.
+Le cache s'est vidé une seconde fois (`baseline`/`trigger` à `None` au
+moment de vérifier, ~23h01 UTC) sans redémarrage.
+
+**Hypothèse révisée** : `LocMemCache` de Django effectue par défaut une
+éviction aléatoire ("culling") quand il dépasse son nombre d'entrées
+max (défaut 300, `CULL_FREQUENCY=3`) — avec ~50 tâches qui écrivent des
+clés de cache diverses toute la journée (sentiment, prix, cooldowns
+d'alertes...), ce plafond peut être atteint et faire disparaître
+n'importe quelle clé, y compris celles du circuit breaker, **à tout
+moment de la journée, pas seulement après un redémarrage**. Pas
+confirmé formellement (pas creusé le code source de `LocMemCache` ni
+compté les clés actives ce soir), mais cohérent avec l'observation.
+
+**Risque réel, révisé à la hausse** : ce mécanisme de sécurité (censé
+arrêter les nouvelles entrées d'un sandbox après -3% de drawdown
+journalier) peut se déclencher faussement (comme ce soir, 2 fois) OU
+perdre silencieusement sa protection (le flag de déclenchement
+disparaît, permettant de nouvelles entrées alors qu'un vrai -3% avait
+été détecté plus tôt) — et ce **n'importe quand dans la journée**, pas
+seulement lors d'un déploiement. Un vrai déclenchement pourrait donc ne
+protéger que quelques minutes avant d'être oublié.
+
+**Impact ce soir** : aucun, marché fermé (aucune nouvelle entrée
+n'aurait été tentée de toute façon), aucune position réelle affectée
+(paper trading), et la clé de cache est datée du jour
+(`daily_equity_trip:{sandbox}:{date}`) donc **ne se reporte pas sur
+demain** même sans reset manuel.
 
 **À faire** : migrer ce cache (et tout autre état journalier critique
 au risque similaire — à auditer) vers le backend Redis déjà utilisé
-comme broker Celery, pour qu'il survive aux redémarrages de worker.
-Chantier de fond, pas une urgence puisque le vrai déclenchement de
-ce soir n'a eu aucun effet durable, mais à traiter avant le prochain
-déploiement en pleine séance de marché.
+comme broker Celery, pour qu'il survive aux redémarrages ET à l'éviction
+`LocMemCache`. Vérifier aussi si un `CACHES` explicite avec
+`max_entries` plus élevé suffirait en attendant, ou si un cache Redis
+est vraiment nécessaire. Pas une urgence pour ce soir (aucun trade réel
+en jeu), mais à traiter avant que ce mécanisme ait besoin de protéger
+un vrai drawdown pendant les heures de marché.
