@@ -378,7 +378,9 @@ function Ratio({ label, value, verdict }) {
     <div className={`border rounded-lg px-3 py-2 ${RATIO_LEVEL_STYLES[level]}`}>
       <p className="text-xs text-slate-500 flex items-center">
         {label}
-        {verdict?.text && <InfoTooltip text={verdict.text} />}
+        {/* placement="top" -- ce bloc est en bas de page, ouvrir vers le bas
+            faisait déborder la bulle hors du viewport (signalé en direct). */}
+        {verdict?.text && <InfoTooltip text={verdict.text} placement="top" />}
       </p>
       <p className={`font-medium ${RATIO_VALUE_COLOR[level]}`}>{value}</p>
     </div>
