@@ -427,3 +427,93 @@ class QuantFilterMarginTrendTests(APITestCase):
         # Ne doit jamais planter — c'est exactement ce que ScanResult.objects.create()
         # fait via le JSONField quant_details.
         json.dumps(result.details)
+
+
+def _make_ohlc_frame(rows: int = 30) -> pd.DataFrame:
+    """OHLC + volume factices avec un DatetimeIndex nommé 'Date', pour
+    simuler ce que market_data.Ticker(...).history() renvoie réellement."""
+    dates = pd.date_range("2026-01-01", periods=rows, freq="D")
+    base = 10.0
+    opens, highs, lows, closes, volumes = [], [], [], [], []
+    for i in range(rows):
+        o = base + i * 0.05
+        c = o + (0.3 if i % 3 == 0 else -0.1)
+        h = max(o, c) + 0.2
+        low = min(o, c) - 0.2
+        opens.append(o)
+        highs.append(h)
+        lows.append(low)
+        closes.append(c)
+        volumes.append(100000 + i * 1000)
+    df = pd.DataFrame(
+        {"Open": opens, "High": highs, "Low": lows, "Close": closes, "Volume": volumes},
+        index=pd.DatetimeIndex(dates, name="Date"),
+    )
+    return df
+
+
+class TickerChartViewTests(APITestCase):
+    """
+    Régression : deux bugs trouvés en testant l'endpoint en direct contre le
+    NAS avant d'écrire le frontend (2026-08-10), pas en local seulement.
+    """
+
+    def test_handles_multiindex_columns_from_market_data(self):
+        """
+        market_data.Ticker(...).history() renvoie parfois des colonnes en
+        MultiIndex (ex. ('BTO.TO', 'Open')) plutôt que 'Open' simple --
+        confirmé en direct. Sans l'aplatissement, l'endpoint renvoyait
+        silencieusement candles=[] pour un ticker pourtant valide.
+        """
+        frame = _make_ohlc_frame(30)
+        frame.columns = pd.MultiIndex.from_product([["BTO.TO"], frame.columns])
+
+        with patch("portfolio.market_data.Ticker") as mock_ticker:
+            mock_ticker.return_value.history.return_value = frame
+            response = self.client.get("/api/analysis/ticker/BTO.TO/chart/?period=3mo")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertGreater(len(response.data["candles"]), 0)
+        self.assertGreater(len(response.data["ema20"]), 0)
+
+    def test_response_is_valid_json_despite_nan_rvol(self):
+        """
+        rvol est NaN pour les toutes premières bougies d'une fenêtre (pas
+        assez d'historique pour sa moyenne mobile) -- confirmé en direct :
+        ça faisait planter le rendu JSON de DRF avec "Out of range float
+        values are not JSON compliant: nan" avant le fix.
+        """
+        frame = _make_ohlc_frame(30)  # colonnes simples, pas de MultiIndex ici
+
+        with patch("portfolio.market_data.Ticker") as mock_ticker:
+            mock_ticker.return_value.history.return_value = frame
+            response = self.client.get("/api/analysis/ticker/BTO.TO/chart/?period=3mo")
+
+        self.assertEqual(response.status_code, 200)
+        # response.data (avant rendu) peut encore contenir NaN -- le vrai
+        # test est que le RENDU json ne plante pas, comme un vrai client HTTP.
+        rendered = response.render()
+        json.loads(rendered.content)
+        patterns = response.data.get("patterns", [])
+        for p in patterns:
+            if p.get("rvol") is not None:
+                self.assertFalse(pd.isna(p["rvol"]))
+
+    def test_invalid_ticker_returns_empty_shape_not_error(self):
+        with patch("portfolio.market_data.Ticker") as mock_ticker:
+            mock_ticker.return_value.history.return_value = pd.DataFrame()
+            response = self.client.get("/api/analysis/ticker/ZZZINVALIDXYZ/chart/?period=3mo")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["candles"], [])
+        self.assertEqual(response.data["patterns"], [])
+
+    def test_unknown_period_falls_back_to_3mo(self):
+        frame = _make_ohlc_frame(10)
+        with patch("portfolio.market_data.Ticker") as mock_ticker:
+            mock_ticker.return_value.history.return_value = frame
+            response = self.client.get("/api/analysis/ticker/BTO.TO/chart/?period=garbage")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["period"], "3mo")
+        json.dumps(result.details)
