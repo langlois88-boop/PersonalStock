@@ -10513,13 +10513,24 @@ def _fetch_tsx_symbols(limit: int = 300) -> list[str]:
     édition de la page. Les tickers TSX sur Wikipedia sont bruts (ex. "AEM"),
     sans le suffixe ".TO" qu'utilise le reste de ce projet pour les titres
     canadiens (cf. TSX_LEADER_SYMBOL='AEM.TO' plus haut dans ce fichier).
+
+    Bug corrigé le 2026-08-11 (découvert au premier vrai run de
+    run_broad_index_scan, ~25 tickers en 404) : les titres à catégorie
+    multiple ou fiducie de revenu (ex. "RCI.B", "CAR.UN") utilisent un
+    point comme séparateur sur Wikipedia/TSX, mais Yahoo Finance attend
+    un tiret ("RCI-B.TO", "CAR-UN.TO") -- ajouter ".TO" tel quel produisait
+    "RCI.B.TO" (deux points), toujours 404 côté Yahoo. Le point interne est
+    donc remplacé par un tiret avant d'ajouter le suffixe ".TO".
     """
     try:
         tables = _read_wikipedia_tables('https://en.wikipedia.org/wiki/S%26P/TSX_Composite_Index')
         frame = next((t for t in tables if 'Ticker' in t.columns), None)
         if frame is None:
             raise ValueError("Aucune table avec une colonne 'Ticker' trouvée sur la page TSX Composite.")
-        symbols = [f"{str(s).strip().upper()}.TO" for s in frame['Ticker'].tolist() if str(s).strip()]
+        symbols = [
+            f"{str(s).strip().upper().replace('.', '-')}.TO"
+            for s in frame['Ticker'].tolist() if str(s).strip()
+        ]
         return symbols[:limit]
     except Exception:
         logger.warning("Échec _fetch_tsx_symbols (scrape Wikipedia), pas de fallback statique pour le TSX.", exc_info=True)
