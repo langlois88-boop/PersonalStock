@@ -209,6 +209,13 @@ class TickerChartView(APIView):
 
         enriched = enrich_bars_with_patterns(df)
         annotations = build_pattern_annotations(enriched)
+        # rvol est NaN pour les toutes premières bougies (pas assez
+        # d'historique pour sa moyenne mobile 20 jours) -- confirmé en
+        # direct : ça faisait planter le rendu JSON de DRF ("Out of range
+        # float values are not JSON compliant: nan"). NaN -> None (null).
+        for ann in annotations:
+            if isinstance(ann.get("rvol"), float) and pd.isna(ann["rvol"]):
+                ann["rvol"] = None
 
         def _time_val(ts):
             try:
