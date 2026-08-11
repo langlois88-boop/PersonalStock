@@ -16,6 +16,15 @@ import html2canvas from 'html2canvas';
 import jsPDF from 'jspdf';
 import { Term } from './ui/Tooltip';
 import { GLOSSARY } from '../glossary';
+import { tickerDetailPath } from '../tickerUrl';
+
+// Même iconographie que AnalysisScreener.js, pour la cohérence entre les
+// deux pages (le screener et cette vue de performance montrent les mêmes
+// verdicts sur les mêmes positions).
+const LAB_VERDICT_BADGES = {
+  confirmed: { icon: '✅', label: 'Confirmé', className: 'bg-emerald-500/15 text-emerald-200 border-emerald-500/30' },
+  uncertain: { icon: '⚠️', label: 'Incertain', className: 'bg-amber-500/15 text-amber-200 border-amber-500/30' },
+};
 
 const formatPct = (value, digits = 2) => {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
@@ -64,6 +73,10 @@ function AnalyticsLabPage() {
   const [diagnosticMeta, setDiagnosticMeta] = useState(null);
   const [diagnosticLoading, setDiagnosticLoading] = useState(false);
   const [diagnosticError, setDiagnosticError] = useState(null);
+  const [labPerf, setLabPerf] = useState(null);
+  const [labLoading, setLabLoading] = useState(true);
+  const [labError, setLabError] = useState(null);
+  const [labSortDesc, setLabSortDesc] = useState(true);
 
   useEffect(() => {
     let isMounted = true;
@@ -112,6 +125,46 @@ function AnalyticsLabPage() {
       isMounted = false;
     };
   }, [sandboxFilter, universe]);
+
+  // Fetch séparé, pas mergé dans le Promise.all ci-dessus : loadBacktest()
+  // vide TOUS ses états sur la moindre erreur (un seul catch pour 5 appels),
+  // et FUNDAMENTAL_LAB est un module distinct (analysis app) qui ne doit pas
+  // pouvoir faire disparaître le reste de la page (backtest, sandboxes...)
+  // s'il échoue. Même pattern de rafraîchissement que le reste de la page
+  // malgré tout : fetch au chargement seulement, pas de polling.
+  useEffect(() => {
+    let isMounted = true;
+    const loadLabPerf = async () => {
+      setLabLoading(true);
+      setLabError(null);
+      try {
+        const data = await cachedGet('analysis/lab/performance/', {}, 30000);
+        if (!isMounted) return;
+        setLabPerf(data);
+      } catch (err) {
+        if (!isMounted) return;
+        setLabPerf(null);
+        setLabError("Impossible de charger les performances du Fundamental Lab.");
+      } finally {
+        if (isMounted) setLabLoading(false);
+      }
+    };
+    loadLabPerf();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const labPositionsSorted = useMemo(() => {
+    const positions = labPerf?.positions || [];
+    return [...positions].sort((a, b) => {
+      const av = a.current_return_pct;
+      const bv = b.current_return_pct;
+      if (av === null || av === undefined) return 1;
+      if (bv === null || bv === undefined) return -1;
+      return labSortDesc ? bv - av : av - bv;
+    });
+  }, [labPerf, labSortDesc]);
 
   const chartData = useMemo(() => {
     if (!backtest?.dates?.length) return [];
@@ -335,6 +388,108 @@ function AnalyticsLabPage() {
           Export PDF
         </button>
       </div>
+
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+        <div className="mb-4">
+          <p className="text-white font-semibold">Fundamental Lab</p>
+          <p className="text-xs text-slate-400">
+            Picks du screener fondamental (Claude/DeepSeek) — confirmed vs uncertain vs picks manuels
+          </p>
+        </div>
+        {labLoading ? (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {[1, 2, 3].map((item) => (
+              <div key={item} className="h-20 rounded-2xl border border-slate-800 bg-slate-900/60 animate-pulse" />
+            ))}
+          </div>
+        ) : labError ? (
+          <p className="text-rose-300 text-sm">{labError}</p>
+        ) : labPositionsSorted.length === 0 ? (
+          <p className="text-slate-400 text-sm">
+            Aucune position pour l'instant — lance un scan depuis le Screener fondamental.
+          </p>
+        ) : (
+          <>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+              <div className="bg-slate-950/60 border border-slate-800 rounded-2xl p-4">
+                <p className="text-xs text-slate-400 uppercase tracking-[0.2em]">✅ Confirmed (n={labPerf.confirmed.count})</p>
+                <p className="text-2xl text-white font-semibold">{formatPct(labPerf.confirmed.avg_return_pct)}</p>
+              </div>
+              <div className="bg-slate-950/60 border border-slate-800 rounded-2xl p-4">
+                <p className="text-xs text-slate-400 uppercase tracking-[0.2em]">⚠️ Uncertain (n={labPerf.uncertain.count})</p>
+                <p className="text-2xl text-white font-semibold">{formatPct(labPerf.uncertain.avg_return_pct)}</p>
+              </div>
+              <div className="bg-slate-950/60 border border-slate-800 rounded-2xl p-4">
+                <p className="text-xs text-slate-400 uppercase tracking-[0.2em]">⭐ Picks manuels (n={labPerf.manual_picks.count})</p>
+                <p className="text-2xl text-white font-semibold">{formatPct(labPerf.manual_picks.avg_return_pct)}</p>
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-sm">
+                <thead className="text-slate-400">
+                  <tr>
+                    <th className="text-left px-3 py-2">Ticker</th>
+                    <th className="text-left px-3 py-2">Verdict</th>
+                    <th className="text-left px-3 py-2">Entrée</th>
+                    <th className="text-left px-3 py-2">Actuel</th>
+                    <th
+                      className="text-left px-3 py-2 cursor-pointer select-none"
+                      onClick={() => setLabSortDesc((prev) => !prev)}
+                    >
+                      Rendement {labSortDesc ? '↓' : '↑'}
+                    </th>
+                    <th className="text-left px-3 py-2">Manuel</th>
+                    <th className="text-left px-3 py-2">Entrée le</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-900">
+                  {labPositionsSorted.map((p) => {
+                    const badge = LAB_VERDICT_BADGES[p.final_verdict] || {};
+                    const entry = Number(p.entry_price);
+                    const hasReturn = p.current_return_pct !== null && p.current_return_pct !== undefined;
+                    const currentPrice = hasReturn ? entry * (1 + p.current_return_pct / 100) : null;
+                    const priceDigits = entry < 5 ? 4 : 2;
+                    const returnColor = !hasReturn
+                      ? 'text-slate-400'
+                      : p.current_return_pct >= 0 ? 'text-emerald-300' : 'text-rose-300';
+                    return (
+                      <tr key={p.id} className={`hover:bg-slate-900/40 ${!p.is_open ? 'opacity-50' : ''}`}>
+                        <td className="px-3 py-2 text-slate-100">
+                          <a href={tickerDetailPath(p.ticker)} className="hover:underline">{p.ticker}</a>
+                          {!p.is_open && (
+                            <span className="ml-2 text-xs text-slate-500" title={p.manual_note || undefined}>
+                              (fermée)
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2">
+                          <span className={`inline-flex items-center px-2 py-1 rounded-full border text-xs ${badge.className || 'bg-slate-700/30 text-slate-200 border-slate-600/40'}`}>
+                            {badge.icon} {badge.label || p.final_verdict}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 text-slate-300">{formatNumber(entry, priceDigits)}</td>
+                        <td className="px-3 py-2 text-slate-300">
+                          {currentPrice === null ? '—' : formatNumber(currentPrice, priceDigits)}
+                        </td>
+                        <td className={`px-3 py-2 font-medium ${returnColor}`}>
+                          {hasReturn ? formatPct(p.current_return_pct) : '—'}
+                        </td>
+                        <td className="px-3 py-2 text-center" title={p.manually_selected ? p.manual_note || undefined : undefined}>
+                          {p.manually_selected ? '⭐' : '—'}
+                        </td>
+                        <td className="px-3 py-2 text-slate-400 text-xs">
+                          {new Date(p.entry_date).toLocaleDateString('fr-CA')}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </div>
+
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         <div className="xl:col-span-2 space-y-6">
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">

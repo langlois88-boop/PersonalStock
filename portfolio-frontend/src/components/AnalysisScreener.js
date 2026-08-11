@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import api from '../api/api';
 import { cachedGet, invalidateCache } from '../api/cachedApi';
+import { tickerDetailPath } from '../tickerUrl';
 
 const VERDICT_BADGES = {
   confirmed: { icon: '✅', label: 'Confirmé', className: 'bg-emerald-500/15 text-emerald-200 border-emerald-500/30' },
@@ -21,15 +22,6 @@ const formatNumber = (value, digits = 2) => {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
   return Number(value).toFixed(digits);
 };
-
-// Encode le point en %2E plutôt que de le laisser littéral dans l'URL du
-// lien -- trouvé le 2026-08-10 : un filtre réseau/logiciel de sécurité côté
-// client peut bloquer/altérer toute URL contenant ".to" (domaine national
-// des Tonga, associé au piratage), même dans un simple segment de chemin
-// comme "BTO.TO" qui n'a rien d'un vrai nom de domaine. encodeURIComponent
-// ne suffit pas ici : le point est un caractère "unreserved" qu'il laisse
-// toujours tel quel. Voir TickerDetail.js pour le décodage côté réception.
-const encodeTickerForUrl = (ticker) => String(ticker || '').replace(/\./g, '%2E');
 
 function AnalysisScreener() {
   const [selectedPreset, setSelectedPreset] = useState(PRESETS[0].slug);
@@ -184,7 +176,7 @@ function AnalysisScreener() {
                   return (
                     <tr key={r.id} className="hover:bg-slate-900/40">
                       <td className="px-3 py-2 text-slate-100">
-                        <a href={`/analysis/ticker/${encodeTickerForUrl(r.ticker)}`} className="hover:underline">{r.ticker}</a>
+                        <a href={tickerDetailPath(r.ticker)} className="hover:underline">{r.ticker}</a>
                       </td>
                       <td className="px-3 py-2">
                         <span className={`inline-flex items-center px-2 py-1 rounded-full border text-xs ${badge.className || 'bg-slate-700/30 text-slate-200 border-slate-600/40'}`}>
