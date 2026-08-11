@@ -728,3 +728,49 @@ soir)** :
 - Point 6 : confirmé rester **ouvert, pas résolu** — correctement
   séparé pour une vraie discussion avant Partie B (capital réel qui
   bouge automatiquement), pas oublié.
+
+### Résultat du A-test réel (2026-08-11, 22h06-22h36 UTC, ~30 min)
+
+```
+{'status': 'ok', 'universe_scanned': 720, 'basic_data_ok': 690,
+ 'coverage_ratio': 0.958, 'survivors_this_week': 4,
+ 'total_active_now': 4, 'newly_deactivated_by_miss': 0,
+ 'newly_deactivated_by_cap': 0}
+```
+
+**4 survivants** sur 690 tickers évalués (690/720 = 95.8% de
+couverture, run non-dégradé) :
+
+| Ticker | Indice | Piotroski | Altman Z |
+|---|---|---|---|
+| FVI.TO (Fortuna Mining) | TSX | 9 | 5.82 |
+| K.TO (Kinross Gold) | TSX | 9 | 8.21 |
+| ADBE (Adobe) | SP500 | 7 | 7.48 |
+| OGC.TO (OceanaGold) | TSX | 7 | 8.1 |
+
+Résultat directionnellement sensé : très peu de survivants (cohérent
+avec "tous les seuils obligatoires, ET pas OU" -- l'objectif était une
+poignée de titres, pas un tri large), tous largement au-dessus des
+seuils Altman Z (>3.0) et Piotroski (>=7). Concentration inattendue
+mais explicable sur les mines d'or/métaux précieux TSX (FVI/K/OGC) --
+plausible dans le contexte actuel (marges/bilans robustes typiques du
+secteur en période de prix élevés), pas un signe de bug.
+
+**Bug découvert pendant ce run, corrigé séparément avant le prochain
+cycle** : `_fetch_tsx_symbols` produisait des tickers invalides pour
+les titres à catégorie multiple/fiducie de revenu (point interne au
+lieu du tiret attendu par Yahoo -- ex. `RCI.B.TO` au lieu de
+`RCI-B.TO`), ~25 titres TSX skippés ce cycle (dont Rogers, Teck,
+CCL Industries, CGI...). Corrigé (`.replace('.', '-')` avant le
+suffixe `.TO`), vérifié en direct sur 5 tickers affectés, déployé
+séparément (commit `49b42f65`) -- prendra effet au prochain cycle
+hebdomadaire (dimanche prochain), pas relancé rétroactivement sur ce
+run de test.
+
+**Décision** : `universe_source="combined"` reste **NON activé**.
+Un seul cycle réel ne suffit pas pour juger de la stabilité
+semaine-après-semaine (le but de `consecutive_weeks_missed` est
+justement d'observer plusieurs semaines avant de faire confiance à la
+liste) -- à réévaluer après 2-3 cycles hebdomadaires réels (donc pas
+avant début septembre 2026, le prochain tournant dimanche prochain
+avec le fix TSX inclus).
