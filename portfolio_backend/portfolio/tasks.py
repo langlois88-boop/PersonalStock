@@ -10469,13 +10469,30 @@ def _yahoo_fundamentals(symbol: str) -> dict[str, float]:
         return {}
 
 
+def _read_wikipedia_tables(url: str) -> list:
+    """
+    pd.read_html(url) directement échoue sur Wikipedia avec "HTTP Error 403:
+    Forbidden" -- confirmé en direct le 2026-08-11 (urllib.request.urlopen
+    interne à pandas n'envoie pas de User-Agent, Wikipedia rejette les
+    requêtes qui ressemblent à un bot nu). Fetch via `requests` (déjà une
+    dépendance du projet) avec un User-Agent standard, puis on donne le HTML
+    déjà téléchargé à pd.read_html() -- celui-ci sait très bien parser une
+    chaîne HTML directement, il n'a besoin d'ouvrir l'URL lui-même que dans
+    le cas d'usage par défaut.
+    """
+    resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; PersonalStock/1.0)'}, timeout=15)
+    resp.raise_for_status()
+    return pd.read_html(resp.text)
+
+
 def _fetch_sp500_symbols(limit: int = 50) -> list[str]:
     try:
-        tables = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
+        tables = _read_wikipedia_tables('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
         frame = tables[0]
         symbols = [str(s).strip().upper().replace('.', '-') for s in frame['Symbol'].tolist()]
         return symbols[:limit]
     except Exception:
+        logger.warning("Échec _fetch_sp500_symbols (scrape Wikipedia), fallback BLUECHIP_SYMBOLS.", exc_info=True)
         fallback = [s.strip().upper() for s in os.getenv('BLUECHIP_SYMBOLS', '').split(',') if s.strip()]
         return fallback[:limit]
 
