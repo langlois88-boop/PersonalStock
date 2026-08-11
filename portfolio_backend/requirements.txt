@@ -41,3 +41,12 @@ psycopg2-binary
 reportlab
 plotly
 shap
+# lxml : requis par pd.read_html() -- absent jusqu'ici (2026-08-11), ce qui
+# faisait échouer silencieusement _fetch_sp500_symbols() (portfolio/tasks.py)
+# à chaque appel, avec retombée sur un fallback BLUECHIP_SYMBOLS lui-même
+# jamais défini dans .env -> liste vide. _analyze_bluechip_rebounds()
+# (bluechip_dip_scanner) tournait donc depuis le début sur un univers
+# systématiquement vide, sans erreur visible (gère déjà le cas vide
+# proprement). Ajouté pour le nouveau balayage large SP500/TSX, répare le
+# même coup ce bug pré-existant.
+lxml
