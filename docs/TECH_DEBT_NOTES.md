@@ -702,3 +702,29 @@ terminée).
 
 `universe_source="combined"` reste **NON activé** sur aucun preset
 jusqu'à validation du résultat de ce cycle.
+
+**Nuances ajoutées par l'utilisateur en relecture (2026-08-11, même
+soir)** :
+- Point 2 (couverture 70%) : si le scan reste dégradé **plusieurs
+  semaines de suite** (pas juste un incident isolé), les tickers déjà
+  actifs ne décroissent jamais MAIS ne se rafraîchissent pas non plus —
+  ils restent figés sur leur dernière vraie confirmation
+  (`piotroski_score`/`altman_z_score`/`last_confirmed` obsolètes). Pas
+  un problème dans l'immédiat (le comportement voulu reste "ne pas
+  pénaliser à tort"), mais si un ticker actif semble ne plus se mettre
+  à jour depuis longtemps, c'est la première piste à vérifier (regarder
+  l'historique des `status` retournés par les runs récents, pas
+  supposer un bug ailleurs).
+- Point 5 (écarts Piotroski/Altman vs GuruFocus) : la cause la plus
+  probable est la fraîcheur des données (annuel yfinance vs mix
+  trimestriel plus récent), pas un bug de formule — confirmé par le
+  fait que la classification qualitative tient dans les 2 cas testés.
+  Vigilance à avoir : un ticker **limite** (score proche du seuil
+  `STRICT_PIOTROSKI_MIN=7`, ex. 6 ou 7 pile) est le cas où ce même
+  écart de fraîcheur pourrait faire basculer un vrai verdict (passe/ne
+  passe pas) — si un faux négatif/positif suspect apparaît un jour sur
+  un titre proche du seuil, vérifier la fraîcheur des états financiers
+  annuels avant de suspecter la formule elle-même.
+- Point 6 : confirmé rester **ouvert, pas résolu** — correctement
+  séparé pour une vraie discussion avant Partie B (capital réel qui
+  bouge automatiquement), pas oublié.
