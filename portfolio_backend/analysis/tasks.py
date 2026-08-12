@@ -29,7 +29,7 @@ from django.utils import timezone
 
 from portfolio import market_data
 from portfolio.models import PaperTrade, SandboxWatchlist
-from portfolio.alpaca_data_lab import submit_lab_market_order
+from portfolio.alpaca_data_lab import submit_lab_market_order, get_lab_order_by_id
 
 from .models import (
     ScreenerPreset, ScanRun, ScanResult, FundamentalLabPosition,
@@ -643,14 +643,83 @@ def monitor_lab_positions(self) -> dict:
     utilisé avant ce soir) -- pas de take-profit, pas de trailing stop.
     Objectif : fermer la faille de capital avant d'aller plus loin, pas
     répliquer toute la sophistication des sandboxes ML existants.
+
+    Garde-fou ajouté le 2026-08-11 (revue avant l'ouverture du 2026-08-12,
+    suite au dry-run ADBE placé hors marché, order_id 7dbe7a3d-...) : un
+    ordre 'ACCEPTED'/'NEW' n'a PAS encore de position réelle derrière --
+    comparer son prix au stop-loss et tenter une vente dessus serait une
+    action sur du vide (échec silencieux ou bruyant selon le comportement
+    d'Alpaca pour une vente à découvert non voulue, jamais testé). On
+    vérifie maintenant le statut RÉEL de l'ordre via get_lab_order_by_id
+    (compte dédié) avant toute comparaison de prix -- seul un ordre
+    effectivement 'filled' est éligible au stop-loss. Sert aussi de
+    synchro légère au passage (broker_status/entry_price recalés sur le
+    remplissage réel dès qu'il est détecté) -- pas une tâche de synchro
+    complète, juste ce qui est nécessaire pour que ce garde-fou soit fiable.
     """
     trades = PaperTrade.objects.filter(sandbox="FUNDAMENTAL_LAB", broker="ALPACA_LAB", status="OPEN")
     checked = 0
     closed = 0
+    skipped_unfilled = 0
     for trade in trades:
         checked += 1
         if not trade.stop_loss:
             continue
+        if not trade.broker_order_id:
+            logger.warning(
+                "monitor_lab_positions: %s (PaperTrade %s) sans broker_order_id, stop-loss non vérifiable ce cycle.",
+                trade.ticker, trade.id,
+            )
+            continue
+
+        order_status = get_lab_order_by_id(trade.broker_order_id)
+        if order_status is None:
+            logger.warning(
+                "monitor_lab_positions: échec de la vérification du statut réel de l'ordre pour %s "
+                "(order_id=%s) -- API Alpaca indisponible ou ordre introuvable, stop-loss non vérifié ce cycle.",
+                trade.ticker, trade.broker_order_id,
+            )
+            continue
+
+        raw_status = getattr(order_status, "status", None)
+        status_value = str(getattr(raw_status, "value", raw_status) or "").lower()
+        try:
+            filled_qty = float(getattr(order_status, "filled_qty", None) or 0.0)
+        except Exception:
+            filled_qty = 0.0
+
+        if status_value != "filled" or filled_qty <= 0:
+            skipped_unfilled += 1
+            logger.info(
+                "monitor_lab_positions: %s (order_id=%s) statut réel='%s' filled_qty=%s -- pas encore rempli, "
+                "stop-loss non applicable ce cycle (aucune position réelle à protéger).",
+                trade.ticker, trade.broker_order_id, status_value, filled_qty,
+            )
+            if status_value and status_value != (trade.broker_status or "").lower():
+                trade.broker_status = status_value
+                trade.broker_updated_at = timezone.now()
+                trade.save(update_fields=["broker_status", "broker_updated_at"])
+            continue
+
+        if (trade.broker_status or "").lower() != "filled":
+            update_fields = ["broker_status", "broker_updated_at", "broker_filled_qty"]
+            trade.broker_status = "filled"
+            trade.broker_updated_at = timezone.now()
+            trade.broker_filled_qty = filled_qty
+            filled_avg_price = getattr(order_status, "filled_avg_price", None)
+            try:
+                if filled_avg_price is not None:
+                    trade.entry_price = round(float(filled_avg_price), 4)
+                    trade.broker_avg_price = float(filled_avg_price)
+                    update_fields += ["entry_price", "broker_avg_price"]
+            except Exception:
+                pass
+            trade.save(update_fields=update_fields)
+            logger.info(
+                "monitor_lab_positions: %s (order_id=%s) confirmé REMPLI -- entry_price recalé sur %.4f.",
+                trade.ticker, trade.broker_order_id, float(trade.entry_price),
+            )
+
         try:
             data = fetch_ticker_data(trade.ticker)
         except Exception:
@@ -702,6 +771,6 @@ def monitor_lab_positions(self) -> dict:
             )
         closed += 1
 
-    result = {"checked": checked, "closed": closed}
+    result = {"checked": checked, "closed": closed, "skipped_unfilled": skipped_unfilled}
     logger.info("monitor_lab_positions terminé: %s", result)
     return result
