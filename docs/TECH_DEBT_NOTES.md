@@ -945,3 +945,71 @@ habituelle des scans 9h45/16h30 (et surveiller si le scan de 9h45 ouvre
 une nouvelle position FUNDAMENTAL_LAB pendant que l'ordre ADBE d'hier
 est encore en transition -- scénario justement cité comme risque
 potentiel avant le fix).
+
+## 13. [FAIT le 2026-08-12] Partie C — Diagnostic signal WATCHLIST bloqué à zéro
+
+**Contexte** : `base_model_signal` variait normalement (0.24-0.58 sur les
+logs), mais le `final` (celui qui gate vraiment l'achat) était observé à
+exactement 0 sur toute une semaine de `SystemLog`. Demande explicite de
+diagnostiquer avant de corriger, et de ne pas supposer qu'un fix règle
+tout juste parce que le signal n'est plus bloqué à 0 (risque de
+calibration masquée derrière le premier bug).
+
+**Ce n'est PAS un bug de code (aucun crash, NaN, ou échec silencieux).**
+Deux causes réelles, confirmées avec des données de production
+(`SystemLog.metadata['signal_distribution']`, pas une supposition) :
+
+**1. `payload['signal']` pour WATCHLIST n'a JAMAIS été dérivé de
+`base_model_signal`** — c'est une confusion de prémisse, pas un bug :
+`_signal()` (`portfolio/tasks.py:5460`) remplace entièrement le signal
+du modèle ML par `_mean_reversion_score()` (RSI14 + bonus Bollinger)
+pour ce sandbox spécifiquement — déjà documenté explicitement en
+commentaire dans le code avant ce soir. `base_model_signal` est
+seulement stocké à titre diagnostique, jamais utilisé pour la décision
+d'achat de WATCHLIST.
+
+**2. Qualité des données : 4 tickers sur 10 radiés/invalides.**
+`FLT.V`, `HIVE.V`, `BITF.TO`, `LUG` renvoyaient tous un 404 Yahoo
+Finance — pas des radiations réelles mais des **changements de suffixe
+d'échange non suivis** (même classe de bug que le fix TSX `RCI.B.TO` de
+la nuit dernière) :
+- `FLT.V` → `FLT.TO` (Volatus Aerospace, gradué TSXV→TSX)
+- `HIVE.V` → `HIVE.TO` (HIVE Digital Technologies, gradué TSXV→TSX)
+- `BITF.TO` → `KEEL.TO` (Bitfarms rebrandé "Keel Infrastructure",
+  avril 2026, changement de ticker)
+- `LUG` → `LUG.TO` (Lundin Gold, suffixe manquant)
+Tous vérifiés en direct (prix réels obtenus) avant correction.
+**Corrigé** : `SandboxWatchlist(sandbox='WATCHLIST').symbols` mis à
+jour en DB sur le NAS (changement de donnée, pas de code). Vérifié
+après coup : 10/10 tickers produisent maintenant un signal valide
+(avant : 6/10).
+
+**3. Calibration confirmée problématique (la 2e couche que l'utilisateur
+anticipait)** : `buy_threshold=0.55` pour WATCHLIST (confirmé via
+`SystemLog.metadata['buy_threshold']`, valeur réelle en production).
+`rsi_score = max(0.0, (30-rsi)/30)` plafonne à 0 dès que RSI >= 30, et
+le bonus Bollinger n'ajoute que +0.15 max — pour atteindre 0.55 il faut
+RSI ≲ 18, une survente extrême, pas juste "pas cher". Confirmé sur les
+données réelles :
+- 7-10 août : `final`=0.0/0.0/0.0 sur des dizaines d'entrées
+  consécutives (aucun des 6 tickers valides sous RSI 30 pendant 3 jours).
+- 10 août 3h38 → aujourd'hui : `final` devient non-nul (jusqu'à
+  0.34-0.49) mais **ne franchit jamais 0.55** — le seuil reste
+  structurellement hors de portée même quand le marché bouge.
+- Vérifié en direct aujourd'hui : RSI des 6 tickers alors valides =
+  44-92, aucun proche de la survente.
+
+**Décision explicite : le nettoyage des tickers est fait, la
+calibration (seuil/formule) N'EST PAS touchée ce soir** — c'est une
+décision de stratégie de trading, pas un bug à corriger unilatéralement.
+À rediscuter séparément si voulu.
+
+**Reste ouvert / à surveiller** :
+- `HIVE_MONITOR_SYMBOL=HIVE.V` dans `deploy/.env` (utilisé par la tâche
+  séparée `monitor_hive_trade`, alerte de prix sur un seul symbole —
+  n'a AUCUN rapport avec le pipeline PaperTrade/WATCHLIST, vérifié en
+  B1) a le même symbole périmé. Pas corrigé ce soir (hors scope de
+  Partie C), à faire séparément si voulu (`HIVE.V` → `HIVE.TO`).
+- Avec le nettoyage des tickers, `final` devrait maintenant produire
+  des échantillons sur 10 tickers au lieu de 6 aux prochains scans —
+  à confirmer sur les prochains cycles réels (pas supposé).
