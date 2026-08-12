@@ -850,3 +850,49 @@ des containers en prod).
 été placé -- besoin d'un dry-run contrôlé, confirmé directement sur le
 dashboard Alpaca (pas seulement en DB), avant de considérer B2 comme
 validé en conditions réelles.
+
+### B3 — Dry-run manuel isolé (2026-08-11 23h53 UTC)
+
+Position unique ADBE (~$264, 1 action) créée manuellement via
+`_create_lab_position` sur un vrai `ScanResult` construit pour le test
+(verdict marqué explicitement comme test manuel dans `quant_details`,
+pas un vrai verdict LLM). Ordre confirmé **directement via l'API Alpaca**
+(pas juste en DB), `get_lab_order_by_id` interrogé indépendamment :
+`symbol=ADBE qty=1 side=BUY status=ACCEPTED`, `buying_power` du compte
+réduit de $50 000 à $49 736.74 -- capital réellement engagé sur le
+compte dédié `PA34ZP3JNN2T`.
+
+**Bug trouvé avant qu'il ne compte pour de vrai** : l'ordre a été soumis
+hors heures de marché (19h53 ET), donc `filled_qty=0` -- pas encore
+rempli. `monitor_lab_positions` (version initiale) comparait le prix
+marché au stop_loss pour toute position `status='OPEN'` en DB, **sans
+jamais vérifier si l'ordre avait réellement été rempli côté Alpaca**. Le
+test du soir est resté propre uniquement parce que le prix ADBE était
+loin du stop -- pas parce que le code se protégeait correctement. Un
+stop-loss cassé sur un ordre encore `ACCEPTED` aurait déclenché une
+tentative de vente réelle sur une position qui n'existe pas encore
+côté broker (comportement Alpaca jamais testé dans ce cas).
+
+**Corrigé avant l'ouverture du 2026-08-12** (bloquant, pas juste noté --
+demande explicite) : `monitor_lab_positions` interroge maintenant
+`get_lab_order_by_id` et vérifie `status == 'filled'` AVANT toute
+comparaison prix/stop-loss. Sert aussi de synchro légère : au premier
+remplissage détecté, `entry_price`/`broker_avg_price`/`broker_status`
+sont recalés sur les vraies données de fill (pas une tâche de synchro
+complète, juste ce qu'il faut pour que ce garde-fou soit fiable).
+Validé en 2 temps avant déploiement : (1) appel direct de
+`get_lab_order_by_id` sur l'ordre ADBE en attente, confirmé
+`status='accepted'` → non éligible ; (2) exécution complète de
+`monitor_lab_positions()` en conteneur jetable, résultat
+`{'checked': 1, 'closed': 0, 'skipped_unfilled': 1}`, log exact
+conforme à l'attendu. Déployé (backend + les 3 workers/beat reconstruits
+et recréés).
+
+**Reste à vérifier demain matin (2026-08-12), ajouté à la checklist** :
+confirmer que l'ordre ADBE se remplit réellement à l'ouverture
+(`filled_qty` 0→1), que `monitor_lab_positions` détecte ce remplissage
+et recale `entry_price` sur le prix réel, en plus de la vérification
+habituelle des scans 9h45/16h30 (et surveiller si le scan de 9h45 ouvre
+une nouvelle position FUNDAMENTAL_LAB pendant que l'ordre ADBE d'hier
+est encore en transition -- scénario justement cité comme risque
+potentiel avant le fix).
