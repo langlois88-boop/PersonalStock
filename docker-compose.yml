@@ -88,20 +88,23 @@ services:
     build:
       context: ./portfolio_backend
       dockerfile: Dockerfile
-    command: celery -A portfolio_backend beat --loglevel=INFO
+    # --schedule (2026-08-12) : le fichier d'état "dernière exécution" de
+    # Beat vit par défaut dans le CWD du process (/app/celerybeat-schedule.db,
+    # jamais monté) -- écrasé à chaque --force-recreate, donc Beat "oubliait"
+    # avoir déjà tourné aujourd'hui et re-déclenchait des tâches planifiées à
+    # un horaire fixe hors de leur fenêtre -- cause racine confirmée de
+    # l'item 7/TECH_DEBT_NOTES.md : 3 exécutions hors-calendrier de
+    # run_daily_scan la nuit du 2026-08-11/12 (aucune position dupliquée
+    # grâce au garde-fou existant, mais du budget Claude gaspillé pour rien).
+    # Une variable d'env CELERYBEAT_SCHEDULE existait déjà ici mais n'était
+    # lue par AUCUN code du projet (pas une variable standard Celery) --
+    # remplacée par le vrai flag CLI, seul mécanisme qui fonctionne
+    # réellement, vérifié en direct sur le NAS avant ce commit.
+    command: celery -A portfolio_backend beat --loglevel=INFO --schedule=/celerybeat/celerybeat-schedule
     env_file:
       - ./deploy/.env
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    environment:
-      # 2026-08-12 : déplacé de /tmp (effacé à chaque --force-recreate,
-      # donc Beat "oubliait" avoir déjà tourné aujourd'hui et re-déclenchait
-      # des tâches planifiées à un horaire fixe hors de leur fenêtre --
-      # cause racine confirmée de l'item 7/TECH_DEBT_NOTES.md : 3 exécutions
-      # hors-calendrier de run_daily_scan la nuit du 2026-08-11/12, aucune
-      # position dupliquée grâce au garde-fou existant mais du budget Claude
-      # gaspillé pour rien) vers un volume nommé persistant.
-      - CELERYBEAT_SCHEDULE=/celerybeat/celerybeat-schedule
     depends_on:
       - postgres
       - redis
