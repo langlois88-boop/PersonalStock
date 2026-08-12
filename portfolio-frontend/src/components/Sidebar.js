@@ -29,14 +29,28 @@ const navItems = [
 
 function Sidebar() {
   return (
-    <aside className="bg-slate-950 text-slate-200 w-full lg:w-64 p-6 flex lg:flex-col gap-6 border-r border-slate-900">
-      <div>
+    // Mobile (< lg) : barre horizontale compacte, icônes seules, défilement
+    // horizontal si ça déborde -- avant ce fix, les 8 items s'empilaient
+    // verticalement avec icône+texte, sans limite de hauteur, et pouvaient
+    // occuper 400-500px sur un écran de téléphone (~700px de haut),
+    // laissant à peine de la place pour la page elle-même (bug rapporté :
+    // "on arrive pas à voir la page, on peut seulement scroller").
+    // Desktop (lg+) : comportement inchangé, menu vertical complet avec
+    // libellés.
+    <aside className="bg-slate-950 text-slate-200 w-full lg:w-64 flex-shrink-0 border-r border-slate-900">
+      <div className="hidden lg:block p-6">
         <p className="text-xs uppercase tracking-[0.3em] text-slate-500">ML Trading Lab</p>
         <h1 className="text-xl font-semibold text-white">Command Center</h1>
       </div>
-      <nav className="flex flex-col gap-2">
+      <nav className="flex lg:flex-col gap-2 overflow-x-auto lg:overflow-visible p-3 lg:p-6 lg:pt-0">
         {navItems.map((item) => {
           const Icon = item.icon;
+          const content = (
+            <>
+              <Icon size={18} className="flex-shrink-0" />
+              <span className="hidden lg:inline">{item.label}</span>
+            </>
+          );
           if (item.external) {
             return (
               <a
@@ -44,10 +58,9 @@ function Sidebar() {
                 href={item.to}
                 target="_blank"
                 rel="noreferrer"
-                className="flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition text-slate-400 hover:text-white hover:bg-slate-900"
+                className="flex items-center gap-3 px-3 lg:px-4 py-2 lg:py-3 rounded-xl text-sm transition text-slate-400 hover:text-white hover:bg-slate-900 flex-shrink-0 whitespace-nowrap"
               >
-                <Icon size={18} />
-                <span>{item.label}</span>
+                {content}
               </a>
             );
           }
@@ -56,14 +69,13 @@ function Sidebar() {
               key={item.id}
               to={item.to}
               end={item.to === '/'}
-              className={({ isActive }) => `flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition ${
+              className={({ isActive }) => `flex items-center gap-3 px-3 lg:px-4 py-2 lg:py-3 rounded-xl text-sm transition flex-shrink-0 whitespace-nowrap ${
                 isActive
                   ? 'bg-indigo-500/15 text-indigo-200 border border-indigo-500/30'
                   : 'text-slate-400 hover:text-white hover:bg-slate-900'
               }`}
             >
-              <Icon size={18} />
-              <span>{item.label}</span>
+              {content}
             </NavLink>
           );
         })}
