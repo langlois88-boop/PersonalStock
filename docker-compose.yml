@@ -94,7 +94,14 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      - CELERYBEAT_SCHEDULE=/tmp/celerybeat-schedule
+      # 2026-08-12 : déplacé de /tmp (effacé à chaque --force-recreate,
+      # donc Beat "oubliait" avoir déjà tourné aujourd'hui et re-déclenchait
+      # des tâches planifiées à un horaire fixe hors de leur fenêtre --
+      # cause racine confirmée de l'item 7/TECH_DEBT_NOTES.md : 3 exécutions
+      # hors-calendrier de run_daily_scan la nuit du 2026-08-11/12, aucune
+      # position dupliquée grâce au garde-fou existant mais du budget Claude
+      # gaspillé pour rien) vers un volume nommé persistant.
+      - CELERYBEAT_SCHEDULE=/celerybeat/celerybeat-schedule
     depends_on:
       - postgres
       - redis
@@ -105,6 +112,7 @@ services:
       - backend_db:/app/db
       - backend_models:/app/portfolio/ml_engine/models
       - ${BACKUP_SSD_PATH:-/mnt/BackupSSD}:/mnt/BackupSSD
+      - celerybeat_schedule:/celerybeat
     restart: unless-stopped
 
   realtime_tracker:
@@ -139,3 +147,4 @@ volumes:
   backend_static:
   backend_db:
   backend_models:
+  celerybeat_schedule:
