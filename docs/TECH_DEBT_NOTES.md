@@ -363,11 +363,60 @@ d'écriture systématique) lors du chantier Celery plus large (item 5).
 
 ---
 
-## 7. [PRIORITÉ ÉLEVÉE, découvert le 2026-08-10 ~21h35 UTC] Beat déclenche plusieurs tâches en rafale toutes les ~3-3.5h — pré-existant, pas causé par les changements de ce soir
+## 7. [CORRIGÉ le 2026-08-12 ~20h42 UTC] Beat déclenche plusieurs tâches en rafale toutes les ~3-3.5h — pré-existant, pas causé par les changements du 2026-08-10
 
-**Statut : diagnostiqué, cause probable identifiée mais PAS confirmée,
-volontairement PAS touché ce soir (bug plus profond que prévu — arrêt
-et documentation, comme convenu).**
+**Statut : fermé. Hypothèse du 2026-08-10 (BDB0210 checksum error /
+fichier de planning éphémère) CONFIRMÉE avec une preuve concrète, corrigée,
+vérifiée en direct (persistance survivant à un `--force-recreate`).**
+
+**Preuve concrète qui manquait le 2026-08-10** : la nuit du 2026-08-11/12,
+`celery_beat` a été recréé 4 fois (déploiements Partie A/B) — chaque fois
+avec le message `BDB0210 celerybeat-schedule.db: metadata page checksum
+error`. Résultat mesuré : **3 exécutions hors-calendrier de
+`run_daily_scan`** (03h31, 04h58, 06h43 UTC — aucune ne correspond aux
+créneaux 9h45/16h30 ET configurés), soit exactement le mécanisme
+suspecté : Beat "oublie" `last_run_at` pour plusieurs entrées à la fois
+et les redéclare "dues" simultanément. Impact réel de ces 3 exécutions :
+aucune position dupliquée (le garde-fou de l'item 8 a bloqué les 21
+évaluations), mais ~65 000 tokens Claude gaspillés sur 13 appels.
+
+**Cause racine exacte** (plus précise que l'hypothèse du 2026-08-10) :
+le fichier persistant de Beat vivait dans le CWD du conteneur
+(`/app/celerybeat-schedule.db`), jamais monté sur un volume Docker —
+donc *toujours* perdu à la recréation du conteneur, pas seulement en
+cas de corruption occasionnelle. Une variable d'env `CELERYBEAT_SCHEDULE`
+préexistante dans `docker-compose.yml` laissait croire qu'un chemin
+`/tmp/...` était déjà configuré, mais elle n'était lue par **aucun**
+code du projet (pas une variable standard Celery) — donc sans effet
+réel, le fichier restait toujours au chemin par défaut non monté.
+
+**Fix appliqué** (`docker-compose.yml`) :
+1. Nouveau volume nommé `celerybeat_schedule` monté sur `/celerybeat`.
+2. `command:` du service `celery_beat` : ajout du flag CLI réel
+   `--schedule=/celerybeat/celerybeat-schedule` (le seul mécanisme qui
+   fonctionne, vérifié en direct — la variable d'env supprimée).
+
+**Vérifié en direct sur le NAS avant de considérer le point clos** :
+log de démarrage confirme `db -> /celerybeat/celerybeat-schedule` (plus
+le chemin par défaut) ; fichier `celerybeat-schedule` (524 288 octets,
+dbm réel) présent avec le bon timestamp ; un second `--force-recreate`
+délibéré montre le **même** fichier, même timestamp, aucune erreur
+`BDB0210` — persistance confirmée, pas juste supposée.
+
+**Conséquence pratique** : les futurs redéploiements touchant
+`celery_beat` (fréquents dans ce projet) n'entraîneront plus ce
+comportement. `tsx-guardian-30s` (item 4) et le volume de la queue par
+défaut (item 5/9) restent des chantiers séparés, non résolus par ce fix
+— seule la cause des rafales/re-déclenchements hors-calendrier est
+corrigée ici.
+
+---
+
+### Diagnostic original (2026-08-10, conservé pour l'historique du raisonnement)
+
+**Statut original : diagnostiqué, cause probable identifiée mais PAS
+confirmée, volontairement PAS touché ce soir-là (bug plus profond que
+prévu — arrêt et documentation, comme convenu).**
 
 **Découvert en vérifiant** pourquoi `monitor_active_trade` apparaissait
 ~12 fois à la même seconde dans les logs. En creusant sur une fenêtre de
