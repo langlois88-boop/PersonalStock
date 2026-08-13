@@ -486,9 +486,13 @@ pas une correction à l'aveugle en fin de soirée.
 
 ---
 
-## 8. `_create_lab_position` ne vérifie jamais une position déjà ouverte pour le même ticker
-**Statut : ouvert, découvert le 2026-08-10 ~22h40 UTC. Symptôme
-nettoyé, cause PAS corrigée (décision explicite de l'utilisateur).**
+## 8. [CORRIGÉ, découvert le 2026-08-10, fix jamais documenté ici avant le 2026-08-13] `_create_lab_position` ne vérifiait jamais une position déjà ouverte pour le même ticker
+**Statut : fermé. Doc mise à jour le 2026-08-13 après vérification
+directe du code (pas juste supposé) : le check anti-doublon est bien
+présent et actif dans `_create_lab_position` (`analysis/tasks.py:277`).
+Le fix a été appliqué à un moment de cette session sans que cette entrée
+ne soit mise à jour en conséquence — corrigé maintenant pour que la doc
+reflète l'état réel.**
 
 **Confirmé** (`analysis/tasks.py:203`, fonction `_create_lab_position`) :
 aucun check `FundamentalLabPosition.objects.filter(ticker=..., preset=...,
