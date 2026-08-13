@@ -529,10 +529,51 @@ voulu exactement) avant de coder.
 
 ---
 
-## 9. Circuit breaker (`_daily_equity_circuit_breaker`) utilise le cache Django par défaut (non persistant, pas Redis)
-**Statut : ouvert, deux faux déclenchements confirmés ce soir (un 3e
-touchant AI_PENNY en plus d'AI_BLUECHIP), cause structurelle toujours
-pas corrigée, portée revue à la hausse après le 2e épisode.**
+## 9. [CORRIGÉ le 2026-08-13] Circuit breaker (`_daily_equity_circuit_breaker`) utilise le cache Django par défaut (non persistant, pas Redis)
+**Statut : fermé. Troisième épisode réel le 2026-08-13 (redémarrage
+complet du NAS) a fourni la confirmation manquante, corrigé le soir
+même — état déplacé vers Redis, vérifié en conditions réelles.**
+
+### Correctif (2026-08-13)
+
+**Nouvelle preuve avant le fix** : le 2026-08-13, un redémarrage complet
+du NAS (tous les containers, pas seulement PersonalStock) a coïncidé
+avec un second déclenchement du breaker pour AI_BLUECHIP ET AI_PENNY,
+~8h après leur premier déclenchement de la journée, avec un `capital`
+**identique au chiffre près** aux deux occasions (23803.36$/10038.11$ —
+`capital = initial_capital + closed_pnl`, inchangé car 0 trade fermé
+entre les deux). Mathématiquement, une baseline correctement conservée
+ne peut pas re-déclencher sur une valeur d'équité inchangée
+(`equity_now >= baseline` reste vrai) — confirme que l'état a bien été
+perdu, pas qu'un vrai second drawdown s'est produit.
+
+**Fix** : `_daily_equity_circuit_breaker` et `reset_daily_equity_breaker`
+(`portfolio/tasks.py`) réécrites pour utiliser un client Redis dédié
+(`_circuit_breaker_redis_client()`, lazy-init, `REDIS_URL` déjà utilisé
+comme broker Celery dans ce projet) au lieu du framework `cache` de
+Django par défaut. Changement volontairement **surgical** : seul cet
+état précis change de backend, pas tous les usages de `cache.*` ailleurs
+dans `tasks.py` (portée plus large, plus risquée, pas nécessaire pour
+corriger ce problème précis).
+
+**Vérifié, pas juste supposé corrigé** :
+- 5 tests de régression contre le **vrai** Redis (pas un mock — un mock
+  en mémoire aurait masqué exactement le bug corrigé), dont un qui
+  simule explicitement un redémarrage de worker (recrée le client Redis
+  module-level) et confirme que la baseline puis le déclenchement
+  survivent.
+- Vérification en direct sur le NAS après déploiement, container
+  `backend` fraîchement recréé (donc cache en mémoire vidé pour de
+  vrai, pas simulé) : baseline établie à 10000$, déclenchement correct
+  à -4% après un redémarrage simulé additionnel du client Redis lui-même.
+
+**Note** : les clés de déclenchement d'AI_BLUECHIP/AI_PENNY du
+2026-08-13 (avant le fix) ne sont pas récupérables rétroactivement
+(écrites dans l'ancien LocMemCache, disparu avec le redémarrage) — sans
+impact réel, la clé est datée du jour et ne se reporte pas sur demain de
+toute façon.
+
+### Diagnostic original (2026-08-11, conservé pour l'historique)
 
 **Confirmé** : pas de bloc `CACHES` dans `settings.py` → Django utilise
 `LocMemCache` par défaut (cache en mémoire du process, PAS Redis) pour
