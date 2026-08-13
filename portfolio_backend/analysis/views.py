@@ -4,18 +4,21 @@ inclus depuis portfolio_backend/urls.py sous 'api/analysis/'.
 """
 
 import logging
+import os
 
 import pandas as pd
 from django.db.models import Avg, Count
+from django.utils import timezone
 from rest_framework import serializers, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import (
     ScreenerPreset, ScanRun, ScanResult, FundamentalLabPosition,
-    RejectionLog, RejectionOutcome,
+    RejectionLog, RejectionOutcome, ManualTickerCheck,
 )
 from .tasks import run_daily_scan
+from .services.manual_check import run_manual_check
 
 logger = logging.getLogger(__name__)
 
@@ -364,3 +367,61 @@ class RejectionAuditView(APIView):
         ]
 
         return Response({"summary": summary, "flagged_for_review": flagged_data})
+
+
+class ManualTickerCheckView(APIView):
+    """
+    POST : vérification manuelle à la demande sur N'IMPORTE QUEL ticker
+    (pas seulement l'univers habituel des sandboxes) -- pipeline complet
+    (quant -> DeepSeek -> Claude) réutilisé tel quel via
+    services.manual_check.run_manual_check, mais AUCUNE écriture dans
+    ScanResult / FundamentalLabPosition / CustomWatchlistTicker /
+    PaperTrade. Pure lecture, isolée de tout le reste -- aucune position
+    n'est jamais créée depuis ce bouton.
+
+    Tracé uniquement dans ManualTickerCheck (ticker/date/résultats/coût
+    tokens) pour ne pas perdre un raisonnement Claude déjà payé -- pas un
+    signal, pas un scan, jamais lu par le pipeline automatique.
+
+    Garde-fou de coût : max MANUAL_CHECK_DAILY_LIMIT (défaut 20)
+    vérifications/jour -- rien n'empêche de taper des tickers au hasard,
+    donc pas de filtre quant de présélection en amont comme le pipeline
+    normal ; ce plafond évite qu'un usage répété fasse dériver le budget
+    Claude mensuel sans que ce soit visible immédiatement.
+    """
+
+    def post(self, request, ticker):
+        daily_limit = int(os.getenv("MANUAL_CHECK_DAILY_LIMIT", "20"))
+        today_count = ManualTickerCheck.objects.filter(checked_at__date=timezone.localdate()).count()
+        if today_count >= daily_limit:
+            return Response(
+                {
+                    "error": (
+                        f"Limite quotidienne de vérifications manuelles atteinte "
+                        f"({daily_limit}/jour) -- réessaie demain."
+                    ),
+                },
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        result = run_manual_check(ticker)
+        if result.get("error"):
+            return Response(result, status=status.HTTP_404_NOT_FOUND)
+
+        ManualTickerCheck.objects.create(
+            ticker=result["ticker"],
+            sector=result.get("sector", ""),
+            quant_score=result.get("quant_score", 0.0),
+            quant_details=result.get("quant_details", {}),
+            price_at_check=result.get("price"),
+            deepseek_verdict=result.get("deepseek_verdict", ""),
+            deepseek_reasoning=result.get("deepseek_reasoning", ""),
+            claude_verdict=result.get("claude_verdict", ""),
+            claude_reasoning=result.get("claude_reasoning", ""),
+            claude_tokens_used=result.get("claude_tokens_used", 0),
+            final_verdict=result.get("final_verdict", ""),
+        )
+
+        result["checks_used_today"] = today_count + 1
+        result["checks_daily_limit"] = daily_limit
+        return Response(result)

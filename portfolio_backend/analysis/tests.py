@@ -10,10 +10,10 @@ from portfolio.models import PaperTrade, SandboxWatchlist
 
 from .models import (
     ScreenerPreset, ScanRun, ScanResult, FundamentalLabPosition,
-    RejectionLog, RejectionOutcome,
+    RejectionLog, RejectionOutcome, ManualTickerCheck,
 )
 from . import tasks
-from .services import quant_filter
+from .services import quant_filter, manual_check
 from .services.deepseek_triage import DeepSeekResult
 from .services.claude_verifier import ClaudeResult
 from .services.quant_filter import QuantResult
@@ -516,3 +516,122 @@ class TickerChartViewTests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["period"], "3mo")
+
+
+class RunManualCheckTests(APITestCase):
+    """
+    services.manual_check.run_manual_check : miroir en lecture seule de
+    _process_candidate (mêmes fonctions réutilisées), mais ne doit RIEN
+    écrire en DB -- c'est ManualTickerCheckView qui se charge de la trace
+    optionnelle, pas cette fonction.
+    """
+
+    def test_insufficient_data_returns_error_dict_not_exception(self):
+        with patch.object(manual_check, "evaluate_ticker", return_value=None):
+            result = manual_check.run_manual_check("ZZZINVALIDXYZ")
+        self.assertIn("error", result)
+        self.assertEqual(result["ticker"], "ZZZINVALIDXYZ")
+
+    def test_deepseek_rejection_skips_claude(self):
+        quant_result = _make_quant_result(ticker="DAR")
+        with patch.object(manual_check, "evaluate_ticker", return_value=quant_result), \
+                patch.object(manual_check, "triage_ticker") as mock_deepseek, \
+                patch.object(manual_check, "verify_ticker") as mock_claude:
+            mock_deepseek.return_value = DeepSeekResult(verdict="negative_reason", reasoning="Fraude alléguée.")
+
+            result = manual_check.run_manual_check("dar")  # minuscule -> doit être normalisé
+
+            mock_claude.assert_not_called()
+
+        self.assertEqual(result["ticker"], "DAR")
+        self.assertEqual(result["final_verdict"], "rejected_deepseek")
+        self.assertEqual(result["claude_verdict"], "")
+
+    def test_claude_confirmed_verdict_propagates(self):
+        quant_result = _make_quant_result(ticker="DAR")
+        with patch.object(manual_check, "evaluate_ticker", return_value=quant_result), \
+                patch.object(manual_check, "triage_ticker") as mock_deepseek, \
+                patch.object(manual_check, "verify_ticker") as mock_claude:
+            mock_deepseek.return_value = DeepSeekResult(verdict="no_reason", reasoning="Rien de notable.")
+            mock_claude.return_value = ClaudeResult(verdict="confirmed", reasoning="Bilan solide.", tokens_used=1500)
+
+            result = manual_check.run_manual_check("DAR")
+
+        self.assertEqual(result["final_verdict"], "confirmed")
+        self.assertEqual(result["claude_tokens_used"], 1500)
+
+    def test_claude_rejected_maps_to_rejected_claude(self):
+        quant_result = _make_quant_result(ticker="DAR")
+        with patch.object(manual_check, "evaluate_ticker", return_value=quant_result), \
+                patch.object(manual_check, "triage_ticker") as mock_deepseek, \
+                patch.object(manual_check, "verify_ticker") as mock_claude:
+            mock_deepseek.return_value = DeepSeekResult(verdict="no_reason", reasoning="Rien de notable.")
+            mock_claude.return_value = ClaudeResult(verdict="rejected", reasoning="Trop cher.")
+
+            result = manual_check.run_manual_check("DAR")
+
+        self.assertEqual(result["final_verdict"], "rejected_claude")
+
+    def test_runs_even_when_quant_filter_fails(self):
+        """Le bouton doit donner un avis complet même sur un ticker qui ne
+        passerait pas le filtre quant du pipeline auto -- c'est justement
+        le cas d'usage (vérifier un ticker hors de la présélection habituelle)."""
+        failing_quant = QuantResult(
+            ticker="DAR", sector="Energy", passed=False, score=0.0, price=5.0,
+            details={"pe_ratio": None, "sector": "Energy"},
+            reasons_failed=["ROE 4.0% < seuil 10%"],
+        )
+        with patch.object(manual_check, "evaluate_ticker", return_value=failing_quant), \
+                patch.object(manual_check, "triage_ticker") as mock_deepseek, \
+                patch.object(manual_check, "verify_ticker") as mock_claude:
+            mock_deepseek.return_value = DeepSeekResult(verdict="no_reason", reasoning="")
+            mock_claude.return_value = ClaudeResult(verdict="uncertain", reasoning="")
+
+            result = manual_check.run_manual_check("DAR")
+
+        mock_deepseek.assert_called_once()
+        mock_claude.assert_called_once()
+        self.assertFalse(result["quant_passed"])
+        self.assertEqual(result["final_verdict"], "uncertain")
+
+
+class ManualTickerCheckViewTests(APITestCase):
+    """L'endpoint doit tracer dans ManualTickerCheck uniquement -- jamais
+    ScanResult/FundamentalLabPosition/CustomWatchlistTicker/PaperTrade."""
+
+    def test_creates_manual_check_record_only(self):
+        quant_result = _make_quant_result(ticker="DAR")
+        with patch.object(manual_check, "evaluate_ticker", return_value=quant_result), \
+                patch.object(manual_check, "triage_ticker") as mock_deepseek, \
+                patch.object(manual_check, "verify_ticker") as mock_claude:
+            mock_deepseek.return_value = DeepSeekResult(verdict="no_reason", reasoning="Rien de notable.")
+            mock_claude.return_value = ClaudeResult(verdict="confirmed", reasoning="Bilan solide.", tokens_used=1200)
+
+            response = self.client.post("/api/analysis/ticker/DAR/manual-check/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["final_verdict"], "confirmed")
+        self.assertEqual(ManualTickerCheck.objects.count(), 1)
+        record = ManualTickerCheck.objects.get()
+        self.assertEqual(record.ticker, "DAR")
+        self.assertEqual(record.claude_tokens_used, 1200)
+
+        # Aucune trace ailleurs -- le point central de cette fonctionnalité.
+        self.assertEqual(ScanResult.objects.count(), 0)
+        self.assertEqual(FundamentalLabPosition.objects.count(), 0)
+
+    def test_invalid_ticker_returns_404_and_no_record(self):
+        with patch.object(manual_check, "evaluate_ticker", return_value=None):
+            response = self.client.post("/api/analysis/ticker/ZZZINVALIDXYZ/manual-check/")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(ManualTickerCheck.objects.count(), 0)
+
+    def test_daily_limit_enforced(self):
+        for i in range(20):
+            ManualTickerCheck.objects.create(ticker=f"T{i}", final_verdict="confirmed")
+
+        response = self.client.post("/api/analysis/ticker/DAR/manual-check/")
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(ManualTickerCheck.objects.count(), 20)

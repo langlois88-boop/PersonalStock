@@ -238,3 +238,39 @@ class CustomWatchlistTicker(models.Model):
 
     def __str__(self) -> str:
         return f"{self.ticker} ({self.source_index}) active={self.is_active}"
+
+
+class ManualTickerCheck(models.Model):
+    """
+    Vérification manuelle à la demande (2026-08-13), sur n'importe quel
+    ticker tapé depuis la fiche ticker -- complètement isolée du pipeline
+    automatique. Réutilise les mêmes fonctions (evaluate_ticker,
+    triage_ticker, verify_ticker) mais ne crée JAMAIS de ScanResult, de
+    FundamentalLabPosition, de CustomWatchlistTicker ni de PaperTrade.
+    Cette table existe uniquement pour ne pas perdre un raisonnement
+    Claude déjà payé -- ce n'est pas un signal d'achat, pas un scan, pas
+    une entrée dans un sandbox. Voir analysis/services/manual_check.py.
+    """
+
+    ticker = models.CharField(max_length=20, db_index=True)
+    checked_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    sector = models.CharField(max_length=50, blank=True, default='')
+    quant_score = models.FloatField(default=0.0)
+    quant_details = models.JSONField(default=dict, blank=True)
+    price_at_check = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+
+    deepseek_verdict = models.CharField(max_length=20, blank=True, default='')
+    deepseek_reasoning = models.TextField(blank=True, default='')
+
+    claude_verdict = models.CharField(max_length=20, blank=True, default='')
+    claude_reasoning = models.TextField(blank=True, default='')
+    claude_tokens_used = models.IntegerField(default=0)
+
+    final_verdict = models.CharField(max_length=20, blank=True, default='')
+
+    class Meta:
+        ordering = ['-checked_at']
+
+    def __str__(self) -> str:
+        return f"{self.ticker} manual check {self.final_verdict} ({self.checked_at:%Y-%m-%d %H:%M})"
