@@ -388,9 +388,18 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.monitor_active_signals',
         'schedule': crontab(minute='*/2', hour='9-16', day_of_week='mon-fri'),
     },
-    'tsx-guardian-30s': {
+    # Renommé le 2026-08-13 (TECH_DEBT_NOTES.md item 4) : le nom disait
+    # "30s" mais l'intervalle réel était timedelta(seconds=120) = 2 min,
+    # ET la tâche tournait 24/7 (aucune restriction horaire), contrairement
+    # à toutes les autres tâches de surveillance de ce fichier -- confirmé
+    # avec l'utilisateur que c'était un oubli, pas voulu (pas de
+    # surveillance overnight intentionnelle). Restreint aux heures de
+    # marché comme 'active-signal-monitor-1min' juste au-dessus (même
+    # cadence de 2 min, même fenêtre) plutôt que de laisser tourner pour
+    # rien marché fermé.
+    'tsx-guardian-120s': {
         'task': 'portfolio.tasks.monitor_active_trade',
-        'schedule': timedelta(seconds=120),
+        'schedule': crontab(minute='*/2', hour='9-16', day_of_week='mon-fri'),
     },
     'paper-trade-retrain-daily': {
         'task': 'portfolio.tasks.retrain_from_paper_trades_daily',

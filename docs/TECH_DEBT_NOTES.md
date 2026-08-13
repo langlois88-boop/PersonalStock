@@ -95,10 +95,18 @@ confirmer le fix.
 
 ---
 
-## 4. `tsx-guardian-30s` — nom trompeur, tourne 24/7 pas juste en heures de marché
-**Statut : diagnostiqué (voir item 7), correction EXPLICITEMENT mise en
-pause — ne pas resserrer l'horaire ni renommer avant que l'item 7 soit
-clarifié.**
+## 4. [CORRIGÉ le 2026-08-13] `tsx-guardian-30s` — nom trompeur, tournait 24/7 pas juste en heures de marché
+**Statut : fermé. Item 7 clarifié et corrigé le 2026-08-12 (débloquait
+celui-ci) ; confirmé avec l'utilisateur le 2026-08-13 que le 24/7 était
+un oubli, pas voulu (pas de surveillance overnight intentionnelle).**
+
+**Fix** : renommé `tsx-guardian-30s` → `tsx-guardian-120s` (nom qui
+reflète enfin le vrai intervalle), et remplacé `timedelta(seconds=120)`
+par `crontab(minute='*/2', hour='9-16', day_of_week='mon-fri')` — même
+cadence de 2 minutes, mais restreinte aux heures de marché comme
+`active-signal-monitor-1min` juste au-dessus dans `settings.py`
+(pattern déjà établi pour ce type de tâche, réutilisé plutôt
+qu'inventé). Ne tourne plus inutilement marché fermé/weekend.
 
 Mise à jour 2026-08-10 ~21h35 UTC : en creusant ce point (via un
 diagnostic hors-marché plus large sur `penny_sniper_alert`/
