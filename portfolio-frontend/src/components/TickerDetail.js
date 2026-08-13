@@ -196,10 +196,21 @@ function TickerDetail() {
     setManualCheckError(null);
     setManualCheck(null);
     try {
-      const res = await api.post(`analysis/ticker/${rawTicker}/manual-check/`);
+      // Timeout par défaut de l'instance axios = 30s (api.js) -- confirmé
+      // en direct que cet appel précis prend ~70-90s (DeepSeek + Claude en
+      // séquence), largement au-dessus. Override local plutôt que de
+      // relever le défaut global, qui sert aussi des endpoints censés
+      // échouer vite. 150s = marge au-dessus du pire cas observé (112s
+      // pour un autre appel Claude+réseau lent ce soir).
+      const res = await api.post(`analysis/ticker/${rawTicker}/manual-check/`, null, { timeout: 150000 });
       setManualCheck(res.data);
     } catch (e) {
-      if (e.response?.status === 429) {
+      if (e.code === 'ECONNABORTED') {
+        setManualCheckError(
+          "L'analyse prend plus de temps que prévu (>150s) — DeepSeek ou Claude est probablement lent/indisponible. "
+          + 'Réessaie dans quelques minutes.'
+        );
+      } else if (e.response?.status === 429) {
         setManualCheckError(e.response.data?.error || 'Limite quotidienne de vérifications manuelles atteinte.');
       } else if (e.response?.status === 404) {
         setManualCheckError(e.response.data?.error || `Ticker "${ticker}" introuvable ou données insuffisantes.`);
