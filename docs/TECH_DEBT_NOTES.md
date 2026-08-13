@@ -1013,3 +1013,57 @@ décision de stratégie de trading, pas un bug à corriger unilatéralement.
 - Avec le nettoyage des tickers, `final` devrait maintenant produire
   des échantillons sur 10 tickers au lieu de 6 aux prochains scans —
   à confirmer sur les prochains cycles réels (pas supposé).
+
+## 14. [LIMITATION CONNUE, découvert le 2026-08-13] La couverture news du pipeline (Alpaca) rate des vents contraires réels, pas juste des catastrophes
+
+**Statut : documenté, pas corrigé — comportement à connaître pour interpréter
+tous les verdicts `confirmed` du pipeline (screener auto ET analyse manuelle),
+pas un bug isolé à réparer.**
+
+**Origine** : test manuel sur DAR (bouton "Analyse manuelle complète") —
+Claude a rendu `confirmed` en citant surtout le côté haussier (EPS/ventes
+au-dessus des attentes, relèvements d'objectifs de cours). Un article
+TipRanks trouvé séparément par l'utilisateur mentionnait des vents
+contraires réels et documentés : "Near-Term Margin Compression Concerns"
+(marge Fuel Specialties en baisse de 1,5 point, pression attendue au
+Q3) et "Volume Headwinds" (contraction de volume de 2% dans Performance
+Chemicals, contraintes d'approvisionnement) — rien de dramatique (pas de
+fraude, pas de perte de contrat), donc probablement pas suffisant pour
+faire basculer le verdict, mais absent du raisonnement de Claude.
+
+**Vérifié en direct (`analysis/services/news.py::fetch_recent_news`,
+pas une supposition)** — deux causes concrètes, cumulatives :
+
+1. **Couverture de source limitée.** Les 9 articles réellement retournés
+   par l'API news Alpaca pour DAR (`days_back=60, limit=10`) sont **tous
+   de source `benzinga`** — aucun TipRanks. L'article en question n'était
+   donc simplement jamais dans le pool de candidats envoyé à DeepSeek/
+   Claude, indépendamment de la fenêtre de 60 jours ou du jugement du LLM.
+2. **Résumés fréquemment vides.** 6 des 9 articles reçus avaient
+   `summary` = chaîne vide — seul le titre était exploitable (ex.
+   "Darling Ingredients Q2 EPS $2.41 Beats $0.97 Estimate" sans aucun
+   détail). Même si l'article TipRanks avait été de source Benzinga, un
+   résumé vide n'aurait transmis aucun détail de marge/volume de toute
+   façon.
+
+**Interprétation à retenir pour l'avenir** (résumé de la discussion) :
+un verdict `confirmed` de ce pipeline signifie **"aucune raison
+dramatique trouvée dans les sources couvertes"**, pas "aucun vent
+contraire n'existe". Le système semble fiable pour écarter les vraies
+alertes rouges (fraude, perte de contrat, guidance coupée) mais moins
+outillé pour peser des nuances plus subtiles ("pression persistante
+attendue", pas une urgence mais un facteur réel) qui n'apparaissent que
+dans des sources hors Benzinga ou dans le corps d'un article (pas le titre).
+
+**Pistes non explorées, à évaluer séparément si voulu** (pas fait ici,
+hors scope de cette découverte) :
+- Élargir `fetch_recent_news` à d'autres sources que Benzinga (si l'API
+  Alpaca le permet via un paramètre, pas vérifié).
+- `limit=10` : vérifier si un `limit` plus élevé changerait la
+  composition (pas testé — les 9 articles reçus couvraient déjà toute la
+  fenêtre de 60 jours sans être plafonnés par la limite, donc probablement
+  pas le facteur limitant ici, mais à confirmer sur un ticker plus suivi).
+- Gérer les résumés vides différemment (ex. skip un article sans résumé
+  plutôt que de l'envoyer comme un titre nu, ou fetch le corps complet
+  ailleurs) — change le comportement du prompt pour tous les tickers,
+  à peser avant de toucher.
