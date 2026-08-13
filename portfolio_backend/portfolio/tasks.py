@@ -10170,7 +10170,15 @@ def refresh_ai_bluechip_watchlist() -> dict[str, Any]:
                 'min_score': min_score,
                 'include_universe': 'true',
             },
-            timeout=60,
+            # 2026-08-12 (ML_PIPELINE_AUDIT.md) : timeout=60 était trop court
+            # -- /api/ai/opportunities/ fait un yf.Ticker(...).info synchrone
+            # par symbole (~50 tickers, Stock.objects.all() + mega_universe),
+            # confirmé en direct à 112s réels pour une réponse 200 valide, pas
+            # un blocage infini. Cette tâche tourne sur Beat (horaire, pas
+            # urgente) donc une marge généreuse ne coûte rien ; c'est la cause
+            # directe pour laquelle SandboxWatchlist(AI_BLUECHIP) restait vide
+            # -- l'exception était avalée proprement mais jamais visible.
+            timeout=int(os.getenv('AI_BLUECHIP_REFRESH_TIMEOUT_S', '180')),
         )
         resp.raise_for_status()
         payload = resp.json() or []
