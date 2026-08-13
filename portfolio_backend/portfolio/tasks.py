@@ -4039,7 +4039,16 @@ def _sandbox_env_int(sandbox: str, name: str, default: str) -> int:
 
 
 def _env_list(prefix: str, name: str, default: str) -> list[str]:
-    raw = os.getenv(f'{prefix}_{name}', os.getenv(f'PAPER_{name}', default))
+    # Bug corrigé le 2026-08-12 (ML_PIPELINE_AUDIT.md) : os.getenv(key, fallback)
+    # ne retombe sur `fallback` que si `key` est ABSENTE, pas si elle est
+    # présente mais vide -- deploy/.env avait `AI_BLUECHIP_WATCHLIST=` (chaîne
+    # vide, pas absente), donc PAPER_WATCHLIST/`default` n'était jamais
+    # atteint : le chemin SIM d'AI_BLUECHIP scannait littéralement 0 ticker.
+    # `or` en cascade traite une chaîne vide comme "non définie", ce qui est
+    # le comportement voulu ici (seul appelant : _get_watchlist, aucun cas
+    # où une watchlist vide-mais-explicite doit être distinguée d'une
+    # watchlist absente).
+    raw = os.getenv(f'{prefix}_{name}') or os.getenv(f'PAPER_{name}') or default
     items = [s.strip().upper() for s in str(raw).split(',') if s.strip()]
     return items
 
