@@ -107,6 +107,7 @@ from .ml_engine.engine.data_fusion import DataFusionEngine
 from .ml_engine.backtester import (
     AIBacktester,
     FEATURE_COLUMNS,
+    TIME_SERIES_SPLITS,
     apply_feature_weighting_to_signal,
     get_model_version,
     get_model_path,
@@ -115,6 +116,7 @@ from .ml_engine.backtester import (
     train_fusion_model,
     train_fusion_model_from_labels,
 )
+from .ml_engine.validation import PurgedTimeSeriesSplit
 from .ai_advisor import DeepSeekAdvisor
 
 logger = logging.getLogger(__name__)
@@ -9300,18 +9302,68 @@ def retrain_from_paper_trades_daily(sandbox_override: str | None = None) -> dict
         return frame
 
     def _split_time(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Corrigé le 2026-08-12 (ML_PIPELINE_AUDIT.md, item 0.4) : utilisait
+        une simple coupure chronologique brute (pas d'embargo/purge autour
+        de la frontière train/holdout). PurgedTimeSeriesSplit
+        (ml_engine/validation.py) existait déjà et fonctionnait
+        correctement, mais seulement via le chemin d'entraînement MANUEL
+        (`manage.py ml_scanner` -> pipelines/*_pipeline.py ->
+        training/trainer.py) -- jamais branché sur ce chemin automatique
+        quotidien. Fait exprès AVANT tout assouplissement de seuil (voir
+        même document) : les premiers nouveaux trades générés par la phase
+        d'exploration doivent être validés par la méthode la plus solide
+        disponible dès le départ, pas la plus faible.
+
+        Prend le DERNIER split généré par PurgedTimeSeriesSplit (le holdout
+        le plus récent chronologiquement, équivalent du "X% le plus
+        récent" que l'ancienne coupure brute produisait) -- mais avec une
+        fenêtre de purge avant la coupure et un embargo après le holdout,
+        pour éviter la fuite d'info qu'une feature à fenêtre glissante (ex.
+        rsi_14, volatility_20, calculée sur les N derniers points) peut
+        introduire entre échantillons voisins de part et d'autre de la
+        frontière train/test.
+
+        n_splits par défaut = TIME_SERIES_SPLITS (déjà défini et utilisé
+        pour la même notion dans backtester.py, réutilisé ici pour
+        cohérence plutôt qu'un nouveau réglage inventé) -- donne une
+        fenêtre de holdout d'environ 1/(n_splits+1), proche de l'ancien
+        holdout_ratio par défaut (0.2).
+        """
         if df.empty:
             return df, pd.DataFrame()
-        df = df.sort_values('entry_date')
+        df = df.sort_values('entry_date').reset_index(drop=True)
         if holdout_days > 0:
+            # Mode "jours calendaires fixes" : une fenêtre de dates, pas une
+            # fraction de l'échantillon -- pas de notion de "splits" à
+            # purger ici, sémantique différente, comportement inchangé.
             cut = timezone.now() - timedelta(days=holdout_days)
             train_df = df[df['entry_date'] < cut]
             holdout_df = df[df['entry_date'] >= cut]
             return train_df, holdout_df
-        split_index = int(len(df) * (1 - holdout_ratio))
-        train_df = df.iloc[:split_index] if split_index > 0 else df
-        holdout_df = df.iloc[split_index:] if split_index < len(df) else pd.DataFrame()
-        return train_df, holdout_df
+
+        n_splits = int(os.getenv('PAPER_TRADE_TIME_SERIES_SPLITS', str(TIME_SERIES_SPLITS)))
+        purge_window = int(os.getenv('PAPER_TRADE_PURGE_WINDOW', '2'))
+        embargo_pct = float(os.getenv('PAPER_TRADE_EMBARGO_PCT', '0.01'))
+        splitter = PurgedTimeSeriesSplit(n_splits=n_splits, purge_window=purge_window, embargo_pct=embargo_pct)
+        splits = list(splitter.split(df.values))
+        if not splits:
+            # Pas assez d'échantillons pour un split purgé valide (petit
+            # sandbox, début de la phase d'exploration) -- repli explicite
+            # sur l'ancienne coupure brute plutôt que de bloquer le
+            # ré-entraînement entièrement. Loggé, jamais silencieux.
+            logger.warning(
+                "retrain_from_paper_trades_daily: PurgedTimeSeriesSplit n'a produit aucun split "
+                "valide (n=%d échantillons, n_splits=%d) -- repli sur la coupure chronologique simple.",
+                len(df), n_splits,
+            )
+            split_index = int(len(df) * (1 - holdout_ratio))
+            train_df = df.iloc[:split_index] if split_index > 0 else df
+            holdout_df = df.iloc[split_index:] if split_index < len(df) else pd.DataFrame()
+            return train_df, holdout_df
+
+        train_idx, test_idx = splits[-1]
+        return df.iloc[train_idx], df.iloc[test_idx]
 
     def _train_for_sandbox(selected_sandbox: str) -> dict[str, Any]:
         model_name = 'PENNY' if selected_sandbox == 'AI_PENNY' else 'BLUECHIP'
