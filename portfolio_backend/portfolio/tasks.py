@@ -5378,6 +5378,15 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     if sandbox == 'AI_PENNY':
         buy_threshold = 0.20
         sell_threshold = 0.10
+    if _exploration_phase_enabled():
+        # Phase d'exploration (2026-08-12, voir docs/EXPLORATION_PHASE_2026-08.md).
+        # Découvert en calibrant les seuils AVANT de brancher ce garde-fou :
+        # les 3 lignes juste au-dessus écrasent {PREFIX}_BUY_THRESHOLD lu
+        # via _env_float un peu plus haut dans cette fonction -- éditer
+        # AI_BLUECHIP_BUY_THRESHOLD/AI_PENNY_BUY_THRESHOLD dans deploy/.env
+        # n'a donc AUCUN effet réel sur ce chemin SIM. Seul un override
+        # explicite ici change vraiment le comportement.
+        buy_threshold = float(os.getenv('EXPLORATION_PHASE_BUY_THRESHOLD', '0.55'))
     capital = initial_capital + closed_pnl
     available = max(0.0, capital - open_value)
     min_available_capital = _env_float(prefix, 'MIN_AVAILABLE_CAPITAL', '0.0')
@@ -6479,6 +6488,14 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
     universe = 'PENNY' if sandbox == 'AI_PENNY' else 'BLUECHIP'
     model_path = get_model_path(universe)
     buy_threshold = _env_float(prefix, 'BUY_THRESHOLD', '0.82')
+    if _exploration_phase_enabled():
+        # Phase d'exploration (2026-08-12, voir docs/EXPLORATION_PHASE_2026-08.md).
+        # Ce chemin (contrairement au chemin SIM) n'a pas de seuil codé en
+        # dur -- il retombait déjà sur PAPER_BUY_THRESHOLD (0.55) faute de
+        # {prefix}_BUY_THRESHOLD explicite. Override explicite quand même,
+        # pour ne pas dépendre d'une coïncidence de repli si PAPER_BUY_
+        # THRESHOLD change un jour pour une autre raison.
+        buy_threshold = float(os.getenv('EXPLORATION_PHASE_BUY_THRESHOLD', '0.55'))
     sell_threshold = _env_float(prefix, 'SELL_THRESHOLD', '0.4')
     trail_pct = _env_float(prefix, 'TRAIL_PCT', '0.04')
     atr_mult = _env_float(prefix, 'ATR_MULT', '1.5')
