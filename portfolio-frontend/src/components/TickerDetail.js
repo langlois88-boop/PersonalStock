@@ -5,6 +5,7 @@ import {
   LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer,
 } from 'recharts';
 import { cachedGet } from '../api/cachedApi';
+import api from '../api/api';
 import { InfoTooltip } from './ui/Tooltip';
 
 const VERDICT_BADGES = {
@@ -159,6 +160,13 @@ function TickerDetail() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
+  // Analyse manuelle à la demande (2026-08-13) -- état séparé du chargement
+  // normal de la fiche : n'affecte jamais le reste de la page, purement
+  // informatif, ne crée jamais de position (voir handleManualCheck).
+  const [manualCheck, setManualCheck] = useState(null);
+  const [manualCheckLoading, setManualCheckLoading] = useState(false);
+  const [manualCheckError, setManualCheckError] = useState(null);
+
   const fetchDetail = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -175,6 +183,33 @@ function TickerDetail() {
   useEffect(() => {
     fetchDetail();
   }, [fetchDetail]);
+
+  const handleManualCheck = async () => {
+    const confirmed = window.confirm(
+      "Ceci va lancer une analyse complète (filtre quant + DeepSeek + Claude) sur ce ticker.\n\n"
+      + "Coût estimé : ~0,01-0,015$ (appel Claude API).\n\n"
+      + "Aucune position ne sera créée -- résultat informatif seulement.\n\nContinuer ?"
+    );
+    if (!confirmed) return;
+
+    setManualCheckLoading(true);
+    setManualCheckError(null);
+    setManualCheck(null);
+    try {
+      const res = await api.post(`analysis/ticker/${rawTicker}/manual-check/`);
+      setManualCheck(res.data);
+    } catch (e) {
+      if (e.response?.status === 429) {
+        setManualCheckError(e.response.data?.error || 'Limite quotidienne de vérifications manuelles atteinte.');
+      } else if (e.response?.status === 404) {
+        setManualCheckError(e.response.data?.error || `Ticker "${ticker}" introuvable ou données insuffisantes.`);
+      } else {
+        setManualCheckError(e.message || "Échec de l'analyse manuelle.");
+      }
+    } finally {
+      setManualCheckLoading(false);
+    }
+  };
 
   if (loading) {
     return (
@@ -241,6 +276,86 @@ function TickerDetail() {
             {data.market_cap ? `Cap. ${(data.market_cap / 1e9).toFixed(2)}G$` : ''}
           </p>
         </div>
+      </div>
+
+      {/* Analyse manuelle à la demande -- n'importe quel ticker, jamais de
+          position créée. Toujours visible, indépendamment de l'historique
+          de scan (comme demandé). */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="text-white font-semibold">Analyse manuelle complète</p>
+            <p className="text-xs text-slate-500">Filtre quant + DeepSeek + Claude, à la demande — aucune position ouverte.</p>
+          </div>
+          <button
+            onClick={handleManualCheck}
+            disabled={manualCheckLoading}
+            className="px-4 py-2 rounded-xl text-sm font-medium bg-indigo-500/15 text-indigo-200 border border-indigo-500/30 hover:bg-indigo-500/25 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+          >
+            {manualCheckLoading ? (
+              <>
+                <span className="inline-block w-3 h-3 border-2 border-indigo-200 border-t-transparent rounded-full animate-spin" />
+                Analyse en cours… (30-90s)
+              </>
+            ) : (
+              '🔎 Analyse manuelle complète'
+            )}
+          </button>
+        </div>
+
+        {manualCheckError && (
+          <div className="mt-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-200 text-sm px-4 py-3">
+            {manualCheckError}
+          </div>
+        )}
+
+        {manualCheck && !manualCheckError && (
+          <div className="mt-4 border-t border-slate-800 pt-4 space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
+              {VERDICT_BADGES[manualCheck.final_verdict] && (
+                <span className={`inline-flex items-center px-2 py-1 rounded-full border text-xs ${VERDICT_BADGES[manualCheck.final_verdict].className}`}>
+                  {VERDICT_BADGES[manualCheck.final_verdict].icon} {VERDICT_BADGES[manualCheck.final_verdict].label}
+                </span>
+              )}
+              <span className="text-xs text-slate-500">
+                Score quant {formatNumber(manualCheck.quant_score)} · Prix {formatNumber(manualCheck.price)}$ · Secteur {manualCheck.sector || '—'}
+              </span>
+            </div>
+
+            <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-200 text-xs px-3 py-2">
+              ℹ️ Analyse à titre informatif seulement — aucune position ouverte, aucun ajout au screener automatique.
+            </div>
+
+            {manualCheck.quant_reasons_failed?.length > 0 && (
+              <div>
+                <p className="text-xs uppercase tracking-wide text-slate-500 mb-1">Filtre quantitatif — non passé</p>
+                <ul className="text-sm text-slate-300 list-disc list-inside">
+                  {manualCheck.quant_reasons_failed.map((reason, idx) => <li key={idx}>{reason}</li>)}
+                </ul>
+              </div>
+            )}
+
+            {manualCheck.deepseek_reasoning && (
+              <div>
+                <p className="text-xs uppercase tracking-wide text-sky-300 mb-1">DeepSeek ({manualCheck.deepseek_verdict})</p>
+                <p className="text-sm text-slate-300 whitespace-pre-wrap">{manualCheck.deepseek_reasoning}</p>
+              </div>
+            )}
+
+            {manualCheck.claude_reasoning && (
+              <div>
+                <p className="text-xs uppercase tracking-wide text-indigo-300 mb-1">
+                  Claude ({manualCheck.claude_verdict}{manualCheck.claude_tokens_used ? ` · ${manualCheck.claude_tokens_used} tokens` : ''})
+                </p>
+                <p className="text-sm text-slate-300 whitespace-pre-wrap">{manualCheck.claude_reasoning}</p>
+              </div>
+            )}
+
+            <p className="text-xs text-slate-600">
+              {manualCheck.checks_used_today}/{manualCheck.checks_daily_limit} vérifications manuelles utilisées aujourd'hui.
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Bloc 1 — Radar 5 facteurs */}
