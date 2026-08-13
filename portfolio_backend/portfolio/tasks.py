@@ -1311,6 +1311,31 @@ def _dynamic_position_target(equity: float) -> float:
     return max(min_value, min(max_value, float(target)))
 
 
+def _exploration_phase_enabled() -> bool:
+    """
+    Phase d'exploration temporaire (2026-08-12, voir
+    docs/EXPLORATION_PHASE_2026-08.md) : objectif unique = générer >=20
+    trades fermés/sandbox pour sortir du verrou circulaire de
+    ré-entraînement (docs/ML_PIPELINE_AUDIT.md). Flag explicite plutôt
+    qu'un changement en dur, pour qu'il soit impossible d'oublier de le
+    retirer -- désactiver = repasser EXPLORATION_PHASE_ENABLED à false,
+    aucun changement de code requis pour revenir au calcul normal.
+    """
+    return os.getenv('EXPLORATION_PHASE_ENABLED', 'false').lower() in {'1', 'true', 'yes', 'y'}
+
+
+def _exploration_position_value(available_capital: float) -> float:
+    """
+    Taille de position fixe pour la phase d'exploration -- $1000 par
+    défaut (EXPLORATION_PHASE_POSITION_SIZE), indépendant du calcul
+    habituel par sandbox (dynamic sizing, boosts, facteurs de confiance).
+    Toujours plafonnée au capital réellement disponible du sandbox, même
+    en exploration -- garde-fou de base demandé explicitement.
+    """
+    target = float(os.getenv('EXPLORATION_PHASE_POSITION_SIZE', '1000'))
+    return max(0.0, min(target, max(0.0, available_capital)))
+
+
 def _time_hhmm(dt_value: datetime | None = None) -> str:
     dt_value = dt_value or _ny_time_now()
 
@@ -6032,15 +6057,18 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             _decision_log(symbol, sandbox, 'SKIP', 'confidence_too_low', signal)
             decision_stats['blocked_confidence'] += 1
             continue
-        position_value = _dynamic_position_target(capital)
-        position_value = min(position_value, available, position_cap, risk_budget)
-        position_value *= _multi_model_boost(symbol, float(signal or 0), universe, use_alpaca)
-        position_value *= regime_risk_factor
-        position_value *= confidence_factor
-        position_value *= reentry_size_factor
-        if sandbox == 'AI_PENNY':
-            min_position_value = float(os.getenv('AI_PENNY_MIN_POSITION_VALUE', '50'))
-            position_value = max(position_value, min_position_value)
+        if _exploration_phase_enabled():
+            position_value = _exploration_position_value(min(available, capital))
+        else:
+            position_value = _dynamic_position_target(capital)
+            position_value = min(position_value, available, position_cap, risk_budget)
+            position_value *= _multi_model_boost(symbol, float(signal or 0), universe, use_alpaca)
+            position_value *= regime_risk_factor
+            position_value *= confidence_factor
+            position_value *= reentry_size_factor
+            if sandbox == 'AI_PENNY':
+                min_position_value = float(os.getenv('AI_PENNY_MIN_POSITION_VALUE', '50'))
+                position_value = max(position_value, min_position_value)
         quantity = int(position_value / price) if price else 0
         if sandbox == 'AI_PENNY' and quantity <= 0 and price:
             quantity = 1
@@ -6072,6 +6100,9 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 'intraday_price_to_vwap': float(intraday_ctx.get('price_to_vwap') or 0),
             })
         entry_features.update(_entry_time_features(symbol))
+        exploration_mode = _exploration_phase_enabled()
+        if exploration_mode:
+            entry_features['exploration_phase'] = True
         try:
             # This used to be unguarded — a NameError here (undefined
             # `allocation` in the notes f-string, fixed above) would have
@@ -6096,6 +6127,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 notes=(
                     f"Signal {signal:.2f} / ATR {atr:.2f} | Mise suggérée {position_value:.0f}$ "
                     f"(Confiance {float(signal or 0) * 100:.1f}%)"
+                    + (" | [EXPLORATION PHASE 2026-08 -- voir docs/EXPLORATION_PHASE_2026-08.md]" if exploration_mode else "")
                 ),
             )
             if os.getenv('TRADE_REASON_ALERTS', 'false').lower() in {'1', 'true', 'yes', 'y'}:
@@ -6866,14 +6898,17 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
 
         position_cap = buying_power * position_cap_pct
         risk_budget = buying_power * risk_pct
-        position_value = _dynamic_position_target(float(equity_now or buying_power or 0))
-        position_value = min(position_value, position_cap, risk_budget, buying_power)
-        position_value *= _multi_model_boost(symbol, float(signal or 0), universe, True)
-        position_value *= reentry_size_factor
-        if tier == 'T1':
-            position_value *= tier1_size_mult
-        elif tier == 'T3':
-            position_value *= tier3_size_mult
+        if _exploration_phase_enabled():
+            position_value = _exploration_position_value(buying_power)
+        else:
+            position_value = _dynamic_position_target(float(equity_now or buying_power or 0))
+            position_value = min(position_value, position_cap, risk_budget, buying_power)
+            position_value *= _multi_model_boost(symbol, float(signal or 0), universe, True)
+            position_value *= reentry_size_factor
+            if tier == 'T1':
+                position_value *= tier1_size_mult
+            elif tier == 'T3':
+                position_value *= tier3_size_mult
         qty = int(position_value / price) if price else 0
         if qty <= 0:
             _send_telegram_alert(
@@ -6957,6 +6992,7 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
             continue
 
         notes = _gemini_trade_reason(symbol, signal_payload) if allow_gemini else None
+        exploration_mode = _exploration_phase_enabled()
         PaperTrade.objects.create(
             ticker=symbol,
             sandbox=sandbox,
@@ -6968,6 +7004,7 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
                 'tier': tier,
                 'tier_reasons': tier_reasons,
                 'alpaca_high_water': price,
+                **({'exploration_phase': True} if exploration_mode else {}),
             },
             entry_explanations=(signal_payload or {}).get('explanations'),
             model_name=(signal_payload or {}).get('model_name', universe),
@@ -6980,7 +7017,8 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
             stop_loss=round(stop_loss, 2),
             status='OPEN',
             pnl=0,
-            notes=(notes or '') + f" | tier {tier}",
+            notes=(notes or '') + f" | tier {tier}"
+            + (" | [EXPLORATION PHASE 2026-08 -- voir docs/EXPLORATION_PHASE_2026-08.md]" if exploration_mode else ""),
         )
         if os.getenv('TRADE_REASON_ALERTS', 'false').lower() in {'1', 'true', 'yes', 'y'}:
             reason = (signal_payload or {}).get('explanations') or []

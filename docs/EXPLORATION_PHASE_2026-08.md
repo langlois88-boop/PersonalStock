@@ -117,15 +117,57 @@ mieux vaut sous-viser et ajuster à la hausse après observation réelle
 
 ## Étape 2 — Taille de position fixe $1000, mode exploration
 
-(section complétée après implémentation)
+Nouveau flag explicite `EXPLORATION_PHASE_ENABLED` (`portfolio/tasks.py`,
+`_exploration_phase_enabled()`) — `false` par défaut, aucun effet tant
+qu'il n'est pas activé. `_exploration_position_value(capital_disponible)`
+retourne `min(EXPLORATION_PHASE_POSITION_SIZE, capital_disponible)` —
+$1000 par défaut, toujours plafonné au capital réel disponible du
+sandbox (garde-fou de base demandé explicitement).
+
+Branché aux deux points de calcul de taille de position réels (les seuls
+qui créent une `PaperTrade` d'achat pour WATCHLIST/AI_BLUECHIP/AI_PENNY) :
+- `_execute_paper_trades_for_sandbox` (chemin SIM, `broker='SIM'`)
+- `_execute_alpaca_paper_trades_for_sandbox` (chemin Alpaca réel,
+  `broker='ALPACA'`)
+
+Quand le flag est actif, le calcul habituel (dynamic sizing, boost
+multi-modèle, facteur de régime, facteur de confiance, facteur de
+ré-entrée, multiplicateurs de tier) est entièrement sauté au profit du
+montant fixe — pas juste une valeur par défaut modifiée, une branche
+séparée et explicite (`if _exploration_phase_enabled(): ... else: ...`).
 
 ## Étape 3 — Garde-fous vérifiés actifs
 
-(section complétée après vérification)
+Vérifié en lisant le code autour de chaque point d'insertion (pas juste
+supposé) :
+- **Circuit breaker** (`_daily_equity_circuit_breaker`) : appelé au tout
+  début des deux fonctions (avant la boucle par symbole), bien avant tout
+  code lié à l'exploration — untouched, un déclenchement retourne
+  toujours immédiatement sans jamais atteindre le calcul de position.
+- **Tous les `blocked_*`** (exposition, confiance, corrélation, spread,
+  ATR spike, tendance BTC/secteur, blacklist de pertes, etc.) : tous
+  évalués AVANT le bloc de calcul de taille modifié, aucun réordonnancement.
+- **Stop-loss / sortie** : formule de `stop_distance`/`stop_loss`
+  complètement inchangée, calculée après (pas avant, pas dans) le bloc
+  modifié.
+
+Seul ce qui devait changer a changé : le calcul du MONTANT à investir
+une fois qu'une décision d'achat a déjà été validée par tous les
+garde-fous existants.
 
 ## Étape 4 — Flag `exploration_phase`
 
-(section complétée après implémentation)
+Pas de nouveau champ DB (pas de migration) — utilise les métadonnées déjà
+disponibles sur `PaperTrade`, comme demandé :
+- `entry_features['exploration_phase'] = True` (champ JSON déjà utilisé
+  pour stocker les features au moment de l'entrée).
+- `notes` : suffixe explicite `"[EXPLORATION PHASE 2026-08 -- voir
+  docs/EXPLORATION_PHASE_2026-08.md]"` ajouté sur les deux chemins
+  (SIM et Alpaca), pour qu'un humain qui lit la DB directement (pas juste
+  une requête JSON) voie immédiatement le contexte.
+
+Requête pour isoler ces trades plus tard :
+`PaperTrade.objects.filter(entry_features__exploration_phase=True)`.
 
 ## Étape 5 — Tests, déploiement, surveillance
 
