@@ -113,6 +113,36 @@ suggérant qu'un seuil encore plus bas produirait "plus d'occasions" —
 mieux vaut sous-viser et ajuster à la hausse après observation réelle
 (étape 5) que sur-viser et devoir intervenir en urgence.
 
+### Correction en cours de route : les éditions `.env` ci-dessus étaient inertes
+
+Découvert en dry-runnant l'étape 2 (pas supposé) : `_execute_paper_trades_
+for_sandbox` (chemin SIM) lit `{PREFIX}_BUY_THRESHOLD` via `_env_float`,
+**puis l'écrase sans condition quelques lignes plus loin** avec des
+valeurs codées en dur par sandbox (`AI_BLUECHIP=0.80`, `WATCHLIST=0.55`,
+`AI_PENNY=0.20`). Éditer `AI_BLUECHIP_BUY_THRESHOLD`/`AI_PENNY_BUY_
+THRESHOLD` dans `deploy/.env` (fait plus haut dans cette section)
+**n'avait donc aucun effet réel sur ce chemin**. Confirmé en direct :
+après l'édition `.env`, `SystemLog` continuait à logger
+`buy_threshold=0.8` pour AI_BLUECHIP. Découverte bonus : le seuil SIM
+réel d'AI_PENNY était déjà `0.20` codé en dur — la valeur `0.82` dans
+`.env` n'était jamais utilisée par ce chemin, lue puis immédiatement
+jetée.
+
+**`deploy/.env` restauré à ses valeurs d'origine** (`0.85`/`0.82`,
+backup toujours dans `deploy/.env.pre_exploration_phase_backup_20260812`)
+— laisser un changement inerte en place aurait été trompeur. **Le vrai
+mécanisme** : nouvel override explicite `EXPLORATION_PHASE_BUY_THRESHOLD`
+(défaut 0.55), gated par `EXPLORATION_PHASE_ENABLED`, appliqué APRÈS le
+bloc codé en dur dans le chemin SIM et après la lecture d'env dans le
+chemin Alpaca (qui n'a pas d'override codé en dur, mais retombait sur
+`PAPER_BUY_THRESHOLD` par coïncidence plutôt que par un choix explicite).
+
+**Vérifié en direct après le vrai fix** : `buy_threshold effectif = 0.55`
+pour WATCHLIST, AI_BLUECHIP, ET AI_PENNY simultanément (requête
+`SystemLog` fraîche après un cycle complet des 3 sandboxes, mode
+exploration activé) — confirmé pour de vrai cette fois, pas juste
+supposé depuis une édition de fichier de config.
+
 ---
 
 ## Étape 2 — Taille de position fixe $1000, mode exploration
@@ -171,4 +201,53 @@ Requête pour isoler ces trades plus tard :
 
 ## Étape 5 — Tests, déploiement, surveillance
 
-(section complétée après déploiement)
+**Tests unitaires** (`portfolio/tests_exploration_phase.py`) : 6 tests
+sur `_exploration_phase_enabled`/`_exploration_position_value`
+(désactivé par défaut, respect du flag, jamais au-dessus du capital
+disponible, override respecté). Exécutés via `manage.py test` sur le
+NAS : 6/6 OK. Suite existante liée aux paper trades
+(`tests_paper_trade_decision_stats`, `tests_bluechip_watchlist_merge`,
+`tests_after_hours_schedule_gate`) : 9/9 OK, aucune régression.
+
+**Dry-run en conteneur jetable** (`docker compose run --rm -e
+EXPLORATION_PHASE_ENABLED=true ...`) avant tout déploiement en prod —
+a justement permis de trouver et corriger le bug des seuils codés en
+dur (section précédente) avant qu'il n'atteigne la prod. Deuxième
+dry-run après le vrai fix : `buy_threshold effectif = 0.55` confirmé
+pour les 3 sandboxes. 0 trade créé sur ces runs précis (normal — dépend
+des conditions de marché à l'instant T, pas un signe de problème ; le
+marché était fermé au moment du test).
+
+**Déployé en prod le 2026-08-12** : `EXPLORATION_PHASE_ENABLED=true`,
+`EXPLORATION_PHASE_POSITION_SIZE=1000`,
+`EXPLORATION_PHASE_BUY_THRESHOLD=0.55` dans `deploy/.env`. `backend`,
+`celery_worker`, `celery_beat`, `celery_worker_analysis` reconstruits et
+recréés. Vérifié en direct sur le conteneur en cours d'exécution (pas
+juste supposé) : `EXPLORATION_PHASE_ENABLED=true` bien lu.
+
+**Bonus découvert pendant les tests, hors scope, non corrigé** :
+`InconsistentVersionWarning` de scikit-learn à chaque chargement de
+modèle (`.pkl` entraînés avec sklearn 1.8.0, servis avec 1.9.0 installé
+dans l'image actuelle). Pas un crash, mais un vrai risque de dérive de
+comportement du modèle non quantifié. Noté ici pour référence future,
+pas traité ce soir (hors scope de cette phase).
+
+### À surveiller dans les prochains jours (marché fermé au moment du déploiement)
+
+- Le rythme réel de trades approche-t-il 5-15/semaine combiné, sans
+  exploser dessus (risque identifié : fréquence d'exécution très élevée,
+  surtout le chemin Alpaca à */2min) ?
+- Les tailles de position sont-elles bien $1000 (plafonnées au capital
+  disponible) sur les trades réels créés ?
+- `entry_features__exploration_phase=True` permet d'isoler ces trades à
+  tout moment : `PaperTrade.objects.filter(sandbox=X,
+  entry_features__exploration_phase=True)`.
+- Compte des trades FERMÉS par sandbox, vers l'objectif de 20 :
+  `PaperTrade.objects.filter(sandbox=X, status='CLOSED',
+  entry_features__exploration_phase=True).count()`.
+- WATCHLIST : confirmer qu'elle reste effectivement à ~0 trade (cohérent
+  avec le diagnostic formule/RSI) plutôt que de supposer que ça reste
+  vrai indéfiniment.
+
+**Rappel non négociable** : à ≥20 trades fermés pour un sandbox donné,
+ne pas resserrer automatiquement — revenir discuter avec l'utilisateur.
