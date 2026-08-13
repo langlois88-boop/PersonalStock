@@ -1,6 +1,6 @@
 import json
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 from django.utils import timezone
@@ -89,10 +89,25 @@ class CreateLabPositionTests(APITestCase):
             final_verdict=verdict,
         )
 
+    def _fake_alpaca_order(self):
+        """
+        _create_lab_position (Partie B, 2026-08-11) place maintenant un vrai
+        ordre Alpaca via submit_lab_market_order pour tout ticker non-TSX --
+        mocké ici plutôt que de laisser l'appel réseau réel se produire en
+        test (retournerait None hors environnement configuré, faisant
+        échouer silencieusement toute la branche avant même d'atteindre
+        PaperTrade.objects.create).
+        """
+        order = MagicMock()
+        order.id = "fake-order-id-123"
+        order.status = "accepted"
+        return order
+
     def test_creates_lab_position_and_real_paper_trade(self):
         scan_result = self._make_scan_result()
 
-        tasks._create_lab_position(scan_result, self.preset, Decimal("21500.00"))
+        with patch.object(tasks, "submit_lab_market_order", return_value=self._fake_alpaca_order()):
+            tasks._create_lab_position(scan_result, self.preset, Decimal("21500.00"))
 
         lab_position = FundamentalLabPosition.objects.get(scan_result=scan_result)
         self.assertEqual(lab_position.ticker, "WINW")
@@ -128,7 +143,8 @@ class CreateLabPositionTests(APITestCase):
         """Une exception pendant la création du PaperTrade ne doit jamais remonter."""
         scan_result = self._make_scan_result()
 
-        tasks._create_lab_position(scan_result, self.preset, Decimal("21500.00"))
+        with patch.object(tasks, "submit_lab_market_order", return_value=self._fake_alpaca_order()):
+            tasks._create_lab_position(scan_result, self.preset, Decimal("21500.00"))
 
         lab_position = FundamentalLabPosition.objects.get(scan_result=scan_result)
         self.assertIsNone(lab_position.paper_trade_id)
@@ -144,7 +160,8 @@ class CreateLabPositionTests(APITestCase):
         doublon.
         """
         first_scan_result = self._make_scan_result()
-        tasks._create_lab_position(first_scan_result, self.preset, Decimal("21500.00"))
+        with patch.object(tasks, "submit_lab_market_order", return_value=self._fake_alpaca_order()):
+            tasks._create_lab_position(first_scan_result, self.preset, Decimal("21500.00"))
         self.assertEqual(FundamentalLabPosition.objects.filter(ticker="WINW").count(), 1)
         self.assertEqual(PaperTrade.objects.filter(sandbox="FUNDAMENTAL_LAB").count(), 1)
 
@@ -265,8 +282,12 @@ class ProcessCandidatePipelineTests(APITestCase):
 
     def test_claude_confirmed_creates_lab_position(self):
         quant_result = _make_quant_result(ticker="ATD")
+        fake_order = MagicMock()
+        fake_order.id = "fake-order-id-456"
+        fake_order.status = "accepted"
         with patch.object(tasks, "triage_ticker") as mock_deepseek, \
-                patch.object(tasks, "verify_ticker") as mock_claude:
+                patch.object(tasks, "verify_ticker") as mock_claude, \
+                patch.object(tasks, "submit_lab_market_order", return_value=fake_order):
             mock_deepseek.return_value = DeepSeekResult(verdict="no_reason", reasoning="Rien de notable.")
             mock_claude.return_value = ClaudeResult(verdict="confirmed", reasoning="Inefficience de marché.")
 
