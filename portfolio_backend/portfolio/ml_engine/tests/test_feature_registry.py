@@ -62,7 +62,7 @@ def test_watchlist_alias_resolves_to_fusion_not_unused_bluechip_list() -> None:
     (retrain_from_paper_trades_daily) imports FEATURE_COLUMNS
     (= FUSION_FEATURE_NAMES) directly, never via get_feature_names — so the
     two could silently resolve 'WATCHLIST features' to two different lists
-    (27 vs 52) depending on which was called. Nothing called the alias in
+    (27 vs 54) depending on which was called. Nothing called the alias in
     production at audit time, but the trap was real and dormant."""
     assert get_feature_names("WATCHLIST") == list(FUSION_FEATURE_NAMES)
-    assert len(get_feature_names("WATCHLIST")) == 52
+    assert len(get_feature_names("WATCHLIST")) == 54

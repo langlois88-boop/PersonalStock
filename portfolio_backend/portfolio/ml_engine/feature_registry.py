@@ -257,7 +257,7 @@ def get_feature_names(model_name: str, fallback: List[str] | None = None) -> Lis
         # "aucun pipeline n'importe cette liste actuellement" -- un piège
         # silencieux (rien n'appelait get_feature_names('WATCHLIST') en
         # production au moment de l'audit, mais le premier code qui l'aurait
-        # fait aurait reçu 27 features au lieu des 52 réellement utilisées
+        # fait aurait reçu 27 features au lieu des 54 réellement utilisées
         # par le modèle chargé pour WATCHLIST -- data_fusion_brain_
         # bluechip_v1.pkl, entraîné sur FUSION_FEATURE_NAMES). WATCHLIST n'a
         # pas son propre modèle (partagé avec AI_BLUECHIP au niveau du

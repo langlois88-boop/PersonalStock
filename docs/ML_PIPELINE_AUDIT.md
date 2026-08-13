@@ -35,7 +35,7 @@ d'intake et de calcul du signal brut :
   BLUECHIP, CRYPTO, FUSION, RECOMMENDER) — pas toutes réellement utilisées
   (voir "Feature registry" plus bas). Le modèle FUSION (celui réellement
   chargé pour WATCHLIST/AI_BLUECHIP/AI_PENNY) utilise `FUSION_FEATURE_NAMES`,
-  **52 features** (momentum, tendance, volatilité, volume, structure de
+  **54 features** (momentum, tendance, volatilité, volume, structure de
   prix, bougies/patterns, macro, order book, fondamentaux, fractional
   differencing — liste complète dans le fichier).
 - **Modèle** : `_model_signal()` (`portfolio/tasks.py:4937`) appelle
@@ -105,10 +105,10 @@ incohérences internes déjà documentées par ses propres commentaires :
 - **Piège actif confirmé** : `get_feature_names('WATCHLIST')` résout vers
   l'alias `BLUECHIP` — la liste "jamais utilisée nulle part" ci-dessus.
   Mais le chemin de ré-entraînement réel (`retrain_from_paper_trades_daily`)
-  importe `FEATURE_COLUMNS` directement depuis `FUSION` (52 features), sans
+  importe `FEATURE_COLUMNS` directement depuis `FUSION` (54 features), sans
   jamais appeler `get_feature_names()`. **Deux fonctions différentes
   peuvent donc résoudre "les features de WATCHLIST" vers deux listes
-  different (27 vs 52)** selon laquelle est appelée — personne n'a
+  different (27 vs 54)** selon laquelle est appelée — personne n'a
   encore été mordu par ça (rien n'appelle `get_feature_names('WATCHLIST')`
   en production actuellement, vérifié), mais le piège est réel et prêt à
   se déclencher au premier nouveau code qui l'utiliserait sans le savoir.
