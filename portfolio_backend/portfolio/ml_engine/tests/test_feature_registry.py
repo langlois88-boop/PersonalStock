@@ -3,7 +3,12 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from portfolio.ml_engine.feature_registry import CRYPTO_FEATURE_NAMES, PENNY_FEATURE_NAMES
+from portfolio.ml_engine.feature_registry import (
+    CRYPTO_FEATURE_NAMES,
+    FUSION_FEATURE_NAMES,
+    PENNY_FEATURE_NAMES,
+    get_feature_names,
+)
 
 
 def _synthetic_ohlcv(n: int = 200, seed: int = 0) -> pd.DataFrame:
@@ -46,3 +51,18 @@ def test_penny_feature_names_match_what_penny_pipeline_computes() -> None:
 
     assert PENNY_FEATURES == list(PENNY_FEATURE_NAMES)
     assert len(PENNY_FEATURE_NAMES) == 7
+
+
+def test_watchlist_alias_resolves_to_fusion_not_unused_bluechip_list() -> None:
+    """Regression test (2026-08-12, ML_PIPELINE_AUDIT.md): 'WATCHLIST' used
+    to alias to BLUECHIP_FEATURE_NAMES (27 features) — a list this module's
+    own comments describe as imported by no pipeline at all. WATCHLIST has
+    no dedicated model (it shares data_fusion_brain_bluechip_v1.pkl with
+    AI_BLUECHIP), and the actual retrain path
+    (retrain_from_paper_trades_daily) imports FEATURE_COLUMNS
+    (= FUSION_FEATURE_NAMES) directly, never via get_feature_names — so the
+    two could silently resolve 'WATCHLIST features' to two different lists
+    (27 vs 52) depending on which was called. Nothing called the alias in
+    production at audit time, but the trap was real and dormant."""
+    assert get_feature_names("WATCHLIST") == list(FUSION_FEATURE_NAMES)
+    assert len(get_feature_names("WATCHLIST")) == 52

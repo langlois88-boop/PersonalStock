@@ -252,7 +252,19 @@ def get_feature_names(model_name: str, fallback: List[str] | None = None) -> Lis
         "AI_CRYPTO": "CRYPTO",
         "PENNY_STOCK": "PENNY",
         "BLUE_CHIP": "BLUECHIP",
-        "WATCHLIST": "BLUECHIP",
+        # Corrigé le 2026-08-12 (ML_PIPELINE_AUDIT.md) : pointait vers
+        # BLUECHIP_FEATURE_NAMES, une liste documentée plus haut comme
+        # "aucun pipeline n'importe cette liste actuellement" -- un piège
+        # silencieux (rien n'appelait get_feature_names('WATCHLIST') en
+        # production au moment de l'audit, mais le premier code qui l'aurait
+        # fait aurait reçu 27 features au lieu des 52 réellement utilisées
+        # par le modèle chargé pour WATCHLIST -- data_fusion_brain_
+        # bluechip_v1.pkl, entraîné sur FUSION_FEATURE_NAMES). WATCHLIST n'a
+        # pas son propre modèle (partagé avec AI_BLUECHIP au niveau du
+        # fichier .pkl), mais son chemin de features réel EST FUSION -- même
+        # registre que celui que retrain_from_paper_trades_daily importe
+        # directement (FEATURE_COLUMNS = list(FUSION_FEATURE_NAMES)).
+        "WATCHLIST": "FUSION",
     }
     resolved = aliases.get(key, key)
     if resolved in FEATURE_REGISTRY:
