@@ -16,6 +16,7 @@ import requests
 import random
 import json
 import pandas as pd
+import redis
 from time import sleep
 from zoneinfo import ZoneInfo
 from celery import shared_task
@@ -4609,6 +4610,34 @@ def _price_velocity_drop(intraday_ctx: dict[str, Any] | None, bars_back: int = 5
     return drop <= threshold
 
 
+_circuit_breaker_redis: redis.Redis | None = None
+
+
+def _circuit_breaker_redis_client() -> redis.Redis:
+    """
+    Client Redis dédié à l'état du circuit breaker (2026-08-13, item 9 de
+    TECH_DEBT_NOTES.md) -- PAS le cache Django par défaut (LocMemCache,
+    en mémoire du process, jamais persisté). Confirmé en conditions
+    réelles le 2026-08-13 : un redémarrage complet du NAS a fait perdre
+    l'état (baseline/déjà-déclenché-aujourd'hui) de tous les workers, ce
+    qui a très probablement contribué à un second déclenchement du
+    breaker pour AI_BLUECHIP/AI_PENNY avec un `capital` pourtant
+    identique au premier déclenchement (aucun trade fermé entre les
+    deux -- mathématiquement, une baseline correctement conservée
+    n'aurait pas dû re-déclencher sur une valeur inchangée).
+
+    Redis est déjà utilisé dans ce projet (broker Celery, REDIS_URL) --
+    réutilisé ici directement (pas via le framework cache de Django, pour
+    ne toucher QUE cet état précis, pas tous les usages de `cache.*`
+    ailleurs dans ce fichier) plutôt que d'introduire un nouveau backend.
+    """
+    global _circuit_breaker_redis
+    if _circuit_breaker_redis is None:
+        redis_url = os.getenv('REDIS_URL', 'redis://redis:6379/0')
+        _circuit_breaker_redis = redis.Redis.from_url(redis_url, decode_responses=True)
+    return _circuit_breaker_redis
+
+
 def _daily_equity_circuit_breaker(sandbox: str, equity_now: float) -> dict[str, Any]:
     threshold = float(os.getenv('DAILY_EQUITY_DRAWDOWN_PCT', '0.03'))
     result = {
@@ -4620,29 +4649,31 @@ def _daily_equity_circuit_breaker(sandbox: str, equity_now: float) -> dict[str, 
     }
     if equity_now <= 0:
         return result
+    r = _circuit_breaker_redis_client()
     key = f"daily_equity_base:{sandbox}:{_ny_time_now().strftime('%Y%m%d')}"
     trigger_key = f"daily_equity_trip:{sandbox}:{_ny_time_now().strftime('%Y%m%d')}"
-    baseline = cache.get(key)
+    day_seconds = 60 * 60 * 24
+    baseline = r.get(key)
     if baseline is None:
-        cache.set(key, float(equity_now), timeout=60 * 60 * 24)
+        r.set(key, repr(float(equity_now)), ex=day_seconds)
         result['baseline'] = float(equity_now)
         return result
     baseline = float(baseline)
     result['baseline'] = baseline
     if baseline <= 0:
         return result
-    if cache.get(trigger_key):
+    if r.get(trigger_key):
         result['triggered'] = True
         return result
     if equity_now >= baseline:
-        cache.set(key, float(equity_now), timeout=60 * 60 * 24)
+        r.set(key, repr(float(equity_now)), ex=day_seconds)
         result['baseline'] = float(equity_now)
         result['drawdown'] = 0.0
         return result
     drawdown = (equity_now - baseline) / baseline
     result['drawdown'] = drawdown
     if drawdown <= -abs(threshold):
-        cache.set(trigger_key, True, timeout=60 * 60 * 24)
+        r.set(trigger_key, '1', ex=day_seconds)
         result['triggered'] = True
         result['first_trigger'] = True
     return result
@@ -4651,17 +4682,18 @@ def _daily_equity_circuit_breaker(sandbox: str, equity_now: float) -> dict[str, 
 def reset_daily_equity_breaker(sandbox: str | None = None, day: date | None = None) -> dict[str, Any]:
     day_key = (day or _ny_time_now().date()).strftime('%Y%m%d')
     sandboxes = [sandbox] if sandbox else ['AI_PENNY', 'AI_BLUECHIP', 'WATCHLIST']
+    r = _circuit_breaker_redis_client()
     cleared = []
     for box in sandboxes:
         if not box:
             continue
         trigger_key = f"daily_equity_trip:{box}:{day_key}"
         baseline_key = f"daily_equity_base:{box}:{day_key}"
-        if cache.get(trigger_key):
-            cache.delete(trigger_key)
+        if r.get(trigger_key):
+            r.delete(trigger_key)
             cleared.append(box)
-        if cache.get(baseline_key):
-            cache.delete(baseline_key)
+        if r.get(baseline_key):
+            r.delete(baseline_key)
     return {'cleared': cleared, 'date': day_key}
 
 
