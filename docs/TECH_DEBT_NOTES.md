@@ -1120,3 +1120,57 @@ hors scope de cette découverte) :
   plutôt que de l'envoyer comme un titre nu, ou fetch le corps complet
   ailleurs) — change le comportement du prompt pour tous les tickers,
   à peser avant de toucher.
+
+---
+
+## 15. [CORRIGÉ le 2026-08-14, leçon opérationnelle] nginx met en cache l'IP de `backend` au démarrage — toute recréation de `backend` sans recréer `frontend` casse TOUTES les routes `/api/`
+
+**Statut : fermé pour cette occurrence (redémarrage de `frontend`), mais
+la cause structurelle reste vraie à chaque déploiement futur — à retenir,
+pas un bug de code.**
+
+**Symptôme signalé** : "Screener fondamental... Request failed with
+status code 502... Aucun résultat pour ce preset." Vérifié : **pas
+spécifique au screener** — `/api/analysis/ticker/AAPL/`,
+`/api/paper-trades/summary/`, `/api/logs/*` retournaient tous 502 au
+même moment.
+
+**Cause confirmée** (`docker logs personalstock-frontend-1`) :
+```
+connect() failed (111: Connection refused) while connecting to upstream,
+upstream: "http://172.16.5.9:8000/..."
+```
+`nginx.conf` utilise `proxy_pass http://backend:8000;` avec un nom
+d'hôte statique — nginx résout ce nom **une seule fois, au démarrage du
+process nginx**, et met le résultat en cache pour toute la durée de vie
+du container (comportement nginx standard, pas une erreur de config en
+soi). Cette session a recréé `backend` plusieurs fois le 2026-08-13 (fix
+`tsx-guardian`, entre autres) sans recréer `frontend` à chaque fois —
+`backend` a reçu une nouvelle IP Docker interne à chaque recréation,
+mais `frontend`/nginx continuait d'essayer l'ancienne IP, devenue
+invalide. Confirmé : appel direct à `backend` sur le port hôte mappé
+(8001) fonctionnait très bien pendant tout ce temps — seul le chemin
+interne nginx → backend était cassé, donc invisible sans vérifier
+spécifiquement les logs nginx.
+
+**Fix immédiat** : `docker compose restart frontend` — force nginx à
+redémarrer son process et donc à ré-résoudre `backend` vers l'IP
+actuelle. Confirmé : les 3 endpoints testés (`ticker/AAPL`,
+`paper-trades/summary`, `screener/.../run/`) sont repassés à 200/202
+immédiatement après.
+
+**À retenir pour tous les déploiements futurs** : recréer `backend`
+(ou n'importe quel service que nginx proxy) **sans** recréer/redémarrer
+`frontend` juste après laisse une fenêtre où toutes les routes `/api/`
+sont cassées, silencieusement (aucune erreur ne remonte tant que
+personne n'utilise l'app ou ne vérifie les logs nginx précisément).
+Deux options pour l'avenir :
+1. **Discipline manuelle** : toujours inclure `frontend` dans la liste
+   des services `--force-recreate`/`restart` quand `backend` est
+   recréé, même si le code frontend lui-même n'a pas changé.
+2. **Fix structurel possible** (pas fait ce soir, à évaluer séparément) :
+   nginx supporte un résolveur dynamique (`resolver 127.0.0.11
+   valid=10s;` + variable dans `proxy_pass` au lieu d'un nom d'hôte en
+   dur) qui re-résout périodiquement sans jamais nécessiter de
+   redémarrage manuel de `frontend`. Éliminerait la classe de bug
+   entière plutôt que de compter sur la discipline à chaque fois.
