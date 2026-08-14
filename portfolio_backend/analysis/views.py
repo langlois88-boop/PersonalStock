@@ -385,8 +385,12 @@ class LabWeeklySuggestionsView(APIView):
             "suggestions": [
                 {
                     "id": s.id,
-                    "week_start": s.week_start,
-                    "generated_at": s.generated_at,
+                    # isoformat() explicite plutôt que de laisser le renderer DRF
+                    # s'en charger -- garde le type prévisible (str) aussi bien
+                    # dans les tests (response.data, avant rendu JSON) que côté
+                    # client.
+                    "week_start": s.week_start.isoformat(),
+                    "generated_at": s.generated_at.isoformat(),
                     "positions_closed_analyzed": s.positions_closed_analyzed,
                     "has_pattern": s.has_pattern,
                     "summary": s.summary,
