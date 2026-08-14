@@ -4638,7 +4638,31 @@ def _circuit_breaker_redis_client() -> redis.Redis:
     return _circuit_breaker_redis
 
 
-def _daily_equity_circuit_breaker(sandbox: str, equity_now: float) -> dict[str, Any]:
+def _daily_equity_circuit_breaker(sandbox: str, equity_now: float, broker_path: str = 'SIM') -> dict[str, Any]:
+    """
+    `broker_path` ajouté le 2026-08-14 (TECH_DEBT_NOTES.md item 16) : ce
+    breaker est appelé depuis DEUX chemins pour le même `sandbox`, sur
+    deux échelles totalement incompatibles --
+    `_execute_paper_trades_for_sandbox` (SIM) passe `capital` = la petite
+    comptabilité papier interne au sandbox (~10-25k$), tandis que
+    `_execute_alpaca_paper_trades_for_sandbox` (ALPACA) passe l'équité
+    RÉELLE du compte Alpaca PARTAGÉ entre WATCHLIST/AI_BLUECHIP/AI_PENNY
+    (~100k$). Avant ce fix, les deux écrivaient dans la MÊME clé de
+    cache -- quel que soit le chemin qui tournait en premier chaque
+    jour fixait la baseline à son échelle, et l'autre chemin se voyait
+    comparé contre elle : un "drawdown" de ~-76% à ~-90%, garanti de
+    déclencher le breaker presque immédiatement chaque jour, sans
+    rapport avec une vraie perte. Confirmé en direct le 2026-08-14 :
+    baseline stockée = 100019.01$ (quasi identique à l'équité réelle du
+    compte partagé, 100005.51$ vérifiée séparément), alors que le
+    `capital` loggé au déclenchement pour AI_BLUECHIP/AI_PENNY était
+    23803.36$/10038.11$ -- deux échelles qui n'ont jamais dû partager
+    une baseline. Chaque chemin garde maintenant sa propre clé
+    (`{sandbox}:{broker_path}:{date}`) -- deux garde-fous indépendants,
+    chacun protégeant ce qu'il ferme réellement en cas de déclenchement
+    (positions SIM vs vraies positions Alpaca), plutôt qu'un seul
+    garde-fou incohérent entre les deux.
+    """
     threshold = float(os.getenv('DAILY_EQUITY_DRAWDOWN_PCT', '0.03'))
     result = {
         'triggered': False,
@@ -4650,8 +4674,8 @@ def _daily_equity_circuit_breaker(sandbox: str, equity_now: float) -> dict[str, 
     if equity_now <= 0:
         return result
     r = _circuit_breaker_redis_client()
-    key = f"daily_equity_base:{sandbox}:{_ny_time_now().strftime('%Y%m%d')}"
-    trigger_key = f"daily_equity_trip:{sandbox}:{_ny_time_now().strftime('%Y%m%d')}"
+    key = f"daily_equity_base:{sandbox}:{broker_path}:{_ny_time_now().strftime('%Y%m%d')}"
+    trigger_key = f"daily_equity_trip:{sandbox}:{broker_path}:{_ny_time_now().strftime('%Y%m%d')}"
     day_seconds = 60 * 60 * 24
     baseline = r.get(key)
     if baseline is None:
@@ -4684,16 +4708,20 @@ def reset_daily_equity_breaker(sandbox: str | None = None, day: date | None = No
     sandboxes = [sandbox] if sandbox else ['AI_PENNY', 'AI_BLUECHIP', 'WATCHLIST']
     r = _circuit_breaker_redis_client()
     cleared = []
+    # Réinitialise les DEUX chemins (voir _daily_equity_circuit_breaker,
+    # 2026-08-14) -- un reset doit débloquer le sandbox en entier, pas
+    # seulement le chemin SIM ou seulement Alpaca.
     for box in sandboxes:
         if not box:
             continue
-        trigger_key = f"daily_equity_trip:{box}:{day_key}"
-        baseline_key = f"daily_equity_base:{box}:{day_key}"
-        if r.get(trigger_key):
-            r.delete(trigger_key)
-            cleared.append(box)
-        if r.get(baseline_key):
-            r.delete(baseline_key)
+        for broker_path in ('SIM', 'ALPACA'):
+            trigger_key = f"daily_equity_trip:{box}:{broker_path}:{day_key}"
+            baseline_key = f"daily_equity_base:{box}:{broker_path}:{day_key}"
+            if r.get(trigger_key):
+                r.delete(trigger_key)
+                cleared.append(f"{box}:{broker_path}")
+            if r.get(baseline_key):
+                r.delete(baseline_key)
     return {'cleared': cleared, 'date': day_key}
 
 
@@ -5424,7 +5452,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
     min_available_capital = _env_float(prefix, 'MIN_AVAILABLE_CAPITAL', '0.0')
     block_new_entries = sandbox == 'AI_PENNY' and min_available_capital > 0 and available < min_available_capital
     regime = get_market_regime_context()
-    breaker = _daily_equity_circuit_breaker(sandbox, capital)
+    breaker = _daily_equity_circuit_breaker(sandbox, capital, broker_path='SIM')
     if breaker.get('triggered'):
         if breaker.get('first_trigger'):
             for trade in open_trades_list:
@@ -6573,7 +6601,7 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
     except Exception:
         equity_now = None
     equity_now = equity_now if equity_now is not None else buying_power
-    breaker = _daily_equity_circuit_breaker(sandbox, float(equity_now or 0))
+    breaker = _daily_equity_circuit_breaker(sandbox, float(equity_now or 0), broker_path='ALPACA')
     if breaker.get('triggered'):
         if breaker.get('first_trigger'):
             for symbol, pos in positions.items():
