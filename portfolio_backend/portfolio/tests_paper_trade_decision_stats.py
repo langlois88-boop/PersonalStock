@@ -116,7 +116,7 @@ class PaperTradeDecisionStatsInvariantTests(TestCase):
             'get_market_sentiment': lambda: ('NEUTRAL', {}),
             '_market_sentiment_score': lambda: 0.5,
             'get_market_regime_context': lambda: {'risk_off': False},
-            '_daily_equity_circuit_breaker': lambda sandbox, capital: {'triggered': False},
+            '_daily_equity_circuit_breaker': lambda sandbox, capital, **kwargs: {'triggered': False},
             '_weak_list_health': lambda: {'defensive': False},
             '_atr_spike': lambda symbol, use_alpaca=False: False,
             '_btc_trend_ok': lambda symbol: True,
