@@ -39,6 +39,7 @@ from .services.quant_filter import run_quant_filter, fetch_ticker_data
 from .services.deepseek_triage import triage_ticker
 from .services.claude_verifier import verify_ticker
 from .services.broad_scan_filter import evaluate_ticker_strict
+from .services.sanity_check import check_sanity
 
 logger = logging.getLogger(__name__)
 
@@ -229,8 +230,11 @@ def _process_candidate(scan_run: ScanRun, preset: ScreenerPreset, quant_result, 
     scan_result.claude_verdict = claude_result.verdict
     scan_result.claude_reasoning = claude_result.reasoning
     scan_result.claude_tokens_used = claude_result.tokens_used
+    scan_result.claude_confidence = claude_result.confidence
     scan_result.verdict_source = claude_result.verdict_source
-    scan_result.save(update_fields=["claude_verdict", "claude_reasoning", "claude_tokens_used", "verdict_source"])
+    scan_result.save(update_fields=[
+        "claude_verdict", "claude_reasoning", "claude_tokens_used", "claude_confidence", "verdict_source",
+    ])
 
     if claude_result.verdict == "rejected":
         scan_result.final_verdict = "rejected_claude"
@@ -274,6 +278,25 @@ def _create_lab_position(scan_result: ScanResult, preset: ScreenerPreset, benchm
     distinctes pour BTO.TO (~296$ engagés au lieu de ~99$) faute de ce
     check — voir docs/TECH_DEBT_NOTES.md item 8.
     """
+    # Garde-fou de sécurité (2026-08-14, cas HAIN) -- APRÈS le verdict LLM,
+    # AVANT toute création de position, peu importe si Claude a dit
+    # confirmed/uncertain. Voir analysis/services/sanity_check.py. Le
+    # verdict LLM d'origine (scan_result.claude_verdict) n'est PAS écrasé --
+    # seul final_verdict passe à 'flagged_anomaly', pour garder la
+    # traçabilité complète (ce n'est pas Claude qui a jugé mauvais, c'est un
+    # seuil déterministe qui a bloqué l'ouverture malgré le verdict).
+    sanity = check_sanity(scan_result.quant_details)
+    if not sanity.passed:
+        scan_result.final_verdict = "flagged_anomaly"
+        scan_result.anomaly_reason = sanity.reason_text
+        scan_result.save(update_fields=["final_verdict", "anomaly_reason"])
+        logger.warning(
+            "%s bloqué par le garde-fou de sécurité (verdict LLM d'origine=%s) -- "
+            "aucune position créée. Raison(s) : %s",
+            scan_result.ticker, scan_result.claude_verdict or "n/a", sanity.reason_text,
+        )
+        return
+
     already_open = FundamentalLabPosition.objects.filter(
         ticker=scan_result.ticker, preset=preset, is_open=True,
     ).exists()
@@ -762,7 +785,19 @@ def monitor_lab_positions(self) -> dict:
         lab_position = FundamentalLabPosition.objects.filter(paper_trade=trade).first()
         if lab_position:
             lab_position.is_open = False
-            lab_position.save(update_fields=["is_open"])
+            lab_position.exit_price = trade.exit_price
+            lab_position.exit_date = trade.exit_date
+            lab_position.close_reason = "stop_loss"
+            try:
+                entry = float(lab_position.entry_price)
+                lab_position.realized_return_pct = (
+                    round((float(trade.exit_price) - entry) / entry * 100, 2) if entry else None
+                )
+            except Exception:
+                lab_position.realized_return_pct = None
+            lab_position.save(update_fields=[
+                "is_open", "exit_price", "exit_date", "close_reason", "realized_return_pct",
+            ])
         else:
             logger.warning(
                 "monitor_lab_positions: PaperTrade %s fermé (stop-loss) mais aucune FundamentalLabPosition "

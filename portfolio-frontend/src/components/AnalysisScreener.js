@@ -6,7 +6,17 @@ import { tickerDetailPath } from '../tickerUrl';
 const VERDICT_BADGES = {
   confirmed: { icon: '✅', label: 'Confirmé', className: 'bg-emerald-500/15 text-emerald-200 border-emerald-500/30' },
   uncertain: { icon: '⚠️', label: 'Incertain', className: 'bg-amber-500/15 text-amber-200 border-amber-500/30' },
+  // Garde-fou de sécurité (2026-08-14, cas HAIN) : bloqué par un seuil
+  // déterministe, pas par un jugement LLM -- badge volontairement distinct
+  // des deux autres pour qu'on ne le confonde jamais avec un vrai rejet.
+  flagged_anomaly: { icon: '⛔', label: 'Bloqué (garde-fou)', className: 'bg-rose-500/15 text-rose-200 border-rose-500/30' },
 };
+
+const ANOMALY_GUARDRAIL_MESSAGE = (
+  "Bloqué par garde-fou de sécurité — ratios jugés anormaux, pas d'ouverture "
+  "automatique. Vérification manuelle possible via le bouton \"Analyse manuelle "
+  "complète\" sur la fiche ticker si tu veux quand même l'examiner."
+);
 
 // 'value-catalyst' retiré le 2026-08-10 : offert dans le menu mais jamais
 // créé côté backend (aucun ScreenerPreset avec ce slug en base -- 404
@@ -179,7 +189,10 @@ function AnalysisScreener() {
                         <a href={tickerDetailPath(r.ticker)} className="hover:underline">{r.ticker}</a>
                       </td>
                       <td className="px-3 py-2">
-                        <span className={`inline-flex items-center px-2 py-1 rounded-full border text-xs ${badge.className || 'bg-slate-700/30 text-slate-200 border-slate-600/40'}`}>
+                        <span
+                          className={`inline-flex items-center px-2 py-1 rounded-full border text-xs ${badge.className || 'bg-slate-700/30 text-slate-200 border-slate-600/40'}`}
+                          title={r.final_verdict === 'flagged_anomaly' ? ANOMALY_GUARDRAIL_MESSAGE : undefined}
+                        >
                           {badge.icon} {badge.label || r.final_verdict}
                         </span>
                       </td>
@@ -190,7 +203,20 @@ function AnalysisScreener() {
                         {r.quant_details?.roe !== null && r.quant_details?.roe !== undefined ? `${formatNumber(r.quant_details.roe, 1)}%` : '—'}
                       </td>
                       <td className="px-3 py-2 text-slate-400 max-w-xl">
-                        <div className="whitespace-pre-wrap break-words">{r.claude_reasoning || '—'}</div>
+                        {r.final_verdict === 'flagged_anomaly' ? (
+                          <div className="space-y-1">
+                            <div className="whitespace-pre-wrap break-words text-rose-300">
+                              {ANOMALY_GUARDRAIL_MESSAGE}
+                            </div>
+                            {r.anomaly_reason && (
+                              <div className="whitespace-pre-wrap break-words text-xs text-slate-500">
+                                Raison(s) : {r.anomaly_reason}
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="whitespace-pre-wrap break-words">{r.claude_reasoning || '—'}</div>
+                        )}
                       </td>
                       <td className="px-3 py-2">
                         <button

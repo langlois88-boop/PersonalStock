@@ -36,8 +36,8 @@ class ScanResultSerializer(serializers.ModelSerializer):
         fields = [
             "id", "ticker", "sector", "quant_score", "quant_details",
             "price_at_scan", "deepseek_verdict", "deepseek_reasoning",
-            "claude_verdict", "claude_reasoning", "final_verdict",
-            "candle_pattern_detected", "created_at", "lab_position_id",
+            "claude_verdict", "claude_reasoning", "claude_confidence", "final_verdict",
+            "anomaly_reason", "candle_pattern_detected", "created_at", "lab_position_id",
         ]
 
     def get_lab_position_id(self, obj):

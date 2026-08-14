@@ -13,6 +13,9 @@ const VERDICT_BADGES = {
   uncertain: { icon: '⚠️', label: 'Incertain', className: 'bg-amber-500/15 text-amber-200 border-amber-500/30' },
   rejected_claude: { icon: '❌', label: 'Rejeté (Claude)', className: 'bg-rose-500/15 text-rose-200 border-rose-500/30' },
   rejected_deepseek: { icon: '❌', label: 'Rejeté (DeepSeek)', className: 'bg-rose-500/15 text-rose-200 border-rose-500/30' },
+  // Garde-fou de sécurité (2026-08-14, cas HAIN) : bloqué par un seuil
+  // déterministe sur les ratios, pas par un jugement LLM.
+  flagged_anomaly: { icon: '⛔', label: 'Bloqué (garde-fou)', className: 'bg-rose-500/15 text-rose-200 border-rose-500/30' },
 };
 
 const formatNumber = (value, digits = 2) => {

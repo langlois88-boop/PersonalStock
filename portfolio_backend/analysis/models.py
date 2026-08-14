@@ -58,6 +58,12 @@ class ScanResult(models.Model):
         ('uncertain', 'uncertain'),
         ('rejected_deepseek', 'rejected_deepseek'),
         ('rejected_claude', 'rejected_claude'),
+        # Garde-fou de sécurité (2026-08-14, cas HAIN) : bloqué par
+        # analysis.services.sanity_check APRÈS le verdict LLM (peu importe
+        # s'il disait confirmed/uncertain) -- distinct d'un rejet LLM, voir
+        # SanityCheckResult et anomaly_reason ci-dessous. claude_verdict
+        # garde le verdict LLM d'origine pour traçabilité complète.
+        ('flagged_anomaly', 'flagged_anomaly'),
     )
 
     scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name='results')
@@ -73,6 +79,18 @@ class ScanResult(models.Model):
     claude_verdict = models.CharField(max_length=20, blank=True, default='')
     claude_reasoning = models.TextField(blank=True, default='')
     claude_tokens_used = models.IntegerField(default=0)
+    # verify_ticker() (claude_verifier.py) retourne déjà 'low'/'medium'/'high'
+    # dans ClaudeResult.confidence mais ne le stockait nulle part avant le
+    # 2026-08-14 (audit ML_LAB_FUTURE_MODEL.md, Partie 2) -- utilisé puis
+    # perdu. Feature potentielle pour un futur modèle entraîné sur les
+    # résultats réels (verdict LLM + confiance -> performance).
+    claude_confidence = models.CharField(max_length=10, blank=True, default='')
+
+    # Raison précise du garde-fou de sécurité (analysis.services.sanity_check)
+    # quand final_verdict == 'flagged_anomaly' -- vide sinon. Distinct de
+    # claude_reasoning/deepseek_reasoning : ce texte vient d'un calcul de
+    # seuils déterministe, pas d'un LLM.
+    anomaly_reason = models.TextField(blank=True, default='')
 
     VERDICT_SOURCE_CHOICES = (
         # Un seul appel Claude (CLAUDE_VOTE_CALLS<=1) -- comportement
@@ -129,6 +147,23 @@ class FundamentalLabPosition(models.Model):
     manually_selected = models.BooleanField(default=False)
     manual_note = models.TextField(blank=True, default='')
     is_open = models.BooleanField(default=True)
+
+    CLOSE_REASON_CHOICES = (
+        ('stop_loss', 'stop_loss'),
+        ('manual', 'manual'),
+    )
+    # Ajoutés le 2026-08-14 (audit ML_LAB_FUTURE_MODEL.md, Partie 2) : avant
+    # ça, une position fermée n'était traçable que via son paper_trade lié
+    # (PaperTrade.exit_price/exit_date, et la raison de fermeture seulement
+    # en texte libre dans PaperTrade.notes, pas machine-lisible). Dupliqués
+    # ici plutôt que de forcer une jointure à chaque requête ML future --
+    # cette table est le futur feature/label set, elle doit être
+    # auto-suffisante. Renseignés au moment de la fermeture (voir
+    # analysis/tasks.py::monitor_lab_positions pour stop_loss).
+    exit_price = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    exit_date = models.DateTimeField(null=True, blank=True)
+    close_reason = models.CharField(max_length=20, choices=CLOSE_REASON_CHOICES, blank=True, default='')
+    realized_return_pct = models.FloatField(null=True, blank=True)
 
     # Ordre paper trade réel (portfolio.PaperTrade, sandbox='FUNDAMENTAL_LAB').
     # Nullable : si la création de l'ordre échoue, la position lab existe
@@ -274,3 +309,30 @@ class ManualTickerCheck(models.Model):
 
     def __str__(self) -> str:
         return f"{self.ticker} manual check {self.final_verdict} ({self.checked_at:%Y-%m-%d %H:%M})"
+
+
+class LabWeeklySuggestion(models.Model):
+    """
+    Résumé hebdomadaire automatique (2026-08-14, Partie 3 -- voir
+    analysis.tasks.generate_lab_weekly_suggestions). Cherche des patterns
+    simples et objectifs (corrélation entre un facteur -- ROE bas, FCF Yield
+    extrême, secteur, confiance Claude -- et la performance réelle des
+    positions FUNDAMENTAL_LAB fermées dans la semaine). Ne modifie JAMAIS
+    un seuil ou un comportement automatiquement -- une suggestion texte
+    courte, jamais appliquée sans confirmation explicite d'Eric. Affiché
+    dans un encart sur la page Analytics & ML Lab existante (pas une
+    nouvelle page séparée).
+    """
+
+    week_start = models.DateField(db_index=True)
+    generated_at = models.DateTimeField(auto_now_add=True)
+    positions_closed_analyzed = models.IntegerField(default=0)
+    has_pattern = models.BooleanField(default=False)
+    summary = models.TextField(blank=True, default='')
+
+    class Meta:
+        ordering = ['-generated_at']
+
+    def __str__(self) -> str:
+        tag = "pattern" if self.has_pattern else "aucun pattern"
+        return f"Suggestion semaine du {self.week_start} ({tag})"

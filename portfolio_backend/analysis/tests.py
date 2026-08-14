@@ -17,6 +17,7 @@ from .services import quant_filter, manual_check
 from .services.deepseek_triage import DeepSeekResult
 from .services.claude_verifier import ClaudeResult
 from .services.quant_filter import QuantResult
+from .services.sanity_check import check_sanity
 
 
 def _make_preset(**kwargs):
@@ -208,6 +209,159 @@ class CreateLabPositionTests(APITestCase):
         self.assertTrue(FundamentalLabPosition.objects.filter(scan_result=second_scan_result).exists())
 
 
+class SanityCheckThresholdTests(APITestCase):
+    """
+    Partie 1.3 (2026-08-14) : régression exacte du cas HAIN qui a motivé le
+    garde-fou -- ROE -113%, FCF Yield 234%, Dette/EBITDA 7.12x, un verdict
+    Claude 'confirmed'/'uncertain' qui aurait ouvert une position sans ce
+    garde-fou. Teste la fonction pure d'abord (aucune dépendance DB/pipeline).
+    """
+
+    def test_hain_case_triggers_multiple_thresholds(self):
+        hain_like_details = {
+            "roe": -113.0,
+            "fcf_yield": 234.0,
+            "debt_to_ebitda": 7.12,
+            "pe_ratio": None,
+            "thresholds_used": {"debt_ebitda_max": 3},  # DEFAULT sector
+        }
+        result = check_sanity(hain_like_details)
+        self.assertFalse(result.passed)
+        # Les 3 seuils indépendants doivent tous se déclencher en même temps
+        # sur ce cas précis (pas juste un seul par coïncidence).
+        self.assertEqual(len(result.reasons), 3)
+        self.assertTrue(any("ROE" in r for r in result.reasons))
+        self.assertTrue(any("FCF Yield" in r for r in result.reasons))
+        self.assertTrue(any("Dette/EBITDA" in r for r in result.reasons))
+
+    def test_normal_ratios_pass(self):
+        normal_details = {
+            "roe": 18.0,
+            "fcf_yield": 6.0,
+            "debt_to_ebitda": 1.2,
+            "pe_ratio": 12.0,
+            "thresholds_used": {"debt_ebitda_max": 3},
+        }
+        result = check_sanity(normal_details)
+        self.assertTrue(result.passed)
+        self.assertEqual(result.reasons, [])
+
+    def test_missing_data_signal_triggers_alone(self):
+        details = {
+            "roe": -5.0,  # négatif mais pas assez pour ROE_ANOMALY_THRESHOLD seul
+            "fcf_yield": None,
+            "pe_ratio": None,
+            "debt_to_ebitda": None,
+            "thresholds_used": {"debt_ebitda_max": 3},
+        }
+        result = check_sanity(details)
+        self.assertFalse(result.passed)
+        self.assertEqual(len(result.reasons), 1)
+        self.assertIn("données fondamentales probablement non fiables", result.reasons[0])
+
+    def test_debt_ebitda_uses_sector_threshold_not_fixed_value(self):
+        # 6x est normal pour Utilities (debt_ebitda_max=6) mais serait un
+        # levier extrême pour Technology (debt_ebitda_max=1.5, 2x = 3).
+        utilities_details = {
+            "roe": 10.0, "fcf_yield": 5.0, "debt_to_ebitda": 6.0, "pe_ratio": 15.0,
+            "thresholds_used": {"debt_ebitda_max": 6},
+        }
+        self.assertTrue(check_sanity(utilities_details).passed)
+
+        tech_details = dict(utilities_details, thresholds_used={"debt_ebitda_max": 1.5})
+        result = check_sanity(tech_details)
+        self.assertFalse(result.passed)
+        self.assertTrue(any("Dette/EBITDA" in r for r in result.reasons))
+
+
+class CreateLabPositionSanityGuardrailTests(APITestCase):
+    """
+    Partie 1.2/1.3 : _create_lab_position doit bloquer la création, peu
+    importe le verdict LLM déjà stocké sur le ScanResult (confirmed OU
+    uncertain) -- reproduit le cas HAIN exact au niveau du point de passage
+    unique (avant PaperTrade.objects.create).
+    """
+
+    def setUp(self):
+        self.preset = _make_preset()
+        self.scan_run = ScanRun.objects.create(preset=self.preset, universe_source="sandboxes")
+
+    def _make_hain_like_scan_result(self, verdict):
+        return ScanResult.objects.create(
+            scan_run=self.scan_run,
+            ticker="HAIN",
+            sector="Consumer Defensive",
+            quant_score=2.0,
+            price_at_scan=Decimal("9.50"),
+            quant_details={
+                "roe": -113.0,
+                "fcf_yield": 234.0,
+                "debt_to_ebitda": 7.12,
+                "pe_ratio": None,
+                "thresholds_used": {"debt_ebitda_max": 3},
+            },
+            claude_verdict=verdict,
+            claude_reasoning="Ratios statistiquement suspects mais signal mixte.",
+            final_verdict=verdict,
+        )
+
+    def test_confirmed_verdict_still_blocked(self):
+        scan_result = self._make_hain_like_scan_result("confirmed")
+
+        tasks._create_lab_position(scan_result, self.preset, Decimal("21500.00"))
+
+        scan_result.refresh_from_db()
+        self.assertEqual(scan_result.final_verdict, "flagged_anomaly")
+        self.assertIn("ROE", scan_result.anomaly_reason)
+        # Le verdict LLM d'origine reste tracé, seul final_verdict change.
+        self.assertEqual(scan_result.claude_verdict, "confirmed")
+        self.assertFalse(FundamentalLabPosition.objects.filter(scan_result=scan_result).exists())
+        self.assertEqual(PaperTrade.objects.filter(sandbox="FUNDAMENTAL_LAB").count(), 0)
+
+    def test_uncertain_verdict_still_blocked(self):
+        scan_result = self._make_hain_like_scan_result("uncertain")
+
+        tasks._create_lab_position(scan_result, self.preset, Decimal("21500.00"))
+
+        scan_result.refresh_from_db()
+        self.assertEqual(scan_result.final_verdict, "flagged_anomaly")
+        self.assertFalse(FundamentalLabPosition.objects.filter(scan_result=scan_result).exists())
+        self.assertEqual(PaperTrade.objects.filter(sandbox="FUNDAMENTAL_LAB").count(), 0)
+
+    def test_full_pipeline_blocks_hain_case_end_to_end(self):
+        """
+        Bout en bout via _process_candidate (pas juste _create_lab_position
+        directement) -- confirme que le garde-fou s'applique aussi quand
+        déclenché depuis le vrai chemin d'exécution du scan.
+        """
+        quant_result = QuantResult(
+            ticker="HAIN", sector="Consumer Defensive", passed=True, score=2.0, price=9.50,
+            details={
+                "roe": -113.0, "fcf_yield": 234.0, "debt_to_ebitda": 7.12, "pe_ratio": None,
+                "sector": "Consumer Defensive", "thresholds_used": {"debt_ebitda_max": 3},
+            },
+            reasons_failed=[],
+        )
+        with patch.object(tasks, "triage_ticker") as mock_deepseek, \
+                patch.object(tasks, "verify_ticker") as mock_claude, \
+                patch.object(tasks, "submit_lab_market_order") as mock_order:
+            mock_deepseek.return_value = DeepSeekResult(verdict="uncertain", reasoning="Signal mixte.")
+            mock_claude.return_value = ClaudeResult(
+                verdict="confirmed", reasoning="Ratios suspects mais je penche pour une inefficience.",
+                confidence="low",
+            )
+
+            tasks._process_candidate(self.scan_run, self.preset, quant_result, Decimal("21500.00"))
+
+            mock_order.assert_not_called()
+
+        scan_result = ScanResult.objects.get(scan_run=self.scan_run, ticker="HAIN")
+        self.assertEqual(scan_result.final_verdict, "flagged_anomaly")
+        self.assertEqual(scan_result.claude_verdict, "confirmed")
+        self.assertEqual(scan_result.claude_confidence, "low")
+        self.assertFalse(FundamentalLabPosition.objects.filter(scan_result=scan_result).exists())
+
+
 class RejectionOutcomeBenchmarkTests(APITestCase):
     """
     TODO #4 du brief : benchmark_return_pct doit être calculé à partir du
@@ -312,6 +466,61 @@ class ProcessCandidatePipelineTests(APITestCase):
         scan_result = ScanResult.objects.get(scan_run=scan_run, ticker="RY")
         self.assertEqual(scan_result.final_verdict, "confirmed")
         self.assertTrue(FundamentalLabPosition.objects.filter(scan_result=scan_result).exists())
+
+
+class MonitorLabPositionsCloseFieldsTests(APITestCase):
+    """
+    Partie 2.2 (2026-08-14) : monitor_lab_positions doit renseigner
+    exit_price/exit_date/close_reason/realized_return_pct sur
+    FundamentalLabPosition au moment de la fermeture stop-loss -- avant ça
+    seul is_open passait à False, obligeant à passer par PaperTrade pour
+    retrouver ces informations (et sans raison de fermeture machine-lisible
+    du tout). Futur feature/label set pour un modèle ML, voir
+    docs/ML_LAB_FUTURE_MODEL.md.
+    """
+
+    def setUp(self):
+        self.preset = _make_preset()
+        self.scan_run = ScanRun.objects.create(preset=self.preset, universe_source="sandboxes")
+        self.scan_result = ScanResult.objects.create(
+            scan_run=self.scan_run, ticker="ATD", final_verdict="confirmed",
+            price_at_scan=Decimal("10.00"), quant_score=3.0,
+        )
+        self.trade = PaperTrade.objects.create(
+            ticker="ATD", sandbox="FUNDAMENTAL_LAB", entry_price=Decimal("10.00"),
+            quantity=10, stop_loss=Decimal("9.50"), status="OPEN",
+            broker="ALPACA_LAB", broker_order_id="order-abc", broker_status="new",
+        )
+        self.lab_position = FundamentalLabPosition.objects.create(
+            scan_result=self.scan_result, ticker="ATD", preset=self.preset,
+            entry_price=Decimal("10.00"), entry_date=timezone.now(),
+            paper_trade=self.trade,
+        )
+
+    def test_stop_loss_close_populates_lab_position_close_fields(self):
+        filled_order = MagicMock()
+        filled_order.status = "filled"
+        filled_order.filled_qty = "10"
+        filled_order.filled_avg_price = "10.00"
+
+        sell_order = MagicMock()
+        sell_order.id = "sell-order-xyz"
+        sell_order.status = "filled"
+
+        with patch.object(tasks, "get_lab_order_by_id", return_value=filled_order), \
+                patch.object(tasks, "fetch_ticker_data", return_value={"price": 9.00}), \
+                patch.object(tasks, "submit_lab_market_order", return_value=sell_order):
+            tasks.monitor_lab_positions()
+
+        self.lab_position.refresh_from_db()
+        self.trade.refresh_from_db()
+
+        self.assertFalse(self.lab_position.is_open)
+        self.assertEqual(self.trade.status, "CLOSED")
+        self.assertEqual(float(self.lab_position.exit_price), 9.00)
+        self.assertIsNotNone(self.lab_position.exit_date)
+        self.assertEqual(self.lab_position.close_reason, "stop_loss")
+        self.assertAlmostEqual(self.lab_position.realized_return_pct, -10.0, places=2)
 
 
 class ScreenerApiTests(APITestCase):
