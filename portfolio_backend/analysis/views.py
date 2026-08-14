@@ -15,7 +15,7 @@ from rest_framework.views import APIView
 
 from .models import (
     ScreenerPreset, ScanRun, ScanResult, FundamentalLabPosition,
-    RejectionLog, RejectionOutcome, ManualTickerCheck,
+    RejectionLog, RejectionOutcome, ManualTickerCheck, LabWeeklySuggestion,
 )
 from .tasks import run_daily_scan
 from .services.manual_check import run_manual_check
@@ -367,6 +367,33 @@ class RejectionAuditView(APIView):
         ]
 
         return Response({"summary": summary, "flagged_for_review": flagged_data})
+
+
+class LabWeeklySuggestionsView(APIView):
+    """
+    GET : dernières suggestions hebdomadaires automatiques (Partie 3,
+    2026-08-14 -- voir analysis.tasks.generate_lab_weekly_suggestions).
+    Lecture seule, purement informatif -- aucune action n'est jamais
+    déclenchée depuis ce endpoint. Affiché en encart sur la page Analytics
+    & ML Lab (AnalyticsLabPage.js).
+    """
+
+    def get(self, request):
+        limit = min(int(request.query_params.get("limit", 12)), 52)
+        suggestions = LabWeeklySuggestion.objects.all()[:limit]
+        return Response({
+            "suggestions": [
+                {
+                    "id": s.id,
+                    "week_start": s.week_start,
+                    "generated_at": s.generated_at,
+                    "positions_closed_analyzed": s.positions_closed_analyzed,
+                    "has_pattern": s.has_pattern,
+                    "summary": s.summary,
+                }
+                for s in suggestions
+            ],
+        })
 
 
 class ManualTickerCheckView(APIView):

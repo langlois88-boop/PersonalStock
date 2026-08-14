@@ -3,7 +3,7 @@ from django.urls import path
 from .views import (
     ScreenerResultsView, RunScanView, TickerDetailView, TickerChartView,
     LabPositionMarkManualView, LabPerformanceView, RejectionAuditView,
-    ManualTickerCheckView,
+    ManualTickerCheckView, LabWeeklySuggestionsView,
 )
 
 urlpatterns = [
@@ -14,5 +14,6 @@ urlpatterns = [
     path("ticker/<str:ticker>/manual-check/", ManualTickerCheckView.as_view(), name="analysis-ticker-manual-check"),
     path("lab/<int:position_id>/mark-manual/", LabPositionMarkManualView.as_view(), name="analysis-lab-mark-manual"),
     path("lab/performance/", LabPerformanceView.as_view(), name="analysis-lab-performance"),
+    path("lab/suggestions/", LabWeeklySuggestionsView.as_view(), name="analysis-lab-suggestions"),
     path("rejections/audit/", RejectionAuditView.as_view(), name="analysis-rejections-audit"),
 ]

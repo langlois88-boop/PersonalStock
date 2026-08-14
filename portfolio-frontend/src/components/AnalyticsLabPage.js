@@ -77,6 +77,8 @@ function AnalyticsLabPage() {
   const [labLoading, setLabLoading] = useState(true);
   const [labError, setLabError] = useState(null);
   const [labSortDesc, setLabSortDesc] = useState(true);
+  const [labSuggestions, setLabSuggestions] = useState([]);
+  const [labSuggestionsLoading, setLabSuggestionsLoading] = useState(true);
 
   useEffect(() => {
     let isMounted = true;
@@ -150,6 +152,31 @@ function AnalyticsLabPage() {
       }
     };
     loadLabPerf();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // Partie 3 (2026-08-14) : suggestions hebdomadaires automatiques
+  // (analysis.tasks.generate_lab_weekly_suggestions) -- fetch séparé, même
+  // raisonnement que labPerf ci-dessus (module distinct, ne doit jamais
+  // faire échouer le reste de la page).
+  useEffect(() => {
+    let isMounted = true;
+    const loadLabSuggestions = async () => {
+      setLabSuggestionsLoading(true);
+      try {
+        const data = await cachedGet('analysis/lab/suggestions/', {}, 60000);
+        if (!isMounted) return;
+        setLabSuggestions(data?.suggestions || []);
+      } catch (err) {
+        if (!isMounted) return;
+        setLabSuggestions([]);
+      } finally {
+        if (isMounted) setLabSuggestionsLoading(false);
+      }
+    };
+    loadLabSuggestions();
     return () => {
       isMounted = false;
     };
@@ -487,6 +514,41 @@ function AnalyticsLabPage() {
               </table>
             </div>
           </>
+        )}
+      </div>
+
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+        <div className="mb-3">
+          <p className="text-white font-semibold">💡 Suggestions de la semaine</p>
+          <p className="text-xs text-slate-400">
+            Patterns automatiques (rendement réel vs facteur -- secteur, confiance Claude, ROE, FCF Yield)
+            détectés sur les positions Fundamental Lab fermées. Jamais appliqué automatiquement -- à valider
+            manuellement.
+          </p>
+        </div>
+        {labSuggestionsLoading ? (
+          <div className="h-16 rounded-xl border border-slate-800 bg-slate-900/60 animate-pulse" />
+        ) : labSuggestions.length === 0 ? (
+          <p className="text-slate-400 text-sm">Aucune suggestion générée pour l'instant.</p>
+        ) : (
+          <div className="space-y-2">
+            {labSuggestions.map((s) => (
+              <div
+                key={s.id}
+                className={`rounded-xl border px-3 py-2 text-sm ${
+                  s.has_pattern
+                    ? 'border-amber-500/30 bg-amber-500/10 text-amber-100'
+                    : 'border-slate-800 bg-slate-950/60 text-slate-400'
+                }`}
+              >
+                <div className="flex items-center justify-between text-xs mb-1 opacity-80">
+                  <span>Semaine du {new Date(s.week_start).toLocaleDateString('fr-CA')}</span>
+                  <span>{s.positions_closed_analyzed} position(s) analysée(s)</span>
+                </div>
+                <p className="whitespace-pre-wrap break-words">{s.summary}</p>
+              </div>
+            ))}
+          </div>
         )}
       </div>
 

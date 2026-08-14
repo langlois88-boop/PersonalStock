@@ -1,4 +1,5 @@
 import json
+from datetime import timedelta
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
@@ -10,7 +11,7 @@ from portfolio.models import PaperTrade, SandboxWatchlist
 
 from .models import (
     ScreenerPreset, ScanRun, ScanResult, FundamentalLabPosition,
-    RejectionLog, RejectionOutcome, ManualTickerCheck,
+    RejectionLog, RejectionOutcome, ManualTickerCheck, LabWeeklySuggestion,
 )
 from . import tasks
 from .services import quant_filter, manual_check
@@ -523,6 +524,103 @@ class MonitorLabPositionsCloseFieldsTests(APITestCase):
         self.assertAlmostEqual(self.lab_position.realized_return_pct, -10.0, places=2)
 
 
+class GenerateLabWeeklySuggestionsTests(APITestCase):
+    """
+    Partie 3 (2026-08-14) : generate_lab_weekly_suggestions doit rester
+    silencieux (aucun crash) sur un volume de données faible ou nul --
+    scénario le plus probable dans les premières semaines de ce garde-fou --
+    et ne détecter un pattern que si LAB_SUGGESTION_MIN_OCCURRENCES
+    positions au moins partagent le même facteur ET que l'écart de
+    rendement dépasse LAB_SUGGESTION_DEVIATION_THRESHOLD_PCT.
+    """
+
+    def setUp(self):
+        self.preset = _make_preset()
+        self.scan_run = ScanRun.objects.create(preset=self.preset, universe_source="sandboxes")
+
+    def _make_closed_position(self, ticker, realized_return_pct, sector="Technology", claude_confidence="high", roe=15.0, days_ago=2):
+        scan_result = ScanResult.objects.create(
+            scan_run=self.scan_run, ticker=ticker, sector=sector,
+            price_at_scan=Decimal("10.00"), quant_score=3.0,
+            final_verdict="confirmed", claude_verdict="confirmed", claude_confidence=claude_confidence,
+            quant_details={"roe": roe, "fcf_yield": 5.0, "sector": sector},
+        )
+        exit_date = timezone.now() - timedelta(days=days_ago)
+        return FundamentalLabPosition.objects.create(
+            scan_result=scan_result, ticker=ticker, preset=self.preset,
+            entry_price=Decimal("10.00"), entry_date=exit_date - timedelta(days=3),
+            is_open=False, exit_date=exit_date,
+            exit_price=Decimal(str(10.0 * (1 + realized_return_pct / 100))),
+            close_reason="stop_loss", realized_return_pct=realized_return_pct,
+        )
+
+    def test_no_closed_positions_does_not_crash(self):
+        result = tasks.generate_lab_weekly_suggestions()
+
+        self.assertEqual(result["status"], "no_data")
+        suggestion = LabWeeklySuggestion.objects.get()
+        self.assertFalse(suggestion.has_pattern)
+        self.assertEqual(suggestion.positions_closed_analyzed, 0)
+
+    def test_few_closed_positions_below_min_occurrences_no_pattern(self):
+        # Seulement 2 positions dans le même bucket "Confiance Claude=low" --
+        # sous LAB_SUGGESTION_MIN_OCCURRENCES (5), aucun pattern signalé
+        # même si l'écart de rendement est énorme.
+        self._make_closed_position("A", -50.0, claude_confidence="low")
+        self._make_closed_position("B", -45.0, claude_confidence="low")
+        self._make_closed_position("C", 5.0, claude_confidence="high")
+
+        result = tasks.generate_lab_weekly_suggestions()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["has_pattern"])
+        suggestion = LabWeeklySuggestion.objects.get()
+        self.assertFalse(suggestion.has_pattern)
+        self.assertEqual(suggestion.positions_closed_analyzed, 3)
+
+    def test_clear_pattern_detected_above_min_occurrences_and_deviation(self):
+        # 5 positions "Confiance Claude=low" qui sous-performent nettement
+        # (>= LAB_SUGGESTION_DEVIATION_THRESHOLD_PCT sous la moyenne globale)
+        # -- doit être détecté et résumé.
+        for i in range(5):
+            self._make_closed_position(f"LOW{i}", -40.0, claude_confidence="low")
+        for i in range(3):
+            self._make_closed_position(f"HIGH{i}", 10.0, claude_confidence="high")
+
+        result = tasks.generate_lab_weekly_suggestions()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["has_pattern"])
+        suggestion = LabWeeklySuggestion.objects.get()
+        self.assertTrue(suggestion.has_pattern)
+        self.assertIn("Confiance Claude=low", suggestion.summary)
+        self.assertEqual(suggestion.positions_closed_analyzed, 8)
+
+    def test_positions_outside_the_week_window_are_ignored(self):
+        self._make_closed_position("OLD", -80.0, days_ago=30)
+
+        result = tasks.generate_lab_weekly_suggestions()
+
+        self.assertEqual(result["status"], "no_data")
+        self.assertEqual(result["positions_analyzed"], 0)
+
+    def test_never_writes_outside_labweeklysuggestion_table(self):
+        """
+        Garde-fou explicite du brief : cette tâche ne doit JAMAIS modifier
+        un seuil ou un comportement automatiquement -- vérifie qu'aucun
+        ScreenerPreset (là où vivent les seuils réels) n'est touché.
+        """
+        for i in range(6):
+            self._make_closed_position(f"LOW{i}", -40.0, claude_confidence="low")
+        before = ScreenerPreset.objects.get(pk=self.preset.pk)
+        before_thresholds = dict(before.thresholds)
+
+        tasks.generate_lab_weekly_suggestions()
+
+        after = ScreenerPreset.objects.get(pk=self.preset.pk)
+        self.assertEqual(dict(after.thresholds), before_thresholds)
+
+
 class ScreenerApiTests(APITestCase):
     """
     TODO #3 du brief : ScanResultSerializer doit exposer lab_position_id
@@ -865,3 +963,31 @@ class ManualTickerCheckViewTests(APITestCase):
 
         self.assertEqual(response.status_code, 429)
         self.assertEqual(ManualTickerCheck.objects.count(), 20)
+
+
+class LabWeeklySuggestionsViewTests(APITestCase):
+    """Partie 3.2 : endpoint lecture seule pour l'encart frontend."""
+
+    def test_empty_when_no_suggestions_yet(self):
+        response = self.client.get("/api/analysis/lab/suggestions/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["suggestions"], [])
+
+    def test_returns_latest_suggestions_most_recent_first(self):
+        LabWeeklySuggestion.objects.create(
+            week_start="2026-08-01", positions_closed_analyzed=0, has_pattern=False,
+            summary="Aucune position fermée cette semaine.",
+        )
+        LabWeeklySuggestion.objects.create(
+            week_start="2026-08-08", positions_closed_analyzed=6, has_pattern=True,
+            summary="Confiance Claude=low : 6 positions, sous-performe nettement.",
+        )
+
+        response = self.client.get("/api/analysis/lab/suggestions/")
+
+        self.assertEqual(response.status_code, 200)
+        suggestions = response.data["suggestions"]
+        self.assertEqual(len(suggestions), 2)
+        self.assertEqual(suggestions[0]["week_start"], "2026-08-08")
+        self.assertTrue(suggestions[0]["has_pattern"])

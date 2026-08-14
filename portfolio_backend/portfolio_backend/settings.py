@@ -210,6 +210,7 @@ CELERY_TASK_ROUTES = {
     'analysis.tasks.check_rejection_outcomes': {'queue': 'analysis_queue'},
     'analysis.tasks.run_broad_index_scan': {'queue': 'analysis_queue'},
     'analysis.tasks.monitor_lab_positions': {'queue': 'analysis_queue'},
+    'analysis.tasks.generate_lab_weekly_suggestions': {'queue': 'analysis_queue'},
 }
 
 CELERY_BEAT_SCHEDULE = {
@@ -579,6 +580,14 @@ CELERY_BEAT_SCHEDULE = {
     'weekly-rejection-outcome-check': {
         'task': 'analysis.tasks.check_rejection_outcomes',
         'schedule': crontab(hour=6, minute=0, day_of_week='mon'),
+    },
+    # Partie 3 (2026-08-14) : résumé hebdomadaire de patterns simples sur les
+    # positions FUNDAMENTAL_LAB fermées -- après check_rejection_outcomes
+    # (même matinée, hors marché), jamais d'action automatique, seulement
+    # une suggestion stockée pour la page Analytics & ML Lab.
+    'weekly-lab-suggestions': {
+        'task': 'analysis.tasks.generate_lab_weekly_suggestions',
+        'schedule': crontab(hour=6, minute=30, day_of_week='mon'),
     },
     # Balayage large hebdomadaire S&P 500 + TSX Composite (2026-08-11) --
     # alimente CustomWatchlistTicker, PAS l'univers quotidien tant que

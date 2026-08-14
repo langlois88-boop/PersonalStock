@@ -7,6 +7,7 @@ from .models import (
     FundamentalLabPosition,
     RejectionLog,
     RejectionOutcome,
+    LabWeeklySuggestion,
 )
 
 
@@ -16,3 +17,4 @@ admin.site.register(ScanResult)
 admin.site.register(FundamentalLabPosition)
 admin.site.register(RejectionLog)
 admin.site.register(RejectionOutcome)
+admin.site.register(LabWeeklySuggestion)

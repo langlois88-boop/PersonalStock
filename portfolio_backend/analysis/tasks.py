@@ -33,7 +33,7 @@ from portfolio.alpaca_data_lab import submit_lab_market_order, get_lab_order_by_
 
 from .models import (
     ScreenerPreset, ScanRun, ScanResult, FundamentalLabPosition,
-    RejectionLog, RejectionOutcome, CustomWatchlistTicker,
+    RejectionLog, RejectionOutcome, CustomWatchlistTicker, LabWeeklySuggestion,
 )
 from .services.quant_filter import run_quant_filter, fetch_ticker_data
 from .services.deepseek_triage import triage_ticker
@@ -44,6 +44,18 @@ from .services.sanity_check import check_sanity
 logger = logging.getLogger(__name__)
 
 MISSED_WINNER_ALPHA_THRESHOLD = 15.0  # %, cf. discussion "occasion manquée"
+
+# Partie 3 (2026-08-14) : résumé hebdomadaire automatique de patterns simples
+# et objectifs entre un facteur (secteur, confiance Claude, ROE, FCF Yield)
+# et la performance réelle des positions FUNDAMENTAL_LAB fermées dans la
+# semaine -- voir generate_lab_weekly_suggestions ci-dessous.
+#
+# Nombre minimum de positions dans un groupe avant de le considérer comme un
+# pattern potentiel plutôt qu'une coïncidence sur 1-2 cas.
+LAB_SUGGESTION_MIN_OCCURRENCES = 5
+# Écart minimum (en points de rendement %) entre la moyenne d'un groupe et
+# la moyenne globale de la semaine pour que ce soit signalé comme un pattern.
+LAB_SUGGESTION_DEVIATION_THRESHOLD_PCT = 10.0
 
 # univers_source == "sandboxes" : V1, WATCHLIST/AI_BLUECHIP/AI_PENNY
 # uniquement. "combined" (2026-08-11) y ajoute les survivants du balayage
@@ -809,3 +821,133 @@ def monitor_lab_positions(self) -> dict:
     result = {"checked": checked, "closed": closed, "skipped_unfilled": skipped_unfilled}
     logger.info("monitor_lab_positions terminé: %s", result)
     return result
+
+
+def _lab_suggestion_factor_buckets(positions: list) -> dict:
+    """
+    Regroupe les positions fermées par facteur simple (secteur, confiance
+    Claude, verdict Claude, ROE négatif, FCF Yield élevé) -- une position
+    peut apparaître dans plusieurs groupes (ex. son secteur ET sa confiance)
+    puisqu'on cherche des corrélations indépendantes, pas une partition.
+    Aucun appel réseau/LLM ici -- des comptages/moyennes simples sur des
+    données déjà en DB.
+    """
+    buckets: dict[str, list] = {}
+
+    def _add(label: str, position) -> None:
+        buckets.setdefault(label, []).append(position)
+
+    for position in positions:
+        scan_result = getattr(position, "scan_result", None)
+        if scan_result is None:
+            continue
+        details = scan_result.quant_details or {}
+
+        if scan_result.sector:
+            _add(f"Secteur={scan_result.sector}", position)
+        if scan_result.claude_confidence:
+            _add(f"Confiance Claude={scan_result.claude_confidence}", position)
+        if scan_result.claude_verdict:
+            _add(f"Verdict Claude={scan_result.claude_verdict}", position)
+
+        roe = details.get("roe")
+        if roe is not None and roe < 0:
+            _add("ROE négatif (< 0%)", position)
+
+        # > 15% reste sous le seuil d'anomalie (50%, sanity_check.py) qui
+        # bloque déjà l'ouverture -- ce bucket ne peut donc voir que des
+        # positions "élevées mais pas assez pour être bloquées d'office".
+        fcf_yield = details.get("fcf_yield")
+        if fcf_yield is not None and fcf_yield > 15:
+            _add("FCF Yield élevé (> 15%)", position)
+
+    return buckets
+
+
+@shared_task
+def generate_lab_weekly_suggestions() -> dict:
+    """
+    Partie 3 (2026-08-14) : cherche des patterns simples et objectifs entre
+    un facteur et la performance réelle des positions FUNDAMENTAL_LAB
+    fermées dans les 7 derniers jours -- pour ne pas dépendre d'Eric qui
+    fouille manuellement LabPerformanceView/RejectionAuditView chaque
+    semaine. Volontairement PAS d'IA/LLM ici : une corrélation simple
+    (moyenne de rendement par groupe vs moyenne globale de la semaine), avec
+    un seuil minimum d'occurrences (LAB_SUGGESTION_MIN_OCCURRENCES) pour ne
+    jamais signaler un pattern sur 1-2 cas isolés.
+
+    NE MODIFIE JAMAIS un seuil ou un comportement automatiquement -- stocke
+    uniquement une suggestion texte courte dans LabWeeklySuggestion, à
+    valider explicitement par Eric (affichée dans un encart sur la page
+    Analytics & ML Lab, voir analysis/views.py::LabWeeklySuggestionsView).
+
+    Doit rester silencieux (pas de crash) sur un volume de données faible ou
+    nul -- confirmé par test avec zéro position fermée (le cas le plus
+    probable dans les premières semaines de ce garde-fou).
+    """
+    week_start = (timezone.now() - timedelta(days=7)).date()
+
+    closed_positions = list(
+        FundamentalLabPosition.objects.filter(
+            is_open=False, exit_date__isnull=False, exit_date__date__gte=week_start,
+        ).select_related("scan_result")
+    )
+    positions_analyzed = len(closed_positions)
+
+    if positions_analyzed == 0:
+        summary = "Aucune position FUNDAMENTAL_LAB fermée cette semaine -- rien à analyser."
+        LabWeeklySuggestion.objects.create(
+            week_start=week_start, positions_closed_analyzed=0, has_pattern=False, summary=summary,
+        )
+        logger.info("generate_lab_weekly_suggestions: aucune position fermée cette semaine, rien à analyser.")
+        return {"status": "no_data", "positions_analyzed": 0}
+
+    returns = [p.realized_return_pct for p in closed_positions if p.realized_return_pct is not None]
+    if not returns:
+        summary = (
+            f"{positions_analyzed} position(s) fermée(s) cette semaine, mais aucune n'a de "
+            "realized_return_pct renseigné -- rien à analyser."
+        )
+        LabWeeklySuggestion.objects.create(
+            week_start=week_start, positions_closed_analyzed=positions_analyzed, has_pattern=False, summary=summary,
+        )
+        logger.warning("generate_lab_weekly_suggestions: %d positions fermées sans realized_return_pct.", positions_analyzed)
+        return {"status": "no_returns", "positions_analyzed": positions_analyzed}
+
+    overall_avg = sum(returns) / len(returns)
+
+    patterns = []
+    for label, group in _lab_suggestion_factor_buckets(closed_positions).items():
+        group_returns = [p.realized_return_pct for p in group if p.realized_return_pct is not None]
+        if len(group_returns) < LAB_SUGGESTION_MIN_OCCURRENCES:
+            continue
+        group_avg = sum(group_returns) / len(group_returns)
+        deviation = group_avg - overall_avg
+        if abs(deviation) < LAB_SUGGESTION_DEVIATION_THRESHOLD_PCT:
+            continue
+        direction = "sous-performe" if deviation < 0 else "surperforme"
+        patterns.append(
+            f"{label} : {len(group_returns)} positions, rendement moyen {group_avg:.1f}% "
+            f"({direction} la moyenne globale de {overall_avg:.1f}% de {abs(deviation):.1f} points) "
+            "-- garde-fou additionnel à envisager, à confirmer manuellement avant tout changement."
+        )
+
+    has_pattern = len(patterns) > 0
+    if has_pattern:
+        summary = " | ".join(patterns)
+    else:
+        summary = (
+            f"{positions_analyzed} position(s) fermée(s) analysée(s), rendement moyen {overall_avg:.1f}% -- "
+            f"aucun pattern net détecté cette semaine (seuil : >= {LAB_SUGGESTION_MIN_OCCURRENCES} occurrences, "
+            f"écart >= {LAB_SUGGESTION_DEVIATION_THRESHOLD_PCT:.0f} points vs la moyenne)."
+        )
+
+    LabWeeklySuggestion.objects.create(
+        week_start=week_start, positions_closed_analyzed=positions_analyzed,
+        has_pattern=has_pattern, summary=summary,
+    )
+    logger.info(
+        "generate_lab_weekly_suggestions terminé: %d positions analysées, pattern=%s.",
+        positions_analyzed, has_pattern,
+    )
+    return {"status": "ok", "positions_analyzed": positions_analyzed, "has_pattern": has_pattern}
