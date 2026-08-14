@@ -14,8 +14,8 @@ const VERDICT_BADGES = {
 
 const ANOMALY_GUARDRAIL_MESSAGE = (
   "Bloqué par garde-fou de sécurité — ratios jugés anormaux, pas d'ouverture "
-  "automatique. Vérification manuelle possible via le bouton \"Analyse manuelle "
-  "complète\" sur la fiche ticker si tu veux quand même l'examiner."
+  + "automatique. Vérification manuelle possible via le bouton \"Analyse manuelle "
+  + "complète\" sur la fiche ticker si tu veux quand même l'examiner."
 );
 
 // 'value-catalyst' retiré le 2026-08-10 : offert dans le menu mais jamais
