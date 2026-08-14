@@ -1174,3 +1174,75 @@ Deux options pour l'avenir :
    dur) qui re-résout périodiquement sans jamais nécessiter de
    redémarrage manuel de `frontend`. Éliminerait la classe de bug
    entière plutôt que de compter sur la discipline à chaque fois.
+
+## 16. [CORRIGÉ le 2026-08-14] Circuit breaker partageait une clé de cache entre le chemin SIM (~10-25k$) et le chemin Alpaca réel (~100k$) du même sandbox
+
+**Statut : fermé, déployé et vérifié en production.**
+
+**Découvert pendant** l'investigation "est-ce que baisser les seuils
+d'entrée (phase d'exploration) a aidé à générer des trades ?" —
+AI_BLUECHIP et AI_PENNY déclenchaient le circuit breaker quasi tous les
+jours, ~20-30 min après l'ouverture du marché, quel que soit le
+contexte réel de pertes.
+
+**Cause confirmée** : `_daily_equity_circuit_breaker(sandbox, equity_now)`
+est appelé depuis deux chemins différents pour le même sandbox :
+- `_execute_paper_trades_for_sandbox` (chemin SIM) — passe `capital`, une
+  comptabilité interne fictive de l'ordre de 10-25k$.
+- `_execute_alpaca_paper_trades_for_sandbox` (chemin Alpaca) — passe
+  l'équité réelle du compte Alpaca paper **partagé**, de l'ordre de
+  100k$.
+
+Les deux écrivaient dans **la même clé de cache** Redis
+(`daily_equity_base:{sandbox}:{date}`). Le premier chemin à s'exécuter
+chaque jour fixait la baseline à sa propre échelle ; l'autre chemin,
+comparé à cette baseline étrangère, se voyait à chaque appel afficher un
+"drawdown" de l'ordre de -76 % à -90 %, largement au-delà du seuil de
+3 %, déclenchant le breaker presque tous les jours sans rapport avec une
+vraie perte.
+
+**Preuve concrète recueillie le 2026-08-14** :
+- Baseline Redis du jour pour AI_BLUECHIP : `100019.01` — quasiment
+  identique à l'équité réelle du compte Alpaca partagé interrogée
+  indépendamment via `get_account()` : `100005.51`.
+- `capital` loggé dans `SystemLog` au moment exact des déclenchements
+  AI_BLUECHIP/AI_PENNY : `23803.36` / `10038.11` — correspond à la
+  comptabilité SIM, pas à Alpaca.
+- Confirme directement la contamination croisée : la baseline vient
+  d'Alpaca, la vérification vient de SIM.
+
+Explique très probablement l'essentiel du silence documenté dans
+`docs/ML_PIPELINE_AUDIT.md` (0 trade WATCHLIST/AI_BLUECHIP/AI_PENNY sur
+90 jours) — un breaker qui se déclenche ~20-30 min après l'ouverture
+empêche presque tout trade, indépendamment des seuils d'entrée.
+
+**Fix** : ajout d'un paramètre `broker_path` (`'SIM'` ou `'ALPACA'`,
+défaut `'SIM'`) qui namespace les clés de cache :
+`daily_equity_base:{sandbox}:{broker_path}:{date}` /
+`daily_equity_trip:{sandbox}:{broker_path}:{date}`. Les deux chemins ont
+maintenant chacun leur propre baseline et leur propre état de
+déclenchement — plus jamais de comparaison entre deux échelles
+incompatibles. `reset_daily_equity_breaker` mis à jour pour boucler sur
+les deux `broker_path` par sandbox.
+
+**Alternative envisagée et écartée** : unifier sur l'équité Alpaca
+réelle partout (y compris pour SIM). Écartée parce que SIM et Alpaca
+ferment des ensembles de positions entièrement différents au
+déclenchement — les fusionner sous un seuil de protection unique aurait
+un sens économique douteux (une perte sur le book Alpaca ne devrait pas
+figer les trades SIM, et inversement). Décision validée avec
+l'utilisateur avant implémentation.
+
+**Tests** : 3 nouveaux tests dans
+`tests_circuit_breaker_persistence.py`
+(`DailyEquityCircuitBreakerBrokerPathIsolationTests`) vérifiant
+l'indépendance des baselines, qu'un déclenchement SIM n'affecte pas
+Alpaca, et que l'appel sans `broker_path` explicite reste sur SIM par
+défaut (compatibilité). Suite complète (`tests_circuit_breaker_persistence`
++ `tests_paper_trade_decision_stats`, dont le mock a dû être ajusté pour
+accepter le nouveau kwarg) : 11/11 OK avant déploiement.
+
+**Déployé** : `backend`, `celery_worker`, `celery_worker_analysis`,
+`celery_beat` recréés ensemble le 2026-08-14 (avec `frontend` en même
+temps, par discipline suite à l'item 15) — logs de démarrage propres,
+aucune erreur, proxy nginx→backend vérifié fonctionnel après coup.
