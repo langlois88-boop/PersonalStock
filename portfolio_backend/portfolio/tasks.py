@@ -5433,8 +5433,23 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         trail_pct = 0.05
         min_volume_z = max(min_volume_z, 0.2)
     if sandbox == 'WATCHLIST':
-        buy_threshold = 0.55
-        sell_threshold = 0.25
+        # Recalibré le 2026-08-15 (Option A, voir
+        # docs/WATCHLIST_SIGNAL_DIAGNOSTIC_2026-08.md) suite au passage de
+        # _mean_reversion_score (RSI+Bollinger, échelle [0,1] mais qui ne
+        # dépassait quasiment jamais ~0.15 en pratique) à base_signal brut
+        # (sortie RandomForest sur les 54 features FUSION). Les anciens
+        # seuils 0.55/0.25 étaient calibrés pour l'ancienne échelle, pas la
+        # nouvelle -- basés sur la distribution RÉELLE de base_model_signal
+        # déjà loggée pour WATCHLIST (signal_distribution dans SystemLog,
+        # échantillons du 2026-08-10 au 2026-08-14) : min ~0.17-0.25,
+        # médiane ~0.38-0.47, max ~0.54-0.58 selon les cycles. 0.50 reste
+        # sélectif (au-dessus de la médiane typique) tout en restant
+        # atteignable (sous le max typique) ; 0.30 se situe près du bas de
+        # la fourchette observée. Écart de 0.20, cohérent avec AI_BLUECHIP
+        # (0.80/0.60). À réévaluer une fois assez de trades WATCHLIST
+        # réels accumulés pour un calibrage empirique plus fin.
+        buy_threshold = 0.50
+        sell_threshold = 0.30
     if sandbox == 'AI_PENNY':
         buy_threshold = 0.20
         sell_threshold = 0.10
@@ -5572,28 +5587,34 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             'model_version': '',
             'model_name': universe,
         }
-        # Always stashed, regardless of sandbox, purely for diagnostics
-        # (signal_distribution below) — for WATCHLIST specifically this is
-        # NOT what actually gates the buy decision: payload['signal'] gets
-        # fully overridden by _mean_reversion_score just below, and
-        # base_signal (the trained model's predict_proba output) is
-        # discarded. Kept here so that distinction is visible in logs
-        # instead of silently assumed.
+        # Always stashed, regardless of sandbox, for diagnostics
+        # (signal_distribution below).
         payload['base_model_signal'] = base_signal if base_payload else None
 
-        if sandbox == 'WATCHLIST':
-            score, rsi, lower_band = _mean_reversion_score(symbol)
-            if rsi is None:
-                return payload if base_payload else None
-            payload['signal'] = score
-            payload['model_name'] = 'MEAN_REVERSION'
-            payload['features'] = dict(payload.get('features') or {})
-            payload['features'].update({
-                'rsi14': float(rsi),
-                'mean_reversion_score': float(score),
-                'bollinger_lower': float(lower_band) if lower_band is not None else 0.0,
-            })
-            return payload
+        # WATCHLIST (2026-08-15, voir docs/WATCHLIST_SIGNAL_DIAGNOSTIC_2026-08.md,
+        # Option A) : utilise désormais base_signal tel quel -- comme
+        # AI_BLUECHIP/AI_PENNY, WATCHLIST tombe sur `return payload` en bas
+        # de cette fonction (aucun bloc dédié requis, `payload['signal']`
+        # est déjà `base_signal` via `base_payload`).
+        #
+        # Avant ce changement, ce bloc écrasait payload['signal'] avec
+        # _mean_reversion_score (RSI + Bollinger, 1 seule dimension de
+        # survente) ET payload['model_name'] avec 'MEAN_REVERSION' --
+        # vérifié en direct (diagnostic 2026-08-14) : la formule RSI
+        # elle-même était correcte, mais un déclencheur "survente sévère
+        # uniquement" appliqué aux tickers WATCHLIST réels ne dépassait
+        # quasiment jamais le seuil d'achat (0 trade WATCHLIST dans toute
+        # l'historique du système). Le stamp 'MEAN_REVERSION' cassait aussi
+        # silencieusement retrain_from_paper_trades_daily, qui filtre les
+        # trades WATCHLIST par model_name='BLUECHIP' -- corrigé du même
+        # coup en laissant model_name = universe = 'BLUECHIP' (valeur
+        # renvoyée par _model_signal), sans changement de code séparé.
+        #
+        # FUSION capture déjà la survente (rsi_14/rsi_7/stoch_k_14/
+        # stoch_d_14/williams_r_14/cci_20/bb_pct_b_20/rubber_band_20/
+        # donchian_pct_20, 9 features au total) -- rien n'est perdu par
+        # rapport à l'ancien chemin RSI+Bollinger, qui n'en couvrait qu'une
+        # version plus étroite.
 
         if sandbox == 'AI_BLUECHIP':
             fundamentals_score, fundamentals = _bluechip_fundamental_score(symbol)
@@ -6118,10 +6139,23 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             continue
         if sandbox == 'AI_PENNY':
             confidence_floor = float(os.getenv('AI_PENNY_CONFIDENCE_MIN', '0.35'))
-            confidence_span = max(0.05, 1.0 - confidence_floor)
-            confidence_factor = max(0.0, min(1.0, (float(signal) - confidence_floor) / confidence_span)) if signal is not None else 0.0
         else:
-            confidence_factor = max(0.0, min(1.0, (float(signal) - 0.65) / 0.35)) if signal is not None else 0.0
+            # Was a hardcoded 0.65, independent of `buy_threshold` a few
+            # lines above (item 17, TECH_DEBT_NOTES.md). Harmless while
+            # buy_threshold stayed above 0.65 (AI_BLUECHIP's normal 0.80 --
+            # unaffected, min(0.65, 0.80)=0.65, same as before), but silently
+            # created a dead zone whenever buy_threshold dropped below it:
+            # WATCHLIST's own normal threshold (0.55) and the exploration
+            # phase's override (0.55, see docs/EXPLORATION_PHASE_2026-08.md)
+            # both sit below 0.65 -- a candidate could clear buy_threshold
+            # and still be rejected here for "confidence_too_low", with no
+            # trade ever created despite the visible threshold saying it
+            # should qualify. Confirmed live 2026-08-14: AI_BLUECHIP signal
+            # 0.6089 (> 0.55 buy_threshold) blocked here. Capping the floor
+            # at buy_threshold keeps both gates consistent in every mode.
+            confidence_floor = min(0.65, buy_threshold)
+        confidence_span = max(0.05, 1.0 - confidence_floor)
+        confidence_factor = max(0.0, min(1.0, (float(signal) - confidence_floor) / confidence_span)) if signal is not None else 0.0
         if confidence_factor <= 0:
             _decision_log(symbol, sandbox, 'SKIP', 'confidence_too_low', signal)
             decision_stats['blocked_confidence'] += 1
@@ -6548,15 +6582,31 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
     universe = 'PENNY' if sandbox == 'AI_PENNY' else 'BLUECHIP'
     model_path = get_model_path(universe)
     buy_threshold = _env_float(prefix, 'BUY_THRESHOLD', '0.82')
+    sell_threshold = _env_float(prefix, 'SELL_THRESHOLD', '0.4')
+    if sandbox == 'WATCHLIST':
+        # Recalibré le 2026-08-15 (Option A, voir
+        # docs/WATCHLIST_SIGNAL_DIAGNOSTIC_2026-08.md) -- ce chemin Alpaca
+        # utilisait déjà base_signal brut (pas de bloc _mean_reversion_score
+        # ici, contrairement à l'ancien chemin SIM), mais retombait sur le
+        # défaut 0.82 (calibré pour AI_BLUECHIP/AI_PENNY) faute d'override
+        # dédié -- beaucoup trop strict pour l'échelle réelle observée de
+        # base_model_signal (~0.17-0.58, voir le commentaire équivalent dans
+        # _execute_paper_trades_for_sandbox). Confirmé en direct : 1 seul
+        # trade WATCHLIST Alpaca créé dans toute l'historique du système
+        # sous 0.82. Mêmes valeurs que le chemin SIM (0.50/0.30), pour
+        # cohérence -- même modèle, même échelle de signal.
+        buy_threshold = 0.50
+        sell_threshold = 0.30
     if _exploration_phase_enabled():
         # Phase d'exploration (2026-08-12, voir docs/EXPLORATION_PHASE_2026-08.md).
         # Ce chemin (contrairement au chemin SIM) n'a pas de seuil codé en
-        # dur -- il retombait déjà sur PAPER_BUY_THRESHOLD (0.55) faute de
-        # {prefix}_BUY_THRESHOLD explicite. Override explicite quand même,
-        # pour ne pas dépendre d'une coïncidence de repli si PAPER_BUY_
-        # THRESHOLD change un jour pour une autre raison.
+        # dur pour la plupart des sandboxes -- il retombait déjà sur PAPER_
+        # BUY_THRESHOLD (0.55) faute de {prefix}_BUY_THRESHOLD explicite.
+        # Override explicite quand même, pour ne pas dépendre d'une
+        # coïncidence de repli si PAPER_BUY_THRESHOLD change un jour pour
+        # une autre raison. Gagne sur le bloc WATCHLIST juste au-dessus
+        # (même précédence que le chemin SIM).
         buy_threshold = float(os.getenv('EXPLORATION_PHASE_BUY_THRESHOLD', '0.55'))
-    sell_threshold = _env_float(prefix, 'SELL_THRESHOLD', '0.4')
     trail_pct = _env_float(prefix, 'TRAIL_PCT', '0.04')
     atr_mult = _env_float(prefix, 'ATR_MULT', '1.5')
     risk_pct = _env_float(prefix, 'RISK_PCT', '0.015')
@@ -6569,7 +6619,15 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
     lock_profit_trigger_pct = _env_float(prefix, 'LOCK_PROFIT_TRIGGER_PCT', '0.05')
     lock_profit_stop_pct = _env_float(prefix, 'LOCK_PROFIT_STOP_PCT', '0.03')
     allow_gemini = os.getenv('ALPACA_GEMINI_REASON', 'true').lower() in {'1', 'true', 'yes', 'y'}
-    min_confidence = _env_float(prefix, 'ALPACA_MIN_CONFIDENCE', '0.7')
+    # Capped at buy_threshold (item 17, TECH_DEBT_NOTES.md) -- same class of
+    # bug as the SIM path's confidence_factor a few hundred lines up: this
+    # gate is independent of buy_threshold right above, so a signal that
+    # clears the (possibly lowered, e.g. WATCHLIST's normal 0.55, or the
+    # exploration phase's 0.55 override) buy_threshold could still be
+    # rejected here against the unrelated 0.7 default with no trade ever
+    # created. Normal-mode AI_BLUECHIP/AI_PENNY (buy_threshold 0.80/0.82)
+    # are unaffected -- min(0.7, 0.80)=0.7, same value as before.
+    min_confidence = min(_env_float(prefix, 'ALPACA_MIN_CONFIDENCE', '0.7'), buy_threshold)
     min_sentiment = _env_float(prefix, 'ALPACA_MIN_SENTIMENT', '0.0')
     min_imbalance = _env_float(prefix, 'ALPACA_MIN_IMBALANCE', '1.0')
     manual_approval = os.getenv('ALPACA_MANUAL_APPROVAL', 'false').lower() in {'1', 'true', 'yes', 'y'}
@@ -6655,8 +6713,16 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
         return None
 
     def _alpaca_fusion(symbol: str) -> pd.DataFrame:
+        # Was `fusion.fuse_all() or pd.DataFrame()` -- same anti-pattern as
+        # item 3 (TECH_DEBT_NOTES.md, monitor_hive_trade's DataFrame `or`
+        # crash): `or` evaluates bool(DataFrame), which pandas raises
+        # ValueError on for anything but a single-element frame. Surfaced
+        # here (item 17) by a test double returning an empty-but-not-None
+        # frame -- a real fuse_all() failure that degrades to empty rather
+        # than None would crash this the same way in production.
         fusion = DataFusionEngine(symbol, use_alpaca=True)
-        return fusion.fuse_all() or pd.DataFrame()
+        frame = fusion.fuse_all()
+        return frame if frame is not None else pd.DataFrame()
 
     def _update_open_trade(trade: PaperTrade, price: float, signal: float | None) -> bool:
         frame = _alpaca_fusion(trade.ticker)

@@ -1,8 +1,11 @@
 # Diagnostic — chemin de signal WATCHLIST (RSI seul vs FUSION/base_model_signal)
 
-Statut : **diagnostic pur, rien n'a été modifié**. Ce document répond aux
-étapes 1 et 2 demandées, prépare l'étape 3 (options), et attend une
-décision d'Eric avant toute implémentation.
+**Statut : DÉCISION PRISE ET IMPLÉMENTÉE le 2026-08-15 — Option A choisie
+par Eric.** Voir "Décision et implémentation" tout en bas pour le détail
+du changement de code, du recalibrage des seuils et du fix connexe
+(item 17, TECH_DEBT_NOTES.md) découvert nécessaire pour qu'Option A
+fonctionne réellement. Le reste du document (étapes 1-3 + addendum) est
+conservé tel quel comme trace du diagnostic qui a mené à cette décision.
 
 Contexte de départ (déjà établi la semaine dernière) : WATCHLIST devait être
 une liste de tickers surveillés pour N'IMPORTE QUEL type d'opportunité, pas
@@ -394,3 +397,84 @@ pour trois raisons désormais confirmées :
 La seule réserve à garder en tête (Preuve 1) : les valeurs FUSION actuelles
 sont resserrées entre tickers très différents — pas un blocage, mais un
 point à surveiller après bascule, pas avant.
+
+## Décision et implémentation (2026-08-15)
+
+Eric a choisi **Option A**, avec le recalibrage des seuils buy/sell déjà
+anticipé comme nécessaire, et le fix `model_name` (mentionné en passant
+dans la description de l'Option B) explicitement inclus.
+
+### Changements de code
+
+1. **`_signal()` dans `_execute_paper_trades_for_sandbox`** (`portfolio/tasks.py`) :
+   suppression complète du bloc `if sandbox == 'WATCHLIST': ...` qui
+   écrasait `payload['signal']` avec `_mean_reversion_score` et
+   `payload['model_name']` avec `'MEAN_REVERSION'`. WATCHLIST tombe
+   maintenant sur le même `return payload` par défaut qu'AI_BLUECHIP/
+   AI_PENNY, utilisant `base_signal` (sortie `predict_proba` du
+   `RandomForestClassifier` sur les 54 features FUSION) tel quel. Ce
+   changement corrige **gratuitement** le bug `model_name` documenté à
+   l'étape 2 : `payload['model_name']` reste `universe` = `'BLUECHIP'`
+   (valeur renvoyée par `_model_signal`), qui matche désormais ce que
+   `retrain_from_paper_trades_daily::_train_for_sandbox` filtre pour
+   WATCHLIST — plus besoin d'un fix séparé.
+
+2. **Seuils buy/sell recalibrés, chemin SIM** (`_execute_paper_trades_for_sandbox`) :
+   `buy_threshold`/`sell_threshold` passent de `0.55`/`0.25` (calibrés pour
+   l'ancienne échelle RSI+Bollinger) à **`0.50`/`0.30`**, basés sur la
+   distribution réelle de `base_model_signal` déjà loggée pour WATCHLIST
+   (`SystemLog`, `signal_distribution.base_model_signal`, échantillons du
+   2026-08-10 au 2026-08-14) : min ~0.17-0.25, médiane ~0.38-0.47, max
+   ~0.54-0.58. `0.50` reste sélectif (au-dessus de la médiane typique) tout
+   en étant atteignable (sous le max typique) ; `0.30` se situe près du bas
+   de la fourchette observée. Écart de 0.20, cohérent avec le pattern
+   AI_BLUECHIP (0.80/0.60).
+
+3. **Seuils buy/sell recalibrés, chemin Alpaca** (`_execute_alpaca_paper_trades_for_sandbox`) :
+   ce chemin utilisait déjà `base_signal` brut (pas de bloc
+   `_mean_reversion_score` ici) mais retombait sur le défaut `0.82`
+   (calibré pour AI_BLUECHIP/AI_PENNY), beaucoup trop strict pour
+   l'échelle réelle observée — confirmé en direct : **1 seul trade
+   Alpaca WATCHLIST créé dans toute l'historique du système** sous ce
+   seuil. Mêmes valeurs que le chemin SIM (`0.50`/`0.30`) pour cohérence
+   (même modèle partagé, même échelle de signal).
+
+4. **Fix connexe découvert nécessaire, item 17 (TECH_DEBT_NOTES.md)** :
+   en préparant le déploiement, un second bug indépendant a été trouvé
+   dans le code déjà en cours (diagnostiqué en direct le 2026-08-14, avant
+   ce lot) : `confidence_factor`/`min_confidence` utilisaient un plancher
+   codé en dur (`0.65`/`0.7`), complètement indépendant de `buy_threshold`.
+   **Sans ce fix, le passage sur FUSION n'aurait produit AUCUN trade
+   supplémentaire en pratique** — la distribution réelle de
+   `base_model_signal` (médiane ~0.40, max ~0.54-0.58) tombe presque
+   entièrement dans l'ancienne zone morte 0.50-0.65 (clear `buy_threshold`
+   mais rejeté ensuite pour `confidence_too_low`). Fix : le plancher est
+   désormais plafonné par `buy_threshold`
+   (`confidence_floor = min(0.65, buy_threshold)`), sans impact sur
+   AI_BLUECHIP/AI_PENNY (seuils normaux au-dessus de 0.65, comportement
+   inchangé). Détail complet dans `TECH_DEBT_NOTES.md` item 17.
+
+### Tests
+
+- `WatchlistBaseModelSignalRegressionTests` (`tests_paper_trade_decision_stats.py`) :
+  `_model_signal` et `_mean_reversion_score` mockés pour DISAGREE (l'un
+  clear le seuil, l'autre non) — confirme que le trade créé vient bien de
+  `base_signal`, et que `model_name='BLUECHIP'` (jamais `'MEAN_REVERSION'`).
+- `ConfidenceFloorCappedAtBuyThresholdTests` : un signal dans l'ancienne
+  zone morte (0.55) crée bien un trade désormais ; un signal sous
+  `buy_threshold` reste bloqué au bon endroit.
+- Suite complète `portfolio.tests_paper_trade_decision_stats` (11/11 avant
+  ce lot + les nouveaux) exécutée sur le vrai backend avant déploiement.
+- Chemin Alpaca : pas de suite de tests automatisée dans ce repo (aucune
+  avant ce fix) — vérifié manuellement en rejouant le calcul en direct sur
+  la production (voir item 17).
+
+### Suivi recommandé (pas fait dans ce lot, à surveiller)
+
+- Les seuils `0.50`/`0.30` sont un calibrage raisonné à partir de la
+  distribution observée, pas un optimum empirique (aucun trade WATCHLIST
+  réel n'existe encore sous ce nouveau chemin pour calibrer autrement). À
+  réévaluer une fois quelques semaines de trades réels accumulées.
+- La réserve notée dans l'addendum (valeurs `base_model_signal` resserrées
+  entre tickers très différents, 0.31-0.32) reste valable — à surveiller,
+  pas un bloquant.

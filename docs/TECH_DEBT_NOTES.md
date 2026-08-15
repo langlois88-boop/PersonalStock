@@ -1246,3 +1246,56 @@ accepter le nouveau kwarg) : 11/11 OK avant déploiement.
 `celery_beat` recréés ensemble le 2026-08-14 (avec `frontend` en même
 temps, par discipline suite à l'item 15) — logs de démarrage propres,
 aucune erreur, proxy nginx→backend vérifié fonctionnel après coup.
+
+## 17. [CORRIGÉ le 2026-08-15] `confidence_factor`/`min_confidence` utilisaient un plancher codé en dur, indépendant de `buy_threshold`
+
+**Statut : fermé, déployé avec le passage WATCHLIST sur FUSION (item lié,
+voir docs/WATCHLIST_SIGNAL_DIAGNOSTIC_2026-08.md).**
+
+**Découvert le 2026-08-14** en direct sur AI_BLUECHIP : un signal `0.6089`
+(> `buy_threshold` 0.55, phase d'exploration active) était quand même
+bloqué, avec la raison `confidence_too_low` — alors que le seuil affiché
+disait que ce candidat aurait dû qualifier.
+
+**Cause confirmée** : `confidence_factor` (chemin SIM,
+`_execute_paper_trades_for_sandbox`) et `min_confidence` (chemin Alpaca,
+`_execute_alpaca_paper_trades_for_sandbox`) utilisaient un plancher codé en
+dur (`0.65` / `ALPACA_MIN_CONFIDENCE` défaut `0.7`) **complètement
+indépendant** de `buy_threshold`, quelques lignes plus haut dans la même
+fonction. Sans conséquence tant que `buy_threshold` restait au-dessus de ce
+plancher (AI_BLUECHIP normal : 0.80, `min(0.65, 0.80) = 0.65`, comportement
+inchangé) — mais dès que `buy_threshold` descendait sous 0.65/0.7 (la phase
+d'exploration à 0.55, ou désormais le nouveau seuil WATCHLIST à 0.50, voir
+item lié), une zone morte apparaissait : un candidat pouvait passer
+`buy_threshold` et se faire quand même rejeter ici, sans qu'aucun trade ne
+soit jamais créé malgré un seuil affiché qui disait pourtant "oui".
+
+**Pertinence directe pour WATCHLIST (item lié, 2026-08-15)** : sans ce fix,
+le passage de WATCHLIST sur `base_signal` (Option A) n'aurait produit
+**aucun trade supplémentaire en pratique** — la distribution réelle de
+`base_model_signal` pour WATCHLIST (médiane ~0.40, max ~0.54-0.58, voir
+diagnostic) tombe presque entièrement dans l'ancienne zone morte
+0.50-0.65.
+
+**Fix** : le plancher est maintenant plafonné par `buy_threshold` --
+`confidence_floor = min(0.65, buy_threshold)` (SIM) et `min_confidence =
+min(_env_float(prefix, 'ALPACA_MIN_CONFIDENCE', '0.7'), buy_threshold)`
+(Alpaca) -- les deux gates restent cohérents entre eux dans tous les modes
+(normal, phase d'exploration, ou tout futur seuil abaissé), sans jamais
+relever le plancher au-dessus de sa valeur d'origine.
+
+**Tests** : 2 nouveaux tests dans `tests_paper_trade_decision_stats.py`
+(`ConfidenceFloorCappedAtBuyThresholdTests`) — un signal dans l'ancienne
+zone morte (0.55, entre le nouveau seuil WATCHLIST 0.50 et l'ancien
+plancher 0.65) crée bien un trade maintenant ; un signal sous
+`buy_threshold` reste bloqué au bon endroit (`blocked_threshold`, pas
+`blocked_confidence`). Non-régression AI_BLUECHIP/AI_PENNY (seuils
+normaux, au-dessus de 0.65) confirmée par les tests existants
+(`PaperTradeDecisionStatsInvariantTests`), inchangés.
+
+**Non testé automatiquement** : le chemin Alpaca (`_execute_alpaca_paper_
+trades_for_sandbox`) n'a pas de suite de tests dédiée dans ce repo (aucune
+avant ce fix) — construire un harnais complet (compte Alpaca, positions,
+ordres, tiers) aurait été disproportionné pour cette correction ponctuelle.
+Vérifié manuellement en rejouant le calcul en direct sur la production à la
+place (voir item lié).

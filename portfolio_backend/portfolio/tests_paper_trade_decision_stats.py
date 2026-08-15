@@ -191,3 +191,192 @@ class PaperTradeDecisionStatsInvariantTests(TestCase):
         stats = self._run('AI_BLUECHIP', 'AI_BLUECHIP', signal_by_symbol, reinforce_signal_symbol='EXISTB')
         _assert_invariant(self, stats)
         self.assertEqual(stats['watchlist'], 3)
+
+
+class WatchlistBaseModelSignalRegressionTests(TestCase):
+    """
+    Regression for the 2026-08-15 Option A switch (see
+    docs/WATCHLIST_SIGNAL_DIAGNOSTIC_2026-08.md): WATCHLIST must gate on
+    base_signal (the FUSION/RandomForest predict_proba output via
+    _model_signal), NOT _mean_reversion_score -- and the created PaperTrade
+    must be stamped model_name='BLUECHIP' (not 'MEAN_REVERSION'), otherwise
+    retrain_from_paper_trades_daily silently finds zero WATCHLIST trades
+    forever (the second bug documented in the same diagnostic).
+
+    Deliberately makes _model_signal and _mean_reversion_score DISAGREE
+    (one clears the buy threshold, the other doesn't) so the test can tell
+    which one actually gates the decision -- a scenario where both mocks
+    happen to agree wouldn't prove anything.
+    """
+
+    def setUp(self):
+        SandboxWatchlist.objects.update_or_create(
+            sandbox='WATCHLIST', defaults={'symbols': ['WINW']},
+        )
+
+    def test_created_trade_uses_base_signal_and_bluechip_model_name(self):
+        captured: dict = {}
+
+        def _capture_system_log(category, level, message, symbol=None, metadata=None):
+            if metadata is not None and 'watchlist' in metadata:
+                captured['decision_stats'] = metadata
+
+        simple_mocks = {
+            'get_latest_trade_price': lambda symbol: 10.0,
+            'get_daily_bars': _fake_get_daily_bars,
+            'get_intraday_context': lambda *a, **k: None,
+            '_intraday_context_for_timeframe': lambda *a, **k: None,
+            'get_market_sentiment': lambda: ('NEUTRAL', {}),
+            '_market_sentiment_score': lambda: 0.5,
+            'get_market_regime_context': lambda: {'risk_off': False},
+            '_daily_equity_circuit_breaker': lambda sandbox, capital, **kwargs: {'triggered': False},
+            '_weak_list_health': lambda: {'defensive': False},
+            '_atr_spike': lambda symbol, use_alpaca=False: False,
+            '_btc_trend_ok': lambda symbol: True,
+            '_earnings_blackout': lambda symbol, days=2: (False, None),
+            '_daily_trend_ok': lambda symbol, use_alpaca=False: True,
+            '_correlation_blocked': lambda symbol, open_symbols: False,
+            '_spread_too_wide': lambda symbol, max_pct: False,
+            '_loss_blacklist': lambda symbol, sandbox: False,
+            '_sector_trend_ok': lambda symbol: True,
+            '_reddit_hype_risk': lambda symbol: False,
+            '_pump_dump_risk': lambda ctx, sentiment: False,
+            '_penny_breakout_score': lambda bars: (False, 0.0),
+            '_finbert_recent_sentiment': lambda symbol, days=2: (0.0, []),
+            '_system_log': _capture_system_log,
+            # Clears the new WATCHLIST buy_threshold (0.50) -- if base_signal
+            # gates the decision (new code), this candidate is created.
+            '_model_signal': lambda symbol, universe, model_path, use_alpaca=False: {
+                'signal': 0.90,
+                'features': {},
+                'explanations': [],
+                'model_version': 'test-v1',
+                'model_name': universe,
+            },
+            # Deliberately BELOW the buy_threshold -- if this were still
+            # gating the decision (old code), the candidate would be
+            # blocked instead of created.
+            '_mean_reversion_score': lambda symbol: (0.0, 65.0, 9.0),
+        }
+
+        with ExitStack() as stack:
+            for name, value in simple_mocks.items():
+                stack.enter_context(patch.object(tasks, name, value))
+            stack.enter_context(patch.object(tasks.yf, 'Ticker', _FakeTicker))
+            stack.enter_context(patch(
+                'portfolio.services.signal_engine_patches.should_trade_with_mtf',
+                return_value=(True, {}),
+            ))
+            tasks._execute_paper_trades_for_sandbox('WATCHLIST', 'PAPER')
+
+        self.assertIn('decision_stats', captured)
+        self.assertEqual(captured['decision_stats']['created'], 1)
+        # New WATCHLIST thresholds (0.50/0.30, recalibrated for base_signal's
+        # real scale) -- not the old 0.55/0.25 calibrated for
+        # _mean_reversion_score's near-always-under-0.15 scale.
+        self.assertEqual(captured['decision_stats']['buy_threshold'], 0.50)
+
+        trade = PaperTrade.objects.get(ticker='WINW', sandbox='WATCHLIST')
+        self.assertAlmostEqual(float(trade.entry_signal), 0.90, places=2)
+        # The core of the retrain-pipeline fix: model_name must be
+        # 'BLUECHIP' (what retrain_from_paper_trades_daily filters on for
+        # WATCHLIST), never the old 'MEAN_REVERSION' stamp.
+        self.assertEqual(trade.model_name, 'BLUECHIP')
+        self.assertNotEqual(trade.model_name, 'MEAN_REVERSION')
+
+
+class ConfidenceFloorCappedAtBuyThresholdTests(TestCase):
+    """
+    Regression for item 17 (TECH_DEBT_NOTES.md, found live 2026-08-14):
+    confidence_factor's floor was a hardcoded 0.65, entirely independent of
+    `buy_threshold` a few lines above it -- harmless while buy_threshold
+    stayed above 0.65 (AI_BLUECHIP's normal 0.80), but for any sandbox/mode
+    whose buy_threshold sits below 0.65 (WATCHLIST's new base_signal
+    threshold, 0.50, chief among them -- see
+    docs/WATCHLIST_SIGNAL_DIAGNOSTIC_2026-08.md), it created a dead zone: a
+    candidate could clear buy_threshold and still be rejected here for
+    'confidence_too_low', with zero trades ever created despite the visible
+    threshold saying it should qualify. Without this fix, WATCHLIST's
+    Option A switch would have produced zero additional trades in
+    practice -- its real base_model_signal distribution (median ~0.4,
+    max ~0.55-0.58) sits almost entirely inside the old 0.50-0.65 dead
+    zone.
+    """
+
+    def setUp(self):
+        SandboxWatchlist.objects.update_or_create(
+            sandbox='WATCHLIST', defaults={'symbols': ['WINW']},
+        )
+
+    def _run_watchlist_with_signal(self, signal_value: float) -> dict:
+        captured: dict = {}
+
+        def _capture_system_log(category, level, message, symbol=None, metadata=None):
+            if metadata is not None and 'watchlist' in metadata:
+                captured['decision_stats'] = metadata
+
+        simple_mocks = {
+            'get_latest_trade_price': lambda symbol: 10.0,
+            'get_daily_bars': _fake_get_daily_bars,
+            'get_intraday_context': lambda *a, **k: None,
+            '_intraday_context_for_timeframe': lambda *a, **k: None,
+            'get_market_sentiment': lambda: ('NEUTRAL', {}),
+            '_market_sentiment_score': lambda: 0.5,
+            'get_market_regime_context': lambda: {'risk_off': False},
+            '_daily_equity_circuit_breaker': lambda sandbox, capital, **kwargs: {'triggered': False},
+            '_weak_list_health': lambda: {'defensive': False},
+            '_atr_spike': lambda symbol, use_alpaca=False: False,
+            '_btc_trend_ok': lambda symbol: True,
+            '_earnings_blackout': lambda symbol, days=2: (False, None),
+            '_daily_trend_ok': lambda symbol, use_alpaca=False: True,
+            '_correlation_blocked': lambda symbol, open_symbols: False,
+            '_spread_too_wide': lambda symbol, max_pct: False,
+            '_loss_blacklist': lambda symbol, sandbox: False,
+            '_sector_trend_ok': lambda symbol: True,
+            '_reddit_hype_risk': lambda symbol: False,
+            '_pump_dump_risk': lambda ctx, sentiment: False,
+            '_penny_breakout_score': lambda bars: (False, 0.0),
+            '_finbert_recent_sentiment': lambda symbol, days=2: (0.0, []),
+            '_system_log': _capture_system_log,
+            '_model_signal': lambda symbol, universe, model_path, use_alpaca=False: {
+                'signal': signal_value,
+                'features': {},
+                'explanations': [],
+                'model_version': 'test-v1',
+                'model_name': universe,
+            },
+            '_mean_reversion_score': lambda symbol: (0.0, None, None),
+        }
+
+        with ExitStack() as stack:
+            for name, value in simple_mocks.items():
+                stack.enter_context(patch.object(tasks, name, value))
+            stack.enter_context(patch.object(tasks.yf, 'Ticker', _FakeTicker))
+            stack.enter_context(patch(
+                'portfolio.services.signal_engine_patches.should_trade_with_mtf',
+                return_value=(True, {}),
+            ))
+            tasks._execute_paper_trades_for_sandbox('WATCHLIST', 'PAPER')
+
+        self.assertIn('decision_stats', captured)
+        return captured['decision_stats']
+
+    def test_signal_in_the_former_dead_zone_now_creates_a_trade(self):
+        # 0.55: clears WATCHLIST's new buy_threshold (0.50) but sits below
+        # the OLD hardcoded confidence floor (0.65) -- would have been
+        # silently rejected as 'confidence_too_low' before this fix.
+        stats = self._run_watchlist_with_signal(0.55)
+
+        self.assertEqual(stats['created'], 1)
+        self.assertEqual(stats['blocked_confidence'], 0)
+        trade = PaperTrade.objects.get(ticker='WINW', sandbox='WATCHLIST')
+        self.assertAlmostEqual(float(trade.entry_signal), 0.55, places=2)
+
+    def test_signal_below_buy_threshold_still_blocked_at_threshold_not_confidence(self):
+        # Sanity check: a genuinely weak signal is still rejected -- just at
+        # the right gate (below_threshold), not conflated with confidence.
+        stats = self._run_watchlist_with_signal(0.40)
+
+        self.assertEqual(stats['created'], 0)
+        self.assertEqual(stats['blocked_threshold'], 1)
+        self.assertEqual(stats['blocked_confidence'], 0)
