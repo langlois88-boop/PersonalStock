@@ -76,6 +76,10 @@ function AnalyticsLabPage() {
   const [labPerf, setLabPerf] = useState(null);
   const [labLoading, setLabLoading] = useState(true);
   const [labError, setLabError] = useState(null);
+  // Was a single boolean hardcoded to the "Rendement" column only. Generalized
+  // to a (key, direction) pair so every column header can sort, following the
+  // same click-to-toggle pattern the Rendement header already had.
+  const [labSortKey, setLabSortKey] = useState('current_return_pct');
   const [labSortDesc, setLabSortDesc] = useState(true);
   const [labSuggestions, setLabSuggestions] = useState([]);
   const [labSuggestionsLoading, setLabSuggestionsLoading] = useState(true);
@@ -182,16 +186,59 @@ function AnalyticsLabPage() {
     };
   }, []);
 
+  // "Actuel" isn't a field on `p` -- it's derived (entry * (1 + return%))
+  // the same way the table cell itself computes it a bit further down, so
+  // sorting by it needs the same formula rather than a raw field lookup.
+  const labSortValue = (p, key) => {
+    switch (key) {
+      case 'ticker':
+        return (p.ticker || '').toUpperCase();
+      case 'final_verdict':
+        return (p.final_verdict || '').toUpperCase();
+      case 'entry_price':
+        return p.entry_price === null || p.entry_price === undefined ? null : Number(p.entry_price);
+      case 'current_price':
+        if (p.current_return_pct === null || p.current_return_pct === undefined) return null;
+        return Number(p.entry_price) * (1 + p.current_return_pct / 100);
+      case 'current_return_pct':
+        return p.current_return_pct === null || p.current_return_pct === undefined ? null : Number(p.current_return_pct);
+      case 'manually_selected':
+        return p.manually_selected ? 1 : 0;
+      case 'entry_date':
+        return p.entry_date ? new Date(p.entry_date).getTime() : null;
+      default:
+        return null;
+    }
+  };
+
   const labPositionsSorted = useMemo(() => {
     const positions = labPerf?.positions || [];
     return [...positions].sort((a, b) => {
-      const av = a.current_return_pct;
-      const bv = b.current_return_pct;
+      const av = labSortValue(a, labSortKey);
+      const bv = labSortValue(b, labSortKey);
+      // Missing values always sink to the bottom regardless of sort
+      // direction (same rule the old Rendement-only sort already used) --
+      // "no data" isn't meaningfully "highest" or "lowest".
       if (av === null || av === undefined) return 1;
       if (bv === null || bv === undefined) return -1;
+      if (typeof av === 'string' || typeof bv === 'string') {
+        const cmp = String(av).localeCompare(String(bv));
+        return labSortDesc ? -cmp : cmp;
+      }
       return labSortDesc ? bv - av : av - bv;
     });
-  }, [labPerf, labSortDesc]);
+  }, [labPerf, labSortKey, labSortDesc]);
+
+  const handleLabSort = (key) => {
+    if (key === labSortKey) {
+      setLabSortDesc((prev) => !prev);
+    } else {
+      setLabSortKey(key);
+      setLabSortDesc(true);
+    }
+  };
+
+  const labSortArrow = (key) => (labSortKey === key ? (labSortDesc ? ' ↓' : ' ↑') : '');
 
   // Used to plot a 60-month "Projection 5y" line by seeding a monthly
   // dollar contribution ($2300) onto the tail of the 12-month backtest
@@ -444,18 +491,30 @@ function AnalyticsLabPage() {
               <table className="min-w-full text-sm">
                 <thead className="text-slate-400">
                   <tr>
-                    <th className="text-left px-3 py-2">Ticker</th>
-                    <th className="text-left px-3 py-2">Verdict</th>
-                    <th className="text-left px-3 py-2">Entrée</th>
-                    <th className="text-left px-3 py-2">Actuel</th>
+                    <th className="text-left px-3 py-2 cursor-pointer select-none" onClick={() => handleLabSort('ticker')}>
+                      Ticker{labSortArrow('ticker')}
+                    </th>
+                    <th className="text-left px-3 py-2 cursor-pointer select-none" onClick={() => handleLabSort('final_verdict')}>
+                      Verdict{labSortArrow('final_verdict')}
+                    </th>
+                    <th className="text-left px-3 py-2 cursor-pointer select-none" onClick={() => handleLabSort('entry_price')}>
+                      Entrée{labSortArrow('entry_price')}
+                    </th>
+                    <th className="text-left px-3 py-2 cursor-pointer select-none" onClick={() => handleLabSort('current_price')}>
+                      Actuel{labSortArrow('current_price')}
+                    </th>
                     <th
                       className="text-left px-3 py-2 cursor-pointer select-none"
-                      onClick={() => setLabSortDesc((prev) => !prev)}
+                      onClick={() => handleLabSort('current_return_pct')}
                     >
-                      Rendement {labSortDesc ? '↓' : '↑'}
+                      Rendement{labSortArrow('current_return_pct')}
                     </th>
-                    <th className="text-left px-3 py-2">Manuel</th>
-                    <th className="text-left px-3 py-2">Entrée le</th>
+                    <th className="text-left px-3 py-2 cursor-pointer select-none" onClick={() => handleLabSort('manually_selected')}>
+                      Manuel{labSortArrow('manually_selected')}
+                    </th>
+                    <th className="text-left px-3 py-2 cursor-pointer select-none" onClick={() => handleLabSort('entry_date')}>
+                      Entrée le{labSortArrow('entry_date')}
+                    </th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-900">
