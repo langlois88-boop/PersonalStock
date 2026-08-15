@@ -11,11 +11,22 @@ function LivePaperTrading() {
   const [livePositions, setLivePositions] = useState({});
   const [brokerFilter, setBrokerFilter] = useState('ALL');
 
+  // Was a plain string ("MA20: 99.4% · vol_regime: 0.5% · ...") -- raw
+  // ML feature codes with zero explanation in the compact card view (the
+  // detail modal already used getFeatureExplanation/Term for this, see
+  // lines below; this summary line didn't). Same visible text, now each
+  // feature gets the same hoverable "(i)" plain-language explanation
+  // instead of requiring a click into "Détails" to find out what it means.
   const formatExplanation = (explanations = []) => {
     if (!Array.isArray(explanations) || explanations.length === 0) return '—';
-    return explanations
-      .map((item) => `${item.feature}: ${Number(item.contribution || 0).toFixed(1)}%`)
-      .join(' · ');
+    return explanations.map((item, idx) => (
+      <span key={`${item.feature}-${idx}`}>
+        {idx > 0 && ' · '}
+        <Term text={getFeatureExplanation(item.feature)}>
+          <span>{item.feature}: {Number(item.contribution || 0).toFixed(1)}%</span>
+        </Term>
+      </span>
+    ));
   };
 
   // Le backend écrit la raison de sortie (stop-loss touché, signal IA,

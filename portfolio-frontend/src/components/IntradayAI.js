@@ -75,6 +75,17 @@ function IntradayAI() {
     if (!seriesRef.current) return;
     seriesRef.current.setData(bars);
     seriesRef.current.setMarkers(markers);
+    // Without this, the time scale keeps whatever range it had before this
+    // data load (the library's own default, or an empty chart's default
+    // zoom) instead of framing the bars that just arrived -- observed live
+    // (2026-08-15) as a handful of candles squeezed into a sliver on the
+    // right edge with the rest of the chart empty. fitContent() was
+    // already called on window resize (below) but never after a fresh
+    // setData, which is the actual moment the visible range needs to
+    // change.
+    if (bars.length > 0 && chartRef.current) {
+      chartRef.current.timeScale().fitContent();
+    }
   }, [bars, markers]);
 
   const fetchData = async (overrideSymbol) => {

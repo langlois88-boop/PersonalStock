@@ -193,37 +193,26 @@ function AnalyticsLabPage() {
     });
   }, [labPerf, labSortDesc]);
 
+  // Used to plot a 60-month "Projection 5y" line by seeding a monthly
+  // dollar contribution ($2300) onto the tail of the 12-month backtest
+  // curve, then appending those points to the SAME chart/axis as the
+  // "Backtest Comparator" (Buy & Hold vs Strategy, 12m). Confirmed live
+  // (2026-08-15) this made the chart actively misleading, not just
+  // busy: 5 years of accumulated contributions (~$138k) dwarf a 12-month
+  // starting-capital curve, so Buy & Hold/Strategy render as a flat line
+  // pinned near the bottom while a disconnected-looking green line shoots
+  // up on the right -- exactly the opposite of what a comparator chart is
+  // for (seeing whether Strategy beat Buy & Hold). Removed rather than
+  // rescaled: nothing else on this page reads `chartData` expecting a
+  // projection tail, and the stated chart title/subtitle ("Backtest
+  // Comparator" · "12m") never promised a 5-year forward projection.
   const chartData = useMemo(() => {
     if (!backtest?.dates?.length) return [];
-    const base = backtest.dates.map((date, index) => ({
+    return backtest.dates.map((date, index) => ({
       date,
       buyHold: backtest.buy_hold_curve?.[index] ?? null,
       strategy: backtest.equity_curve?.[index] ?? null,
-      projection: null,
     }));
-
-    const curve = backtest.equity_curve || [];
-    if (curve.length < 2) return base;
-
-    const years = Math.max(1, curve.length / 252);
-    const lastValue = curve[curve.length - 1];
-    const cagr = lastValue > 0 ? Math.pow(lastValue, 1 / years) - 1 : 0;
-
-    const monthlyContribution = 2300;
-    const monthlyRate = cagr / 12;
-    let projected = lastValue;
-    const projectionPoints = Array.from({ length: 60 }, (_, i) => {
-      const month = i + 1;
-      projected = projected * (1 + monthlyRate) + monthlyContribution;
-      return {
-        date: `+${month}m`,
-        buyHold: null,
-        strategy: null,
-        projection: projected,
-      };
-    });
-
-    return [...base, ...projectionPoints];
   }, [backtest]);
 
   const sandboxChartData = useMemo(() => {
@@ -593,7 +582,6 @@ function AnalyticsLabPage() {
                   <Legend />
                   <Line type="monotone" dataKey="buyHold" name="Buy & Hold" stroke="#38bdf8" strokeWidth={2} dot={false} />
                   <Line type="monotone" dataKey="strategy" name="Strategy" stroke="#6366f1" strokeWidth={2} dot={false} />
-                  <Line type="monotone" dataKey="projection" name="Projection 5y" stroke="#22c55e" strokeWidth={2} strokeDasharray="6 6" dot={false} />
                 </LineChart>
               </ResponsiveContainer>
             )}
