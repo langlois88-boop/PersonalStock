@@ -19,6 +19,22 @@ from portfolio import tasks
 from portfolio.models import PaperTrade, SandboxWatchlist
 
 
+def _set_sandbox_watchlist(sandbox: str, symbols: list[str]) -> None:
+    """SandboxWatchlist.objects.update_or_create(...) followed by a forced
+    read-after-write check. Confirmed by direct investigation (2026-08-15):
+    _get_watchlist can otherwise intermittently observe a stale/empty
+    SandboxWatchlist row right after this write (same test transaction) and
+    silently fall through to its env-var default (26 real tickers) instead
+    of the fixture just written -- reproduced reliably in isolation, not
+    fixed by --no-cache rebuilds, and consistently avoided by forcing a real
+    read in between. Root cause not fully understood (looks like a
+    Django/psycopg2 test-transaction visibility quirk, not anything in this
+    project's own code) -- this is the empirically verified workaround."""
+    SandboxWatchlist.objects.update_or_create(sandbox=sandbox, defaults={'symbols': symbols})
+    actual = list(SandboxWatchlist.objects.filter(sandbox=sandbox).values_list('symbols', flat=True))
+    assert actual == [symbols], f"SandboxWatchlist fixture not visible right after writing it: {actual}"
+
+
 def _fake_yf_history(*args, **kwargs) -> pd.DataFrame:
     idx = pd.date_range('2024-01-01', periods=20, freq='D')
     return pd.DataFrame(
@@ -83,9 +99,7 @@ class PaperTradeDecisionStatsInvariantTests(TestCase):
     accounting invariant on the resulting decision_stats."""
 
     def _run(self, sandbox, prefix, signal_by_symbol, reinforce_signal_symbol=None):
-        SandboxWatchlist.objects.update_or_create(
-            sandbox=sandbox, defaults={'symbols': list(signal_by_symbol.keys())},
-        )
+        _set_sandbox_watchlist(sandbox, list(signal_by_symbol.keys()))
         if reinforce_signal_symbol:
             PaperTrade.objects.create(
                 ticker=reinforce_signal_symbol,
@@ -210,9 +224,7 @@ class WatchlistBaseModelSignalRegressionTests(TestCase):
     """
 
     def setUp(self):
-        SandboxWatchlist.objects.update_or_create(
-            sandbox='WATCHLIST', defaults={'symbols': ['WINW']},
-        )
+        _set_sandbox_watchlist('WATCHLIST', ['WINW'])
 
     def test_created_trade_uses_base_signal_and_bluechip_model_name(self):
         captured: dict = {}
@@ -267,6 +279,11 @@ class WatchlistBaseModelSignalRegressionTests(TestCase):
                 'portfolio.services.signal_engine_patches.should_trade_with_mtf',
                 return_value=(True, {}),
             ))
+            # Explicit, not left to whatever EXPLORATION_PHASE_ENABLED
+            # happens to be set to on the real host -- these tests assert
+            # exact buy_threshold/gating values, so they must not depend on
+            # live deploy/.env state (see docs/EXPLORATION_PHASE_2026-08.md).
+            stack.enter_context(patch.dict('os.environ', {'EXPLORATION_PHASE_ENABLED': 'false'}))
             tasks._execute_paper_trades_for_sandbox('WATCHLIST', 'PAPER')
 
         self.assertIn('decision_stats', captured)
@@ -304,9 +321,7 @@ class ConfidenceFloorCappedAtBuyThresholdTests(TestCase):
     """
 
     def setUp(self):
-        SandboxWatchlist.objects.update_or_create(
-            sandbox='WATCHLIST', defaults={'symbols': ['WINW']},
-        )
+        _set_sandbox_watchlist('WATCHLIST', ['WINW'])
 
     def _run_watchlist_with_signal(self, signal_value: float) -> dict:
         captured: dict = {}
@@ -356,6 +371,11 @@ class ConfidenceFloorCappedAtBuyThresholdTests(TestCase):
                 'portfolio.services.signal_engine_patches.should_trade_with_mtf',
                 return_value=(True, {}),
             ))
+            # Explicit, not left to whatever EXPLORATION_PHASE_ENABLED
+            # happens to be set to on the real host -- these tests assert
+            # exact buy_threshold/gating values, so they must not depend on
+            # live deploy/.env state (see docs/EXPLORATION_PHASE_2026-08.md).
+            stack.enter_context(patch.dict('os.environ', {'EXPLORATION_PHASE_ENABLED': 'false'}))
             tasks._execute_paper_trades_for_sandbox('WATCHLIST', 'PAPER')
 
         self.assertIn('decision_stats', captured)

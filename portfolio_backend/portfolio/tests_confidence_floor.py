@@ -81,6 +81,17 @@ class ConfidenceFloorSimPathTests(TestCase):
         SandboxWatchlist.objects.update_or_create(
             sandbox=sandbox, defaults={'symbols': list(signal_by_symbol.keys())},
         )
+        # Read-after-write sanity check -- confirmed by direct investigation
+        # (2026-08-15) that _get_watchlist otherwise intermittently observes
+        # a stale/empty SandboxWatchlist row and falls through to its env-var
+        # default (26 real tickers) instead of the fixture just written a
+        # line above, inside this same test transaction. Forcing a real read
+        # here (not just relying on the ORM instance already in memory)
+        # reliably avoids it.
+        actual = list(SandboxWatchlist.objects.filter(sandbox=sandbox).values_list('symbols', flat=True))
+        assert actual == [list(signal_by_symbol.keys())], (
+            f"SandboxWatchlist fixture not visible right after writing it: {actual}"
+        )
 
         def _tracking_signal(symbol):
             value = signal_by_symbol.get(symbol)
