@@ -25,7 +25,7 @@ import pandas as pd
 from django.test import TestCase
 
 from portfolio import tasks
-from portfolio.models import PaperTrade
+from portfolio.models import PaperTrade, SandboxWatchlist
 
 
 def _fake_get_daily_bars(symbol, days=30) -> pd.DataFrame:
@@ -78,6 +78,10 @@ class ConfidenceFloorSimPathTests(TestCase):
     non-AI_PENNY sandboxes must never exceed the effective buy_threshold."""
 
     def _run(self, sandbox, prefix, signal_by_symbol, env=None):
+        SandboxWatchlist.objects.update_or_create(
+            sandbox=sandbox, defaults={'symbols': list(signal_by_symbol.keys())},
+        )
+
         def _tracking_signal(symbol):
             value = signal_by_symbol.get(symbol)
             return 0.0 if value is None else value
