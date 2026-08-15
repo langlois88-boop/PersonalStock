@@ -8,9 +8,18 @@ Contexte de départ (déjà établi la semaine dernière) : WATCHLIST devait êt
 une liste de tickers surveillés pour N'IMPORTE QUEL type d'opportunité, pas
 une stratégie de survente technique spécifique. Le chemin de décision réel
 utilise `_mean_reversion_score` (RSI + Bollinger), resté à 0.0 sur 100% des
-79 échantillons historiques échantillonnés. Cette valeur "toujours 0.0" n'a
-**pas été ré-investiguée** dans cette session (hors scope de l'étape 1-2
-demandée) — seule la formule elle-même est documentée ci-dessous.
+79 échantillons historiques échantillonnés.
+
+**Mise à jour** : le "toujours 0.0" et le "signal NVDA/AMZN dupliqué à 16
+décimales" ont été ré-investigués (voir Addendum tout en bas) — **ce ne
+sont PAS la même cause racine**. Conclusion courte : la formule
+`_mean_reversion_score` fonctionne correctement aujourd'hui (vérifiée en
+direct, varie normalement avec le RSI réel) ; le "toujours 0.0" reflète une
+réalité de marché (les tickers WATCHLIST actuels ne sont simplement jamais
+assez survendus), pas un bug de calcul. Le "dupliqué à 16 décimales" était
+dans `base_model_signal` (chemin FUSION) début février, ne se reproduit
+plus aujourd'hui, et est sans rapport avec le RSI. Détails complets et
+preuves dans l'Addendum.
 
 ## Étape 1 — Contenu réel de FUSION_FEATURE_NAMES
 
@@ -240,3 +249,148 @@ Ex. `signal = base_model_signal + bonus si RSI < 30 et fermeture <= bande basse`
 | Corrige le bug `model_name`/réentraînement en bonus | ✅ Oui | ❌ Non (à faire séparément) | ✅ Oui (même mécanisme) |
 | Lisibilité du signal | Moyenne (top-5 features) | Élevée (RSI/Bollinger) | Moyenne-Élevée |
 | Recalibrage des seuils buy/sell nécessaire | Oui, probable | Non (si juste un fix de bug) | Oui, probable |
+
+## Addendum (2026-08-14, suite à la demande d'Eric) — le "toujours 0.0" et le "dupliqué à 16 décimales" partagent-ils une cause racine ?
+
+**Réponse courte : non, ce sont deux problèmes distincts, vérifiés séparément
+en rejouant le calcul en direct sur la production.** Aucun changement de
+code effectué — diagnostic seul, ~30 minutes.
+
+### Preuve 1 — Le signal dupliqué NVDA/AMZN à 16 décimales, confirmé dans les vraies données
+
+```
+AMZN  WATCHLIST     2026-02-17  entry_signal=0.6592413017098232  model_name=BLUECHIP
+AMZN  AI_BLUECHIP   2026-02-17  entry_signal=0.6592413017098232  model_name=BLUECHIP
+NVDA  WATCHLIST     2026-02-20  entry_signal=0.6592413017098232  model_name=BLUECHIP
+```
+
+Confirmé : **3 trades, 2 tickers différents, 2 sandboxes différentes, 3
+jours d'écart — un signal identique au bit près.** C'est bien
+`base_model_signal` (le chemin FUSION/RandomForest), pas
+`_mean_reversion_score` : `model_name='BLUECHIP'` sur les 3, et ces dates
+(17-20 février) précèdent l'introduction de `_mean_reversion_score` pour
+WATCHLIST — à ce moment-là, WATCHLIST utilisait encore directement le
+signal FUSION brut, exactement comme AI_BLUECHIP aujourd'hui.
+
+**Rejoué en direct aujourd'hui** (`_model_signal` appelé pour de vrai,
+même modèle `.pkl`, même code) :
+
+```
+NVDA  base_model_signal = 0.31523266584743603
+AMZN  base_model_signal = 0.31352662438312484
+AAPL  base_model_signal = 0.30978636806943716
+MSFT  base_model_signal = 0.3111979847241962
+```
+
+**Ne se reproduit plus** — 4 valeurs différentes aujourd'hui, alors qu'elles
+étaient identiques au bit près en février. Cause la plus probable (pas
+prouvée formellement, mais cohérente avec toutes les preuves disponibles) :
+le modèle `.pkl` en février était très jeune / entraîné sur très peu
+d'échantillons (le pipeline paper-trading démarrait à peine à ce
+moment-là) — un `RandomForestClassifier` sous-entraîné sur un jeu quasi
+vide peut dégénérer en prédicteur quasi-constant, peu importe l'input. Le
+modèle a été ré-entraîné quotidiennement depuis (`retrain_from_paper_trades_daily`)
+avec des mois de données réelles accumulées, ce qui explique naturellement
+la différenciation retrouvée aujourd'hui.
+
+**Nuance à garder en tête pour l'Option A** : les 4 valeurs actuelles
+(0.310-0.315) restent assez resserrées entre elles vu à quel point NVDA
+(RSI=75, sur-acheté) et AAPL (RSI=26, survendu) sont dans des régimes
+opposés — pas une preuve de bug, mais un signal que le modèle FUSION
+partagé ne différencie peut-être pas encore fortement selon les tickers.
+À surveiller si l'Option A est choisie, pas un bloquant en soi.
+
+### Preuve 2 — `_mean_reversion_score` fonctionne correctement aujourd'hui
+
+Rejoué en direct sur des tickers connus, même run que ci-dessus :
+
+```
+NVDA  RSI=75.4  score=0.0     (RSI >= 30, normal)
+AMZN  RSI=66.4  score=0.0     (RSI >= 30, normal)
+MSFT  RSI=84.8  score=0.0     (RSI >= 30, normal)
+AAPL  RSI=26.0  score=0.134   (RSI < 30 -- SCORE POSITIF, formule fonctionne)
+```
+
+La formule réagit correctement à un vrai cas survendu (AAPL) dans le même
+lot de test que les cas non-survendus. **Pas un bug de calcul.**
+
+### Preuve 3 — Rejoué sur les 10 tickers RÉELS de WATCHLIST aujourd'hui
+
+```
+BTO.TO   RSI=81.3   score=0.0
+FLT.TO   RSI=51.9   score=0.0
+BMBL     RSI=40.9   score=0.0
+AIFF     RSI=48.7   score=0.0
+DSP      RSI=64.4   score=0.0
+ALVO     RSI=75.1   score=0.0
+HIVE.TO  RSI=41.5   score=0.0
+KEEL.TO  RSI=39.0   score=0.0
+LUG.TO   RSI=78.4   score=0.0
+NVDA     RSI=75.4   score=0.0
+```
+
+Le "toujours 0.0" **se reproduit bel et bien aujourd'hui, en direct** — mais
+le RSI varie normalement (39 à 81) et n'est simplement JAMAIS sous 30 pour
+ces 10 tickers précis, aujourd'hui. Confirmé : formule correcte, pas de bug
+caché ; c'est un problème de calibrage/de nature du signal (un déclencheur
+"survente sévère uniquement" appliqué à une liste de tickers qui n'entre
+tout simplement pas souvent en survente sévère), exactement le diagnostic
+déjà posé à l'étape 2 de ce document.
+
+### Preuve 4 — Précision sur la provenance du chiffre "79 échantillons"
+
+Tracé jusqu'à sa source réelle : `bluechip_dip_scanner` (`portfolio/tasks.py:7561`),
+qui appelle aussi `_mean_reversion_score` et dont le commentaire cite
+explicitement "WATCHLIST's buy_threshold" comme raison d'être de ce
+logging — presque certainement la source du chiffre "79" évoqué la semaine
+dernière.
+
+**Correction importante** : interrogé les 237 runs de ce diagnostic
+enregistrés depuis le 27 février 2026 — `score_distribution` est **`None`
+(vide) dans 100% des cas, sans exception**. Ce n'est pas "0.0 dans 79
+échantillons" mais littéralement **zéro échantillon n'a jamais atteint
+`_mean_reversion_score`** dans ce chemin précis, parce qu'un filtre en
+amont (`_rsi_divergence`, un test de divergence intrajournalière) rejette
+~75-80% des candidats et le filtre de fourchette de prix rejette le reste
+— `funnel['passed'] = 0` sur les 8 derniers runs consultés (12-14 août),
+`evaluated` oscillant justement autour de 75-79 (probable origine du
+chiffre "79").
+
+**Ce chemin (`bluechip_dip_scanner`) N'EST PAS le chemin de décision réel
+de WATCHLIST** (`_execute_paper_trades_for_sandbox`) — celui-ci appelle
+`_mean_reversion_score` directement, sans le filtre `_rsi_divergence`. Les
+deux chemins partagent la même fonction mais pas les mêmes filtres
+amont. La Preuve 3 ci-dessus (rejoué directement sur le vrai chemin
+WATCHLIST) reste la mesure la plus fiable de son comportement réel.
+
+**Fait confirmé en bonus** : les 4 `PaperTrade` jamais créés pour WATCHLIST
+dans toute l'histoire du système (AMZN 17 fév, NVDA 20 fév, HIVE 24 fév,
+HIVE 28 fév) n'ont **aucun** `mean_reversion_score`/`rsi14` dans
+`entry_features` — `_mean_reversion_score` n'a littéralement jamais produit
+un seul trade WATCHLIST, à aucun moment de l'historique.
+
+### Conclusion de l'addendum
+
+**Les deux symptômes sont confirmés distincts, sans cause commune :**
+
+1. Le signal dupliqué NVDA/AMZN était dans `base_model_signal` (chemin
+   FUSION), causé très probablement par un modèle sous-entraîné début
+   février — **ne se reproduit plus aujourd'hui**, rien à corriger pour le
+   débloquer.
+2. Le "toujours 0.0" de WATCHLIST est dans `_mean_reversion_score` (RSI +
+   Bollinger) — **la formule est correcte**, vérifiée trois fois en direct
+   (formule pure, cas AAPL survendu, 10 vrais tickers WATCHLIST). C'est un
+   problème de calibrage/nature du signal, pas un bug à corriger.
+
+**Aucun bug commun à corriger qui débloquerait WATCHLIST gratuitement.**
+Corriger un "bug de features réutilisées entre appels" n'est pas
+applicable ici — aucun des deux symptômes n'est causé par ça. L'**Option A
+(basculer vers FUSION) reste le choix le mieux soutenu par les faits**,
+pour trois raisons désormais confirmées :
+- FUSION ne montre pas le problème de duplication aujourd'hui (testé en direct).
+- Le "toujours 0.0" est structurel à la formule RSI-seule, pas un accident réparable par un simple fix de bug.
+- Basculer corrige en prime le bug `model_name`/réentraînement documenté plus haut.
+
+La seule réserve à garder en tête (Preuve 1) : les valeurs FUSION actuelles
+sont resserrées entre tickers très différents — pas un blocage, mais un
+point à surveiller après bascule, pas avant.
