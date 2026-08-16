@@ -846,6 +846,96 @@ class QuantFilterMarginTrendTests(APITestCase):
         json.dumps(result.details)
 
 
+class QuantFilterValueCatalystTests(APITestCase):
+    """
+    Preset "Value + Catalyst" (2026-08-16) : thresholds['require_catalyst']
+    ajoute un garde-fou positif (inflexion de marge OU achat d'initiés
+    significatif requis) au-dessus du filtre quantitatif standard, sans
+    changer le comportement de "Undervalued Without Reason" (thresholds={},
+    donc require_catalyst absent).
+    """
+
+    def _mock_info(self, **overrides):
+        base = {
+            "regularMarketPrice": 12.5,
+            "sector": "Technology",
+            "trailingPE": 8.2,
+            "returnOnEquity": 0.18,
+            "totalDebt": 100.0,
+            "ebitda": 200.0,
+            "numberOfAnalystOpinions": 3,
+        }
+        base.update(overrides)
+        return base
+
+    def _flat_margin_trend(self):
+        # Pas d'inflexion : marges constantes.
+        return pd.DataFrame(
+            {"Q1": [1000.0, 350.0], "Q2": [1000.0, 350.0], "Q3": [1000.0, 350.0], "Q4": [1000.0, 350.0]},
+            index=["Total Revenue", "Gross Profit"],
+        )
+
+    def test_require_catalyst_rejects_when_no_margin_inflection_and_no_insider_buying(self):
+        with patch.object(quant_filter, "market_data") as mock_market_data, \
+                patch.object(quant_filter.yf, "Ticker") as mock_yf_ticker, \
+                patch.object(quant_filter, "_fetch_insider_buying", return_value={"insiders_buying": False, "insider_buy_total": 0.0}) as mock_insider:
+            mock_market_data.Ticker.return_value.info = self._mock_info()
+            mock_yf_ticker.return_value.quarterly_financials = self._flat_margin_trend()
+
+            result = quant_filter.evaluate_ticker("AAPL", preset_thresholds={"require_catalyst": True})
+
+        mock_insider.assert_called_once_with("AAPL")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("catalyseur" in r for r in result.reasons_failed))
+
+    def test_require_catalyst_passes_on_insider_buying_alone(self):
+        with patch.object(quant_filter, "market_data") as mock_market_data, \
+                patch.object(quant_filter.yf, "Ticker") as mock_yf_ticker, \
+                patch.object(quant_filter, "_fetch_insider_buying", return_value={"insiders_buying": True, "insider_buy_total": 75000.0}):
+            mock_market_data.Ticker.return_value.info = self._mock_info()
+            mock_yf_ticker.return_value.quarterly_financials = self._flat_margin_trend()
+
+            result = quant_filter.evaluate_ticker("AAPL", preset_thresholds={"require_catalyst": True})
+
+        self.assertTrue(result.passed)
+        self.assertTrue(result.details.get("insiders_buying"))
+        self.assertEqual(result.details.get("insider_buy_total"), 75000.0)
+        json.dumps(result.details)  # JSONField-serializable, même contrainte que le test ci-dessus
+
+    def test_require_catalyst_passes_on_margin_inflection_alone(self):
+        with patch.object(quant_filter, "market_data") as mock_market_data, \
+                patch.object(quant_filter.yf, "Ticker") as mock_yf_ticker, \
+                patch.object(quant_filter, "_fetch_insider_buying", return_value={"insiders_buying": False, "insider_buy_total": 0.0}):
+            mock_market_data.Ticker.return_value.info = self._mock_info()
+            mock_yf_ticker.return_value.quarterly_financials = self._quarterly_financials_with_inflection_for_catalyst()
+
+            result = quant_filter.evaluate_ticker("AAPL", preset_thresholds={"require_catalyst": True})
+
+        self.assertTrue(result.passed)
+        self.assertTrue(result.details.get("margin_inflection_detected"))
+
+    def _quarterly_financials_with_inflection_for_catalyst(self):
+        return pd.DataFrame(
+            {"Q1": [1000.0, 420.0], "Q2": [1000.0, 320.0], "Q3": [1000.0, 300.0], "Q4": [1000.0, 400.0]},
+            index=["Total Revenue", "Gross Profit"],
+        )
+
+    def test_default_preset_never_calls_insider_fetch(self):
+        """thresholds={} (Undervalued Without Reason) -- require_catalyst absent,
+        aucun appel réseau supplémentaire, comportement inchangé pour ce preset."""
+        with patch.object(quant_filter, "market_data") as mock_market_data, \
+                patch.object(quant_filter.yf, "Ticker") as mock_yf_ticker, \
+                patch.object(quant_filter, "_fetch_insider_buying") as mock_insider:
+            mock_market_data.Ticker.return_value.info = self._mock_info()
+            mock_yf_ticker.return_value.quarterly_financials = self._flat_margin_trend()
+
+            result = quant_filter.evaluate_ticker("AAPL", preset_thresholds={})
+
+        mock_insider.assert_not_called()
+        self.assertTrue(result.passed)
+        self.assertNotIn("insiders_buying", result.details)
+
+
 def _make_ohlc_frame(rows: int = 30) -> pd.DataFrame:
     """OHLC + volume factices avec un DatetimeIndex nommé 'Date', pour
     simuler ce que market_data.Ticker(...).history() renvoie réellement."""
@@ -1080,3 +1170,28 @@ class LabWeeklySuggestionsViewTests(APITestCase):
         self.assertEqual(len(suggestions), 2)
         self.assertEqual(suggestions[0]["week_start"], "2026-08-08")
         self.assertTrue(suggestions[0]["has_pattern"])
+
+
+class RunScanUsesCombinedUniverseTests(APITestCase):
+    """
+    2026-08-16 (Eric, explicit decision) : _run_scan_for_preset était codé
+    en dur sur universe_source='sandboxes' (~23 tickers des watchlists ML,
+    pas un vrai univers de titres sous-évalués) -- passé à 'combined'
+    (sandboxes + CustomWatchlistTicker actifs, alimenté par
+    run_broad_index_scan) maintenant que la condition d'activation
+    documentée dans docs/TECH_DEBT_NOTES.md item 11 est remplie (un cycle
+    réel a tourné avec succès le 2026-08-11).
+
+    Univers vide dans ce test (aucune SandboxWatchlist/CustomWatchlistTicker
+    fixture) -- _run_scan_for_preset retourne tôt sans appeler le filtre
+    quant ni aucun service réseau/LLM, donc ce test vérifie uniquement le
+    universe_source enregistré sur le ScanRun, sans mock nécessaire.
+    """
+
+    def test_scan_run_records_combined_universe_source(self):
+        preset = _make_preset()
+        tasks._run_scan_for_preset(preset)
+
+        scan_run = ScanRun.objects.get(preset=preset)
+        self.assertEqual(scan_run.universe_source, "combined")
+        self.assertEqual(scan_run.status, "completed")

@@ -161,7 +161,15 @@ def run_daily_scan(self, preset_slug: str = None):
 
 
 def _run_scan_for_preset(preset: ScreenerPreset):
-    scan_run = ScanRun.objects.create(preset=preset, universe_source="sandboxes")
+    # Was hardcoded to "sandboxes" (~23 tickers from the ML paper-trading
+    # watchlists) -- switched to "combined" (2026-08-16, Eric's explicit
+    # decision) now that the activation condition documented in
+    # docs/TECH_DEBT_NOTES.md item 11 is met: a real run_broad_index_scan
+    # cycle completed successfully on 2026-08-11 (720 tickers -> 4
+    # survivors). "sandboxes" alone was never a meaningful universe for a
+    # value screener -- it just re-scanned tickers already being traded by
+    # unrelated ML strategies, not an actual pool of undervalued candidates.
+    scan_run = ScanRun.objects.create(preset=preset, universe_source="combined")
 
     try:
         tickers = _get_universe(scan_run.universe_source)
