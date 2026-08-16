@@ -56,7 +56,13 @@ function MarketScannerPanel({ onSelect }) {
           >
             <div className="flex items-center justify-between">
               <span className="font-semibold text-slate-200">{item.symbol}</span>
-              <span className="text-xs text-emerald-300">+{item.change_pct}%</span>
+              {/* Was a hardcoded "+" in front of item.change_pct with a
+                  fixed emerald color -- for a negative change this printed
+                  a literal "+-4.39%" and stayed green regardless of sign.
+                  Now the sign/color follow the real value. */}
+              <span className={`text-xs font-semibold ${Number(item.change_pct) >= 0 ? 'text-emerald-300' : 'text-red-400'}`}>
+                {Number(item.change_pct) >= 0 ? '+' : ''}{item.change_pct}%
+              </span>
             </div>
             <div className="flex flex-wrap gap-2 text-xs text-slate-400 mt-1">
               <span>RVOL {item.rvol}</span>

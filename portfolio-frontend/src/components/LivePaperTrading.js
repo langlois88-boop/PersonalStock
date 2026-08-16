@@ -295,6 +295,20 @@ function LivePaperTrading() {
               <div>Qté: {selectedTrade.quantity}</div>
               <div>Coût total : {formatMoney(tradeCost(selectedTrade))} ({selectedTrade.quantity} × ${selectedTrade.entry_price})</div>
               <div>Valeur de revente : {formatMoney(tradeResaleValue(selectedTrade))}</div>
+              {selectedTrade.status === 'CLOSED' && (
+                <div>
+                  P&L : <span className={Number(selectedTrade.pnl || 0) >= 0 ? 'text-emerald-400 font-semibold' : 'text-red-400 font-semibold'}>
+                    {formatMoney(selectedTrade.pnl)}
+                  </span>
+                </div>
+              )}
+              {selectedTrade.status !== 'CLOSED' && (selectedTrade.unrealized_pnl !== undefined) && (
+                <div>
+                  U-P&L : <span className={Number(selectedTrade.unrealized_pnl || 0) >= 0 ? 'text-emerald-400 font-semibold' : 'text-red-400 font-semibold'}>
+                    {formatMoney(selectedTrade.unrealized_pnl)}
+                  </span>
+                </div>
+              )}
               <div className="col-span-2">Pourquoi vendu : {formatExitReason(selectedTrade.notes) || (selectedTrade.status === 'CLOSED' ? 'Aucune information enregistrée.' : '—')}</div>
             </div>
 
@@ -302,12 +316,17 @@ function LivePaperTrading() {
               <p className="text-xs uppercase tracking-[0.2em] text-slate-400"><Term text={GLOSSARY.topExplanations}>Top explications</Term></p>
               <div className="mt-2 space-y-2">
                 {(selectedTrade.entry_explanations || []).length ? (
-                  selectedTrade.entry_explanations.map((item) => (
-                    <div key={item.feature} className="flex items-center justify-between text-sm text-slate-200">
-                      <Term text={getFeatureExplanation(item.feature)}><span>{item.feature}</span></Term>
-                      <span>{Number(item.contribution || 0).toFixed(2)}%</span>
-                    </div>
-                  ))
+                  selectedTrade.entry_explanations.map((item) => {
+                    const contribution = Number(item.contribution || 0);
+                    return (
+                      <div key={item.feature} className="flex items-center justify-between text-sm text-slate-200">
+                        <Term text={getFeatureExplanation(item.feature)}><span>{item.feature}</span></Term>
+                        <span className={contribution >= 0 ? 'text-emerald-400' : 'text-red-400'}>
+                          {contribution >= 0 ? '+' : ''}{contribution.toFixed(2)}%
+                        </span>
+                      </div>
+                    );
+                  })
                 ) : (
                   <p className="text-sm text-slate-400">Aucune explication disponible.</p>
                 )}

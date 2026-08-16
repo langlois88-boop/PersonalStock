@@ -205,7 +205,7 @@ function IntradayAI() {
           </div>
           <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
             <p className="text-xs uppercase text-slate-500"><Term text={GLOSSARY.confidence}>Probabilité IA</Term></p>
-            <p className="text-lg font-semibold">
+            <p className={`text-lg font-semibold ${stats.probability != null ? (stats.probability >= 0.5 ? 'text-emerald-400' : 'text-red-400') : ''}`}>
               {stats.probability != null ? `${(stats.probability * 100).toFixed(1)}%` : 'n/a'}
             </p>
           </div>
@@ -223,8 +223,8 @@ function IntradayAI() {
           </div>
           <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
             <p className="text-xs uppercase text-slate-500">Profit potentiel</p>
-            <p className="text-lg font-semibold">
-              {potentialProfitPct != null ? `${potentialProfitPct.toFixed(2)}%` : 'n/a'}
+            <p className={`text-lg font-semibold ${potentialProfitPct != null ? (potentialProfitPct >= 0 ? 'text-emerald-400' : 'text-red-400') : ''}`}>
+              {potentialProfitPct != null ? `${potentialProfitPct >= 0 ? '+' : ''}${potentialProfitPct.toFixed(2)}%` : 'n/a'}
             </p>
           </div>
           {gemini && (
