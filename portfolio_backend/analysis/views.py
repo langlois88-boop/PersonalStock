@@ -59,6 +59,16 @@ class LabPositionSerializer(serializers.ModelSerializer):
         ]
 
     def get_current_return_pct(self, obj):
+        # Was always computed against *today's* live price, even for closed
+        # positions -- so "current_return_pct" for a position closed weeks
+        # ago silently meant "what it would be worth if you'd kept holding
+        # it", not what the trade actually realized at exit. For a closed
+        # position with a real exit on record, use the realized outcome
+        # instead (open positions are unaffected -- no realized_return_pct
+        # exists for them yet, so this falls through to the live-price calc
+        # exactly as before).
+        if not obj.is_open and obj.realized_return_pct is not None:
+            return round(obj.realized_return_pct, 2)
         current_price = self.context.get("current_prices", {}).get(obj.ticker)
         if current_price and obj.entry_price:
             return round((float(current_price) - float(obj.entry_price)) / float(obj.entry_price) * 100, 2)
@@ -307,7 +317,19 @@ class LabPerformanceView(APIView):
     def get(self, request):
         from .services.quant_filter import fetch_ticker_data
 
-        positions = FundamentalLabPosition.objects.select_related("scan_result").all()
+        # Excludes closed positions with no exit_date recorded -- confirmed
+        # live (2026-08-15) to be exactly the 9 duplicate-scan cleanup rows
+        # from the item 8 incident (2026-08-10, TECH_DEBT_NOTES.md): closed
+        # directly in DB with is_open=False but no exit_price/exit_date/
+        # realized_return_pct, so they were never a real trading outcome.
+        # The one code path that legitimately closes a position (tasks.py
+        # ~line 799) always sets exit_date in the same write, so this filter
+        # can't accidentally catch a genuine close. Without it these 9 dead
+        # rows inflated both the displayed count() and the avg_return_pct
+        # for "Confirmed"/"Uncertain" on this dashboard.
+        positions = FundamentalLabPosition.objects.select_related("scan_result").exclude(
+            is_open=False, exit_date__isnull=True,
+        )
         current_prices = {}
         for ticker in positions.values_list("ticker", flat=True).distinct():
             data = fetch_ticker_data(ticker)

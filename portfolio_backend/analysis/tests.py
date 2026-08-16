@@ -524,6 +524,95 @@ class MonitorLabPositionsCloseFieldsTests(APITestCase):
         self.assertAlmostEqual(self.lab_position.realized_return_pct, -10.0, places=2)
 
 
+class LabPerformanceViewTests(APITestCase):
+    """
+    Confirmed live 2026-08-15 (session investigating a user-reported
+    duplicate-looking ticker list on /lab): LabPerformanceView counted and
+    averaged in 9 dead rows left over from the item 8 incident
+    (TECH_DEBT_NOTES.md, 2026-08-10) -- closed directly in DB with
+    is_open=False but no exit_price/exit_date/realized_return_pct, since
+    they were duplicate-scan cleanup, never a real trade outcome. Also,
+    current_return_pct recomputed against *today's* live price even for
+    genuinely closed positions, so a position closed weeks ago silently
+    reported "what it would be worth if you'd kept holding it" instead of
+    what it actually realized at exit.
+    """
+
+    def setUp(self):
+        self.preset = _make_preset()
+        self.scan_run = ScanRun.objects.create(preset=self.preset, universe_source="sandboxes")
+
+        # Dead duplicate-cleanup row: is_open=False, no exit_date -- must
+        # never be counted or averaged.
+        dud_result = ScanResult.objects.create(
+            scan_run=self.scan_run, ticker="DUPX", final_verdict="confirmed",
+            price_at_scan=Decimal("10.00"), quant_score=3.0,
+        )
+        FundamentalLabPosition.objects.create(
+            scan_result=dud_result, ticker="DUPX", preset=self.preset,
+            entry_price=Decimal("10.00"), entry_date=timezone.now(),
+            is_open=False,
+        )
+
+        # Genuinely closed position: +20% realized at exit, but the live
+        # market has since moved to a price that would compute a very
+        # different return -- current_return_pct must reflect the +20%
+        # realized outcome, not a fresh live-price recomputation.
+        closed_result = ScanResult.objects.create(
+            scan_run=self.scan_run, ticker="REAL", final_verdict="confirmed",
+            price_at_scan=Decimal("10.00"), quant_score=3.0,
+        )
+        self.closed_position = FundamentalLabPosition.objects.create(
+            scan_result=closed_result, ticker="REAL", preset=self.preset,
+            entry_price=Decimal("10.00"), entry_date=timezone.now(),
+            is_open=False, exit_price=Decimal("12.00"), exit_date=timezone.now(),
+            close_reason="signal", realized_return_pct=20.0,
+        )
+
+        # Still-open position: current_return_pct must keep using the live
+        # price (unchanged behavior).
+        open_result = ScanResult.objects.create(
+            scan_run=self.scan_run, ticker="OPEN", final_verdict="uncertain",
+            price_at_scan=Decimal("10.00"), quant_score=3.0,
+        )
+        self.open_position = FundamentalLabPosition.objects.create(
+            scan_result=open_result, ticker="OPEN", preset=self.preset,
+            entry_price=Decimal("10.00"), entry_date=timezone.now(), is_open=True,
+        )
+
+    def test_dead_duplicate_rows_excluded_from_positions_and_counts(self):
+        # LabPerformanceView imports fetch_ticker_data locally from
+        # quant_filter (not via `tasks`) -- patch the source it actually
+        # resolves against at call time.
+        with patch.object(quant_filter, "fetch_ticker_data", return_value={"price": 11.0}):
+            response = self.client.get("/api/analysis/lab/performance/")
+
+        self.assertEqual(response.status_code, 200)
+        tickers = {p["ticker"] for p in response.data["positions"]}
+        self.assertNotIn("DUPX", tickers, "dead duplicate-cleanup row leaked into the positions list")
+        self.assertEqual(tickers, {"REAL", "OPEN"})
+        # DUPX had final_verdict='confirmed' just like REAL -- if it leaked
+        # through, count would be 2 instead of 1.
+        self.assertEqual(response.data["confirmed"]["count"], 1)
+
+    def test_closed_position_uses_realized_return_not_live_price(self):
+        # Live price implies -50% ((5-10)/10) -- must NOT show up anywhere;
+        # the closed position's realized +20% must win instead.
+        with patch.object(quant_filter, "fetch_ticker_data", return_value={"price": 5.0}):
+            response = self.client.get("/api/analysis/lab/performance/")
+
+        closed = next(p for p in response.data["positions"] if p["ticker"] == "REAL")
+        self.assertEqual(closed["current_return_pct"], 20.0)
+        self.assertEqual(response.data["confirmed"]["avg_return_pct"], 20.0)
+
+    def test_open_position_still_uses_live_price(self):
+        with patch.object(quant_filter, "fetch_ticker_data", return_value={"price": 11.0}):
+            response = self.client.get("/api/analysis/lab/performance/")
+
+        opened = next(p for p in response.data["positions"] if p["ticker"] == "OPEN")
+        self.assertEqual(opened["current_return_pct"], 10.0)
+
+
 class GenerateLabWeeklySuggestionsTests(APITestCase):
     """
     Partie 3 (2026-08-14) : generate_lab_weekly_suggestions doit rester
