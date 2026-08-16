@@ -111,6 +111,14 @@ class ConfidenceFloorSimPathTests(TestCase):
             '_intraday_context_for_timeframe': lambda *a, **k: None,
             'get_market_sentiment': lambda: ('NEUTRAL', {}),
             '_market_sentiment_score': lambda: 0.5,
+            # Unmocked, this reads the real wall clock (_ny_time_now()) and
+            # applies a real -10% "lunch hour" signal penalty whenever the
+            # suite happens to run between 11:30am-1:30pm ET -- confirmed
+            # live 2026-08-16 (11:42am ET): made this exact test flaky
+            # depending purely on time of day, nothing to do with the code
+            # under test. Already mocked in ConfidenceFloorAlpacaPathTests
+            # below; was missing here.
+            '_time_of_day_penalty': lambda *a, **k: 1.0,
             'get_market_regime_context': lambda: {'risk_off': False},
             '_daily_equity_circuit_breaker': lambda sandbox, capital, **kwargs: {'triggered': False},
             '_weak_list_health': lambda: {'defensive': False},

@@ -269,6 +269,12 @@ class WatchlistBaseModelSignalRegressionTests(TestCase):
             # gating the decision (old code), the candidate would be
             # blocked instead of created.
             '_mean_reversion_score': lambda symbol: (0.0, 65.0, 9.0),
+            # Unmocked, this reads the real wall clock and applies a real
+            # -10% "lunch hour" signal penalty between 11:30am-1:30pm ET --
+            # confirmed live 2026-08-16 (11:42am ET) to make this test's
+            # exact entry_signal assertion flaky depending purely on time
+            # of day.
+            '_time_of_day_penalty': lambda *a, **k: 1.0,
         }
 
         with ExitStack() as stack:
@@ -361,6 +367,8 @@ class ConfidenceFloorCappedAtBuyThresholdTests(TestCase):
                 'model_name': universe,
             },
             '_mean_reversion_score': lambda symbol: (0.0, None, None),
+            # Same time-of-day flakiness as WatchlistBaseModelSignalRegressionTests above.
+            '_time_of_day_penalty': lambda *a, **k: 1.0,
         }
 
         with ExitStack() as stack:

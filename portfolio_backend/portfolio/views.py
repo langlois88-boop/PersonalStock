@@ -85,6 +85,7 @@ from .tasks import (
 	process_alpaca_trade_approval,
 	telegram_answer_callback,
 	_decision_log,
+	_market_closed_now,
 )
 from .serializers import (
 	AccountSerializer,
@@ -2196,6 +2197,12 @@ class AlpacaIntradayView(APIView):
 				**score_basis,
 			},
 			'gemini': gemini_review,
+			# Added so the frontend can show "marché fermé" instead of
+			# silently displaying 0.00/50% defaults as if they were real
+			# computed signals (reported live 2026-08-15: every intraday
+			# stat falls back to its neutral default outside market hours,
+			# with no indication why).
+			'market_closed': _market_closed_now(),
 		}
 		return Response(_clean_json(payload), status=200)
 
@@ -2292,7 +2299,11 @@ class MarketScannerView(APIView):
 		if results:
 			for item in results:
 				item['patterns'] = _normalize_patterns(item.get('patterns') or [])
-		return Response(_clean_json({'results': results}), status=200)
+		# Same reasoning as AlpacaIntradayView: Score falls back to exactly
+		# 0.5 for every symbol when there's no live pattern/RVOL data to
+		# compute from (e.g. market closed), which otherwise looks like a
+		# broken/identical score rather than "no signal available right now".
+		return Response(_clean_json({'results': results, 'market_closed': _market_closed_now()}), status=200)
 
 
 class PortfolioDashboardView(APIView):

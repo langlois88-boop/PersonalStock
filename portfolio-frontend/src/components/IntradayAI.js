@@ -16,6 +16,7 @@ function IntradayAI() {
   const [gemini, setGemini] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [marketClosed, setMarketClosed] = useState(false);
   const chartContainerRef = useRef(null);
   const chartRef = useRef(null);
   const seriesRef = useRef(null);
@@ -115,6 +116,7 @@ function IntradayAI() {
       setGuidance(payload.guidance || []);
       setStats(payload.stats || null);
       setGemini(payload.gemini || null);
+      setMarketClosed(Boolean(payload.market_closed));
       const mapped = (payload.annotations || []).map((item) => {
         const isBull = (item.signal || 0) >= 0;
         return {
@@ -170,6 +172,13 @@ function IntradayAI() {
           </button>
         </div>
       </header>
+
+      {marketClosed && (
+        <p className="text-xs text-amber-300/90 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
+          Marché fermé — les stats ci-dessous (Pattern Signal, RVOL, Volatilité, Probabilité IA) retombent à
+          leur valeur neutre faute de données intraday fraîches, pas un vrai signal calculé.
+        </p>
+      )}
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,2fr),minmax(0,1fr)]">
         <div className="min-w-0 bg-slate-950 border border-slate-900 rounded-3xl p-4 overflow-hidden">

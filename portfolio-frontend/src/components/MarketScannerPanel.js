@@ -4,12 +4,14 @@ import api from '../api/api';
 function MarketScannerPanel({ onSelect }) {
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [marketClosed, setMarketClosed] = useState(false);
 
   const fetchResults = async () => {
     setLoading(true);
     try {
       const response = await api.get('/market/scanner/');
       setResults(response.data?.results || []);
+      setMarketClosed(Boolean(response.data?.market_closed));
     } catch (err) {
       setResults([]);
     } finally {
@@ -33,6 +35,11 @@ function MarketScannerPanel({ onSelect }) {
           Rafraîchir
         </button>
       </div>
+      {marketClosed && (
+        <p className="text-xs text-amber-300/90 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
+          Marché fermé — RVOL/pattern non calculables, Score retombe à sa valeur neutre (0.5) pour tous les titres.
+        </p>
+      )}
       {loading && <p className="text-slate-500 text-sm">Chargement…</p>}
       {!loading && results.length === 0 && (
         <p className="text-slate-500 text-sm">Aucune cible détectée.</p>
