@@ -86,6 +86,7 @@ from .tasks import (
 	telegram_answer_callback,
 	_decision_log,
 	_market_closed_now,
+	_effective_sandbox_thresholds,
 )
 from .serializers import (
 	AccountSerializer,
@@ -6855,6 +6856,33 @@ class AIBacktesterView(APIView):
 				'equity_curve': result.raw_equity_curve,
 			},
 		})
+
+
+class RiskSnapshotView(APIView):
+    """
+    GET : lecture seule des vrais paramètres de risque actuellement actifs,
+    par sandbox -- remplace les curseurs factices de RiskControlCenter.js
+    (2026-08-16, Eric a explicitement choisi cette option plutôt que de
+    construire un vrai système d'écriture, pour zéro risque sur
+    l'exécution réelle). N'écrit jamais rien, ne modifie aucun
+    comportement -- juste un rapport fidèle de ce qui tourne déjà.
+    """
+
+    def get(self, request):
+        sandboxes = [
+            ('WATCHLIST', 'PAPER'),
+            ('AI_BLUECHIP', 'AI_BLUECHIP'),
+            ('AI_PENNY', 'AI_PENNY'),
+        ]
+        return Response({
+            'sandboxes': [
+                {'sandbox': sandbox, **_effective_sandbox_thresholds(sandbox, prefix)}
+                for sandbox, prefix in sandboxes
+            ],
+            'daily_drawdown_circuit_breaker_pct': float(os.getenv('DAILY_EQUITY_DRAWDOWN_PCT', '0.03')) * 100,
+            'dynamic_position_min': float(os.getenv('DYNAMIC_POSITION_MIN', '50')),
+            'dynamic_position_max': float(os.getenv('DYNAMIC_POSITION_MAX', '3000')),
+        })
 
 
 class TradingDiagnosticView(APIView):

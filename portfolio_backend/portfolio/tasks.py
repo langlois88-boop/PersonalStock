@@ -4056,6 +4056,35 @@ def _env_float(prefix: str, name: str, default: str) -> float:
     return float(os.getenv(f'{prefix}_{name}', os.getenv(f'PAPER_{name}', default)))
 
 
+def _effective_sandbox_thresholds(sandbox: str, prefix: str) -> dict[str, float]:
+    """
+    Read-only mirror of the buy_threshold/sell_threshold resolution logic in
+    _execute_paper_trades_for_sandbox (~line 5379-5464) -- deliberately a
+    SEPARATE function, not a refactor of that one, so this can be added for
+    the read-only Risk Control Center (2026-08-16, Eric explicitly chose
+    the zero-execution-risk option) without touching a single line of the
+    live trading path. Trade-off accepted: if the real thresholds are
+    recalibrated again, this needs updating too -- both are commented to
+    point at each other for that reason.
+    """
+    buy_threshold = _env_float(prefix, 'BUY_THRESHOLD', '0.75')
+    sell_threshold = _env_float(prefix, 'SELL_THRESHOLD', '0.4')
+    if sandbox == 'AI_BLUECHIP':
+        buy_threshold, sell_threshold = 0.80, 0.60
+    if sandbox == 'WATCHLIST':
+        buy_threshold, sell_threshold = 0.50, 0.30
+    if sandbox == 'AI_PENNY':
+        buy_threshold, sell_threshold = 0.20, 0.10
+    exploration = _exploration_phase_enabled()
+    if exploration:
+        buy_threshold = float(os.getenv('EXPLORATION_PHASE_BUY_THRESHOLD', '0.55'))
+    return {
+        'buy_threshold': buy_threshold,
+        'sell_threshold': sell_threshold,
+        'exploration_override_active': exploration,
+    }
+
+
 def _sandbox_env_float(sandbox: str, name: str, default: str) -> float:
     key = f'{sandbox}_{name}'
     return float(os.getenv(key, os.getenv(name, default)))
