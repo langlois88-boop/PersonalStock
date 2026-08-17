@@ -344,6 +344,43 @@ price` a déjà été appelée dans le worker avant que Beat ne dispatche
 la tâche — fragile indépendamment du flag. Laissé tel quel, décision
 explicite de ne toucher que le carve-out du ménage ce soir.
 
+### Suite (même soir, 2026-08-10 21h47 EDT) : `detect_model_drift` corrigé quelques heures plus tard — jamais reflété ici avant le 2026-08-17
+
+**Cette note a induit en erreur pendant une semaine** : relue le
+2026-08-17 (demande "petit et rapide" pour corriger l'indentation), la
+lecture du code en cours (`portfolio/tasks.py:6436` et suivantes) a
+montré que `detect_model_drift` est **déjà** une fonction `@shared_task`
+de niveau module, correctement indentée, avec un commentaire interne
+daté du 2026-08-10 expliquant le fix. `git log` confirme : commit
+`6375a25c` ("Fix detect_model_drift accidentally nested inside a dead
+function"), le même soir que ce paragraphe, à 21h47 EDT — donc
+**quelques heures après** que cette note ait été écrite (~18h20-18h27
+EDT). Le fix a bien dédenté `detect_model_drift` au niveau module et
+restauré `_alpaca_position_avg_price` à son corps d'origine, sans rien
+changer à la logique interne de `detect_model_drift`.
+
+Ce paragraphe n'a simplement jamais été mis à jour pour le refléter —
+la tâche est restée listée comme un problème ouvert dans ce document
+pendant une semaine alors qu'elle était déjà réglée en production.
+
+**Revérifié le 2026-08-17** avant de clore ce point :
+- `grep` sur `portfolio/tasks.py` confirme `detect_model_drift` définie
+  seule, au niveau module (ligne 6437), séparée de
+  `_alpaca_position_avg_price` (ligne 6426).
+- `settings.py` confirme `'model-drift-check-daily'` bien présent dans
+  `CELERY_BEAT_SCHEDULE` (ligne 413) — toujours dans le lot retiré par
+  `AFTER_HOURS_TASKS_ENABLED` (décision item 12, inchangée : ne pas
+  activer la gouvernance ML en bloc). La tâche ne tourne donc toujours
+  pas automatiquement aujourd'hui, mais **si elle tournait**, elle
+  s'enregistrerait et s'exécuterait correctement — ce n'est plus une
+  mine dormante.
+- `portfolio/tests_detect_model_drift.py` (créé par le fix du
+  2026-08-10) rejoué : 6/6 OK.
+
+**Aucun changement de code nécessaire aujourd'hui** — uniquement cette
+correction de documentation, pour que ce fichier reste une source
+fiable de "qu'est-ce qui reste à faire".
+
 **Fait** : `cleanup-taskrunlog-daily` et `cleanup-system-logs-weekly`
 sortis de la liste conditionnelle dans `settings.py` (commit
 `e8034210`), tournent maintenant indépendamment du flag. Le reste des
@@ -1299,3 +1336,260 @@ avant ce fix) — construire un harnais complet (compte Alpaca, positions,
 ordres, tiers) aurait été disproportionné pour cette correction ponctuelle.
 Vérifié manuellement en rejouant le calcul en direct sur la production à la
 place (voir item lié).
+
+---
+
+## 18. [CORRIGÉ le 2026-08-16] `LabPerformanceView` comptait et moyennait des lignes FUNDAMENTAL_LAB mortes/dupliquées
+
+**Statut : fermé, déployé et vérifié.**
+
+**Découvert** en révisant les stats affichées par le panneau "Analytics
+Lab" (patterns automatiques rendement réel vs facteur — secteur,
+confiance Claude, ROE, FCF Yield). `LabPerformanceView.get()` faisait
+`FundamentalLabPosition.objects.select_related("scan_result").all()` —
+incluait donc des positions fermées par un nettoyage de doublons (même
+ticker, même scan, entrées orphelines créées avant qu'une garde anti-
+doublon n'existe, cf. item 8) sans jamais avoir été de vraies positions
+vivantes. Ces lignes gonflaient artificiellement le nombre d'échantillons
+et diluaient les moyennes de rendement par facteur.
+
+**Fix** : `.exclude(is_open=False, exit_date__isnull=True)` — exclut
+précisément les positions fermées sans date de sortie (signature des
+lignes de nettoyage, distinctes d'une position normalement fermée qui a
+toujours un `exit_date`).
+
+**Fix lié, même vue** : `LabPositionSerializer.get_current_return_pct`
+retournait un rendement recalculé au prix live même pour les positions
+déjà **fermées** — incohérent avec le P&L réellement réalisé à la
+sortie. Corrigé pour retourner `round(obj.realized_return_pct, 2)`
+quand la position est fermée et qu'un rendement réalisé existe,
+et ne retomber sur le calcul au prix live que pour les positions encore
+ouvertes.
+
+**Tests** : `LabPerformanceViewTests` (3 tests, `analysis/tests.py`) —
+confirme que les lignes de nettoyage sont exclues des stats, que le
+rendement réalisé prime sur le calcul live pour une position fermée, et
+non-régression sur une position ouverte normale.
+
+---
+
+## 19. [FAIT le 2026-08-16] Code couleur gain/vert perte/rouge + badge marché fermé sur les panneaux de trading
+
+**Statut : fermé, déployé et vérifié.**
+
+**Demande utilisateur** (revue UI complète, transcription de l'app
+collée en direct) : rendre les gains/pertes visuellement immédiats
+("ajoute les couleurs si gain vert si perte rouge etc, rend ça clair et
+facile à comprendre rapidement"), et clarifier pourquoi l'Intraday
+affiche parfois un tableau figé (marché fermé, pas un bug de
+chargement).
+
+**Fix, plusieurs panneaux** (`LivePaperTrading.js`, `AnalyticsLabPage.js`,
+`IntradayAI.js`, `MarketScannerPanel.js`) : couleur conditionnelle
+(vert/rouge, plus neutre à zéro) sur le P&L des trades, le détail d'un
+trade, la liste Watchlist IA, et les stats Intraday — au lieu d'une
+couleur fixe indépendante du signe.
+
+**Bug trouvé en chemin dans `MarketScannerPanel.js`** : `+{item.
+change_pct}%` préfixait un "+" en dur et gardait `text-emerald-300`
+(vert) même quand `change_pct` était négatif — un titre en baisse de
+-4.39 % s'affichait "+-4.39%" en vert. Corrigé avec un signe et une
+couleur conditionnels au signe réel de la valeur.
+
+**Fix backend associé** : ajout d'un flag `market_closed` (calculé via
+`_market_closed_now()`, déjà utilisé ailleurs dans `tasks.py`) à
+`MarketScannerView` et `AlpacaIntradayView`. Le frontend affiche
+maintenant un badge explicite "marché fermé" plutôt que de laisser
+deviner si un tableau figé est un bug de chargement ou l'état normal
+hors-séance.
+
+**Effet de bord découvert et corrigé au passage** : 3 tests
+(`ConfidenceFloorSimPathTests`, `WatchlistBaseModelSignalRegressionTests`,
+`ConfidenceFloorCappedAtBuyThresholdTests`) sont devenus intermittents
+en travaillant dans cette zone du code — `_time_of_day_penalty()`
+n'était pas mocké et lisait l'heure réelle, appliquant une vraie
+pénalité de -10 % "heure du lunch" (11h30-13h30 ET) selon l'heure à
+laquelle la suite tournait. Corrigé en ajoutant
+`'_time_of_day_penalty': lambda *a, **k: 1.0` aux dictionnaires de mock
+des classes concernées.
+
+---
+
+## 20. [FAIT le 2026-08-16] Risk Control Center — remplacement des curseurs `localStorage` factices par un snapshot réel en lecture seule
+
+**Statut : fermé, déployé et vérifié.**
+
+**Découvert** en répondant à la question directe de l'utilisateur : "le
+risk control fonctionne-t-il, si je le change ça va tout changer ?". Le
+composant `RiskControlCenter.js` affichait des curseurs (seuils
+d'achat/vente, drawdown max, taille de position) entièrement
+déconnectés du backend — ils lisaient et écrivaient uniquement dans
+`localStorage` du navigateur. Les déplacer n'avait strictement aucun
+effet sur le trading réel ; l'app donnait l'illusion d'un panneau de
+contrôle fonctionnel.
+
+**Fix** : nouvelle vue `RiskSnapshotView` (`portfolio/views.py`,
+exposée sur `/api/risk-snapshot/`) et fonction miroir dédiée
+`_effective_sandbox_thresholds(sandbox, prefix)` dans `tasks.py` —
+recalcule les mêmes seuils que le chemin de trading réel (buy/sell
+threshold, effet de la phase d'exploration, drawdown du circuit
+breaker, position min/max) mais **en lecture seule**, sans jamais
+toucher au chemin de trading live. `RiskControlCenter.js` réécrit pour
+afficher ce snapshot réel au lieu de curseurs éditables.
+
+**Décision explicite** : rendre le panneau **read-only** plutôt que de
+lui donner un vrai pouvoir d'écriture — modifier les seuils de trading
+depuis l'UI aurait été un changement de portée bien plus large (config
+en base vs variables d'environnement, validation, audit trail) hors
+cadre d'une session "vérifie et corrige les anomalies".
+
+**Tests** : `tests_risk_snapshot.py` (nouveau fichier,
+`RiskSnapshotViewTests`, 3 tests) — seuils en mode normal, override en
+phase d'exploration, présence des paramètres globaux
+(`daily_drawdown_circuit_breaker_pct`, position min/max).
+
+---
+
+## 21. [FAIT le 2026-08-16] Suite de l'item 11 — univers combiné S&P500+TSX activé sur le scan quotidien, preset Value + Catalyst ajouté
+
+**Statut : fermé, déployé et vérifié.**
+
+**Contexte** : l'item 11 avait construit `universe_source="combined"`
+mais l'avait laissé **désactivé** — décision explicite à l'époque, en
+attendant de voir le screener tourner un moment sur l'univers restreint
+aux sandboxes. Reposé directement par l'utilisateur ("regarde
+undervalue without reason, dis-moi si on devrait modifier quelque
+chose").
+
+**Fix** : `_run_scan_for_preset(preset)` (`analysis/tasks.py`) passe
+maintenant `universe_source="combined"` au lieu de `"sandboxes"` —
+le scan quotidien du preset `undervalued-without-reason` couvre
+désormais tout l'univers S&P500+TSX au lieu des seuls tickers déjà
+présents dans les sandboxes de trading actif.
+
+**Nouveau preset `value-catalyst`** (`ScreenerPreset` id=2,
+`thresholds={'require_catalyst': True}`) : ajoute une exigence de
+catalyseur (achat d'initié détecté, ou inflexion de marge déjà
+existante) en plus du filtre value de base, pour surfacer des tickers
+sous-évalués avec un signal d'intérêt futur plus concret qu'une simple
+décote statique.
+
+**Choix d'implémentation (discuté avec l'utilisateur)** : le preset
+`value-catalyst` **réutilise le même passage du quant filter**
+qu'`undervalued-without-reason` plutôt que de déclencher une requête
+Claude séparée — `evaluate_ticker(ticker, preset_thresholds)` calcule
+`insiders_buying` via un nouvel appel `_fetch_insider_buying(ticker)`
+(FMP, même clé de cache `insider_summary:{ticker}` que
+`portfolio/views.py::_insider_summary`, donc pas de coût API
+supplémentaire si déjà interrogé) uniquement quand
+`thresholds.get("require_catalyst")` est vrai, et n'ajoute la
+vérification Claude qu'après ce filtre local — pas de requête Claude
+dupliquée pour la même analyse de base.
+
+**Bug corrigé au passage** : `_fetch_margin_trend(ticker)` comparait
+`rev` et `gp` avec `if rev and gp and rev != 0:` — `bool(float('nan'))`
+vaut `True` en Python, donc un Gross Profit `NaN` n'était pas filtré et
+se propageait jusqu'à un score `NaN`, faisant planter l'écriture en
+base (voir item 22, trouvé le lendemain en observant ce fix tourner en
+conditions réelles). Corrigé en réutilisant `_safe()`, déjà défini dans
+le même module.
+
+**Tests** : `RunScanUsesCombinedUniverseTests` (1 test,
+`analysis/tests.py`), `QuantFilterValueCatalystTests` (4 tests —
+insider buying détecté/absent, bonus de score, gate `require_catalyst`
+absent par défaut), `QuantFilterMarginTrendTests` étendu avec
+`test_margin_trend_skips_nan_gross_profit_instead_of_producing_nan`.
+
+---
+
+## 22. [CORRIGÉ le 2026-08-17] `NaN` Gross Profit faisait planter les scans réels (`OGC.TO`)
+
+**Statut : fermé, déployé et vérifié en production.**
+
+**Découvert** le lendemain de l'activation de l'univers combiné (item
+21), en observant le premier scan réel tourner sur le nouvel univers
+élargi : `django.db.utils.DataError: invalid input syntax for type
+json` dans les logs (`docker logs
+personalstock-celery_worker_analysis-1`). Tracé par `grep -B60` jusqu'à
+`OGC.TO` (OceanaGold, déjà repéré comme cas limite dans le tableau de
+l'item 11) — son Gross Profit le plus récent est `NaN` chez le
+fournisseur de données.
+
+**Cause** : bug déjà identifié et corrigé une fois dans ce même module
+pour `require_catalyst` (item 21) mais qui existait **aussi** dans
+`_fetch_margin_trend` avant ce correctif — `rev = revenue.get(col); gp
+= gross_profit.get(col)` suivi de `if rev and gp and rev != 0:` ne
+filtre pas `NaN` (`bool(float('nan'))` est `True` en Python). Le score
+`NaN` qui en résultait remontait jusqu'à l'écriture du résultat de scan
+en base, où le champ JSON refusait la valeur — le scan entier plantait
+sur ce ticker au lieu de simplement l'ignorer.
+
+**Fix** : `rev = _safe(revenue.get(col)); gp = _safe(gross_profit.get(col))`
+— réutilise le helper `_safe()` déjà présent dans le module (test
+d'auto-inégalité `value != value`, la manière standard de détecter
+`NaN` sans dépendre de `math.isnan` sur une valeur potentiellement
+`None`).
+
+**Tests** : `test_margin_trend_skips_nan_gross_profit_instead_of_producing_nan`
+(`QuantFilterMarginTrendTests`, `analysis/tests.py`) — confirme qu'un
+Gross Profit `NaN` sur une période ne fait plus planter le calcul et
+que la période est simplement ignorée plutôt que de produire un score
+invalide.
+
+---
+
+## 23. [CORRIGÉ le 2026-08-17] WATCHLIST écrasée par le scanner momentum after-hours après la fermeture du marché
+
+**Statut : fermé, déployé et vérifié (test de régression écrit avant le fix, échoue sur l'ancien code).**
+
+**Découvert** en auditant systématiquement les tâches Beat utilisant le
+pattern `hour='9-16'` (déjà connu pour ne pas s'arrêter exactement à la
+fermeture de 16h00 — `9-16` couvre toute l'heure 16, donc jusqu'à
+16h59 ET, pas juste jusqu'à la clôture). `market_scanner_task` bascule
+vers `_afterhours_market_scan` via `_market_closed_now()` une fois le
+marché fermé, et **cette branche tournait donc encore activement**
+après la clôture, plusieurs fois de suite. Sur les 3 usages totaux de
+`_market_closed_now()` dans tout `portfolio/tasks.py`, celui-ci était
+le seul avec un effet de bord destructeur ; les 2 autres ont été
+confirmés sûrs (un est déjà corrigé, l'autre est un planning fixe à 2h
+du matin sans chevauchement possible).
+
+**Cause** : `_afterhours_market_scan(symbols=None)` faisait un
+`SandboxWatchlist.objects.update_or_create(sandbox='WATCHLIST', ...)`
+**inconditionnel** quand `AI_SCANNER_UPDATE_WATCHLIST_MAIN=true` —
+remplaçait entièrement la liste de tickers évaluée le matin même par
+Option A (`base_model_signal`, voir item 13) par le résultat du scan
+after-hours, parfois un seul symbole si le scan momentum ne trouvait
+presque rien après la clôture.
+
+**Premier essai, abandonné après un test qui l'a pris en défaut** :
+réutiliser `_merge_bluechip_watchlist` en généralisant son paramètre
+`sandbox` (déjà construit pour AI_BLUECHIP, item lié). Mauvais choix
+d'architecture — cette fonction ne préserve que les symboles portant un
+`protect_until` explicite dans `symbol_sources` ; les tickers de base
+de WATCHLIST n'avaient jamais été écrits avec une telle protection
+(mécanisme propre au dip-scanner AI_BLUECHIP), donc ils se faisaient
+évincer exactement comme n'importe quel candidat non protégé — même bug
+sous une autre forme, capturé par le test de régression écrit avant le
+fix plutôt que découvert en production. Généralisation entièrement
+annulée (retour à `sandbox='AI_BLUECHIP'` en dur, avec une note dans la
+docstring expliquant pourquoi ce mécanisme ne convient pas à
+WATCHLIST).
+
+**Fix retenu** : fusion additive dédiée, écrite directement dans
+`_afterhours_market_scan` — conserve toujours la liste WATCHLIST
+existante, ne comble que la place restante (jusqu'à `main_limit`) avec
+les nouveaux tickers repérés after-hours qui n'y sont pas déjà. N'écrit
+en base que si la liste fusionnée diffère réellement de l'existante.
+
+**Tests** : `AfterhoursScanMergesIntoWatchlistTests`
+(`tests_bluechip_watchlist_merge.py`) —
+`test_thin_afterhours_result_does_not_wipe_existing_watchlist` : seed 10
+tickers `ML{i}` (simulant l'évaluation Option A du matin), mock d'un
+DataFrame de breakout synthétique pour un nouveau symbole, confirme que
+les 10 tickers existants **et** le nouveau survivent. Suite complète
+(`portfolio` + `analysis`) : 138/138 OK avant déploiement.
+
+**Déployé** : `backend`, `celery_worker`, `celery_worker_analysis`,
+`celery_beat`, `frontend` recréés ensemble (frontend inclus par
+discipline suite à la leçon de l'item 15).
