@@ -88,8 +88,20 @@ def _fetch_margin_trend(ticker: str) -> list:
             revenue = financials_q.loc["Total Revenue"]
             gross_profit = financials_q.loc["Gross Profit"]
             for col in financials_q.columns[:4]:
-                rev = revenue.get(col)
-                gp = gross_profit.get(col)
+                # `if rev and gp` seul ne filtre PAS un NaN -- `bool(float('nan'))`
+                # vaut True en Python (seul 0.0 est falsy), donc un Gross Profit
+                # manquant (NaN, courant sur les tickers du balayage large
+                # S&P500+TSX -- petites capitalisations, dépôts trimestriels
+                # incomplets -- confirmé en direct le 2026-08-17 sur OGC.TO,
+                # qui a fait planter 2 scans réels le jour même de l'activation
+                # de universe_source='combined') passait ce garde-fou tel quel,
+                # produisait un NaN dans margin_trend, puis faisait planter
+                # ScanResult.objects.create() (Postgres jsonb refuse le token
+                # NaN, invalide en JSON strict, contrairement à json.dumps
+                # Python qui l'accepte silencieusement). _safe() applique déjà
+                # le test d'auto-inégalité NaN utilisé ailleurs dans ce module.
+                rev = _safe(revenue.get(col))
+                gp = _safe(gross_profit.get(col))
                 if rev and gp and rev != 0:
                     # pandas .loc[...] renvoie des scalaires numpy (float64) —
                     # cast en float natif tout de suite, sinon les comparaisons

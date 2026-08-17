@@ -823,6 +823,34 @@ class QuantFilterMarginTrendTests(APITestCase):
         for value in trend:
             self.assertIs(type(value), float)  # pas numpy.float64
 
+    def test_margin_trend_skips_nan_gross_profit_instead_of_producing_nan(self):
+        """
+        Confirmé en direct le 2026-08-17 : OGC.TO (nouveau ticker via
+        universe_source='combined') a un Gross Profit NaN sur un trimestre --
+        `if rev and gp` seul ne le filtre pas (bool(float('nan')) est True en
+        Python), donc un NaN atterrissait dans margin_trend puis faisait
+        planter ScanResult.objects.create() (Postgres jsonb rejette le token
+        NaN, invalide en JSON strict). A fait échouer 2 scans réels le jour
+        même de l'activation de l'univers combiné.
+        """
+        financials_with_nan_quarter = pd.DataFrame(
+            {
+                "Q1": [1000.0, 420.0],
+                "Q2": [1000.0, float("nan")],  # trimestre avec Gross Profit manquant
+                "Q3": [1000.0, 300.0],
+                "Q4": [1000.0, 400.0],
+            },
+            index=["Total Revenue", "Gross Profit"],
+        )
+        with patch.object(quant_filter.yf, "Ticker") as MockYfTicker:
+            MockYfTicker.return_value.quarterly_financials = financials_with_nan_quarter
+            trend = quant_filter._fetch_margin_trend("OGC.TO")
+
+        self.assertEqual(len(trend), 3)  # le trimestre NaN est sauté, pas les 4
+        for value in trend:
+            self.assertFalse(value != value, f"NaN trouvé dans margin_trend: {trend}")
+        json.dumps(trend)  # doit rester sérialisable en JSON strict (Postgres jsonb)
+
     def test_evaluate_ticker_details_are_json_serializable(self):
         with patch.object(quant_filter, "market_data") as mock_market_data, \
                 patch.object(quant_filter.yf, "Ticker") as mock_yf_ticker:
