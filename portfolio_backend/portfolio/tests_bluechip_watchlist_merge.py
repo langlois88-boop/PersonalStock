@@ -3,9 +3,11 @@ hourly refresh no longer overwrite each other unconditionally)."""
 
 from __future__ import annotations
 
+import os
 from datetime import timedelta
 from unittest.mock import patch
 
+import pandas as pd
 from django.test import TestCase
 from django.utils import timezone
 
@@ -103,3 +105,58 @@ class MergeBluechipWatchlistTests(TestCase):
         self.assertIn('DIPWIN', watchlist.symbols)
         self.assertEqual(refresh_result['watchlist_merge']['kept'], 1)
         self.assertEqual(refresh_result['watchlist_merge']['added'], 0)
+
+
+class AfterhoursScanMergesIntoWatchlistTests(TestCase):
+    """
+    Confirmed live 2026-08-17: market-scanner-5min stays scheduled through
+    all of hour 16 ET (hour='9-16' covers 16:00-16:59, not just up to the
+    16:00 close), so market_scanner_task's _market_closed_now() branch into
+    _afterhours_market_scan fires repeatedly after the close. That function
+    used to do an unconditional SandboxWatchlist.objects.update_or_create
+    on sandbox='WATCHLIST' -- a thin afterhours result (sometimes a single
+    symbol) wiped out the entire ML-evaluated (Option A, base_model_signal)
+    ticker list WATCHLIST otherwise runs on. First attempt reused
+    _merge_bluechip_watchlist -- wrong fit (that function only keeps
+    symbols carrying an explicit `protect_until`, so WATCHLIST's
+    never-protected base was still getting evicted, just via a different
+    path -- caught by this very test). Now uses a dedicated, simpler
+    additive merge inline in _afterhours_market_scan: always keep the
+    existing list, only fill remaining room (up to main_limit) with new
+    afterhours picks not already present.
+    """
+
+    def _daily_history_with_breakout(self) -> pd.DataFrame:
+        # 20 daily closes, flat, then a jump + volume spike on the last bar
+        # -- clears SCANNER_MIN_PRICE/MAX_PRICE/MIN_CHANGE_PCT/MIN_VOLUME/
+        # AFTERHOURS_DAILY_RVOL_MIN/SCANNER_MIN_CONFIDENCE at their defaults.
+        closes = [5.0] * 19 + [6.0]  # +20% on the last bar
+        volumes = [200000] * 19 + [900000]  # well above min_volume, big rvol
+        idx = pd.date_range('2026-07-20', periods=20, freq='D')
+        return pd.DataFrame({'Close': closes, 'Volume': volumes}, index=idx)
+
+    def test_thin_afterhours_result_does_not_wipe_existing_watchlist(self):
+        SandboxWatchlist.objects.update_or_create(
+            sandbox='WATCHLIST',
+            defaults={'symbols': [f'ML{i}' for i in range(10)]},  # this morning's Option A evaluation
+        )
+
+        with patch.object(tasks.yf, 'Ticker') as mock_ticker, \
+                patch.dict(os.environ, {
+                    # AI_SCANNER_UPDATE_WATCHLIST_MAIN's whole block (including
+                    # the WATCHLIST merge) is nested inside `if update_watchlist
+                    # and results:` -- AI_SCANNER_UPDATE_WATCHLIST must stay
+                    # true (its own default) for the WATCHLIST branch to be
+                    # reached at all. This test doesn't assert anything about
+                    # AI_PENNY's own write in that same block.
+                    'AI_SCANNER_UPDATE_WATCHLIST': 'true',
+                    'AI_SCANNER_UPDATE_WATCHLIST_MAIN': 'true',
+                    'AI_SCANNER_MAIN_LIMIT': '15',
+                }):
+            mock_ticker.return_value.history.return_value = self._daily_history_with_breakout()
+            tasks._afterhours_market_scan(symbols=['NEWPICK'])
+
+        watchlist = SandboxWatchlist.objects.get(sandbox='WATCHLIST')
+        for i in range(10):
+            self.assertIn(f'ML{i}', watchlist.symbols, f"ML{i} was wiped out by the afterhours merge")
+        self.assertIn('NEWPICK', watchlist.symbols)

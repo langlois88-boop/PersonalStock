@@ -1184,14 +1184,39 @@ def _afterhours_market_scan(symbols: list[str] | None = None) -> dict[str, Any]:
         )
         if os.getenv('AI_SCANNER_UPDATE_WATCHLIST_MAIN', 'false').lower() in {'1', 'true', 'yes', 'y'}:
             main_limit = int(os.getenv('AI_SCANNER_MAIN_LIMIT', '15'))
-
-
-            SandboxWatchlist.objects.update_or_create(
-                sandbox='WATCHLIST',
-
-
-                defaults={'symbols': [entry['symbol'] for entry in results[:max(1, main_limit)]]},
-            )
+            # Was an unconditional update_or_create -- confirmed live
+            # 2026-08-17: market-scanner-5min stays scheduled through all
+            # of hour 16 ET (hour='9-16' covers 16:00-16:59, not just up to
+            # the 16:00 close), so every post-close firing replaced
+            # WATCHLIST's entire ML-evaluated ticker list with whatever
+            # (sometimes just 1 symbol) this afterhours momentum scan found
+            # at that moment -- unrelated to the Option A base_model_signal
+            # evaluation WATCHLIST otherwise runs.
+            #
+            # First attempt reused _merge_bluechip_watchlist (the existing
+            # AI_BLUECHIP anti-overwrite mechanism) -- wrong fit, caught by
+            # its own regression test: that function only keeps existing
+            # symbols carrying an explicit, still-valid `protect_until`
+            # (bluechip_dip_scanner's picks are written *with* protection
+            # specifically so they survive refresh_ai_bluechip_watchlist's
+            # unprotected writes); WATCHLIST's base list has never been
+            # written with any such protection, so it was still being
+            # evicted wholesale, just via a different code path. What this
+            # call site actually needs is simpler: always keep the existing
+            # list, only fill remaining room (up to main_limit) with new
+            # afterhours picks not already present -- never let a thin
+            # afterhours result displace the existing base.
+            existing_watch = SandboxWatchlist.objects.filter(sandbox='WATCHLIST').first()
+            existing_symbols = list(existing_watch.symbols) if existing_watch and existing_watch.symbols else []
+            afterhours_symbols = [entry['symbol'] for entry in results[:max(1, main_limit)]]
+            new_unique = [s for s in afterhours_symbols if s not in existing_symbols]
+            room = max(0, main_limit - len(existing_symbols))
+            merged_watch = existing_symbols + new_unique[:room]
+            if merged_watch != existing_symbols:
+                SandboxWatchlist.objects.update_or_create(
+                    sandbox='WATCHLIST',
+                    defaults={'symbols': merged_watch, 'source': 'afterhours_scan+existing'},
+                )
 
 
 
@@ -7499,6 +7524,16 @@ def _merge_bluechip_watchlist(
     survives refresh_ai_bluechip_watchlist's hourly, looser-filtered writes
     for `protect_hours`. Pass `protect_hours=None` (refresh's case) to grant
     the symbols being written here no such protection of their own.
+
+    NOTE (2026-08-17) : ne convient PAS tel quel à un "toujours garder
+    l'existant, juste ajouter" -- seuls les symboles explicitement protégés
+    (protect_until futur) survivent à un merge ; un symbole présent mais
+    jamais écrit avec protection se fait évincer comme n'importe quel
+    candidat perdant. Confirmé par un test qui a échoué en tentant de
+    réutiliser cette fonction pour WATCHLIST (voir _afterhours_market_scan,
+    qui utilise désormais une fusion additive dédiée, plus simple, pour ce
+    besoin précis) -- laissé tel quel ici, toujours correct pour son usage
+    d'origine (coordination dip-scanner/refresh sur AI_BLUECHIP).
 
     Returns counts for logging: kept (still-protected survivors), added
     (new symbols that made it in), removed (previously-listed symbols that
