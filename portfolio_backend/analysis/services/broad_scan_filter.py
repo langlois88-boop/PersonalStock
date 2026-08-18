@@ -36,7 +36,14 @@ logger = logging.getLogger(__name__)
 STRICT_ROE_MIN = 15.0
 STRICT_ROIC_MIN = 12.0
 STRICT_PEG_MAX = 1.2
-STRICT_FCF_YIELD_MIN = 6.0
+STRICT_FCF_YIELD_MIN = 5.0  # 6.0 -> 5.0 le 2026-08-18, voir docs/TECH_DEBT_NOTES.md :
+# testé en direct sur un échantillon spread de 35/720 tickers de l'univers réel
+# avant ce changement -- 1 seul repêché (INTU, FCF Yield 5.46%, seule raison
+# d'échec à 6%), les autres tickers proches de la frontière (AMP, GEV, HSY,
+# RL...) échouaient déjà pour d'autres critères et ne sont pas affectés.
+# Extrapolation prudente sur l'univers complet : quelques candidats de plus
+# par semaine, pas une explosion -- le filtre reste à 7 autres critères
+# stricts simultanés (ROE, ROIC, PEG, Piotroski, Altman Z, dette, marge).
 STRICT_PIOTROSKI_MIN = 7
 STRICT_ALTMAN_Z_MIN = 3.0
 DEFAULT_TAX_RATE = 0.25  # utilisé seulement si 'Tax Rate For Calcs' absent
