@@ -18,14 +18,14 @@ const ANOMALY_GUARDRAIL_MESSAGE = (
   + "complète\" sur la fiche ticker si tu veux quand même l'examiner."
 );
 
-// 'value-catalyst' retiré le 2026-08-10 : offert dans le menu mais jamais
-// créé côté backend (aucun ScreenerPreset avec ce slug en base -- 404
-// systématique confirmé). 'value-catalyst' n'existait que comme fixture de
-// test (analysis/tests.py), pas comme vrai preset seedé en production. À
-// réintroduire ici une fois qu'un vrai ScreenerPreset "Value + Catalyst"
-// existe côté backend, pas avant.
+// 'value-catalyst' retiré le 2026-08-10 (offert dans le menu mais jamais créé
+// côté backend, 404 systématique) -- réintroduit le 2026-08-17 maintenant que
+// le vrai ScreenerPreset existe en base (id=2, thresholds={'require_catalyst':
+// True}, construit et activé le 2026-08-16, voir docs/TECH_DEBT_NOTES.md
+// item 21).
 const PRESETS = [
   { slug: 'undervalued-without-reason', label: 'Undervalued Without Reason' },
+  { slug: 'value-catalyst', label: 'Value + Catalyst' },
 ];
 
 const formatNumber = (value, digits = 2) => {
