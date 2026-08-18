@@ -1593,3 +1593,57 @@ les 10 tickers existants **et** le nouveau survivent. Suite complète
 **Déployé** : `backend`, `celery_worker`, `celery_worker_analysis`,
 `celery_beat`, `frontend` recréés ensemble (frontend inclus par
 discipline suite à la leçon de l'item 15).
+
+---
+
+## 24. [CORRIGÉ le 2026-08-18, leçon opérationnelle] `docker compose build backend frontend` ne reconstruit PAS les images de `celery_worker`/`celery_worker_analysis`/`celery_beat`, même déploiement identique au Dockerfile
+
+**Statut : fermé, découvert et corrigé le jour même.**
+
+**Découvert** en vérifiant que le nouveau planning Beat hebdomadaire
+(`weekly-crypto-swing-retrain`) était bien enregistré après déploiement --
+`docker exec celery_beat grep ... settings.py` ne trouvait rien, alors que
+le commit était pourtant bien présent dans `git log` sur le NAS.
+
+**Cause** : `celery_worker`, `celery_worker_analysis` et `celery_beat`
+partagent exactement le même `build: {context: ./portfolio_backend,
+dockerfile: Dockerfile}` que `backend` dans `docker-compose.yml` -- mais
+Docker Compose construit et tague **une image distincte par service**
+(`personalstock-celery_beat`, `personalstock-celery_worker`, etc.), même
+quand le contexte de build est identique. `docker compose build backend
+frontend` (la commande utilisée pour **tous** les déploiements de cette
+session, y compris plus tôt aujourd'hui -- seuil FCF item 22bis/pipeline
+crypto swing) ne reconstruit que l'image `backend`. Le `--force-recreate`
+qui suit recrée bien les *conteneurs* `celery_worker`/`celery_worker_
+analysis`/`celery_beat`, mais à partir de leur *ancienne image*, restée
+identique à leur dernière reconstruction explicite -- ici, la veille
+(2026-08-17 17h46 EDT, déploiement du fix WATCHLIST after-hours).
+
+**Conséquence réelle** : tout le code backend déployé pendant cette
+session AVANT cette découverte (seuil FCF `STRICT_FCF_YIELD_MIN` 6%→5%,
+tout le pipeline crypto swing y compris `retrain_crypto_swing_model_
+weekly`) était bien présent dans `backend` (API, vues, shells manuels --
+d'où le fait que les tests live faits directement via `docker exec
+backend python manage.py shell` étaient fiables), mais **absent des
+workers/Beat qui exécutent réellement les tâches planifiées** jusqu'à ce
+correctif. Aucun impact utilisateur constaté (rien de tout ça n'était
+encore sur le chemin critique du trading actif), mais aurait pu passer
+inaperçu bien plus longtemps sur un fix touchant une tâche déjà active.
+
+**Fix** : `docker compose build celery_worker celery_worker_analysis
+celery_beat` (en plus de `backend`/`frontend`) avant tout `--force-
+recreate` qui les inclut. Vérifié après coup : les 4 conteneurs
+(`backend`, `celery_beat`, `celery_worker`, `celery_worker_analysis`)
+partagent maintenant le même digest d'image, planning Beat confirmé
+présent dans le conteneur `celery_beat` lui-même.
+
+**Leçon retenue pour tous les déploiements futurs** : la commande de
+déploiement standard doit être `docker compose build backend
+celery_worker celery_worker_analysis celery_beat frontend` (les 5
+services, pas seulement `backend frontend`) dès qu'un changement touche
+`portfolio_backend/` -- pas seulement pour les changements de tâches
+Celery/planning, puisque n'importe quel changement de code Python
+(vues, services, modèles) est de toute façon dans la même image
+partagée. Complète directement la leçon de l'item 15 (nginx/IP backend)
+-- les deux sont désormais à vérifier systématiquement à chaque
+déploiement.
