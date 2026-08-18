@@ -601,6 +601,18 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'analysis.tasks.run_broad_index_scan',
         'schedule': crontab(hour=20, minute=0, day_of_week='sun'),
     },
+    # Réentraînement hebdomadaire du pipeline SWING crypto (2026-08-18) --
+    # 21h30 ET, après weekly-broad-index-scan (20h00) pour éviter la
+    # contention de ressources pendant son propre run (potentiellement
+    # long). AI_CRYPTO reste désactivé (pas de watchlist configurée) --
+    # cette tâche ne fait que réentraîner/réévaluer le modèle en arrière-
+    # plan, elle ne trade rien. Rejet silencieux (log SUCCESS, pas
+    # d'alerte) si le modèle ne franchit pas les portes de qualité --
+    # comportement voulu, voir retrain_crypto_swing_model_weekly.
+    'weekly-crypto-swing-retrain': {
+        'task': 'portfolio.tasks.retrain_crypto_swing_model_weekly',
+        'schedule': crontab(hour=21, minute=30, day_of_week='sun'),
+    },
     # Stop-loss minimal pour les positions FUNDAMENTAL_LAB à ordre Alpaca
     # réel (broker='ALPACA_LAB', voir docs/TECH_DEBT_NOTES.md item 11,
     # Partie B 2026-08-11) -- aucun mécanisme de sortie n'existait avant ça.

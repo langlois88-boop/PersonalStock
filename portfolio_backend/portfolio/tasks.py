@@ -4077,6 +4077,77 @@ def nightly_closed_market_retrain() -> dict[str, Any]:
     return report_payload
 
 
+@shared_task
+def retrain_crypto_swing_model_weekly() -> dict[str, Any]:
+    """Réentraînement périodique du pipeline SWING crypto (2026-08-18, voir
+    portfolio/ml_engine/crypto_training.py::train_crypto_swing_model).
+
+    Univers volontairement restreint à BTC-USD/ETH-USD par défaut --
+    testé en direct le 2026-08-18 : élargir à SOL/BNB/XRP n'améliorait pas
+    le walk-forward F1 (pire, légèrement, sur le CV), conforme à la
+    décision de se concentrer sur les deux cryptos "sérieuses" plutôt que
+    sur des altcoins plus bruyants. horizon_days=14/target_pct=0.05 = la
+    meilleure combinaison trouvée dans ce balayage (walk-forward F1 0.301,
+    toujours sous le seuil de déploiement 0.50 à cette date) -- changeable
+    sans redéploiement via CRYPTO_SWING_LABEL_HORIZON_DAYS/CRYPTO_SWING_
+    TARGET_PCT.
+
+    Comme save_crypto_swing_model rejette tout modèle sous les portes de
+    qualité (cv_mean>=0.55, walk-forward F1>=0.50) sans jamais écraser un
+    modèle existant plus faible, un rejet hebdomadaire n'est PAS une
+    erreur de tâche -- c'est le comportement voulu tant que la barre n'est
+    pas atteinte. Alerte Telegram seulement si un modèle est réellement
+    sauvegardé (franchissement de la barre, événement rare et notable),
+    silence sinon (juste un log SUCCESS avec le résultat du rejet) pour ne
+    pas spammer une notification hebdomadaire sans nouvelle réelle.
+    """
+    from portfolio.ml_engine.crypto_training import (
+        CRYPTO_SWING_DEFAULT_SYMBOLS,
+        save_crypto_swing_model,
+        train_crypto_swing_model,
+    )
+
+    log = _task_log_start('retrain_crypto_swing_model_weekly')
+    symbols_env = os.getenv('CRYPTO_SWING_SYMBOLS', '')
+    symbols = [s.strip().upper() for s in symbols_env.split(',') if s.strip()] or list(CRYPTO_SWING_DEFAULT_SYMBOLS)
+
+    try:
+        payload = train_crypto_swing_model(symbols)
+    except Exception as exc:
+        _task_log_finish(log, 'ERROR', {'symbols': symbols}, error=str(exc))
+        return {'status': 'error', 'error': str(exc), 'symbols': symbols}
+
+    wf = payload.get('walk_forward') or []
+    wf_f1 = float(sum(r.get('f1', 0.0) for r in wf) / len(wf)) if wf else 0.0
+    result = {
+        'symbols': symbols,
+        'n_samples': payload.get('n_samples'),
+        'cv_mean': payload.get('cv_mean'),
+        'walk_forward_f1': round(wf_f1, 3),
+    }
+
+    try:
+        model_path = save_crypto_swing_model(payload)
+        result.update({'status': 'deployed', 'model_path': model_path})
+        _send_telegram_alert(
+            "\n".join([
+                "🚀 Nouveau modèle SWING crypto déployé",
+                f"Symboles: {', '.join(symbols)}",
+                f"CV mean: {payload.get('cv_mean'):.3f}",
+                f"Walk-forward F1: {wf_f1:.3f}",
+                f"Échantillons: {payload.get('n_samples')}",
+            ]),
+            allow_during_blackout=True,
+            category='mlops',
+        )
+    except ValueError as exc:
+        # Rejet attendu (portes de qualité) -- pas une erreur, voir docstring.
+        result.update({'status': 'rejected', 'reason': str(exc)})
+
+    _task_log_finish(log, 'SUCCESS', result)
+    return result
+
+
 def _env_float(prefix: str, name: str, default: str) -> float:
     return float(os.getenv(f'{prefix}_{name}', os.getenv(f'PAPER_{name}', default)))
 

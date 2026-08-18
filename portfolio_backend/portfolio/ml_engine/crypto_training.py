@@ -41,6 +41,13 @@ DEFAULT_SYMBOLS = [
 
 CRYPTO_MODEL_PATH = Path(__file__).resolve().parent / 'crypto_brain_v1.pkl'
 
+# Univers par défaut du pipeline SWING -- volontairement restreint à BTC/ETH
+# (2026-08-18, décision explicite), contrairement à DEFAULT_SYMBOLS ci-dessus
+# (pipeline intraday, inchangé). Élargir à SOL/BNB/XRP n'a pas amélioré le
+# walk-forward F1 lors du balayage du 2026-08-18 -- légèrement pire même sur
+# le CV -- donc pas de raison d'ajouter le bruit de ces altcoins ici.
+CRYPTO_SWING_DEFAULT_SYMBOLS = ['BTC-USD', 'ETH-USD']
+
 
 def _auto_push_enabled() -> bool:
     return (
@@ -213,12 +220,20 @@ def train_crypto_swing_model(
     même structure de validation que train_crypto_model (CV purgée +
     walk-forward + portes de qualité avant sauvegarde), features et horizon
     différents. Chemin totalement séparé -- ne touche jamais crypto_brain_
-    v1.pkl (intraday) ni son propre paper trading."""
+    v1.pkl (intraday) ni son propre paper trading.
+
+    Défauts horizon_days=14/target_pct=0.05 : meilleure combinaison trouvée
+    dans un balayage en direct le 2026-08-18 sur BTC-USD/ETH-USD seuls (7
+    combinaisons testées, walk-forward F1 de 0.170 à 0.301 -- celle-ci la
+    moins mauvaise, mais AUCUNE n'a encore franchi le seuil de déploiement
+    0.50 à cette date, voir save_crypto_swing_model). Reste changeable sans
+    toucher au code via CRYPTO_SWING_LABEL_HORIZON_DAYS/CRYPTO_SWING_
+    TARGET_PCT si un futur balayage trouve mieux."""
     _ensure_django()
     print(f"[{datetime.utcnow().isoformat()}Z] Swing training started")
     years = int(os.getenv('CRYPTO_SWING_HISTORY_YEARS', str(years)))
-    horizon_days = int(os.getenv('CRYPTO_SWING_LABEL_HORIZON_DAYS', str(horizon_days or 10)))
-    target_pct = float(os.getenv('CRYPTO_SWING_TARGET_PCT', str(target_pct or 0.08)))
+    horizon_days = int(os.getenv('CRYPTO_SWING_LABEL_HORIZON_DAYS', str(horizon_days or 14)))
+    target_pct = float(os.getenv('CRYPTO_SWING_TARGET_PCT', str(target_pct or 0.05)))
 
     dataset, labels, feature_cols = build_crypto_swing_dataset(
         symbols, years=years, horizon_days=horizon_days, target_pct=target_pct,
@@ -590,10 +605,12 @@ def save_crypto_model(payload: dict, output_path: Path | None = None, auto_push:
 
 if __name__ == '__main__':
     symbols_env = os.getenv('CRYPTO_SYMBOLS', '')
-    symbols = [s.strip().upper() for s in symbols_env.split(',') if s.strip()] or DEFAULT_SYMBOLS
+    swing_mode = os.getenv('CRYPTO_TRAINING_MODE', 'intraday').strip().lower() == 'swing'
+    default_symbols = CRYPTO_SWING_DEFAULT_SYMBOLS if swing_mode else DEFAULT_SYMBOLS
+    symbols = [s.strip().upper() for s in symbols_env.split(',') if s.strip()] or default_symbols
     # Défaut inchangé (intraday) pour ne rien casser d'existant -- passer
     # CRYPTO_TRAINING_MODE=swing explicitement pour le nouveau pipeline.
-    if os.getenv('CRYPTO_TRAINING_MODE', 'intraday').strip().lower() == 'swing':
+    if swing_mode:
         payload = train_crypto_swing_model(symbols)
         model_path = save_crypto_swing_model(payload)
         print(f'Saved crypto SWING model to {model_path}')
