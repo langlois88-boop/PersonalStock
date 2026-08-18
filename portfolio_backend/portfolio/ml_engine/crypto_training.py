@@ -15,9 +15,11 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler
 
 from portfolio.ml_engine.export_utils import export_onnx_with_gatekeeper, save_model_with_version, write_meta_sidecar
-from portfolio.ml_engine.feature_registry import CRYPTO_FEATURE_NAMES
+from portfolio.ml_engine.feature_registry import CRYPTO_FEATURE_NAMES, CRYPTO_SWING_FEATURE_NAMES
+from portfolio.ml_engine.features.features_technical_v2 import build_full_feature_set
 from portfolio.ml_engine.push_model import _build_meta_from_payload, push_to_portfolio_app
 from portfolio.ml_engine.validation import PurgedTimeSeriesSplit
+from portfolio.patterns import add_pattern_columns
 def _ensure_django() -> None:
     if not os.getenv('DJANGO_SETTINGS_MODULE'):
         os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'portfolio_backend.settings')
@@ -95,6 +97,269 @@ def fetch_crypto_history(symbol: str, days: int = 60) -> pd.DataFrame:
     elif 'date' in hist.columns:
         hist = hist.rename(columns={'date': 'timestamp'})
     return hist
+
+
+CRYPTO_SWING_MODEL_PATH = Path(__file__).resolve().parent / 'crypto_swing_brain_v1.pkl'
+
+
+def fetch_crypto_history_daily(symbol: str, years: int = 6) -> pd.DataFrame:
+    """Bougies JOURNALIÈRES sur plusieurs années -- distinct de
+    fetch_crypto_history (15m/1h, plafonné à 730 jours par les limites
+    yfinance sur les intervalles intraday). yfinance conserve un historique
+    journalier bien plus long pour les cryptos majeures (BTC-USD depuis
+    ~2014) ; les altcoins plus récents (ex. SOL-USD, ~2020) auront
+    naturellement moins de lignes -- géré en aval par le dropna() du
+    pipeline de dataset, pas une erreur ici."""
+    hist = yfin.Ticker(symbol).history(period=f'{max(1, int(years))}y', interval='1d')
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+    hist = hist.reset_index()
+    hist = _normalize_columns(hist)
+    if 'date' in hist.columns:
+        hist = hist.rename(columns={'date': 'timestamp'})
+    elif 'datetime' in hist.columns:
+        hist = hist.rename(columns={'datetime': 'timestamp'})
+    return hist
+
+
+def _build_crypto_swing_features(df: pd.DataFrame, btc_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Features journalières pour le pipeline SWING -- réutilise
+    build_full_feature_set (déjà utilisé et éprouvé pour FUSION_FEATURE_
+    NAMES_V2 sur les actions) et add_pattern_columns (source unique pour les
+    patterns de bougies, voir patterns.py) au lieu de réinventer des formules
+    crypto maison. 'spy_corr_60' est calculé avec les rendements de BTC-USD
+    comme ancre (au lieu du S&P500) et renommé 'btc_corr_60' -- vaut 0.0 pour
+    BTC-USD lui-même (rien à corréler avec soi-même)."""
+    data = _normalize_columns(df.copy())
+    if data.empty or 'close' not in data.columns:
+        return pd.DataFrame()
+
+    btc_returns = None
+    if btc_df is not None and not btc_df.empty:
+        btc_returns = _normalize_columns(btc_df)['close'].pct_change()
+
+    features = build_full_feature_set(
+        close=data['close'],
+        high=data.get('high', data['close']),
+        low=data.get('low', data['close']),
+        volume=data.get('volume', pd.Series(0.0, index=data.index)),
+        open_price=data.get('open'),
+        spy_returns=btc_returns,
+    )
+    features = features.rename(columns={'spy_corr_60': 'btc_corr_60'})
+
+    ohlc = data[['open', 'high', 'low', 'close']] if 'open' in data.columns else data.assign(open=data['close'])[['open', 'high', 'low', 'close']]
+    patterns = add_pattern_columns(ohlc)
+    for col in ('pattern_doji', 'pattern_hammer', 'pattern_engulfing', 'pattern_morning_star'):
+        features[col] = patterns.get(col, 0)
+
+    features['close'] = data['close'].values
+    features['timestamp'] = data['timestamp'].values if 'timestamp' in data.columns else data.index
+    return features.replace([np.inf, -np.inf], np.nan)
+
+
+def _label_swing_targets(close: pd.Series, horizon_days: int = 10, target_pct: float = 0.08) -> pd.Series:
+    """Même logique que _label_targets (rendement futur >= target_pct), mais
+    calibrée à l'échelle swing par défaut : 10 jours de bourse (~2 semaines
+    civiles), +8% -- pas les 2h/+2% du pipeline intraday. Le Bitcoin bouge
+    beaucoup plus qu'une action sur 2 semaines ; un seuil calqué sur les
+    actions (ex. +3-5%) classerait presque toutes les fenêtres comme
+    'gagnantes', diluant le signal."""
+    future = close.shift(-horizon_days)
+    future_return = (future / close) - 1.0
+    return (future_return >= target_pct).astype(int)
+
+
+def build_crypto_swing_dataset(
+    symbols: Iterable[str],
+    years: int = 6,
+    horizon_days: int | None = None,
+    target_pct: float | None = None,
+) -> tuple[pd.DataFrame, pd.Series, list[str]]:
+    btc_df = fetch_crypto_history_daily('BTC-USD', years=years)
+    btc_df = _normalize_columns(btc_df) if not btc_df.empty else btc_df
+    frames = []
+    for symbol in symbols:
+        raw = fetch_crypto_history_daily(symbol, years=years)
+        if raw.empty:
+            continue
+        raw = _normalize_columns(raw)
+        features = _build_crypto_swing_features(raw, btc_df=btc_df)
+        if features.empty:
+            continue
+        features['symbol'] = symbol
+        features['label'] = _label_swing_targets(
+            features['close'], horizon_days=horizon_days or 10, target_pct=target_pct or 0.08,
+        )
+        frames.append(features)
+
+    if not frames:
+        return pd.DataFrame(), pd.Series(dtype=int), []
+
+    dataset = pd.concat(frames, ignore_index=True)
+    feature_cols = list(CRYPTO_SWING_FEATURE_NAMES)
+    dataset = dataset.dropna(subset=feature_cols + ['label'])
+    labels = dataset['label']
+    return dataset, labels, feature_cols
+
+
+def train_crypto_swing_model(
+    symbols: Iterable[str],
+    years: int = 6,
+    horizon_days: int | None = None,
+    target_pct: float | None = None,
+) -> dict[str, object]:
+    """Pipeline SWING (bougies journalières, horizon de jours/semaines) --
+    même structure de validation que train_crypto_model (CV purgée +
+    walk-forward + portes de qualité avant sauvegarde), features et horizon
+    différents. Chemin totalement séparé -- ne touche jamais crypto_brain_
+    v1.pkl (intraday) ni son propre paper trading."""
+    _ensure_django()
+    print(f"[{datetime.utcnow().isoformat()}Z] Swing training started")
+    years = int(os.getenv('CRYPTO_SWING_HISTORY_YEARS', str(years)))
+    horizon_days = int(os.getenv('CRYPTO_SWING_LABEL_HORIZON_DAYS', str(horizon_days or 10)))
+    target_pct = float(os.getenv('CRYPTO_SWING_TARGET_PCT', str(target_pct or 0.08)))
+
+    dataset, labels, feature_cols = build_crypto_swing_dataset(
+        symbols, years=years, horizon_days=horizon_days, target_pct=target_pct,
+    )
+    if dataset.empty:
+        raise ValueError('No crypto swing dataset available')
+
+    dataset = dataset.copy()
+    X = dataset[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+    y = labels.values
+    if len(set(y)) < 2:
+        raise ValueError('Only one class')
+
+    model = RandomForestClassifier(n_estimators=300, max_depth=8, random_state=42, class_weight='balanced')
+    pipeline = Pipeline([
+        ('scaler', RobustScaler()),
+        ('model', model),
+    ])
+
+    splits = PurgedTimeSeriesSplit(
+        n_splits=int(os.getenv('CRYPTO_SWING_PURGED_SPLITS', '5')),
+        purge_window=int(os.getenv('CRYPTO_SWING_PURGE_WINDOW', str(horizon_days))),
+        embargo_pct=float(os.getenv('CRYPTO_SWING_EMBARGO_PCT', '0.01')),
+    )
+    scores = []
+    for train_idx, test_idx in splits.split(X):
+        pipeline.fit(X.iloc[train_idx], y[train_idx])
+        preds = pipeline.predict(X.iloc[test_idx])
+        scores.append(float(balanced_accuracy_score(y[test_idx], preds)))
+
+    def _walk_forward_f1(window_months: int = 3, min_train: int = 60) -> list[dict[str, float | int | str]]:
+        reports = []
+        date_index = dataset['timestamp'] if 'timestamp' in dataset.columns else dataset.index
+        if not isinstance(date_index, pd.DatetimeIndex):
+            try:
+                date_index = pd.to_datetime(date_index, errors='coerce')
+            except Exception:
+                return reports
+        if date_index.isna().all():
+            return reports
+        start = date_index.min()
+        end = date_index.max()
+        if start is None or end is None:
+            return reports
+        test_start = start + pd.DateOffset(months=window_months)
+        while test_start < end:
+            test_end = test_start + pd.DateOffset(months=window_months)
+            train_mask = date_index < test_start
+            test_mask = (date_index >= test_start) & (date_index < test_end)
+            if train_mask.sum() < min_train or test_mask.sum() == 0:
+                test_start = test_end
+                continue
+            X_train = X.loc[train_mask]
+            y_train = y[train_mask]
+            X_test = X.loc[test_mask]
+            y_test = y[test_mask]
+            model_clone = Pipeline([
+                ('scaler', RobustScaler()),
+                ('model', RandomForestClassifier(n_estimators=300, max_depth=8, random_state=42, class_weight='balanced')),
+            ])
+            model_clone.fit(X_train, y_train)
+            preds = model_clone.predict(X_test)
+            f1 = float(f1_score(y_test, preds, zero_division=0)) if len(y_test) else 0.0
+            reports.append({
+                'start': test_start.strftime('%Y-%m-%d'),
+                'end': test_end.strftime('%Y-%m-%d'),
+                'samples': int(len(y_test)),
+                'f1': f1,
+            })
+            test_start = test_end
+        return reports
+
+    walk_forward = _walk_forward_f1()
+    pipeline.fit(X, y)
+    print(f"[{datetime.utcnow().isoformat()}Z] Swing training completed")
+    model_obj = pipeline.named_steps.get('model') if hasattr(pipeline, 'named_steps') else None
+    if model_obj is not None and hasattr(model_obj, 'feature_importances_'):
+        importances = list(zip(feature_cols, model_obj.feature_importances_))
+        print('Feature importances:')
+        for name, score in sorted(importances, key=lambda x: x[1], reverse=True):
+            print(f"{name}: {score:.4f}")
+    return {
+        'model': pipeline,
+        'features': feature_cols,
+        'cv_scores': scores,
+        'cv_mean': float(sum(scores) / len(scores)) if scores else None,
+        'universe': 'CRYPTO_SWING',
+        'model_version': f"v{datetime.utcnow().date().isoformat()}",
+        'trained_at': datetime.utcnow().isoformat() + 'Z',
+        'n_samples': int(len(y)),
+        'label_balance': float(np.mean(y)) if len(y) else 0.0,
+        'walk_forward': walk_forward,
+        'labels': y.tolist(),
+        'symbols': list(symbols),
+        'horizon_days': horizon_days,
+        'target_pct': target_pct,
+    }
+
+
+def save_crypto_swing_model(payload: dict, output_path: Path | None = None, auto_push: bool | None = None) -> str:
+    path = output_path or Path(os.getenv('CRYPTO_SWING_MODEL_PATH', str(CRYPTO_SWING_MODEL_PATH)))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv_scores = payload.get('cv_scores') or []
+    cv_mean = payload.get('cv_mean')
+    wf_f1 = float(np.mean([row.get('f1', 0.0) for row in (payload.get('walk_forward') or [])])) if payload.get('walk_forward') else 0.0
+    cv_min = float(os.getenv('CRYPTO_SWING_CV_MIN', '0.55'))
+    wf_min = float(os.getenv('CRYPTO_SWING_WALK_FORWARD_F1_MIN', '0.50'))
+    if cv_mean is None or cv_mean < cv_min:
+        raise ValueError(f"CV mean {cv_mean:.3f} below threshold {cv_min:.2f} — not deploying")
+    if wf_f1 < wf_min:
+        raise ValueError(f"Walk-forward F1 {wf_f1:.3f} below threshold {wf_min:.2f}")
+    version_info = save_model_with_version(payload, path, 'crypto_swing', metric_name='cv_mean', metric_value=payload.get('cv_mean'))
+    onnx_result = export_onnx_with_gatekeeper(
+        payload=payload,
+        model_path=path,
+        model_name='crypto_swing',
+        feature_names=list(payload.get('features') or CRYPTO_SWING_FEATURE_NAMES),
+        metric_name='cv_mean',
+        metric_direction='higher',
+    )
+    if onnx_result.get('exported'):
+        onnx_path = Path(onnx_result.get('onnx_path'))
+        label_balance = float(payload.get('label_balance') or 0.0)
+        write_meta_sidecar(
+            onnx_path,
+            cv_scores,
+            list(payload.get('features') or CRYPTO_SWING_FEATURE_NAMES),
+            'CRYPTO_SWING',
+            int(payload.get('n_samples') or 0),
+            label_balance,
+        )
+        if auto_push is None:
+            auto_push = _auto_push_enabled()
+        if auto_push:
+            try:
+                meta = _build_meta_from_payload(payload)
+                meta.update({'model_version': version_info.get('model_version')})
+                push_to_portfolio_app('crypto_swing', str(onnx_path), meta=meta)
+            except Exception:
+                pass
+    return str(path)
 
 
 def _build_crypto_features(df: pd.DataFrame, btc_df: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -326,6 +591,13 @@ def save_crypto_model(payload: dict, output_path: Path | None = None, auto_push:
 if __name__ == '__main__':
     symbols_env = os.getenv('CRYPTO_SYMBOLS', '')
     symbols = [s.strip().upper() for s in symbols_env.split(',') if s.strip()] or DEFAULT_SYMBOLS
-    payload = train_crypto_model(symbols)
-    model_path = save_crypto_model(payload)
-    print(f'Saved crypto model to {model_path}')
+    # Défaut inchangé (intraday) pour ne rien casser d'existant -- passer
+    # CRYPTO_TRAINING_MODE=swing explicitement pour le nouveau pipeline.
+    if os.getenv('CRYPTO_TRAINING_MODE', 'intraday').strip().lower() == 'swing':
+        payload = train_crypto_swing_model(symbols)
+        model_path = save_crypto_swing_model(payload)
+        print(f'Saved crypto SWING model to {model_path}')
+    else:
+        payload = train_crypto_model(symbols)
+        model_path = save_crypto_model(payload)
+        print(f'Saved crypto model to {model_path}')

@@ -11,7 +11,15 @@ import pandas as pd
 import yfinance as yfin
 import requests
 
-from .ml_engine.crypto_training import CRYPTO_MODEL_PATH, _build_crypto_features, _normalize_columns, _rsi
+from .ml_engine.crypto_training import (
+    CRYPTO_MODEL_PATH,
+    CRYPTO_SWING_MODEL_PATH,
+    _build_crypto_features,
+    _build_crypto_swing_features,
+    _normalize_columns,
+    _rsi,
+    fetch_crypto_history_daily,
+)
 
 
 def _crypto_symbols() -> list[str]:
@@ -181,6 +189,111 @@ def scan_crypto_drip(symbols: list[str] | None = None) -> list[dict[str, Any]]:
             'blocked': blocked,
             'score': score,
             'price_to_vwap': float(last.get('price_to_vwap', pd.Series([0.0])).iloc[-1]),
+        })
+
+    return results
+
+
+def _load_crypto_swing_model() -> dict[str, Any] | None:
+    """Même logique que _load_crypto_model, chemin séparé (voir
+    crypto_training.py::CRYPTO_SWING_MODEL_PATH -- ne partage jamais de
+    fichier ni de clé d'env avec le pipeline intraday)."""
+    raw_path = os.getenv('CRYPTO_SWING_MODEL_PATH', '').strip()
+    model_path = Path(raw_path) if raw_path else CRYPTO_SWING_MODEL_PATH
+    if not model_path or not model_path.exists():
+        return None
+    try:
+        payload = joblib.load(model_path)
+        if isinstance(payload, dict) and payload.get('model'):
+            return payload
+    except Exception:
+        return None
+    return None
+
+
+def _swing_pullback_pct(symbol_df: pd.DataFrame, lookback_days: int = 20) -> float | None:
+    """Recul (%, négatif) du dernier close par rapport au plus haut des
+    `lookback_days` derniers jours -- le déclencheur d'évaluation à l'échelle
+    swing, équivalent de _drip_trigger (-3% en 1 bougie 15m) mais pour un
+    horizon de jours/semaines : une baisse ponctuelle d'une bougie ne veut
+    rien dire à cette échelle, ce qui compte c'est le recul depuis un sommet
+    récent."""
+    if symbol_df is None or symbol_df.empty or 'close' not in symbol_df.columns:
+        return None
+    window = symbol_df['close'].tail(max(2, lookback_days))
+    recent_high = float(window.max())
+    if recent_high <= 0:
+        return None
+    last_close = float(symbol_df['close'].iloc[-1])
+    return (last_close / recent_high) - 1.0
+
+
+def scan_crypto_swing(symbols: list[str] | None = None, years: int = 2) -> list[dict[str, Any]]:
+    """Équivalent SWING de scan_crypto_drip -- bougies JOURNALIÈRES, modèle
+    entraîné sur CRYPTO_SWING_FEATURE_NAMES (voir crypto_training.py::
+    train_crypto_swing_model), déclenché sur un recul depuis un sommet
+    récent plutôt qu'une chute ponctuelle intraday. Retourne [] tant
+    qu'aucun modèle swing entraîné n'existe (crypto_swing_brain_v1.pkl) --
+    pas d'erreur, comportement identique à scan_crypto_drip sans modèle
+    (score=None pour tous)."""
+    symbols = [s.strip().upper() for s in (symbols or []) if s and str(s).strip()]
+    if not symbols:
+        symbols = _crypto_symbols()
+    pullback_threshold = float(os.getenv('CRYPTO_SWING_PULLBACK_THRESHOLD', '0.15'))
+    lookback_days = int(os.getenv('CRYPTO_SWING_PULLBACK_LOOKBACK_DAYS', '20'))
+
+    btc_df = _normalize_columns(fetch_crypto_history_daily('BTC-USD', years=years))
+    panic_verdict = _crypto_panic_verdict(_fetch_15m('BTC-USD'))  # panique systémique reste une lecture court terme
+    model_payload = _load_crypto_swing_model()
+    model = model_payload.get('model') if model_payload else None
+    feature_cols = model_payload.get('features') if model_payload else None
+
+    results: list[dict[str, Any]] = []
+    for symbol in symbols:
+        df = _normalize_columns(fetch_crypto_history_daily(symbol, years=years))
+        if df.empty:
+            continue
+        pullback = _swing_pullback_pct(df, lookback_days=lookback_days)
+        if pullback is None or pullback > -abs(pullback_threshold):
+            continue  # pas assez reculé depuis le sommet récent pour que la question "la chute est-elle finie ?" ait un sens
+
+        features = _build_crypto_swing_features(df, btc_df=btc_df)
+        if features.empty:
+            continue
+        last = features.tail(1)
+
+        rsi_val = float(last.get('rsi_14', pd.Series([np.nan])).iloc[-1])
+        oversold = rsi_val <= float(os.getenv('CRYPTO_SWING_RSI_OVERSOLD', '30'))
+
+        score = None
+        if model and feature_cols:
+            sample = last.copy()
+            for col in feature_cols:
+                if col not in sample.columns:
+                    sample[col] = 0.0
+            X = sample[feature_cols].fillna(0).values
+            try:
+                proba = model.predict_proba(X)[0][1]
+                score = float(proba)
+            except Exception:
+                score = None
+
+        btc_panic, btc_corr = _btc_panic(df.tail(60), btc_df.tail(60) if not btc_df.empty else btc_df)
+        blocked = btc_panic and panic_verdict == 'SYSTEMIC' and symbol != 'BTC-USD'
+        results.append({
+            'symbol': symbol,
+            'price': float(last['close'].iloc[-1]),
+            'pullback_pct': round(pullback * 100, 2),
+            'rsi': rsi_val,
+            'oversold': oversold,
+            'btc_panic': btc_panic,
+            'panic_verdict': panic_verdict,
+            'btc_corr': btc_corr,
+            'blocked': blocked,
+            'score': score,
+            'bb_pct_b_20': float(last.get('bb_pct_b_20', pd.Series([np.nan])).iloc[-1]),
+            'pattern_hammer': bool(last.get('pattern_hammer', pd.Series([0])).iloc[-1]),
+            'pattern_morning_star': bool(last.get('pattern_morning_star', pd.Series([0])).iloc[-1]),
         })
 
     return results

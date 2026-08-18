@@ -136,6 +136,46 @@ CRYPTO_FEATURE_NAMES: List[str] = [
     "btc_correlation",
 ]
 
+# ─── Features crypto SWING (2026-08-18) ───────────────────────────────────────
+#
+# CRYPTO_FEATURE_NAMES ci-dessus reste le set INTRADAY (15m/1h, horizon de
+# quelques heures, voir crypto_training.py::train_crypto_model) -- 6 features
+# maison, jamais entraîné en production (crypto_brain_v1.pkl absent).
+#
+# Celui-ci sert le pipeline SWING (bougies journalières, horizon de jours à
+# semaines, voir crypto_training.py::train_crypto_swing_model) -- réutilise
+# directement les fonctions techniques génériques déjà éprouvées sur les
+# actions (features/features_technical_v2.py::build_full_feature_set,
+# patterns.py::add_pattern_columns), pas de formules crypto réinventées.
+# Sous-ensemble de FUSION_FEATURE_NAMES_V2 -- retire ce qui n'a pas de source
+# de données côté crypto (dividend_yield, sentiment_score/news_count,
+# sector_beta_60, macro FRED, order book) ; "spy_corr_60" est calculé avec les
+# rendements de BTC-USD comme ancre au lieu du S&P500 et renommé
+# "btc_corr_60" en sortie (voir _build_crypto_swing_features) -- vaut 0 pour
+# BTC-USD lui-même (rien à corréler avec soi-même).
+CRYPTO_SWING_FEATURE_NAMES: List[str] = [
+    "rsi_14", "rsi_7",
+    "sma_ratio_10_50", "sma_ratio_20_50",
+    "ema_ratio_9_20",
+    "price_to_ema9", "price_to_ema20",
+    "macd_hist", "macd_line",
+    "volume_zscore_20", "rvol_20", "obv_zscore",
+    "volatility_20", "vol_regime", "atr_pct_14",
+    "return_20d", "return_5d", "mom_zscore_20",
+    "bb_pct_b_20", "bb_bandwidth_20",
+    "rubber_band_20",
+    "adx_14", "adx_di_ratio",
+    "stoch_k_14", "stoch_d_14",
+    "williams_r_14",
+    "cci_20",
+    "donchian_pct_20",
+    "fib_distance_50",
+    "price_to_vwap_20",
+    "candle_body_pct", "close_pos_in_range", "gap_pct",
+    "btc_corr_60",
+    "pattern_doji", "pattern_hammer", "pattern_engulfing", "pattern_morning_star",
+]
+
 # ─── Features fusion complètes (modèle principal) ────────────────────────────
 
 FUSION_FEATURE_NAMES: List[str] = [
@@ -231,7 +271,8 @@ FEATURE_REGISTRY: Dict[str, List[str]] = {
     "STABLE":      STABLE_FEATURE_NAMES,
     "PENNY":       PENNY_FEATURE_NAMES,
     "BLUECHIP":    BLUECHIP_FEATURE_NAMES,
-    "CRYPTO":      CRYPTO_FEATURE_NAMES,
+    "CRYPTO":       CRYPTO_FEATURE_NAMES,
+    "CRYPTO_SWING": CRYPTO_SWING_FEATURE_NAMES,
     "FUSION":      FUSION_FEATURE_NAMES,
     "RECOMMENDER": RECOMMENDER_FEATURE_NAMES,
 }
