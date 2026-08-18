@@ -107,7 +107,15 @@ class PaperTrade(models.Model):
 	ticker = models.CharField(max_length=10)
 	sandbox = models.CharField(max_length=20, choices=SANDBOX_CHOICES, default='WATCHLIST', db_index=True)
 	entry_price = models.DecimalField(max_digits=10, decimal_places=2)
-	quantity = models.IntegerField()
+	# IntegerField -> FloatField le 2026-08-18 : le chemin crypto (SIM
+	# existant ET le nouveau chemin Alpaca swing) a besoin de quantités
+	# fractionnaires (ex. 0.1 BTC) -- un IntegerField tronque silencieusement
+	# tout qty<1 à 0, ce qui aurait annulé silencieusement toute position
+	# crypto dimensionnée normalement (5% d'un compte 100k$ / 50000$ le BTC
+	# = 0.1 BTC, pas 0). Compatible sans perte avec les sandboxes actions
+	# existantes (quantités entières déjà stockées restent des floats
+	# équivalents, ex. 100 -> 100.0).
+	quantity = models.FloatField()
 	entry_date = models.DateTimeField(auto_now_add=True)
 	entry_signal = models.FloatField(null=True, blank=True)
 	entry_features = models.JSONField(null=True, blank=True)

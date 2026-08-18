@@ -109,6 +109,47 @@ def submit_market_order(symbol: str, qty: int, side: str) -> Any | None:
         return None
 
 
+def _to_alpaca_crypto_symbol(symbol: str) -> str:
+    """'BTC-USD' (format interne, yfinance) -> 'BTC/USD' (format Alpaca).
+    Laisse passer tel quel un symbole déjà au format Alpaca."""
+    s = (symbol or '').strip().upper()
+    if not s or '/' in s:
+        return s
+    if '-' in s:
+        base, quote = s.split('-', 1)
+        return f'{base}/{quote}'
+    return s
+
+
+def submit_crypto_market_order(symbol: str, qty: float, side: str) -> Any | None:
+    """Équivalent crypto de submit_market_order -- deux différences
+    obligatoires côté Alpaca, pas juste stylistiques : qty fractionnaire
+    (float, pas int -- on n'achète presque jamais un BTC entier) et
+    TimeInForce.GTC (le marché crypto tourne 24/7, DAY n'a pas de sens et
+    est rejeté par l'API pour les ordres crypto)."""
+    client = _alpaca_trading_client()
+    if client is None or MarketOrderRequest is None or OrderSide is None or TimeInForce is None:
+        return None
+    alpaca_symbol = _to_alpaca_crypto_symbol(symbol)
+    try:
+        qty = float(qty)
+    except (TypeError, ValueError):
+        return None
+    if not alpaca_symbol or qty <= 0:
+        return None
+    try:
+        side_enum = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
+        request = MarketOrderRequest(
+            symbol=alpaca_symbol,
+            qty=round(qty, 8),  # précision satoshi -- largement suffisant pour BTC/ETH
+            side=side_enum,
+            time_in_force=TimeInForce.GTC,
+        )
+        return client.submit_order(request)
+    except Exception:
+        return None
+
+
 def submit_limit_order(symbol: str, qty: int, side: str, limit_price: float) -> Any | None:
     client = _alpaca_trading_client()
     if client is None or LimitOrderRequest is None or OrderSide is None or TimeInForce is None:

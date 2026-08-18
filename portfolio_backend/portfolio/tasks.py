@@ -95,6 +95,7 @@ from .alpaca_data import (
     get_open_positions,
     get_recent_orders,
     submit_market_order,
+    submit_crypto_market_order,
     submit_limit_order,
     get_order_by_id,
     close_position,
@@ -4830,7 +4831,7 @@ def _daily_equity_circuit_breaker(sandbox: str, equity_now: float, broker_path: 
 
 def reset_daily_equity_breaker(sandbox: str | None = None, day: date | None = None) -> dict[str, Any]:
     day_key = (day or _ny_time_now().date()).strftime('%Y%m%d')
-    sandboxes = [sandbox] if sandbox else ['AI_PENNY', 'AI_BLUECHIP', 'WATCHLIST']
+    sandboxes = [sandbox] if sandbox else ['AI_PENNY', 'AI_BLUECHIP', 'WATCHLIST', 'AI_CRYPTO']
     r = _circuit_breaker_redis_client()
     cleared = []
     # Réinitialise les DEUX chemins (voir _daily_equity_circuit_breaker,
@@ -4839,7 +4840,7 @@ def reset_daily_equity_breaker(sandbox: str | None = None, day: date | None = No
     for box in sandboxes:
         if not box:
             continue
-        for broker_path in ('SIM', 'ALPACA'):
+        for broker_path in ('SIM', 'ALPACA', 'ALPACA_SWING'):
             trigger_key = f"daily_equity_trip:{box}:{broker_path}:{day_key}"
             baseline_key = f"daily_equity_base:{box}:{broker_path}:{day_key}"
             if r.get(trigger_key):
@@ -6664,7 +6665,13 @@ def _execute_paper_trades_for_crypto_sandbox() -> dict[str, Any]:
         if price <= 0:
             continue
         max_position_value = min(capital * position_cap_pct, capital * max(risk_pct, 0.001))
-        qty = int(max_position_value / price)
+        # int() ici tronquait silencieusement tout qty<1 à 0 (bug pré-
+        # existant, jamais surfacé -- cette fonction n'est appelée par
+        # aucune tâche Celery à ce jour) : à 50 000$ le BTC, une position
+        # normale (ex. 5% d'un capital de 10-25k$) donne qty<1 à chaque
+        # fois. round(..., 6) préserve la fraction (PaperTrade.quantity est
+        # un FloatField depuis le 2026-08-18, voir models.py).
+        qty = round(max_position_value / price, 6)
         if qty <= 0 or (qty * price) > available:
             continue
         stop_loss = price * (1 - stop_loss_pct)
@@ -6699,6 +6706,157 @@ def _execute_paper_trades_for_crypto_sandbox() -> dict[str, Any]:
         'available': round(available, 2),
         'symbols': watchlist,
     }
+
+
+def _execute_alpaca_paper_trades_for_crypto_swing() -> dict[str, Any]:
+    """Exécution des trades SWING crypto sur le compte Alpaca paper
+    PARTAGÉ (2026-08-18) -- même compte que WATCHLIST/AI_BLUECHIP/AI_PENNY,
+    voir item 16 (TECH_DEBT_NOTES.md) pour pourquoi broker_path isole
+    correctement le circuit breaker malgré le partage. Utilise scan_crypto_
+    swing (bougies journalières, portfolio/crypto_processor.py) -- PAS
+    scan_crypto_drip (intraday, utilisé par _execute_paper_trades_for_
+    crypto_sandbox ci-dessus, qui reste elle-même jamais appelée par aucune
+    tâche Celery à ce jour).
+
+    Désactivé par défaut (AI_CRYPTO_SWING_ENABLED='false') -- contrairement
+    à AI_CRYPTO_ENABLED (chemin SIM, défaut 'true' faute d'avoir jamais été
+    câblé à une tâche réelle), ceci passe de VRAIS ordres papier sur le
+    compte Alpaca partagé dès activation -- doit rester un choix explicite,
+    pas un défaut silencieux.
+
+    Taille de position volontairement prudente (position_cap_pct par
+    défaut 5%, pas les 10% habituels des autres sandboxes Alpaca) --
+    stratégie neuve, jamais éprouvée en conditions réelles (voir aussi le
+    modèle ML lui-même, qui n'a pas encore franchi ses portes de qualité --
+    entry_signal restera souvent None, décision basée sur les règles
+    seules : recul + RSI survendu + absence de panique systémique BTC).
+
+    Pas de PaperTrade créé si l'ordre Alpaca échoue réellement (pas de
+    position fantôme déconnectée d'un vrai ordre papier) -- même
+    discipline que le reste du pipeline Alpaca (voir _create_lab_position
+    côté FUNDAMENTAL_LAB).
+    """
+    sandbox = 'AI_CRYPTO'
+    prefix = 'AI_CRYPTO_SWING'
+    enabled = os.getenv('AI_CRYPTO_SWING_ENABLED', 'false').lower() in {'1', 'true', 'yes', 'y'}
+    if not enabled:
+        return {'status': 'disabled', 'created': 0, 'closed': 0}
+
+    from portfolio.crypto_processor import scan_crypto_swing
+
+    watch = SandboxWatchlist.objects.filter(sandbox=sandbox).first()
+    if watch and watch.symbols:
+        watchlist = [str(s).strip().upper() for s in watch.symbols if str(s).strip()]
+    else:
+        env_list = os.getenv('AI_CRYPTO_SWING_WATCHLIST') or 'BTC-USD,ETH-USD'
+        watchlist = [s.strip().upper() for s in str(env_list).split(',') if s.strip()]
+
+    buy_threshold = _env_float(prefix, 'BUY_THRESHOLD', '0.55')
+    stop_loss_pct = _env_float(prefix, 'STOP_LOSS_PCT', '0.10')
+    take_profit_pct = _env_float(prefix, 'TAKE_PROFIT_PCT', '0.15')
+    trail_trigger_pct = _env_float(prefix, 'TRAIL_TRIGGER_PCT', '0.08')
+    trail_pct = _env_float(prefix, 'TRAIL_PCT', '0.05')
+    position_cap_pct = _env_float(prefix, 'POSITION_CAP_PCT', '0.05')
+    require_oversold = os.getenv(f'{prefix}_REQUIRE_OVERSOLD', 'true').lower() in {'1', 'true', 'yes', 'y'}
+
+    account = get_account()
+    if account is None:
+        return {'status': 'no_account', 'created': 0, 'closed': 0}
+    equity = float(getattr(account, 'equity', 0) or 0)
+    if equity <= 0:
+        return {'status': 'invalid_equity', 'created': 0, 'closed': 0}
+
+    breaker = _daily_equity_circuit_breaker(sandbox, equity, broker_path='ALPACA_SWING')
+    if breaker.get('triggered'):
+        return {'status': 'circuit_breaker_triggered', 'created': 0, 'closed': 0, 'breaker': breaker}
+
+    open_trades = list(PaperTrade.objects.filter(status='OPEN', sandbox=sandbox, broker='ALPACA', model_name='CRYPTO_SWING'))
+    open_by_symbol = {t.ticker.upper(): t for t in open_trades}
+
+    closed = 0
+    for trade in open_trades:
+        price = _crypto_latest_price(trade.ticker) or float(trade.entry_price)
+        entry_price = float(trade.entry_price)
+        stop_loss = float(trade.stop_loss or (entry_price * (1 - stop_loss_pct)))
+        if price >= entry_price * (1 + trail_trigger_pct):
+            new_stop = max(stop_loss, price * (1 - trail_pct))
+            if new_stop > stop_loss:
+                trade.stop_loss = round(new_stop, 2)
+                trade.save(update_fields=['stop_loss'])
+                stop_loss = float(trade.stop_loss)
+
+        should_close = price <= stop_loss or price >= entry_price * (1 + take_profit_pct)
+        if should_close:
+            order = submit_crypto_market_order(trade.ticker, float(trade.quantity), 'sell')
+            trade.exit_price = round(price, 2)
+            trade.exit_date = timezone.now()
+            trade.status = 'CLOSED'
+            trade.pnl = float(trade.exit_price - entry_price) * float(trade.quantity)
+            trade.outcome = 'WIN' if float(trade.pnl or 0) > 0 else 'LOSS'
+            trade.broker_status = 'submitted' if order is not None else 'failed'
+            trade.notes = (trade.notes or '') + (' | alpaca crypto swing exit' if order is not None else ' | alpaca crypto swing exit (ordre échoué, position DB fermée quand même)')
+            trade.save(update_fields=['exit_price', 'exit_date', 'status', 'pnl', 'outcome', 'broker_status', 'notes'])
+            closed += 1
+
+    results = scan_crypto_swing(symbols=watchlist)
+    created = 0
+    for item in results:
+        symbol = str(item.get('symbol') or '').strip().upper()
+        if not symbol or symbol in open_by_symbol or item.get('blocked'):
+            continue
+        if require_oversold and not bool(item.get('oversold')):
+            continue
+        score = item.get('score')
+        if score is not None and float(score) < buy_threshold:
+            continue
+        price = float(item.get('price') or 0)
+        if price <= 0:
+            continue
+        max_position_value = equity * position_cap_pct
+        qty = round(max_position_value / price, 6)
+        if qty <= 0:
+            continue
+        order = submit_crypto_market_order(symbol, qty, 'buy')
+        if order is None:
+            continue  # ordre réel échoué -- pas de PaperTrade sans exécution derrière
+        PaperTrade.objects.create(
+            ticker=symbol,
+            sandbox=sandbox,
+            entry_price=round(price, 2),
+            quantity=qty,
+            entry_signal=float(score) if score is not None else None,
+            entry_features={
+                'score': score,
+                'rsi': item.get('rsi'),
+                'pullback_pct': item.get('pullback_pct'),
+                'bb_pct_b_20': item.get('bb_pct_b_20'),
+                'btc_corr': item.get('btc_corr'),
+                'pattern_hammer': item.get('pattern_hammer'),
+                'pattern_morning_star': item.get('pattern_morning_star'),
+            },
+            model_name='CRYPTO_SWING',
+            broker='ALPACA',
+            broker_status='submitted',
+            stop_loss=round(price * (1 - stop_loss_pct), 2),
+            status='OPEN',
+            pnl=0,
+            notes='alpaca crypto swing sandbox',
+        )
+        created += 1
+
+    return {'status': 'ok', 'created': created, 'closed': closed, 'symbols': watchlist, 'equity': round(equity, 2)}
+
+
+@shared_task
+def crypto_swing_paper_trade_task() -> dict[str, Any]:
+    log = _task_log_start('crypto_swing_paper_trade_task')
+    try:
+        result = _execute_alpaca_paper_trades_for_crypto_swing()
+    except Exception as exc:
+        _task_log_finish(log, 'ERROR', {}, error=str(exc))
+        raise
+    _task_log_finish(log, 'SUCCESS', result)
+    return result
 
 
 def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, Any]:
