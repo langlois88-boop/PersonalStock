@@ -10,6 +10,7 @@ function LivePaperTrading() {
   const [loading, setLoading] = useState(true);
   const [livePositions, setLivePositions] = useState({});
   const [brokerFilter, setBrokerFilter] = useState('ALL');
+  const [sandboxFilter, setSandboxFilter] = useState('ALL');
 
   // Was a plain string ("MA20: 99.4% · vol_regime: 0.5% · ...") -- raw
   // ML feature codes with zero explanation in the compact card view (the
@@ -62,7 +63,9 @@ function LivePaperTrading() {
     let active = true;
     const load = async () => {
       try {
-        const params = brokerFilter === 'ALL' ? {} : { broker: brokerFilter };
+        const params = {};
+        if (brokerFilter !== 'ALL') params.broker = brokerFilter;
+        if (sandboxFilter !== 'ALL') params.sandbox = sandboxFilter;
         const data = await cachedGet('paper-trades/summary/', params, 30000);
         if (!active) return;
         setSummary(data);
@@ -80,7 +83,7 @@ function LivePaperTrading() {
       active = false;
       clearInterval(interval);
     };
-  }, [brokerFilter]);
+  }, [brokerFilter, sandboxFilter]);
 
   useEffect(() => {
     const wsEnabled = (process.env.REACT_APP_WS_UPDATES || '').toLowerCase() === 'true';
@@ -181,15 +184,28 @@ function LivePaperTrading() {
       <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-white font-semibold">Positions ouvertes</h3>
-          <select
-            value={brokerFilter}
-            onChange={(event) => setBrokerFilter(event.target.value)}
-            className="bg-slate-950/60 border border-slate-800 text-slate-200 text-xs rounded-lg px-2 py-1"
-          >
-            <option value="ALL">Broker: All</option>
-            <option value="SIM">Broker: SIM</option>
-            <option value="ALPACA">Broker: Alpaca</option>
-          </select>
+          <div className="flex items-center gap-2">
+            <select
+              value={sandboxFilter}
+              onChange={(event) => setSandboxFilter(event.target.value)}
+              className="bg-slate-950/60 border border-slate-800 text-slate-200 text-xs rounded-lg px-2 py-1"
+            >
+              <option value="ALL">Sandbox: Toutes</option>
+              <option value="WATCHLIST">WATCHLIST</option>
+              <option value="AI_BLUECHIP">AI_BLUECHIP</option>
+              <option value="AI_PENNY">AI_PENNY</option>
+              <option value="AI_CRYPTO">AI_CRYPTO</option>
+            </select>
+            <select
+              value={brokerFilter}
+              onChange={(event) => setBrokerFilter(event.target.value)}
+              className="bg-slate-950/60 border border-slate-800 text-slate-200 text-xs rounded-lg px-2 py-1"
+            >
+              <option value="ALL">Broker: All</option>
+              <option value="SIM">Broker: SIM</option>
+              <option value="ALPACA">Broker: Alpaca</option>
+            </select>
+          </div>
         </div>
         {summary.open_positions?.length ? (
           <div className="space-y-3">
