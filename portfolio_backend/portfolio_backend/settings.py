@@ -601,15 +601,17 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'analysis.tasks.run_broad_index_scan',
         'schedule': crontab(hour=20, minute=0, day_of_week='sun'),
     },
-    # Exécution des trades SWING crypto sur Alpaca paper (2026-08-18) --
-    # marché crypto 24/7, pas d'heures de marché à respecter. Toutes les 4h
-    # (pas plus fréquent : décisions basées sur des bougies JOURNALIÈRES,
-    # un check plus rapproché ne changerait rien entre deux clôtures
-    # journalières). No-op tant que AI_CRYPTO_SWING_ENABLED='false' (défaut)
-    # -- voir _execute_alpaca_paper_trades_for_crypto_swing.
+    # Exécution des trades SWING crypto sur Alpaca paper (2026-08-18,
+    # passé de 4h à 15 min le même jour -- marché crypto 24/7, coût réseau/
+    # calcul négligeable pour 2 symboles (~22s par run réel mesuré), et le
+    # prix "du jour" chez yfinance se met à jour en continu jusqu'à la
+    # clôture de la bougie journalière -- vérifier plus souvent capte un
+    # vrai recul en formation plus tôt, pas juste du bruit répété). Activé
+    # depuis AI_CRYPTO_SWING_ENABLED=true (deploy/.env, 2026-08-18) -- voir
+    # _execute_alpaca_paper_trades_for_crypto_swing.
     'crypto-swing-paper-trade': {
         'task': 'portfolio.tasks.crypto_swing_paper_trade_task',
-        'schedule': crontab(minute=0, hour='*/4'),
+        'schedule': crontab(minute='*/15'),
     },
     # Réentraînement hebdomadaire du pipeline SWING crypto (2026-08-18) --
     # 21h30 ET, après weekly-broad-index-scan (20h00) pour éviter la
