@@ -4174,7 +4174,12 @@ def _effective_sandbox_thresholds(sandbox: str, prefix: str) -> dict[str, float]
         buy_threshold, sell_threshold = 0.20, 0.10
     exploration = _exploration_phase_enabled()
     if exploration:
-        buy_threshold = float(os.getenv('EXPLORATION_PHASE_BUY_THRESHOLD', '0.55'))
+        # min(), pas un écrasement inconditionnel (2026-08-20, voir le
+        # commentaire jumeau dans _execute_paper_trades_for_sandbox) --
+        # l'override d'exploration ne doit qu'ABAISSER un seuil trop
+        # strict (ex. AI_BLUECHIP 0.80), jamais RELEVER un seuil déjà plus
+        # bas et délibérément calibré (WATCHLIST 0.50, AI_PENNY 0.20).
+        buy_threshold = min(buy_threshold, float(os.getenv('EXPLORATION_PHASE_BUY_THRESHOLD', '0.55')))
     return {
         'buy_threshold': buy_threshold,
         'sell_threshold': sell_threshold,
@@ -5587,7 +5592,20 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
         # AI_BLUECHIP_BUY_THRESHOLD/AI_PENNY_BUY_THRESHOLD dans deploy/.env
         # n'a donc AUCUN effet réel sur ce chemin SIM. Seul un override
         # explicite ici change vraiment le comportement.
-        buy_threshold = float(os.getenv('EXPLORATION_PHASE_BUY_THRESHOLD', '0.55'))
+        #
+        # BUG trouvé le 2026-08-20 : cet override écrasait INCONDITIONNELLEMENT
+        # buy_threshold, y compris pour des sandboxes dont le seuil "normal"
+        # (juste au-dessus) est déjà PLUS BAS que 0.55 -- WATCHLIST (0.50,
+        # petite hausse non voulue) et surtout AI_PENNY (0.20 -> 0.55, +175%).
+        # Confirmé en direct : sur 100 cycles/10 jours, le signal max observé
+        # pour AI_PENNY plafonne à 0.4756 -- sous 0.55 à CHAQUE cycle,
+        # expliquant à lui seul le blocage total des trades AI_PENNY malgré
+        # un modèle qui produit des signaux valides pour la quasi-totalité
+        # de la watchlist (vérifié directement via _model_signal()). min(),
+        # pas un écrasement -- l'exploration ne doit qu'ABAISSER un seuil
+        # trop strict (AI_BLUECHIP 0.80 -> 0.55), jamais RELEVER un seuil
+        # déjà plus permissif et délibérément calibré.
+        buy_threshold = min(buy_threshold, float(os.getenv('EXPLORATION_PHASE_BUY_THRESHOLD', '0.55')))
     capital = initial_capital + closed_pnl
     available = max(0.0, capital - open_value)
     min_available_capital = _env_float(prefix, 'MIN_AVAILABLE_CAPITAL', '0.0')
@@ -6264,7 +6282,18 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             decision_stats['blocked_exposure_cap'] += 1
             continue
         if sandbox == 'AI_PENNY':
-            confidence_floor = float(os.getenv('AI_PENNY_CONFIDENCE_MIN', '0.35'))
+            # Même bug que la branche else juste en dessous (item 17,
+            # TECH_DEBT_NOTES.md), trouvé le 2026-08-20 dans cette branche
+            # dédiée à AI_PENNY qu'item 17 n'a jamais touchée -- 0.35 codé
+            # en dur, indépendant du buy_threshold RÉEL d'AI_PENNY (0.20
+            # normal, voir plus haut dans cette fonction). Un signal pouvait
+            # franchir buy_threshold (0.20) et se faire quand même rejeter
+            # ici ("confidence_too_low") faute qu'aucun trade ne soit jamais
+            # créé malgré un seuil affiché qui disait pourtant "oui" --
+            # confirmé en direct en écrivant le test de régression de ce
+            # fix (signal 0.30, buy_threshold 0.20, bloqué par ce plancher
+            # à 0.35 malgré tout). min(), même remède qu'item 17.
+            confidence_floor = min(float(os.getenv('AI_PENNY_CONFIDENCE_MIN', '0.35')), buy_threshold)
         else:
             # Was a hardcoded 0.65, independent of `buy_threshold` a few
             # lines above (item 17, TECH_DEBT_NOTES.md). Harmless while
@@ -6887,9 +6916,16 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
         # BUY_THRESHOLD (0.55) faute de {prefix}_BUY_THRESHOLD explicite.
         # Override explicite quand même, pour ne pas dépendre d'une
         # coïncidence de repli si PAPER_BUY_THRESHOLD change un jour pour
-        # une autre raison. Gagne sur le bloc WATCHLIST juste au-dessus
-        # (même précédence que le chemin SIM).
-        buy_threshold = float(os.getenv('EXPLORATION_PHASE_BUY_THRESHOLD', '0.55'))
+        # une autre raison.
+        #
+        # min(), pas un écrasement inconditionnel (2026-08-20, même bug que
+        # le chemin SIM -- voir le commentaire jumeau dans
+        # _execute_paper_trades_for_sandbox) : gagne sur le bloc WATCHLIST
+        # juste au-dessus SEULEMENT s'il abaisse réellement le seuil (ex.
+        # défaut 0.82 -> 0.55 pour AI_PENNY, qui n'a pas de bloc dédié sur
+        # ce chemin), jamais s'il le relèverait (WATCHLIST resterait à
+        # 0.50, pas remonté à 0.55).
+        buy_threshold = min(buy_threshold, float(os.getenv('EXPLORATION_PHASE_BUY_THRESHOLD', '0.55')))
     trail_pct = _env_float(prefix, 'TRAIL_PCT', '0.04')
     atr_mult = _env_float(prefix, 'ATR_MULT', '1.5')
     risk_pct = _env_float(prefix, 'RISK_PCT', '0.015')

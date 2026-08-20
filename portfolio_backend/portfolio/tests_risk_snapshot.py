@@ -27,7 +27,13 @@ class RiskSnapshotViewTests(APITestCase):
         self.assertEqual(by_sandbox['AI_PENNY']['buy_threshold'], 0.20)
         self.assertFalse(by_sandbox['WATCHLIST']['exploration_override_active'])
 
-    def test_exploration_mode_overrides_all_sandboxes_to_same_threshold(self):
+    def test_exploration_mode_only_lowers_thresholds_never_raises_them(self):
+        """Corrigé le 2026-08-20 : l'exploration écrasait INCONDITIONNELLEMENT
+        buy_threshold à 0.55 pour toutes les sandboxes, y compris celles dont
+        le seuil normal est déjà plus bas (WATCHLIST 0.50, AI_PENNY 0.20) --
+        les relevant sans raison au lieu de les laisser telles quelles.
+        min(seuil_normal, 0.55) : AI_BLUECHIP (0.80) est abaissé comme prévu,
+        WATCHLIST/AI_PENNY restent à leur propre seuil, déjà plus permissif."""
         with patch.dict(os.environ, {
             'EXPLORATION_PHASE_ENABLED': 'true',
             'EXPLORATION_PHASE_BUY_THRESHOLD': '0.55',
@@ -35,8 +41,10 @@ class RiskSnapshotViewTests(APITestCase):
             response = self.client.get('/api/risk-snapshot/')
 
         by_sandbox = {row['sandbox']: row for row in response.data['sandboxes']}
+        self.assertEqual(by_sandbox['WATCHLIST']['buy_threshold'], 0.50)
+        self.assertEqual(by_sandbox['AI_PENNY']['buy_threshold'], 0.20)
+        self.assertEqual(by_sandbox['AI_BLUECHIP']['buy_threshold'], 0.55)
         for sandbox in ('WATCHLIST', 'AI_BLUECHIP', 'AI_PENNY'):
-            self.assertEqual(by_sandbox[sandbox]['buy_threshold'], 0.55)
             self.assertTrue(by_sandbox[sandbox]['exploration_override_active'])
 
     def test_global_risk_params_present(self):
