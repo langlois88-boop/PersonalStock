@@ -5818,6 +5818,26 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                 'breakout_score': float(breakout_score),
                 'bid_ask_spread_pct': bid_ask_spread_pct,
             })
+            # Red flags pennystock (2026-08-20, voir services/penny_risk_
+            # screen.py) -- LECTURE SEULE du cache rempli par la tâche
+            # hebdomadaire refresh_penny_red_flags_weekly, jamais d'appel
+            # réseau SEC EDGAR ici (cette boucle tourne toutes les 15-30
+            # min, un appel SEC à chaque cycle serait à la fois inutile --
+            # ces données ne changent qu'au rythme trimestriel -- et un
+            # usage excessif d'une API publique gratuite). Informationnel
+            # pour l'instant (visible dans entry_features, pas un blocage
+            # automatique) -- absent (None) tant que la tâche hebdo n'a
+            # jamais tourné pour ce ticker, jamais une erreur.
+            from portfolio.services.penny_risk_screen import get_cached_red_flags
+            red_flags = get_cached_red_flags(symbol)
+            if red_flags:
+                payload['features'].update({
+                    'going_concern_risk': red_flags.get('going_concern', {}).get('going_concern_risk'),
+                    'toxic_convertible_debt': red_flags.get('toxic_convertible_debt', {}).get('toxic_convertible_debt'),
+                    'recent_8k_catalyst': red_flags.get('recent_8k_catalyst', {}).get('recent_8k'),
+                    'cash_runway_quarters': red_flags.get('cash_runway', {}).get('cash_runway_quarters'),
+                    'shares_growth_4q_pct': red_flags.get('atm_dilution', {}).get('shares_growth_4q_pct'),
+                })
             return payload
 
         return payload
@@ -6886,6 +6906,52 @@ def crypto_swing_paper_trade_task() -> dict[str, Any]:
         raise
     _task_log_finish(log, 'SUCCESS', result)
     return result
+
+
+@shared_task
+def refresh_penny_red_flags_weekly() -> dict[str, Any]:
+    """Rafraîchit le cache de risque/catalyseur pennystock (2026-08-20,
+    voir portfolio/services/penny_risk_screen.py) pour toute la watchlist
+    AI_PENNY -- going concern, dette convertible toxique, 8-K récent (SEC
+    EDGAR), cash runway et dilution ATM (yfinance).
+
+    Hebdomadaire, PAS à chaque cycle de trading (15-30 min) : ces données
+    ne changent qu'au rythme trimestriel des dépôts, et interroger SEC
+    EDGAR à chaque cycle serait à la fois inutile et un usage excessif
+    d'une API publique gratuite. La boucle de décision AI_PENNY lit
+    ensuite uniquement le cache déjà peuplé (get_cached_red_flags,
+    jamais d'appel réseau SEC depuis le chemin de trading rapide).
+
+    Informationnel pour l'instant (entry_features, pas un blocage
+    automatique) -- voir _execute_paper_trades_for_sandbox. Un vrai
+    blocage (ex. sur going_concern_risk) serait une décision de trading
+    à valider explicitement, pas un défaut silencieux.
+    """
+    from portfolio.services.penny_risk_screen import refresh_and_cache_red_flags
+
+    log = _task_log_start('refresh_penny_red_flags_weekly')
+    watch = SandboxWatchlist.objects.filter(sandbox='AI_PENNY').first()
+    symbols = list(watch.symbols) if watch and watch.symbols else []
+
+    results: dict[str, Any] = {}
+    errors: list[str] = []
+    for symbol in symbols:
+        try:
+            results[symbol] = refresh_and_cache_red_flags(symbol)
+        except Exception as exc:
+            errors.append(f"{symbol}: {exc}")
+        sleep(0.3)  # bon citoyen SEC EDGAR -- pas de rafale sur une API publique gratuite
+
+    going_concern_count = sum(
+        1 for r in results.values() if r.get('going_concern', {}).get('going_concern_risk') is True
+    )
+    payload = {
+        'symbols_processed': len(results),
+        'going_concern_flagged': going_concern_count,
+        'errors': errors,
+    }
+    _task_log_finish(log, 'SUCCESS', payload)
+    return payload
 
 
 def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, Any]:

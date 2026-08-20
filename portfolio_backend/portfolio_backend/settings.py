@@ -625,6 +625,16 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.retrain_crypto_swing_model_weekly',
         'schedule': crontab(hour=21, minute=30, day_of_week='sun'),
     },
+    # Red flags pennystock AI_PENNY (2026-08-20) -- going concern, dette
+    # convertible toxique, 8-K récent, cash runway, dilution ATM (SEC
+    # EDGAR + yfinance). Hebdomadaire seulement : ces données ne changent
+    # qu'au rythme trimestriel des dépôts -- voir refresh_penny_red_flags_
+    # weekly. 22h00 dimanche, après le réentraînement crypto (21h30) pour
+    # éviter la contention.
+    'weekly-penny-red-flags-refresh': {
+        'task': 'portfolio.tasks.refresh_penny_red_flags_weekly',
+        'schedule': crontab(hour=22, minute=0, day_of_week='sun'),
+    },
     # Stop-loss minimal pour les positions FUNDAMENTAL_LAB à ordre Alpaca
     # réel (broker='ALPACA_LAB', voir docs/TECH_DEBT_NOTES.md item 11,
     # Partie B 2026-08-11) -- aucun mécanisme de sortie n'existait avant ça.
