@@ -11909,7 +11909,12 @@ def _analyze_bluechip_rebounds() -> dict[str, Any]:
         last_close = float(close.iloc[-1])
         if not sma50 or not sma200:
             continue
-        rs = close / spy_close.reindex(close.index).fillna(method='ffill')
+        # fillna(method='ffill') retiré dans les versions récentes de
+        # pandas (trouvé le 2026-08-20 -- code jamais exécuté depuis
+        # longtemps, voir weekend_deep_research, seul appelant, resté
+        # désactivé par AFTER_HOURS_TASKS_ENABLED) -- .ffill() est le
+        # remplacement direct recommandé par pandas, même comportement.
+        rs = close / spy_close.reindex(close.index).ffill()
         rs_mean = rs.rolling(50).mean().iloc[-1]
         rs_score = 1 if rs.iloc[-1] >= rs_mean else 0
         rebound = last_close >= sma50 * 0.99 or last_close >= sma200 * 0.99
