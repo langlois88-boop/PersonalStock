@@ -11981,16 +11981,58 @@ def economic_calendar_module() -> dict[str, Any]:
         return {'status': 'failed', 'error': str(exc)}
 
 
+def _persist_penny_breakout_signals(penny_result: dict[str, Any]) -> int:
+    """Écrit les candidats de _analyze_penny_breakouts dans PennySignal --
+    LA MÊME table que generate_penny_signals_v2 (mentions Reddit/news),
+    pour que le reste de la chaîne existante (/api/penny-analytics/ ->
+    refresh_ai_penny_watchlist -> SandboxWatchlist AI_PENNY) les ramasse
+    sans aucun changement ailleurs. Source de candidats totalement
+    indépendante des mentions sociales (yfinance most_actives, voir
+    _analyze_penny_breakouts) -- ne dépend d'aucune credential Reddit.
+    """
+    today = timezone.now().date()
+    written = 0
+    for item in (penny_result.get('watchlist') or []):
+        symbol = str(item.get('symbol') or '').strip().upper()
+        if not symbol:
+            continue
+        score = max(0.0, min(1.0, float(item.get('score') or 0.0)))
+        PennySignal.objects.update_or_create(
+            symbol=symbol,
+            as_of=today,
+            defaults={
+                'pattern_score': 1.0 if item.get('catalysts') else 0.0,
+                'sentiment_score': float(item.get('sentiment') or 0.0),
+                'hype_score': 0.0,  # aucune donnée de buzz social depuis cette source
+                'liquidity_score': min(1.0, float(item.get('volume_ratio') or 0.0) / 3.0),
+                'combined_score': score,
+                'last_price': float(item.get('last_close') or 0.0),
+                'avg_volume': 0.0,  # non recalculé ici -- déjà filtré >= 500k au départ de _analyze_penny_breakouts
+                'mentions': 0,
+                'data': {
+                    'source': 'market_breakout_scan',
+                    'price_range_pct': item.get('price_range_pct'),
+                    'volume_ratio': item.get('volume_ratio'),
+                    'catalysts': item.get('catalysts'),
+                },
+            },
+        )
+        written += 1
+    return written
+
+
 @shared_task
 def weekend_deep_research() -> dict[str, Any]:
     log = _task_log_start('weekend_deep_research')
     try:
         penny = _analyze_penny_breakouts()
         bluechip = _analyze_bluechip_rebounds()
+        penny_signals_written = _persist_penny_breakout_signals(penny)
         payload = {
             'as_of': timezone.now().isoformat(),
             'penny': penny,
             'bluechip': bluechip,
+            'penny_signals_written': penny_signals_written,
         }
         cache.set('weekend_deep_research', payload, timeout=60 * 60 * 24 * 7)
         _task_log_finish(log, 'SUCCESS', payload)

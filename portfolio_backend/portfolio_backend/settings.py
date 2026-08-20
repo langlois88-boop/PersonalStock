@@ -687,6 +687,17 @@ if not AFTER_HOURS_TASKS_ENABLED:
     # lot (retraining/rollback de modèles notamment) qui reste désactivé par
     # défaut ici. Ils tournent maintenant indépendamment de
     # AFTER_HOURS_TASKS_ENABLED -- voir docs/TECH_DEBT_NOTES.md item 6.
+    # weekend-deep-research-sat sorti de cette liste le 2026-08-20, même
+    # raisonnement que le carve-out du 2026-08-10 ci-dessus : c'est un
+    # scan/score en LECTURE SEULE (_analyze_penny_breakouts/_analyze_
+    # bluechip_rebounds, aucune commande d'achat/vente), pas un mécanisme
+    # de gouvernance ML (retrain/rollback) -- rien à voir avec la décision
+    # explicite de ne pas activer ce lot en bloc (item 12, TECH_DEBT_NOTES.md).
+    # Trouvé en diagnostiquant pourquoi AI_PENNY ne découvre plus de
+    # nouveaux candidats depuis des mois (generate_penny_signals dépend de
+    # credentials Reddit jamais configurées) -- ce mécanisme alternatif,
+    # scanne directement le marché (yfinance most_actives), pas les
+    # mentions sociales, existait déjà tout ce temps, juste jamais activé.
     for task_name in [
         'deep-learning-retro-nightly',
         'nightly-closed-market-retrain',
@@ -694,7 +705,6 @@ if not AFTER_HOURS_TASKS_ENABLED:
         'trading-journal-daily',
         'daily-bot-journal-2005',
         'sunday-evening-briefing',
-        'weekend-deep-research-sat',
         'economic-calendar-weekly',
         'daily-performance-report',
         'daily-profit-tracker',

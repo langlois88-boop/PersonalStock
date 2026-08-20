@@ -1,9 +1,12 @@
-"""Régression : cleanup-taskrunlog-daily et cleanup-system-logs-weekly
-doivent rester planifiés dans CELERY_BEAT_SCHEDULE même quand
-AFTER_HOURS_TASKS_ENABLED est désactivé (défaut sur le NAS -- jamais
-défini dans deploy/.env, donc toujours 'false'). Le reste du lot
-(retraining/rollback de modèles, rapports) doit rester exclu, comme
-avant -- ce changement ne touche que ces 2 tâches de ménage de logs.
+"""Régression : cleanup-taskrunlog-daily, cleanup-system-logs-weekly ET
+(depuis le 2026-08-20) weekend-deep-research-sat doivent rester
+planifiés dans CELERY_BEAT_SCHEDULE même quand AFTER_HOURS_TASKS_ENABLED
+est désactivé (défaut sur le NAS -- jamais défini dans deploy/.env, donc
+toujours 'false'). Le reste du lot (retraining/rollback de modèles,
+rapports) doit rester exclu, comme avant -- ces 3 tâches sont toutes en
+LECTURE SEULE (ménage de logs ou scan/score sans commande d'achat/vente),
+sans rapport avec la décision explicite de ne pas activer la gouvernance
+ML en bloc (item 12, TECH_DEBT_NOTES.md).
 """
 
 from __future__ import annotations
@@ -22,6 +25,14 @@ class AfterHoursScheduleGateTests(TestCase):
         self.assertIn('cleanup-taskrunlog-daily', settings.CELERY_BEAT_SCHEDULE)
         self.assertIn('cleanup-system-logs-weekly', settings.CELERY_BEAT_SCHEDULE)
 
+    def test_weekend_deep_research_always_scheduled(self):
+        """Carve-out du 2026-08-20 -- scan/score en lecture seule
+        (_analyze_penny_breakouts/_analyze_bluechip_rebounds), trouvé en
+        diagnostiquant pourquoi AI_PENNY ne découvre plus de candidats
+        depuis des mois (generate_penny_signals dépend de credentials
+        Reddit jamais configurées)."""
+        self.assertIn('weekend-deep-research-sat', settings.CELERY_BEAT_SCHEDULE)
+
     def test_rest_of_after_hours_batch_still_excluded(self):
         still_excluded = [
             'deep-learning-retro-nightly',
@@ -30,7 +41,6 @@ class AfterHoursScheduleGateTests(TestCase):
             'trading-journal-daily',
             'daily-bot-journal-2005',
             'sunday-evening-briefing',
-            'weekend-deep-research-sat',
             'economic-calendar-weekly',
             'daily-performance-report',
             'daily-profit-tracker',
