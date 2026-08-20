@@ -187,6 +187,33 @@ CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'America/New_York'
 
+# Cache Django (2026-08-20) -- avant ce fix, aucun CACHES n'était défini
+# donc Django retombait sur son défaut, LocMemCache : un cache EN MÉMOIRE
+# DU PROCESS, jamais partagé entre workers et jamais persisté (perdu à
+# chaque redémarrage/déploiement de conteneur -- ce qui arrive à chaque
+# `docker compose up --force-recreate`, très fréquent sur ce projet).
+# Confirmé en direct le 2026-08-20 en testant portfolio/services/
+# penny_risk_screen.py : un cache.set() dans un process invisible dans un
+# second process séparé, comme attendu d'un cache non partagé. Cette même
+# limitation était déjà documentée le 2026-08-13 (_circuit_breaker_redis_
+# client, item 9 TECH_DEBT_NOTES.md) mais corrigée seulement pour ce cas
+# précis (client Redis brut, pas via ce framework), pas globalement --
+# _fetch_insider_buying (analysis/services/quant_filter.py) utilise
+# encore ce cache.* générique depuis le 2026-08-16 sans que personne ne
+# l'ait remarqué avant aujourd'hui.
+#
+# DB Redis 1 (pas 0, qui sert déjà de broker Celery ET de couche Channels
+# -- voir CHANNEL_LAYERS plus bas) + KEY_PREFIX dédié, pour ne jamais
+# entrer en collision avec les clés internes de ces deux autres systèmes
+# ni avec le client Redis brut du circuit breaker (lui-même sur DB 0).
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+        'LOCATION': REDIS_URL.rsplit('/', 1)[0] + '/1',
+        'KEY_PREFIX': 'djcache',
+    },
+}
+
 CHANNEL_LAYERS = {
     'default': {
         'BACKEND': 'channels_redis.core.RedisChannelLayer',
