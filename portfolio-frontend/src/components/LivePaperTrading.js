@@ -325,7 +325,9 @@ function LivePaperTrading() {
                   </span>
                 </div>
               )}
-              <div className="col-span-2">Pourquoi vendu : {formatExitReason(selectedTrade.notes) || (selectedTrade.status === 'CLOSED' ? 'Aucune information enregistrée.' : '—')}</div>
+              <div className="col-span-2">
+                {selectedTrade.status === 'CLOSED' ? 'Pourquoi vendu' : "Raison de l'entrée"} : {formatExitReason(selectedTrade.notes) || (selectedTrade.status === 'CLOSED' ? 'Aucune information enregistrée.' : '—')}
+              </div>
             </div>
 
             <div className="mt-5">
