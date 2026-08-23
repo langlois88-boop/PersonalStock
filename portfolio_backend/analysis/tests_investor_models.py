@@ -256,3 +256,109 @@ class CanSlimTests(_ClearsCacheTestCase):
 
         self.assertFalse(result.passed)
         self.assertFalse(result.details["can_slim"]["passes_screen"])
+
+
+class FactorInvestingTests(_ClearsCacheTestCase):
+    def test_passes_with_quality_low_vol_and_momentum(self):
+        # Tendance montante -> momentum_12_1_pct > 0. ROE=18% (défaut),
+        # D/E=20 (< 50), bêta=0.5 (< 0.8) : 4/4 critères.
+        uptrend = _uptrend_history()
+        bench = _flat_benchmark_history()
+
+        def ticker_side_effect(symbol):
+            m = MagicMock()
+            m.history.return_value = bench if symbol == "^GSPC" else uptrend
+            return m
+
+        with patch.object(quant_filter, "market_data") as mock_md, \
+                patch.object(quant_filter.yf, "Ticker", side_effect=ticker_side_effect), \
+                patch.object(quant_filter, "_fetch_margin_trend", return_value=[]):
+            mock_md.Ticker.return_value.info = _mock_info(
+                regularMarketPrice=50.0, debtToEquity=20.0, beta=0.5,
+            )
+            result = quant_filter.evaluate_ticker("JNJ", preset_thresholds={"require_factor_investing": True})
+
+        self.assertTrue(result.passed, result.reasons_failed)
+        self.assertEqual(result.details["factor_investing"]["criteria_met"], 4)
+        json.dumps(result.details)
+
+    def test_fails_when_high_debt_and_high_beta_outweigh_momentum(self):
+        # Un seul critère (momentum) sur quatre -- endettement et bêta
+        # élevés, ROE sous le seuil : 1/4, en dessous du minimum de 3.
+        uptrend = _uptrend_history()
+        bench = _flat_benchmark_history()
+
+        def ticker_side_effect(symbol):
+            m = MagicMock()
+            m.history.return_value = bench if symbol == "^GSPC" else uptrend
+            return m
+
+        with patch.object(quant_filter, "market_data") as mock_md, \
+                patch.object(quant_filter.yf, "Ticker", side_effect=ticker_side_effect), \
+                patch.object(quant_filter, "_fetch_margin_trend", return_value=[]):
+            mock_md.Ticker.return_value.info = _mock_info(
+                regularMarketPrice=50.0, returnOnEquity=0.05, debtToEquity=150.0, beta=2.2,
+            )
+            result = quant_filter.evaluate_ticker("RISKY", preset_thresholds={"require_factor_investing": True})
+
+        self.assertFalse(result.passed)
+        self.assertLess(result.details["factor_investing"]["criteria_met"], 3)
+
+    def test_default_preset_never_fetches_technical_trend_for_factor_investing(self):
+        with patch.object(quant_filter, "market_data") as mock_md, \
+                patch.object(quant_filter.yf, "Ticker") as mock_yf, \
+                patch.object(quant_filter, "_fetch_margin_trend", return_value=[]), \
+                patch.object(quant_filter, "_fetch_technical_trend") as mock_fetch:
+            mock_md.Ticker.return_value.info = _mock_info()
+            mock_yf.return_value.quarterly_financials = _flat_margin_trend()
+            quant_filter.evaluate_ticker("AAPL", preset_thresholds={})
+        mock_fetch.assert_not_called()
+
+
+class InsiderTradingPresetTests(_ClearsCacheTestCase):
+    def test_passes_when_insiders_are_buying(self):
+        with patch.object(quant_filter, "market_data") as mock_md, \
+                patch.object(quant_filter.yf, "Ticker") as mock_yf, \
+                patch.object(quant_filter, "_fetch_margin_trend", return_value=[]), \
+                patch.object(
+                    quant_filter, "_fetch_insider_buying",
+                    return_value={"insiders_buying": True, "insider_buy_total": 120_000.0},
+                ):
+            mock_md.Ticker.return_value.info = _mock_info()
+            mock_yf.return_value.quarterly_financials = _flat_margin_trend()
+            result = quant_filter.evaluate_ticker("BRCC", preset_thresholds={"require_insider_buying": True})
+
+        self.assertTrue(result.passed, result.reasons_failed)
+        self.assertTrue(result.details["insiders_buying"])
+
+    def test_fails_when_no_insider_buying_even_with_margin_inflection(self):
+        # Contrairement à require_catalyst (OU avec l'inflexion de marge),
+        # ce preset n'a aucune porte de sortie -- l'absence d'achat
+        # d'initiés doit faire échouer même si une inflexion de marge existe.
+        inflecting_margin = pd.DataFrame(
+            {"Q1": [1000.0, 300.0], "Q2": [1000.0, 320.0], "Q3": [1000.0, 340.0], "Q4": [1000.0, 380.0]},
+            index=["Total Revenue", "Gross Profit"],
+        )
+        with patch.object(quant_filter, "market_data") as mock_md, \
+                patch.object(quant_filter.yf, "Ticker") as mock_yf, \
+                patch.object(quant_filter, "_fetch_margin_trend", return_value=[0.30, 0.32, 0.34, 0.38]), \
+                patch.object(
+                    quant_filter, "_fetch_insider_buying",
+                    return_value={"insiders_buying": False, "insider_buy_total": 0.0},
+                ):
+            mock_md.Ticker.return_value.info = _mock_info()
+            mock_yf.return_value.quarterly_financials = inflecting_margin
+            result = quant_filter.evaluate_ticker("NOTE", preset_thresholds={"require_insider_buying": True})
+
+        self.assertFalse(result.passed)
+        self.assertFalse(result.details["insiders_buying"])
+
+    def test_default_preset_never_fetches_insider_buying(self):
+        with patch.object(quant_filter, "market_data") as mock_md, \
+                patch.object(quant_filter.yf, "Ticker") as mock_yf, \
+                patch.object(quant_filter, "_fetch_margin_trend", return_value=[]), \
+                patch.object(quant_filter, "_fetch_insider_buying") as mock_fetch:
+            mock_md.Ticker.return_value.info = _mock_info()
+            mock_yf.return_value.quarterly_financials = _flat_margin_trend()
+            quant_filter.evaluate_ticker("AAPL", preset_thresholds={})
+        mock_fetch.assert_not_called()

@@ -29,6 +29,8 @@ const PRESETS = [
   { slug: 'buffett', label: 'Buffett' },
   { slug: 'minervini', label: 'Minervini (Trend Template)' },
   { slug: 'can-slim', label: 'CAN SLIM (O\'Neil)' },
+  { slug: 'factor-investing', label: 'Factor Investing' },
+  { slug: 'insider-trading', label: 'Insider Trading' },
 ];
 
 const formatNumber = (value, digits = 2) => {

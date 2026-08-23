@@ -219,6 +219,13 @@ def fetch_ticker_data(ticker: str) -> Optional[dict]:
             # NVDA (210%/85%) et AAPL (27%/16%), champs yfinance fiables.
             "eps_growth_qoq": _safe(info.get("earningsQuarterlyGrowth")),
             "revenue_growth_qoq": _safe(info.get("revenueGrowth")),
+            # Factor Investing (2026-08-23) -- déjà calculés par yfinance,
+            # pas besoin de régression maison pour le bêta. ATTENTION :
+            # debtToEquity est déjà en POINTS DE POURCENTAGE (vérifié en
+            # direct : NVDA=6.56 -> 6,56% de dette, PAS 656% -- comparer à
+            # un seuil du même ordre, ex. 50, pas 0.5).
+            "debt_to_equity": _safe(info.get("debtToEquity")),
+            "beta": _safe(info.get("beta")),
         }
     except Exception:
         logger.exception("Erreur fetch données pour %s", ticker)
@@ -446,6 +453,18 @@ def _fetch_technical_trend(ticker: str) -> dict:
         except Exception:
             pass
 
+        # Momentum Factor Investing (2026-08-23) : rendement 12 mois moins
+        # le dernier mois -- Ret_12-1 = P[t-1m]/P[t-12m] - 1. Exclut le
+        # dernier mois volontairement (effet de retournement à court terme
+        # bien documenté -- la formule standard de la littérature, pas une
+        # approximation).
+        momentum_12_1 = None
+        if len(close) > 252:
+            price_12m_ago = float(close.iloc[-252])
+            price_1m_ago = float(close.iloc[-21])
+            if price_12m_ago > 0:
+                momentum_12_1 = round((price_1m_ago / price_12m_ago - 1) * 100, 2)
+
         result = {
             "available": True,
             "price": round(price, 2), "ma50": round(ma50, 2), "ma150": round(ma150, 2),
@@ -453,6 +472,7 @@ def _fetch_technical_trend(ticker: str) -> dict:
             "week_52_high": round(week52_high, 2), "week_52_low": round(week52_low, 2),
             "avg_volume_50d": round(avg_volume) if avg_volume is not None else None,
             "outperforms_market_6m": rel_strength_vs_market,
+            "momentum_12_1_pct": momentum_12_1,
         }
         cache.set(cache_key, result, 60 * 60 * 12)
         return result
@@ -483,6 +503,50 @@ def _evaluate_minervini_template(trend: dict) -> dict:
     return {
         **criteria, "criteria_met": criteria_met, "criteria_total": len(criteria),
         "passes_template": criteria_met == len(criteria),
+    }
+
+
+def _evaluate_factor_investing(data: dict, trend: dict) -> dict:
+    """
+    Factor Investing multi-facteurs -- Momentum, Qualité, Faible
+    volatilité. Version SIMPLIFIÉE d'un vrai système de classement (le
+    texte original veut un Z-score composite sur tout un univers,
+    rebalancé mensuellement, achat du top 10%) : ici, un filtre binaire
+    PAR TICKER (3 des 4 critères requis, pas un classement relatif) --
+    plus simple à intégrer dans le pipeline existant (par ticker, pas
+    par univers classé ensemble). À revisiter si un vrai classement
+    relatif est voulu plus tard.
+
+    Qualité : ROE > 15% ET dette/capitaux propres < 50 (déjà en points
+    de pourcentage chez yfinance -- vérifié en direct : NVDA=6,56 =
+    6,56% de dette, PAS 656%).
+    Faible volatilité : bêta < 0,8 (déjà calculé par yfinance, pas de
+    régression maison).
+    Momentum : rendement 12 mois moins le dernier mois positif (voir
+    _fetch_technical_trend).
+
+    Note : low-vol et momentum sont en tension naturelle (un titre en
+    fort momentum a souvent un bêta plus élevé) -- exiger les 4 critères
+    serait presque toujours impossible. 3/4 requis.
+    """
+    if not trend.get("available"):
+        return {"available": False, "criteria_met": 0, "criteria_total": 4, "passes_screen": False}
+
+    roe, debt_to_equity, beta = data.get("roe"), data.get("debt_to_equity"), data.get("beta")
+    momentum = trend.get("momentum_12_1_pct")
+
+    criteria = {
+        "quality_roe_over_15pct": roe is not None and roe > 15,
+        "quality_debt_to_equity_under_50": debt_to_equity is not None and debt_to_equity < 50,
+        "low_vol_beta_under_0_8": beta is not None and beta < 0.8,
+        "momentum_12_1_positive": momentum is not None and momentum > 0,
+    }
+    criteria_met = sum(1 for v in criteria.values() if v)
+    return {
+        "available": True, **criteria,
+        "roe_pct": roe, "debt_to_equity_pct": debt_to_equity, "beta": beta, "momentum_12_1_pct": momentum,
+        "criteria_met": criteria_met, "criteria_total": len(criteria),
+        "passes_screen": criteria_met >= 3,
     }
 
 
@@ -613,6 +677,25 @@ def evaluate_ticker(ticker: str, preset_thresholds: dict) -> Optional[QuantResul
                 "Aucun catalyseur détecté (ni inflexion de marge, ni achat d'initiés >= 50k$ sur 90 jours)"
             )
 
+    # Preset "Insider Trading" (2026-08-23) -- contrairement à
+    # require_catalyst ci-dessus (OU avec l'inflexion de marge), ce preset
+    # exige l'achat d'initiés SEUL, sans porte de sortie. Appel réseau
+    # séparé de celui ci-dessus : si un preset active les deux flags un
+    # jour, on évite un double appel en réutilisant insider_data s'il a
+    # déjà été fetché.
+    if thresholds.get("require_insider_buying"):
+        if not thresholds.get("require_catalyst"):
+            insider_data = _fetch_insider_buying(ticker)
+            data["insiders_buying"] = insider_data["insiders_buying"]
+            data["insider_buy_total"] = insider_data["insider_buy_total"]
+            insiders_buying = insider_data["insiders_buying"]
+        if insiders_buying:
+            score += 2.0  # seul signal du preset -- poids élevé, comme Minervini/CAN SLIM
+        else:
+            reasons_failed.append(
+                "Aucun achat d'initiés significatif détecté (>= 50k$ sur 90 jours)"
+            )
+
     # Méthode Thorp (2026-08-23, "Comment profiter des erreurs des
     # analystes") -- révisions de bénéfices, voir docstring de
     # _fetch_earnings_revision pour la règle exacte (ratio, pas "zéro
@@ -637,7 +720,11 @@ def evaluate_ticker(ticker: str, preset_thresholds: dict) -> Optional[QuantResul
     # est hors scope). Une seule requête d'historique de prix partagée
     # entre les deux si le preset active l'un OU l'autre.
     technical_trend = {}
-    if thresholds.get("require_minervini_trend") or thresholds.get("require_can_slim"):
+    if (
+        thresholds.get("require_minervini_trend")
+        or thresholds.get("require_can_slim")
+        or thresholds.get("require_factor_investing")
+    ):
         technical_trend = _fetch_technical_trend(ticker)
         data["technical_trend"] = technical_trend
 
@@ -659,6 +746,20 @@ def evaluate_ticker(ticker: str, preset_thresholds: dict) -> Optional[QuantResul
         else:
             reasons_failed.append(
                 f"Filtre CAN SLIM non respecté ({can_slim['criteria_met']}/{can_slim['criteria_total']} critères)"
+            )
+
+    # Factor Investing (2026-08-23) -- version simplifiée par titre (voir
+    # docstring de _evaluate_factor_investing) : Qualité (ROE + D/E) + Faible
+    # volatilité (bêta) + Momentum 12-1. Exige 3/4, pas 4/4 (faible-vol et
+    # momentum sont naturellement en tension).
+    if thresholds.get("require_factor_investing"):
+        factor = _evaluate_factor_investing(data, technical_trend)
+        data["factor_investing"] = factor
+        if factor["passes_screen"]:
+            score += 2.0
+        else:
+            reasons_failed.append(
+                f"Filtre Factor Investing non respecté ({factor['criteria_met']}/{factor['criteria_total']} critères)"
             )
 
     passed = len(reasons_failed) == 0
