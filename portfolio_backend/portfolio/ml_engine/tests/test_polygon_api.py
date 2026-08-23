@@ -6,8 +6,10 @@ docstring de polygon_api.py pour le contexte complet."""
 from unittest.mock import MagicMock, patch
 
 from portfolio.ml_engine.collectors.polygon_api import (
+    fetch_fundamentals,
     fetch_polygon_fundamentals,
     fetch_polygon_sentiment,
+    fetch_yfinance_fundamentals,
 )
 
 
@@ -147,3 +149,68 @@ class TestFetchPolygonSentiment:
 
         mock_get.assert_not_called()
         assert result == {"news_sentiment": 0.0, "news_count": 0}
+
+
+class TestFetchYfinanceFundamentals:
+    def test_converts_roe_ratio_to_percentage_points_and_keeps_debt_to_equity_as_is(self):
+        # debtToEquity de yfinance est déjà en points de pourcentage (voir
+        # docstring du module) -- PAS de *100 dessus, contrairement à
+        # returnOnEquity qui est un ratio 0-1.
+        mock_ticker = MagicMock(info={"returnOnEquity": 0.20062, "debtToEquity": 75.868})
+        with patch("portfolio.ml_engine.collectors.polygon_api.market_data.Ticker", return_value=mock_ticker):
+            result = fetch_yfinance_fundamentals("ATD.TO")
+
+        assert result == {"roe": 20.06, "debt_to_equity": 75.87}
+
+    def test_missing_fields_return_none_not_zero(self):
+        mock_ticker = MagicMock(info={})
+        with patch("portfolio.ml_engine.collectors.polygon_api.market_data.Ticker", return_value=mock_ticker):
+            result = fetch_yfinance_fundamentals("TEC.TO")
+
+        assert result == {"roe": None, "debt_to_equity": None}
+
+    def test_ticker_lookup_failure_degrades_to_default(self):
+        with patch("portfolio.ml_engine.collectors.polygon_api.market_data.Ticker", side_effect=RuntimeError("boom")):
+            result = fetch_yfinance_fundamentals("TEC.TO")
+
+        assert result == {"roe": None, "debt_to_equity": None}
+
+
+class TestFetchFundamentalsCombined:
+    def test_polygon_values_win_when_both_fields_present(self):
+        with patch(
+            "portfolio.ml_engine.collectors.polygon_api.fetch_polygon_fundamentals",
+            return_value={"roe": 119.91, "debt_to_equity": 76.54},
+        ), patch("portfolio.ml_engine.collectors.polygon_api.fetch_yfinance_fundamentals") as mock_yf:
+            result = fetch_fundamentals("AAPL")
+
+        mock_yf.assert_not_called()  # Polygon complet -- jamais besoin du fallback
+        assert result == {"roe": 119.91, "debt_to_equity": 76.54}
+
+    def test_yfinance_fills_in_when_polygon_has_no_tsx_coverage(self):
+        # Cas réel RY.TO/ATD.TO/PDN.TO/SONI.CN : Polygon ne couvre pas la
+        # TSX/CSE, yfinance complète.
+        with patch(
+            "portfolio.ml_engine.collectors.polygon_api.fetch_polygon_fundamentals",
+            return_value={"roe": None, "debt_to_equity": None},
+        ), patch(
+            "portfolio.ml_engine.collectors.polygon_api.fetch_yfinance_fundamentals",
+            return_value={"roe": 16.2, "debt_to_equity": None},
+        ):
+            result = fetch_fundamentals("RY.TO")
+
+        assert result == {"roe": 16.2, "debt_to_equity": None}
+
+    def test_neither_source_covers_the_symbol_returns_default(self):
+        # Cas réel TEC.TO/VFV.TO(ETF)/QQQ/SPY(ETF) -- pas un bug, ces
+        # titres n'ont simplement pas de fondamentaux d'entreprise.
+        with patch(
+            "portfolio.ml_engine.collectors.polygon_api.fetch_polygon_fundamentals",
+            return_value={"roe": None, "debt_to_equity": None},
+        ), patch(
+            "portfolio.ml_engine.collectors.polygon_api.fetch_yfinance_fundamentals",
+            return_value={"roe": None, "debt_to_equity": None},
+        ):
+            result = fetch_fundamentals("TEC.TO")
+
+        assert result == {"roe": None, "debt_to_equity": None}

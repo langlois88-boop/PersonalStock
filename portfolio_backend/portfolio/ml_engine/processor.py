@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from .. import market_data as yf
 
-from .collectors.polygon_api import fetch_polygon_fundamentals, fetch_polygon_sentiment
+from .collectors.polygon_api import fetch_fundamentals, fetch_polygon_sentiment
 from .collectors.fred_api import fetch_fred_latest
 
 
@@ -86,7 +86,7 @@ class DataMerger(MacroImputerMixin):
             if cached is not None:
                 return cached
 
-        fundamentals = fetch_polygon_fundamentals(symbol)
+        fundamentals = fetch_fundamentals(symbol)
         sentiment = fetch_polygon_sentiment(symbol)
         payload = {**fundamentals, **sentiment}
         if cache_backend is not None:

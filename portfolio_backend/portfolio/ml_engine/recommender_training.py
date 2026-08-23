@@ -13,7 +13,7 @@ from sklearn.metrics import precision_recall_curve, f1_score
 
 from .model import FEATURE_COLUMNS, build_model
 from .validation import PurgedTimeSeriesSplit
-from .collectors.polygon_api import fetch_polygon_fundamentals, fetch_polygon_sentiment
+from .collectors.polygon_api import fetch_fundamentals, fetch_polygon_sentiment
 from .collectors.fred_api import fetch_fred_latest
 from ..models import Stock, PriceHistory
 
@@ -70,7 +70,7 @@ def _build_symbol_frame(symbol: str, lookback_days: int, horizon: int, target_pc
     # information -- et le même compromis que le reste du projet fait
     # déjà ailleurs (ex. quant_filter.py n'a pas non plus de fondamentaux
     # point-in-time).
-    fundamentals = fetch_polygon_fundamentals(symbol)
+    fundamentals = fetch_fundamentals(symbol)
     sentiment = fetch_polygon_sentiment(symbol)
     fred_rate = fetch_fred_latest('GS10')
 
