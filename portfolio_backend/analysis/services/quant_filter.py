@@ -215,6 +215,10 @@ def fetch_ticker_data(ticker: str) -> Optional[dict]:
             "num_analysts": _safe(info.get("numberOfAnalystOpinions"), 0),
             "gross_margin_trend": margin_trend,
             "market_cap": _safe(info.get("marketCap")),
+            # CAN SLIM "C"/"A" (2026-08-23) -- vérifiés en direct sur
+            # NVDA (210%/85%) et AAPL (27%/16%), champs yfinance fiables.
+            "eps_growth_qoq": _safe(info.get("earningsQuarterlyGrowth")),
+            "revenue_growth_qoq": _safe(info.get("revenueGrowth")),
         }
     except Exception:
         logger.exception("Erreur fetch données pour %s", ticker)
@@ -249,6 +253,288 @@ def _detect_margin_inflection(margin_trend: list) -> bool:
     trough_idx = margin_trend.index(min(margin_trend[:3]))
     recent = margin_trend[trough_idx:]
     return len(recent) >= 3 and recent[-1] > recent[-2] > recent[0]
+
+
+def _fetch_earnings_revision(ticker: str) -> dict:
+    """
+    Signal de révision des bénéfices (méthode Thorp, "Comment profiter des
+    erreurs des analystes") -- via yfinance earnings_estimate/eps_trend/
+    eps_revisions. Vérifié en direct le 2026-08-23 : disponible et fiable
+    pour les titres à bonne couverture (AAPL/MSFT/NVDA : 20-51 analystes)
+    mais PAS uniforme même chez les blue chips (JNJ : seulement 4).
+
+    Règle de l'article ADAPTÉE, pas appliquée littéralement : "aucune
+    révision à la baisse" est presque impossible à satisfaire dès qu'un
+    titre a une bonne couverture -- vérifié en direct : MSFT, clairement
+    en tendance haussière sur ses prévisions (BPA année en cours et
+    suivante tous deux révisés à la hausse sur 30 jours), a quand même eu
+    9 révisions à la baisse sur 30 jours -- normal avec 26-34 analystes,
+    il y en a toujours qui vont à contre-courant. On utilise un RATIO
+    (hausses / baisses) au lieu d'exiger zéro baisse.
+    """
+    cache_key = f"earnings_revision:{ticker}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    default = {
+        "num_analysts": None, "revised_up_current_year": None,
+        "revised_up_next_year": None, "revision_ratio_30d": None,
+        "revision_magnitude_pct": None, "thorp_signal": False,
+    }
+    try:
+        tk = yf.Ticker(ticker)
+        trend = tk.eps_trend
+        est = tk.earnings_estimate
+        revisions = tk.eps_revisions
+        if trend is None or trend.empty or est is None or est.empty:
+            cache.set(cache_key, default, 60 * 60 * 6)
+            return default
+
+        num_analysts = None
+        if "0y" in est.index:
+            raw = _safe(est.loc["0y", "numberOfAnalysts"])
+            num_analysts = int(raw) if raw is not None else None
+
+        def _revised_up(period):
+            if period not in trend.index:
+                return None, None
+            current = _safe(trend.loc[period, "current"])
+            ago = _safe(trend.loc[period, "30daysAgo"])
+            if current is None or ago is None or ago == 0:
+                return None, None
+            current, ago = float(current), float(ago)
+            return current > ago, (current - ago) / abs(ago) * 100
+
+        up_0y, mag_0y = _revised_up("0y")
+        up_1y, mag_1y = _revised_up("+1y")
+        magnitudes = [m for m in (mag_0y, mag_1y) if m is not None]
+
+        ratio = None
+        if revisions is not None and not revisions.empty:
+            up_total, down_total = 0, 0
+            for period in ("0y", "+1y"):
+                if period in revisions.index:
+                    up_total += int(_safe(revisions.loc[period, "upLast30days"], 0) or 0)
+                    down_total += int(_safe(revisions.loc[period, "downLast30days"], 0) or 0)
+            if down_total > 0:
+                ratio = round(up_total / down_total, 2)
+            elif up_total > 0:
+                ratio = 999.0  # pas de baisse du tout -- "Infinity" n'est pas JSON-valide
+
+        thorp_signal = bool(
+            num_analysts and num_analysts >= 10
+            and up_0y and up_1y
+            and ratio is not None and ratio >= 2.0
+        )
+
+        result = {
+            "num_analysts": num_analysts,
+            "revised_up_current_year": up_0y,
+            "revised_up_next_year": up_1y,
+            "revision_ratio_30d": ratio,
+            "revision_magnitude_pct": round(max(magnitudes), 2) if magnitudes else None,
+            "thorp_signal": thorp_signal,
+        }
+        cache.set(cache_key, result, 60 * 60 * 12)  # 12h -- ces données ne bougent pas d'heure en heure
+        return result
+    except Exception:
+        logger.warning("Erreur fetch earnings revision pour %s", ticker)
+        return default
+
+
+def _fetch_market_distribution_days(index_symbol: str = "^GSPC", window_days: int = 25) -> dict:
+    """
+    "Jours de distribution" (William O'Neil, CAN SLIM) -- signal de SANTÉ
+    DU MARCHÉ GLOBAL, pas un critère par titre : compte, sur les ~5
+    dernières semaines de séances, les jours où l'indice clôture en
+    baisse d'au moins 0,2% sur un volume supérieur à la veille, OU
+    stagne (variation quasi nulle) sur un volume nettement supérieur
+    ("stalling" -- les institutionnels vendent pendant que les
+    particuliers achètent). 4 jours ou plus sur cette fenêtre = signal
+    classique d'O'Neil pour arrêter les nouveaux achats.
+
+    Mis en cache par INDICE, pas par ticker -- même résultat pour tous
+    les tickers scannés dans le même cycle, pas la peine de le
+    recalculer à chaque appel de _evaluate_can_slim.
+    """
+    cache_key = f"market_distribution_days:{index_symbol}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    default = {"available": False, "distribution_days": 0, "under_distribution": False}
+    try:
+        hist = yf.Ticker(index_symbol).history(period="3mo")
+        if hist is None or hist.empty or len(hist) < window_days + 1:
+            cache.set(cache_key, default, 60 * 60)
+            return default
+
+        close, volume = hist["Close"], hist["Volume"]
+        count = 0
+        for pos in range(len(hist) - window_days, len(hist)):
+            if pos <= 0:
+                continue
+            today_close, prev_close = float(close.iloc[pos]), float(close.iloc[pos - 1])
+            today_vol, prev_vol = float(volume.iloc[pos]), float(volume.iloc[pos - 1])
+            if prev_close == 0 or today_vol <= prev_vol:
+                continue
+            pct_change = (today_close - prev_close) / prev_close * 100
+            is_down = pct_change <= -0.2
+            is_stalling = abs(pct_change) < 0.1 and today_vol > prev_vol * 1.1
+            if is_down or is_stalling:
+                count += 1
+
+        result = {"available": True, "distribution_days": count, "window_days": window_days, "under_distribution": count >= 4}
+        cache.set(cache_key, result, 60 * 60)  # 1h -- pertinent au jour le jour, pas la peine de recalculer plus souvent
+        return result
+    except Exception:
+        logger.warning("Erreur fetch distribution days pour %s", index_symbol)
+        return default
+
+
+def _fetch_technical_trend(ticker: str) -> dict:
+    """
+    Base technique partagée par les presets Minervini (Trend Template) et
+    CAN SLIM (partie technique du "L" et du "N") -- moyennes mobiles,
+    sommet/creux 52 semaines, force relative vs marché. Une seule requête
+    d'historique de prix pour les deux, plutôt que dupliquer l'appel réseau.
+
+    Hors scope volontairement (voir docs/TECH_DEBT_NOTES.md pour le suivi) :
+    - Détection de la figure "Tasse avec Anse" -- reconnaissance de forme
+      sur série temporelle, pas un simple seuil ; effort séparé, à
+      valider contre de vrais exemples avant de la brancher sur du
+      capital réel même simulé (voir _fetch_market_distribution_days
+      juste au-dessus pour "jours de distribution", qui LUI est implémenté).
+    - Règles de sortie (stop-loss 7-8%, prise de profit 20-25%,
+      pyramidage) -- ce sont des règles de GESTION DE POSITION après
+      achat, pas des critères de screening. Ça se brancherait sur
+      monitor_lab_positions, pas ici.
+    """
+    cache_key = f"technical_trend:{ticker}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    default = {"available": False}
+    try:
+        hist = yf.Ticker(ticker).history(period="14mo")
+        if hist is None or hist.empty or len(hist) < 210:
+            cache.set(cache_key, default, 60 * 60 * 6)
+            return default
+
+        close = hist["Close"]
+        price = float(close.iloc[-1])
+        ma50 = float(close.rolling(50).mean().iloc[-1])
+        ma150 = float(close.rolling(150).mean().iloc[-1])
+        ma200_series = close.rolling(200).mean()
+        ma200 = float(ma200_series.iloc[-1])
+        ma200_1m_ago = float(ma200_series.iloc[-22]) if len(ma200_series) > 22 else None
+
+        window = close[-252:] if len(close) >= 252 else close
+        week52_high, week52_low = float(window.max()), float(window.min())
+
+        avg_volume = float(hist["Volume"][-50:].mean()) if "Volume" in hist else None
+
+        rel_strength_vs_market = None
+        try:
+            bench = yf.Ticker("^GSPC").history(period="7mo")["Close"]
+            if len(bench) > 126 and len(close) > 126:
+                ticker_return = price / float(close.iloc[-126]) - 1
+                bench_return = float(bench.iloc[-1]) / float(bench.iloc[-126]) - 1
+                rel_strength_vs_market = ticker_return > bench_return
+        except Exception:
+            pass
+
+        result = {
+            "available": True,
+            "price": round(price, 2), "ma50": round(ma50, 2), "ma150": round(ma150, 2),
+            "ma200": round(ma200, 2), "ma200_trending_up_1m": ma200_1m_ago is not None and ma200 > ma200_1m_ago,
+            "week_52_high": round(week52_high, 2), "week_52_low": round(week52_low, 2),
+            "avg_volume_50d": round(avg_volume) if avg_volume is not None else None,
+            "outperforms_market_6m": rel_strength_vs_market,
+        }
+        cache.set(cache_key, result, 60 * 60 * 12)
+        return result
+    except Exception:
+        logger.warning("Erreur fetch technical trend pour %s", ticker)
+        return default
+
+
+def _evaluate_minervini_template(trend: dict) -> dict:
+    """8 critères du "Trend Template" de Mark Minervini (SEPA) -- un
+    filtre binaire chez lui : les 8 doivent être respectés, pas une
+    majorité."""
+    if not trend.get("available"):
+        return {"criteria_met": 0, "criteria_total": 8, "passes_template": False}
+
+    price, ma50, ma150, ma200 = trend["price"], trend["ma50"], trend["ma150"], trend["ma200"]
+    criteria = {
+        "price_above_150_200": price > ma150 and price > ma200,
+        "ma150_above_ma200": ma150 > ma200,
+        "ma200_trending_up_1m": trend["ma200_trending_up_1m"],
+        "ma50_above_150_200": ma50 > ma150 and ma50 > ma200,
+        "price_above_ma50": price > ma50,
+        "price_25pct_above_52w_low": price >= trend["week_52_low"] * 1.25,
+        "price_within_25pct_of_52w_high": price >= trend["week_52_high"] * 0.75,
+        "outperforms_market_6m": bool(trend.get("outperforms_market_6m")),
+    }
+    criteria_met = sum(1 for v in criteria.values() if v)
+    return {
+        **criteria, "criteria_met": criteria_met, "criteria_total": len(criteria),
+        "passes_template": criteria_met == len(criteria),
+    }
+
+
+def _evaluate_can_slim(data: dict, trend: dict) -> dict:
+    """
+    CAN SLIM (William O'Neil) -- partie QUANTIFIABLE seulement (Tasse
+    avec Anse toujours hors scope, voir docstring de
+    _fetch_technical_trend -- reconnaissance de forme, effort séparé,
+    à valider contre de vrais exemples avant de la brancher sur du
+    capital réel même simulé).
+
+    C/A (bénéfices/ventes en forte accélération) : earningsQuarterlyGrowth
+    et revenueGrowth de yfinance -- vérifiés en direct (NVDA 210%/85%,
+    AAPL 27%/16%). La croissance BPA sur 5 ans (aussi dans la méthode
+    originale) est omise : demande un historique annuel fiable sur 5 ans,
+    peu robuste sur un balayage large (dépôts trimestriels incomplets,
+    même mise en garde que _fetch_margin_trend plus haut dans ce module).
+    S (volume) : moyenne 50 jours > 200k actions.
+    L/N (leader technique, nouveaux sommets) : réutilise _fetch_technical_trend.
+    M (direction du marché, "jours de distribution") : voir
+    _fetch_market_distribution_days -- signal de marché global, pas
+    propre au ticker, mais évalué ici parce que c'est une règle CAN SLIM
+    explicite ("ne jamais acheter si le marché est sous distribution").
+    """
+    if not trend.get("available"):
+        return {"available": False, "criteria_met": 0, "criteria_total": 7, "passes_screen": False}
+
+    eps_growth_qoq = data.get("eps_growth_qoq")
+    revenue_growth_qoq = data.get("revenue_growth_qoq")
+    avg_volume = trend.get("avg_volume_50d")
+    market_health = _fetch_market_distribution_days()
+
+    criteria = {
+        "eps_growth_over_20pct": eps_growth_qoq is not None and eps_growth_qoq > 0.20,
+        "revenue_growth_over_20pct": revenue_growth_qoq is not None and revenue_growth_qoq > 0.20,
+        "volume_over_200k": avg_volume is not None and avg_volume > 200_000,
+        "price_above_ma50": trend["price"] > trend["ma50"],
+        "ma50_above_ma200": trend["ma50"] > trend["ma200"],
+        "within_25pct_of_52w_high": trend["price"] >= trend["week_52_high"] * 0.75,
+        "market_not_under_distribution": not market_health.get("under_distribution", False),
+    }
+    criteria_met = sum(1 for v in criteria.values() if v)
+    return {
+        "available": True, **criteria,
+        "eps_growth_qoq_pct": round(eps_growth_qoq * 100, 1) if eps_growth_qoq is not None else None,
+        "revenue_growth_qoq_pct": round(revenue_growth_qoq * 100, 1) if revenue_growth_qoq is not None else None,
+        "market_distribution_days": market_health.get("distribution_days"),
+        "criteria_met": criteria_met, "criteria_total": len(criteria),
+        # Filtre "screen", pas un template binaire comme Minervini -- au moins
+        # 6/7 (toutes sauf une, ex. volume tout juste sous 200k reste acceptable).
+        "passes_screen": criteria_met >= 6,
+    }
 
 
 def merge_thresholds(sector: str, preset_thresholds: dict) -> dict:
@@ -325,6 +611,54 @@ def evaluate_ticker(ticker: str, preset_thresholds: dict) -> Optional[QuantResul
         if not has_catalyst:
             reasons_failed.append(
                 "Aucun catalyseur détecté (ni inflexion de marge, ni achat d'initiés >= 50k$ sur 90 jours)"
+            )
+
+    # Méthode Thorp (2026-08-23, "Comment profiter des erreurs des
+    # analystes") -- révisions de bénéfices, voir docstring de
+    # _fetch_earnings_revision pour la règle exacte (ratio, pas "zéro
+    # baisse" littéral). Même garde-fou que require_catalyst : appel réseau
+    # seulement si le preset le demande.
+    earnings_revision = {}
+    if thresholds.get("require_earnings_revision"):
+        earnings_revision = _fetch_earnings_revision(ticker)
+        data["earnings_revision"] = earnings_revision
+        if earnings_revision.get("thorp_signal"):
+            score += 1.5
+        else:
+            reasons_failed.append(
+                "Pas de signal de révision de bénéfices (Thorp) : "
+                f"analystes={earnings_revision.get('num_analysts')}, "
+                f"ratio hausse/baisse={earnings_revision.get('revision_ratio_30d')}"
+            )
+
+    # Modèles "style d'investisseur" (2026-08-23) -- Minervini (Trend
+    # Template, filtre binaire 8/8) et CAN SLIM (William O'Neil, partie
+    # quantifiable seulement -- voir _fetch_technical_trend pour ce qui
+    # est hors scope). Une seule requête d'historique de prix partagée
+    # entre les deux si le preset active l'un OU l'autre.
+    technical_trend = {}
+    if thresholds.get("require_minervini_trend") or thresholds.get("require_can_slim"):
+        technical_trend = _fetch_technical_trend(ticker)
+        data["technical_trend"] = technical_trend
+
+    if thresholds.get("require_minervini_trend"):
+        minervini = _evaluate_minervini_template(technical_trend)
+        data["minervini"] = minervini
+        if minervini["passes_template"]:
+            score += 2.0  # filtre binaire chez Minervini -- poids élevé, tout ou rien
+        else:
+            reasons_failed.append(
+                f"Trend Template Minervini non respecté ({minervini['criteria_met']}/{minervini['criteria_total']} critères)"
+            )
+
+    if thresholds.get("require_can_slim"):
+        can_slim = _evaluate_can_slim(data, technical_trend)
+        data["can_slim"] = can_slim
+        if can_slim["passes_screen"]:
+            score += 2.0
+        else:
+            reasons_failed.append(
+                f"Filtre CAN SLIM non respecté ({can_slim['criteria_met']}/{can_slim['criteria_total']} critères)"
             )
 
     passed = len(reasons_failed) == 0
