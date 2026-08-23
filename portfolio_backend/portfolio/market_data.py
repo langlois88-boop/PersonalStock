@@ -298,6 +298,19 @@ def _yf_download_fallback(
         pd.DataFrame(),
     )
     if isinstance(fallback, pd.DataFrame) and not fallback.empty:
+        # 2026-08-23 : yfinance.download() renvoie des colonnes MultiIndex
+        # (ticker, champ) même pour UN seul symbole selon la version --
+        # découvert en direct sur QQQ (colonnes ('QQQ', 'Close') etc. au
+        # lieu de 'Close' plat). Tout code appelant "Close" in data ou
+        # data["Close"] (portfolio/ml_engine/processor.py::fetch_price_
+        # features, entre autres) échouait silencieusement et retournait
+        # un jeu de features vide -- jamais d'exception, juste des
+        # features de prix manquantes. Aplati ici, à la source, plutôt
+        # que dans chacun des appelants (download() ET Ticker.history()
+        # partagent ce chemin de repli).
+        if isinstance(fallback.columns, pd.MultiIndex):
+            fallback = fallback.copy()
+            fallback.columns = fallback.columns.get_level_values(-1)
         return fallback
 
     finnhub_key = os.getenv('FINNHUB_API_KEY')
