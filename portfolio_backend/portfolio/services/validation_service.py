@@ -263,7 +263,23 @@ class ValidationService:
         if data is None or data.empty:
             return None
         try:
-            features = train_penny_model._build_features(data).dropna()
+            # 2026-08-23 : _build_features exige (close, volume,
+            # sentiment_score) -- appelée ici avec `data` (le DataFrame
+            # OHLCV complet) tout seul depuis toujours, un TypeError
+            # avalé sans bruit par le except Exception plus bas, donc
+            # _penny_prediction (et DanasConsensusView qui l'affiche)
+            # retournait toujours None peu importe la qualité de la
+            # donnée de prix. Corrigé pour matcher exactement l'appel de
+            # train_penny_model.py::build_dataset.
+            close = train_penny_model._extract_series(data, symbol, ('Adj Close', 'Close'))
+            volume = train_penny_model._extract_series(data, symbol, ('Volume',))
+            if close.empty:
+                return None
+            if volume.empty:
+                volume = close * 0
+            news_payload = fetch_news_sentiment(symbol)
+            sentiment_score = float(news_payload.get('news_sentiment') or 0.0)
+            features = train_penny_model._build_features(close, volume, sentiment_score).dropna()
             if features.empty:
                 return None
             last = features.tail(1)
