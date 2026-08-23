@@ -324,18 +324,6 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': crontab(minute=5, hour=16, day_of_week='mon-fri'),
         'kwargs': {'fast': True},
     },
-    'ai-center-snapshot-open-0935': {
-        'task': 'portfolio.tasks.cache_ai_center_snapshot',
-        'schedule': crontab(minute=35, hour=9, day_of_week='mon-fri'),
-    },
-    'ai-center-snapshot-midday-1230': {
-        'task': 'portfolio.tasks.cache_ai_center_snapshot',
-        'schedule': crontab(minute=30, hour=12, day_of_week='mon-fri'),
-    },
-    'ai-center-snapshot-close-1605': {
-        'task': 'portfolio.tasks.cache_ai_center_snapshot',
-        'schedule': crontab(minute=5, hour=16, day_of_week='mon-fri'),
-    },
     'deepseek-open-0945': {
         'task': 'portfolio.tasks.run_morning_ai_analysis',
         'schedule': crontab(minute=45, hour=9, day_of_week='mon-fri'),

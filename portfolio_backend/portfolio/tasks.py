@@ -13776,21 +13776,7 @@ def cache_optimizer_snapshot(fast: bool = True, portfolio_id: int | None = None)
         return {'status': 'failed', 'error': str(exc)}
 
 
-@shared_task
-def cache_ai_center_snapshot() -> dict[str, Any]:
-    log = _task_log_start('cache_ai_center_snapshot')
-    try:
-        from types import SimpleNamespace
-        from portfolio.views import AICenterView
-
-        request = SimpleNamespace(query_params={}, user=None)
-        response = AICenterView().get(request)
-        payload = getattr(response, 'data', None)
-        if isinstance(payload, dict):
-            ttl_min = int(os.getenv('AI_CENTER_SCHEDULE_TTL_MIN', '360'))
-            cache.set('ai_center:scheduled', payload, timeout=max(60, ttl_min * 60))
-        _task_log_finish(log, 'SUCCESS', {'status': 'ok'})
-        return {'status': 'ok'}
-    except Exception as exc:
-        _task_log_finish(log, 'FAILED', error=str(exc))
-        return {'status': 'failed', 'error': str(exc)}
+# cache_ai_center_snapshot supprimée (2026-08-23) -- AICenterView/DanasBroker
+# retirés (chat LLM local jamais branché au frontend, testé en direct et jugé
+# pas assez fiable/rapide pour valoir la peine). Le cache 'ai_center:scheduled'
+# qu'elle écrivait n'était de toute façon lu nulle part -- write-only.
