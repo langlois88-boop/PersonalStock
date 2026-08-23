@@ -5,9 +5,8 @@ import numpy as np
 import pandas as pd
 from .. import market_data as yf
 
-from .collectors.fmp_api import fetch_fmp_fundamentals, fetch_fmp_sentiment
+from .collectors.polygon_api import fetch_polygon_fundamentals, fetch_polygon_sentiment
 from .collectors.fred_api import fetch_fred_latest
-from .collectors.news_rss import fetch_news_sentiment
 
 
 class MacroImputerMixin:
@@ -65,6 +64,14 @@ class DataMerger(MacroImputerMixin):
         return {"fred_rate": rate}
 
     def fetch_fundamental_features(self, symbol: str) -> Dict[str, Optional[float]]:
+        # Polygon (2026-08-23) remplace FMP (mort, v3 -> 403 depuis le
+        # 31 août 2025) ET le sentiment RSS/FinBERT (de toute façon écrasé
+        # sans condition par ce dernier avant ce changement -- voir
+        # docstring de collectors/polygon_api.py). Cache renommé
+        # (fmp_fundamentals -> polygon_fundamentals) pour ne jamais lire
+        # une entrée fmp_fundamentals:* mise en cache 24h avant ce
+        # changement -- même précaution que le cache technical_trend
+        # trouvé stale plus tôt cette session.
         cache_backend = None
         try:
             from django.core.cache import cache as django_cache
@@ -73,21 +80,18 @@ class DataMerger(MacroImputerMixin):
         except Exception:
             cache_backend = None
 
-        cache_key = f"fmp_fundamentals:{symbol}"
+        cache_key = f"polygon_fundamentals:{symbol}"
         if cache_backend is not None:
             cached = cache_backend.get(cache_key)
             if cached is not None:
                 return cached
 
-        fundamentals = fetch_fmp_fundamentals(symbol)
-        sentiment = fetch_fmp_sentiment(symbol)
+        fundamentals = fetch_polygon_fundamentals(symbol)
+        sentiment = fetch_polygon_sentiment(symbol)
         payload = {**fundamentals, **sentiment}
         if cache_backend is not None:
             cache_backend.set(cache_key, payload, timeout=60 * 60 * 24)
         return payload
-
-    def fetch_news_features(self, symbol: str) -> Dict[str, float]:
-        return fetch_news_sentiment(symbol)
 
     def merge(self, symbol: str) -> Dict[str, Optional[float]]:
         symbol = (symbol or "").upper().strip()
@@ -100,6 +104,5 @@ class DataMerger(MacroImputerMixin):
             **self.fetch_price_features(symbol),
             **self.fetch_fundamental_features(symbol),
             **macro_features,
-            **self.fetch_news_features(symbol),
         }
         return features

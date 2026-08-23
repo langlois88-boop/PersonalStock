@@ -13,6 +13,8 @@ from sklearn.metrics import precision_recall_curve, f1_score
 
 from .model import FEATURE_COLUMNS, build_model
 from .validation import PurgedTimeSeriesSplit
+from .collectors.polygon_api import fetch_polygon_fundamentals, fetch_polygon_sentiment
+from .collectors.fred_api import fetch_fred_latest
 from ..models import Stock, PriceHistory
 
 RECOMMENDER_MODEL_PATH = Path(__file__).resolve().parent / 'recommender_brain_v1.pkl'
@@ -55,11 +57,28 @@ def _build_symbol_frame(symbol: str, lookback_days: int, horizon: int, target_pc
     if df.empty:
         return pd.DataFrame()
 
-    df['roe'] = 0.0
-    df['debt_to_equity'] = 0.0
-    df['news_sentiment'] = 0.0
-    df['news_count'] = 0.0
-    df['fred_rate'] = 0.0
+    # 2026-08-23 : remplace les zéros codés en dur par de vraies valeurs
+    # (Polygon pour fondamentaux/sentiment, FRED pour le taux directeur) --
+    # le modèle n'avait jamais appris de relation avec ces colonnes tant
+    # qu'elles étaient constantes. LIMITE ASSUMÉE, pas corrigée ici :
+    # aucune de ces sources ne donne un historique point-in-time -- on
+    # applique la valeur ACTUELLE comme constante sur toute la fenêtre de
+    # lookback (jusqu'à `lookback_days` en arrière) pour CE symbole. Un
+    # léger biais d'anticipation (la vraie valeur au moment de chaque
+    # ligne historique était probablement différente), mais très
+    # nettement moins faux qu'un zéro constant qui masquait toute
+    # information -- et le même compromis que le reste du projet fait
+    # déjà ailleurs (ex. quant_filter.py n'a pas non plus de fondamentaux
+    # point-in-time).
+    fundamentals = fetch_polygon_fundamentals(symbol)
+    sentiment = fetch_polygon_sentiment(symbol)
+    fred_rate = fetch_fred_latest('GS10')
+
+    df['roe'] = fundamentals.get('roe') if fundamentals.get('roe') is not None else 0.0
+    df['debt_to_equity'] = fundamentals.get('debt_to_equity') if fundamentals.get('debt_to_equity') is not None else 0.0
+    df['news_sentiment'] = sentiment.get('news_sentiment', 0.0)
+    df['news_count'] = sentiment.get('news_count', 0.0)
+    df['fred_rate'] = fred_rate if fred_rate is not None else 0.0
     df['symbol'] = symbol
 
     return df
