@@ -648,6 +648,102 @@ class MonitorLabPositionsTakeProfitAndMaxHoldTests(APITestCase):
         self.assertTrue(lab_position.is_open)
 
 
+class SyncWatchlistFromFundamentalLabTests(APITestCase):
+    """
+    2026-08-23 : remplace, pour WATCHLIST, l'ancien mécanisme d'ajout
+    (fusion du scanner penny 0,50$-10$) -- un décalage prix/style trouvé
+    en discutant pourquoi WATCHLIST ne contenait que des titres sous 10$
+    alors qu'il partage son modèle (FUSION) avec AI_BLUECHIP."""
+
+    def setUp(self):
+        self.preset = _make_preset()
+
+    def _make_confirmed_position(self, ticker, is_open=True):
+        scan_run = ScanRun.objects.create(preset=self.preset, universe_source="sandboxes")
+        scan_result = ScanResult.objects.create(
+            scan_run=scan_run, ticker=ticker, final_verdict="confirmed",
+            price_at_scan=Decimal("10.00"), quant_score=3.0,
+        )
+        return FundamentalLabPosition.objects.create(
+            scan_result=scan_result, ticker=ticker, preset=self.preset,
+            entry_price=Decimal("10.00"), entry_date=timezone.now(), is_open=is_open,
+        )
+
+    def test_adds_confirmed_open_tickers_to_an_empty_watchlist(self):
+        self._make_confirmed_position("ADBE")
+        self._make_confirmed_position("K.TO")
+
+        result = tasks.sync_watchlist_from_fundamental_lab("WATCHLIST")
+
+        watch = SandboxWatchlist.objects.get(sandbox="WATCHLIST")
+        self.assertEqual(set(watch.symbols), {"ADBE", "K.TO"})
+        self.assertEqual(watch.source, "fundamental_lab_confirmed")
+        self.assertEqual(set(result["added"]), {"ADBE", "K.TO"})
+
+    def test_never_removes_existing_symbols_only_adds(self):
+        SandboxWatchlist.objects.create(sandbox="WATCHLIST", symbols=["EXISTING"], source="manual")
+        self._make_confirmed_position("ADBE")
+
+        tasks.sync_watchlist_from_fundamental_lab("WATCHLIST")
+
+        watch = SandboxWatchlist.objects.get(sandbox="WATCHLIST")
+        self.assertIn("EXISTING", watch.symbols)
+        self.assertIn("ADBE", watch.symbols)
+
+    def test_closed_confirmed_positions_are_ignored(self):
+        self._make_confirmed_position("ADBE", is_open=False)
+
+        result = tasks.sync_watchlist_from_fundamental_lab("WATCHLIST")
+
+        self.assertEqual(result["status"], "no_data")
+        self.assertFalse(SandboxWatchlist.objects.filter(sandbox="WATCHLIST").exists())
+
+    def test_uncertain_verdict_is_never_synced_only_confirmed(self):
+        scan_run = ScanRun.objects.create(preset=self.preset, universe_source="sandboxes")
+        scan_result = ScanResult.objects.create(
+            scan_run=scan_run, ticker="BRCC", final_verdict="uncertain",
+            price_at_scan=Decimal("0.80"), quant_score=1.0,
+        )
+        FundamentalLabPosition.objects.create(
+            scan_result=scan_result, ticker="BRCC", preset=self.preset,
+            entry_price=Decimal("0.80"), entry_date=timezone.now(), is_open=True,
+        )
+
+        result = tasks.sync_watchlist_from_fundamental_lab("WATCHLIST")
+        self.assertEqual(result["status"], "no_data")
+
+    def test_respects_the_room_limit(self):
+        SandboxWatchlist.objects.create(sandbox="WATCHLIST", symbols=[], source="manual")
+        self._make_confirmed_position("ADBE")
+        self._make_confirmed_position("K.TO")
+
+        real_getenv = tasks.os.getenv
+        with patch.object(
+            tasks.os, "getenv",
+            side_effect=lambda k, d=None: "1" if k == "WATCHLIST_FROM_LAB_LIMIT" else real_getenv(k, d),
+        ):
+            result = tasks.sync_watchlist_from_fundamental_lab("WATCHLIST")
+
+        self.assertEqual(len(result["added"]), 1)
+
+    def test_duplicate_ticker_across_multiple_positions_added_once(self):
+        self._make_confirmed_position("ADBE")
+        # Deuxième position confirmée sur le même ticker (ex. reconfirmée
+        # par un autre preset) -- ne doit pas être ajoutée deux fois.
+        scan_run2 = ScanRun.objects.create(preset=self.preset, universe_source="sandboxes")
+        scan_result2 = ScanResult.objects.create(
+            scan_run=scan_run2, ticker="ADBE", final_verdict="confirmed",
+            price_at_scan=Decimal("11.00"), quant_score=2.0,
+        )
+        FundamentalLabPosition.objects.create(
+            scan_result=scan_result2, ticker="ADBE", preset=self.preset,
+            entry_price=Decimal("11.00"), entry_date=timezone.now(), is_open=True,
+        )
+
+        result = tasks.sync_watchlist_from_fundamental_lab("WATCHLIST")
+        self.assertEqual(result["added"], ["ADBE"])
+
+
 class LabPerformanceViewTests(APITestCase):
     """
     Confirmed live 2026-08-15 (session investigating a user-reported

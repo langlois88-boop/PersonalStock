@@ -888,6 +888,67 @@ def monitor_lab_positions(self) -> dict:
     return result
 
 
+@shared_task
+def sync_watchlist_from_fundamental_lab(sandbox: str = "WATCHLIST") -> dict:
+    """
+    Alimente portfolio.SandboxWatchlist(sandbox) avec les tickers
+    actuellement CONFIRMÉS et ouverts dans FUNDAMENTAL_LAB (2026-08-23).
+
+    Remplace, pour WATCHLIST, l'ancien mécanisme d'ajout (fusion des
+    trouvailles de portfolio.tasks.market_scanner_task, un scanner penny
+    stock 0,50$-10$) -- trouvé en discutant pourquoi WATCHLIST ne
+    contenait que des titres sous 10$ alors qu'il partage son modèle
+    (FUSION) avec AI_BLUECHIP, un vrai décalage prix/style. Les picks
+    "confirmed" de FUNDAMENTAL_LAB (Claude n'a trouvé AUCUNE raison
+    fondamentale négative -- voir claude_verifier.py) sont un signal plus
+    solide qu'un simple scan technique : vraie vérification fondamentale
+    + raisonnement LLM, pas juste RSI/RVOL.
+
+    N'AJOUTE jamais que dans l'espace restant (jusqu'à
+    WATCHLIST_FROM_LAB_LIMIT) -- ne retire JAMAIS un symbole ici, ce n'est
+    pas son rôle (voir portfolio.tasks.prune_watchlist_weekly pour le
+    retrait, source-agnostique, peu importe comment un titre est arrivé
+    dans la liste).
+    """
+    limit = int(os.getenv("WATCHLIST_FROM_LAB_LIMIT", "25"))
+    # dict.fromkeys(...) plutôt que .distinct() sur le values_list : combiné
+    # à .order_by("-entry_date") sur un champ différent du values_list,
+    # .distinct() ne déduplique pas réellement (piège Django documenté --
+    # order_by() ajoute la colonne au SELECT, ce qui casse DISTINCT sur un
+    # sous-ensemble de colonnes) -- trouvé par un test avec deux positions
+    # confirmées sur le même ticker (dates d'entrée différentes).
+    ordered_tickers = (
+        FundamentalLabPosition.objects.filter(scan_result__final_verdict="confirmed", is_open=True)
+        .order_by("-entry_date")
+        .values_list("ticker", flat=True)
+    )
+    confirmed_tickers = list(dict.fromkeys(ordered_tickers))
+    if not confirmed_tickers:
+        return {"status": "no_data", "sandbox": sandbox}
+
+    watch, _ = SandboxWatchlist.objects.get_or_create(sandbox=sandbox, defaults={"symbols": []})
+    existing = list(watch.symbols or [])
+    new_unique = [t for t in confirmed_tickers if t not in existing]
+    room = max(0, limit - len(existing))
+    added = new_unique[:room]
+
+    if not added:
+        logger.info(
+            "sync_watchlist_from_fundamental_lab: rien à ajouter à %s (existants=%d, room=%d).",
+            sandbox, len(existing), room,
+        )
+        return {"status": "ok", "sandbox": sandbox, "added": [], "existing_count": len(existing)}
+
+    watch.symbols = existing + added
+    watch.source = "fundamental_lab_confirmed"
+    watch.save(update_fields=["symbols", "source"])
+    logger.info(
+        "sync_watchlist_from_fundamental_lab: %d titre(s) ajouté(s) à %s -- %s",
+        len(added), sandbox, ", ".join(added),
+    )
+    return {"status": "ok", "sandbox": sandbox, "added": added, "existing_count": len(existing) + len(added)}
+
+
 def _lab_suggestion_factor_buckets(positions: list) -> dict:
     """
     Regroupe les positions fermées par facteur simple (secteur, confiance

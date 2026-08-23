@@ -237,6 +237,7 @@ CELERY_TASK_ROUTES = {
     'analysis.tasks.check_rejection_outcomes': {'queue': 'analysis_queue'},
     'analysis.tasks.run_broad_index_scan': {'queue': 'analysis_queue'},
     'analysis.tasks.monitor_lab_positions': {'queue': 'analysis_queue'},
+    'analysis.tasks.sync_watchlist_from_fundamental_lab': {'queue': 'analysis_queue'},
     'analysis.tasks.generate_lab_weekly_suggestions': {'queue': 'analysis_queue'},
 }
 
@@ -598,6 +599,19 @@ CELERY_BEAT_SCHEDULE = {
     'daily-fundamental-scan': {
         'task': 'analysis.tasks.run_daily_scan',
         'schedule': crontab(hour=16, minute=30, day_of_week='mon-fri'),  # 30 min après la fermeture ET
+    },
+    # 2026-08-23 : remplace, pour WATCHLIST, l'ancien mécanisme d'ajout
+    # (fusion du scanner penny 0,50$-10$ dans market_scanner_task -- un
+    # décalage prix/style avec le modèle FUSION que WATCHLIST partage
+    # avec AI_BLUECHIP). 15 min après chaque scan FUNDAMENTAL_LAB pour
+    # récupérer les picks confirmés du jour même.
+    'watchlist-sync-morning': {
+        'task': 'analysis.tasks.sync_watchlist_from_fundamental_lab',
+        'schedule': crontab(hour=10, minute=0, day_of_week='mon-fri'),
+    },
+    'watchlist-sync-close': {
+        'task': 'analysis.tasks.sync_watchlist_from_fundamental_lab',
+        'schedule': crontab(hour=16, minute=45, day_of_week='mon-fri'),
     },
     'weekly-rejection-outcome-check': {
         'task': 'analysis.tasks.check_rejection_outcomes',
