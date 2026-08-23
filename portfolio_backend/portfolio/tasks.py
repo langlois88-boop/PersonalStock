@@ -3477,9 +3477,92 @@ def _fetch_yfinance_screeners(scr_ids: list[str], count: int = 200) -> list[dict
     return unique
 
 
+def _fetch_polygon_penny_screener(
+    min_price: float, max_price: float, min_volume: int, max_market_cap: int, max_symbols: int,
+) -> list[dict[str, Any]]:
+    """Remplace le company-screener FMP (2026-08-23) -- son endpoint
+    'stable/company-screener' est en 402 'Restricted Endpoint' sur le plan
+    Basic gratuit (vérifié en direct, indépendant du retrait des
+    legacy endpoints v3/v4 qui touche l'insider trading ailleurs).
+
+    Polygon n'a pas non plus de snapshot temps réel gainers/losers sur ce
+    plan (même 402), MAIS son endpoint 'grouped daily' (clôtures + volume
+    de TOUTE la bourse US en UN seul appel, ~12 500 titres, vérifié en
+    direct 2026-08-23) suffit très bien pour un filtre prix/volume --
+    beaucoup plus précis que les catégories génériques Yahoo/yfinance
+    utilisées par les paliers de repli suivants (testé en direct :
+    'aggressive_small_caps'/'small_cap_gainers'/'day_gainers'/
+    'most_actives' ne donnaient que 7 vrais titres penny sur 703 résultats,
+    la plupart étant des large/mid-caps hors catégorie).
+
+    Le filtre de capitalisation boursière ET de type de titre (exclut
+    ETF/warrants/notes -- ex. TMCWW vu dans les résultats Yahoo) demande
+    un appel par ticker (/v3/reference/tickers/{symbol}), donc appliqué
+    seulement aux meilleurs candidats par volume, plafonné à 4x
+    max_symbols pour ne jamais faire des centaines d'appels si beaucoup
+    de candidats à fort volume se révèlent être des ETF/warrants."""
+    api_key = os.getenv('POLYGON_API_KEY')
+    if not api_key:
+        return []
+
+    grouped_results = None
+    for days_back in range(7):
+        date = (timezone.now().date() - timedelta(days=days_back)).isoformat()
+        payload = _fetch_json(
+            f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}?adjusted=true&apiKey={api_key}"
+        ) or {}
+        results = payload.get('results') or []
+        if results:
+            grouped_results = results
+            break
+    if not grouped_results:
+        return []
+
+    candidates = []
+    for row in grouped_results:
+        symbol = row.get('T')
+        close = _safe_float(row.get('c'))
+        volume = _safe_float(row.get('v'))
+        if not symbol or close is None or volume is None:
+            continue
+        if close < min_price or close > max_price:
+            continue
+        if volume < min_volume:
+            continue
+        candidates.append({'symbol': symbol, 'price': close, 'volume': volume})
+
+    candidates.sort(key=lambda c: c['volume'], reverse=True)
+
+    universe: list[dict[str, Any]] = []
+    lookup_cap = max(max_symbols * 4, 100)
+    for candidate in candidates[:lookup_cap]:
+        if len(universe) >= max_symbols:
+            break
+        details = _fetch_json(
+            f"https://api.polygon.io/v3/reference/tickers/{candidate['symbol']}?apiKey={api_key}"
+        ) or {}
+        result = details.get('results') or {}
+        if result.get('type') != 'CS':  # exclut ETF/warrants/notes/preferred/etc.
+            continue
+        market_cap = _safe_float(result.get('market_cap'))
+        if market_cap is not None and market_cap > max_market_cap:
+            continue
+        universe.append({
+            'symbol': candidate['symbol'],
+            'companyName': result.get('name') or candidate['symbol'],
+            'exchangeShortName': result.get('primary_exchange') or '',
+            'sector': result.get('sic_description') or '',
+            'industry': '',
+            'price': candidate['price'],
+            'marketCap': market_cap,
+            'volume': candidate['volume'],
+        })
+    return universe
+
+
 @shared_task
 def run_penny_ai_scout() -> dict[str, int]:
-    """Nightly FMP + Alpha Vantage pipeline for penny stock AI scores."""
+    """Nightly Polygon + Alpha Vantage pipeline for penny stock AI scores."""
     fmp_key = os.getenv('FMP_API_KEY')
     av_key = os.getenv('ALPHAVANTAGE_API_KEY')
     if not fmp_key:
@@ -3491,22 +3574,11 @@ def run_penny_ai_scout() -> dict[str, int]:
     max_market_cap = int(os.getenv('PENNY_MAX_MARKET_CAP', '50000000'))
     max_symbols = int(os.getenv('PENNY_MAX_SYMBOLS', '50'))
 
-    screener_url = (
-        "https://financialmodelingprep.com/stable/company-screener"
-        f"?priceLowerThan={max_price}&volumeMoreThan={min_volume}"
-        f"&marketCapLowerThan={max_market_cap}&limit={max_symbols}&apikey={fmp_key}"
-    )
-    universe = _fetch_json(screener_url) or []
-    restricted = False
-    if isinstance(universe, dict):
-        error_msg = universe.get('Error Message') or universe.get('error') or universe.get('message')
-        if error_msg and 'Restricted Endpoint' in str(error_msg):
-            restricted = True
-            universe = []
-        elif error_msg:
-            return {'created': 0, 'updated': 0}
-    if not isinstance(universe, list):
-        return {'created': 0, 'updated': 0}
+    # 2026-08-23 : le company-screener FMP est retiré (voir docstring de
+    # _fetch_polygon_penny_screener) -- Polygon devient le premier palier,
+    # les anciens paliers Yahoo/yfinance/SEC/DB restent en repli si
+    # Polygon n'a pas de clé ou est en panne.
+    universe = _fetch_polygon_penny_screener(min_price, max_price, min_volume, max_market_cap, max_symbols)
 
     if not universe:
         scr_id = os.getenv('PENNY_SCREENER_ID', 'penny_stocks')
