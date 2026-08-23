@@ -129,6 +129,7 @@ from .services.validation_service import ValidationService
 from .services.signal_engine_patches import cached_view_result
 from .services.quant_context_builder import build_quant_context, context_to_prompt
 from .services.correlation_guard import compute_correlation_matrix, marginal_correlation_impact
+from .services.penny_risk_screen import fetch_insider_buying
 from .alpaca_data import get_intraday_bars, get_intraday_context
 from .patterns import build_pattern_annotations, enrich_bars_with_patterns
 from .ml_engine.engine.data_fusion import DataFusionEngine
@@ -4395,52 +4396,16 @@ class AccountDashboardView(APIView):
 		}
 
 	def _insider_summary(self, symbol: str) -> dict[str, Any] | None:
-		cache_key = f"insider_summary:{symbol}"
-		cached = cache.get(cache_key)
-		if cached is not None:
-			return cached
-		api_key = os.getenv('FMP_API_KEY')
-		if not api_key:
-			return None
-		url = f"https://financialmodelingprep.com/api/v4/insider-trading?symbol={symbol}&limit=50&apikey={api_key}"
-		try:
-			resp = requests.get(url, timeout=10)
-			if resp.status_code != 200:
-				return None
-			items = resp.json() or []
-		except Exception:
-			return None
-		if not isinstance(items, list) or not items:
-			cache.set(cache_key, None, 60 * 60)
-			return None
-		cutoff = timezone.now() - timedelta(days=90)
-		total_buy = 0.0
-		for item in items:
-			date_str = item.get('transactionDate') or item.get('date')
-			if date_str:
-				try:
-					if datetime.fromisoformat(date_str).date() < cutoff.date():
-						continue
-				except Exception:
-					pass
-			trans_type = (item.get('transactionType') or '').lower()
-			if 'purchase' not in trans_type and 'buy' not in trans_type:
-				continue
-			amount = item.get('transactionValue')
-			if amount is None:
-				price = float(item.get('price') or 0)
-				shares = float(item.get('securitiesTransacted') or 0)
-				amount = price * shares
-			try:
-				total_buy += float(amount or 0)
-			except Exception:
-				continue
-		result = {
-			'total_buy': round(total_buy, 2),
-			'insiders_buying': total_buy >= 50000,
-		}
-		cache.set(cache_key, result, 60 * 60 * 6)
-		return result
+		# Déléguée à portfolio.services.penny_risk_screen (2026-08-23) --
+		# l'ancienne implémentation ici tapait le même endpoint FMP mort
+		# (v4 insider-trading, 403 depuis le 31 août 2025) que celle de
+		# quant_filter.py, avec une clé de résultat différente
+		# ('total_buy' ici vs 'insider_buy_total' là-bas) malgré le MÊME
+		# nom de clé de cache -- vrai bug de longue date, invisible tant
+		# que FMP répondait encore. Une seule implémentation maintenant
+		# (SEC EDGAR Form 4, gratuit), le champ 'insider_buy_total'
+		# remplace 'total_buy' (aucun usage frontend de cette clé trouvé).
+		return fetch_insider_buying(symbol)
 
 	def _institutional_summary(self, symbol: str) -> dict[str, Any] | None:
 		cache_key = f"institutional_summary:{symbol}"

@@ -24,6 +24,7 @@ from django.core.cache import cache
 from django.utils import timezone
 
 from portfolio import market_data
+from portfolio.services.penny_risk_screen import fetch_insider_buying as _fetch_insider_buying
 
 logger = logging.getLogger(__name__)
 
@@ -112,77 +113,6 @@ def _fetch_margin_trend(ticker: str) -> list:
         except KeyError:
             pass  # certains tickers n'ont pas ces lignes exactement nommées
     return list(reversed(margin_trend))  # ordre chronologique
-
-
-def _fetch_insider_buying(ticker: str) -> dict:
-    """
-    Achats d'initiés récents (90 jours), via Financial Modeling Prep --
-    même clé de cache (`insider_summary:{ticker}`) que
-    portfolio/views.py::_insider_summary, pour partager les entrées de
-    cache entre les deux usages plutôt que doubler les appels API pour le
-    même ticker. Volontairement une fonction indépendante ici (pas un
-    import cross-app de cette méthode de View) -- même logique répliquée
-    en ~25 lignes plutôt que de refactoriser un chemin de code existant
-    et déjà en prod, pour ce lot ajouté au screener "Value + Catalyst"
-    (2026-08-16).
-
-    Ne fait jamais planter l'appelant : retourne {'insiders_buying': False,
-    'insider_buy_total': 0.0} sur toute erreur/absence de clé API, comme
-    un simple "pas de signal détecté" plutôt qu'une exception.
-    """
-    default = {"insiders_buying": False, "insider_buy_total": 0.0}
-    cache_key = f"insider_summary:{ticker}"
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    api_key = os.getenv("FMP_API_KEY")
-    if not api_key:
-        return default
-
-    url = f"https://financialmodelingprep.com/api/v4/insider-trading?symbol={ticker}&limit=50&apikey={api_key}"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code != 200:
-            return default
-        items = resp.json() or []
-    except Exception:
-        logger.warning("Erreur fetch insider trading pour %s", ticker)
-        return default
-
-    if not isinstance(items, list) or not items:
-        cache.set(cache_key, default, 60 * 60)
-        return default
-
-    cutoff = timezone.now() - timedelta(days=90)
-    total_buy = 0.0
-    for item in items:
-        date_str = item.get("transactionDate") or item.get("date")
-        if date_str:
-            try:
-                if datetime.fromisoformat(date_str).date() < cutoff.date():
-                    continue
-            except Exception:
-                pass
-        trans_type = (item.get("transactionType") or "").lower()
-        if "purchase" not in trans_type and "buy" not in trans_type:
-            continue
-        amount = item.get("transactionValue")
-        if amount is None:
-            price = float(item.get("price") or 0)
-            shares = float(item.get("securitiesTransacted") or 0)
-            amount = price * shares
-        try:
-            total_buy += float(amount or 0)
-        except Exception:
-            continue
-
-    result = {
-        "insiders_buying": total_buy >= 50000,
-        "insider_buy_total": round(total_buy, 2),
-    }
-    cache.set(cache_key, result, 60 * 60 * 6)
-    return result
 
 
 def fetch_ticker_data(ticker: str) -> Optional[dict]:

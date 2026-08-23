@@ -28,12 +28,16 @@ from __future__ import annotations
 
 import os
 import re
+import xml.etree.ElementTree as ET
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
 import yfinance as yf
 from django.core.cache import cache
+
+logger = logging.getLogger(__name__)
 
 _SEC_TICKER_MAP_CACHE_KEY = "sec_ticker_cik_map"
 _SEC_TICKER_MAP_TTL = 60 * 60 * 24  # 24h -- la liste des tickers SEC ne change pas d'heure en heure
@@ -70,6 +74,128 @@ def _ticker_to_cik(ticker: str) -> str | None:
         except Exception:
             return None
     return mapping.get(ticker.strip().upper())
+
+
+def _sum_form4_purchases(xml_text: str) -> float:
+    """Somme des achats en bourse ouverte (ou privés) dans un seul document
+    Form 4 -- ne compte que les transactions NON dérivées (actions
+    ordinaires, pas options/RSU) avec transactionCode='P' (achat) ET
+    transactionAcquiredDisposedCode='A' (acquis, pas cédé). Exclut
+    volontairement 'M' (levée d'option), 'F' (retenue fiscale), 'G' (don),
+    etc. -- même filtre sémantique que l'ancienne logique FMP ('purchase'
+    seulement, jamais 'exercise'), vérifié en direct sur un vrai Form 4
+    MSFT (2026-08-23) contenant une transaction P/A de 5000 actions à
+    397,35$."""
+    total = 0.0
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return 0.0
+    for txn in root.iter("nonDerivativeTransaction"):
+        code_el = txn.find("./transactionCoding/transactionCode")
+        acquired_el = txn.find("./transactionAmounts/transactionAcquiredDisposedCode/value")
+        if code_el is None or (code_el.text or "").strip() != "P":
+            continue
+        if acquired_el is None or (acquired_el.text or "").strip() != "A":
+            continue
+        shares_el = txn.find("./transactionAmounts/transactionShares/value")
+        price_el = txn.find("./transactionAmounts/transactionPricePerShare/value")
+        try:
+            shares = float(shares_el.text) if shares_el is not None else 0.0
+            price = float(price_el.text) if price_el is not None else 0.0
+        except (TypeError, ValueError):
+            continue
+        total += shares * price
+    return total
+
+
+def fetch_insider_buying(ticker: str) -> dict[str, Any]:
+    """
+    Achats d'initiés récents (90 jours), via SEC EDGAR (Form 4) --
+    remplace l'ancienne implémentation Financial Modeling Prep utilisée à
+    la fois par analysis/services/quant_filter.py (screener "Value +
+    Catalyst"/"Insider Trading") et portfolio/views.py::_insider_summary
+    (fiche ticker), après découverte en direct (2026-08-23) que l'endpoint
+    insider-trading de FMP est mort pour tout le monde (v3/v4 legacy ->
+    403 depuis le 31 août 2025, l'équivalent 'stable' -> 402, hors du plan
+    Basic gratuit). Gratuit, direct à la source légale (un Form 4 doit
+    être déposé dans les 2 jours ouvrables suivant la transaction) --
+    fonction unique ici plutôt que dupliquée dans les deux appelants (les
+    deux anciennes copies avaient d'ailleurs des clés de résultat
+    différentes -- 'total_buy' côté views.py, 'insider_buy_total' côté
+    quant_filter.py -- alors qu'elles partageaient la MÊME clé de cache :
+    un vrai bug de longue date, silencieux tant que les deux endpoints
+    FMP répondaient).
+
+    Ne couvre que les émetteurs américains déposant auprès de la SEC --
+    retourne le défaut 'aucun signal' pour un ticker sans CIK (ex. titres
+    canadiens comme FVI.TO, SONI.CN), jamais une exception. Plafonne à 10
+    Form 4 examinés par ticker sur la fenêtre de 90 jours -- suffisant
+    pour capter un vrai signal d'achat cluster sans scanner des dizaines
+    de dépôts pour un gros titre à forte rotation d'options (donc surtout
+    des codes 'M'/'F', pas 'P').
+    """
+    default = {"insiders_buying": False, "insider_buy_total": 0.0}
+    cache_key = f"insider_summary:{ticker}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    cik = _ticker_to_cik(ticker)
+    if not cik:
+        cache.set(cache_key, default, 60 * 60 * 6)
+        return default
+
+    try:
+        resp = requests.get(
+            f"https://data.sec.gov/submissions/CIK{cik}.json",
+            headers=_sec_headers(), timeout=15,
+        )
+        resp.raise_for_status()
+        recent = (resp.json().get("filings", {}) or {}).get("recent", {}) or {}
+    except Exception:
+        logger.warning("Erreur fetch SEC submissions pour %s", ticker)
+        return default
+
+    forms = recent.get("form", [])
+    dates = recent.get("filingDate", [])
+    accessions = recent.get("accessionNumber", [])
+    docs = recent.get("primaryDocument", [])
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).date()
+
+    total_buy = 0.0
+    checked = 0
+    for form, date_str, accession, doc in zip(forms, dates, accessions, docs):
+        if form not in ("4", "4/A"):
+            continue
+        try:
+            filing_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if filing_date < cutoff:
+            continue
+        if checked >= 10:
+            break
+        checked += 1
+        accession_nodash = accession.replace("-", "")
+        cik_nolead = str(int(cik))
+        basename = doc.split("/")[-1]  # le primaryDocument pointe parfois vers un sous-dossier
+        # xslF345XXX/ (vue rendue HTML) -- le vrai XML est à la racine de l'accession
+        xml_url = f"https://www.sec.gov/Archives/edgar/data/{cik_nolead}/{accession_nodash}/{basename}"
+        try:
+            xml_resp = requests.get(xml_url, headers=_sec_headers(), timeout=15)
+            if xml_resp.status_code != 200:
+                continue
+            total_buy += _sum_form4_purchases(xml_resp.text)
+        except Exception:
+            continue
+
+    result = {
+        "insiders_buying": total_buy >= 50000,
+        "insider_buy_total": round(total_buy, 2),
+    }
+    cache.set(cache_key, result, 60 * 60 * 6)
+    return result
 
 
 def _recent_filing(cik: str, form_type: str) -> dict[str, Any] | None:
