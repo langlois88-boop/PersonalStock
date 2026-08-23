@@ -52,6 +52,32 @@ def _yf_timeout() -> float:
         return 6.0
 
 
+# 2026-08-23 : découvert en vérifiant en direct pourquoi TOUT appel à
+# download()/Ticker.history() sans `end` explicite (l'immense majorité
+# des appels dans ce projet -- juste `period='1y'` etc.) échouait
+# systématiquement côté Alpaca et retombait sur yfinance : le plan de
+# données Alpaca de ce compte refuse toute requête SIP dont la fenêtre
+# se termine dans les 15 dernières minutes ('subscription does not
+# permit querying recent SIP data', reproduit en direct -- confirmé
+# précisément à -14min encore refusé, -16min accepté). Comme `end_dt`
+# par défaut valait `datetime.now()`, ça tombait TOUJOURS dans la zone
+# interdite -- Alpaca n'a donc probablement jamais réellement servi une
+# seule requête `.history()` sans `end` explicite depuis la mise en
+# place de ce plan, silencieusement (jamais d'exception qui remonte
+# jusqu'à l'appelant, juste un aller-retour Alpaca gaspillé avant le
+# repli yfinance à chaque appel). Sans impact sur la donnée retournée
+# pour les appels en barres quotidiennes (la barre du jour même n'est
+# de toute façon pas finalisée avant la clôture), mais impact réel en
+# latence -- et ça explique en partie pourquoi le bug MultiIndex du
+# repli yfinance (voir _yf_download_fallback plus bas) touchait
+# potentiellement CHAQUE appel plutôt qu'un cas limite occasionnel.
+_ALPACA_RECENT_SIP_DELAY_MINUTES = 16
+
+
+def _default_end_for_alpaca_window() -> datetime:
+    return datetime.now(timezone.utc) - timedelta(minutes=_ALPACA_RECENT_SIP_DELAY_MINUTES)
+
+
 def _is_crypto_symbol(symbol: str) -> bool:
     symbol_upper = (symbol or '').upper()
     return '-' in symbol_upper and symbol_upper.endswith(('CAD', 'USD', 'USDT'))
@@ -228,7 +254,12 @@ def download(
     symbol_pairs = [(symbol, _map_symbol(symbol)) for symbol in symbols]
     mapped_symbols = sorted({mapped for _, mapped in symbol_pairs if mapped})
     start_dt = _parse_datetime(start)
-    end_dt = _parse_datetime(end) or datetime.now(timezone.utc)
+    # end explicite -> respecté tel quel (l'appelant sait ce qu'il veut,
+    # et un `end` trop récent échoue proprement côté Alpaca et retombe
+    # sur yfinance comme avant). Pas d'end -> le cas immense majoritaire,
+    # voir _default_end_for_alpaca_window ci-dessus pour pourquoi ça
+    # visait TOUJOURS la zone interdite avant ce correctif.
+    end_dt = _parse_datetime(end) or _default_end_for_alpaca_window()
     if start_dt is None:
         days = _period_to_days(period or '1y')
         start_dt = end_dt - timedelta(days=days)
