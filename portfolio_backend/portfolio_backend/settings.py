@@ -433,6 +433,13 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'portfolio.tasks.cleanup_system_logs',
         'schedule': crontab(minute=0, hour=3, day_of_week='sun'),
     },
+    # 2026-08-23 : rien ne retirait jamais un titre d'une SandboxWatchlist
+    # une fois ajouté -- seulement des mécanismes d'ajout. Lundi 6h15,
+    # avant paper-trade-retrain-daily (7h40) et l'ouverture du marché.
+    'prune-watchlist-weekly': {
+        'task': 'portfolio.tasks.prune_watchlist_weekly',
+        'schedule': crontab(minute=15, hour=6, day_of_week='mon'),
+    },
     'data-pipeline-daily': {
         'task': 'portfolio.tasks.ensure_data_pipeline_daily',
         'schedule': crontab(minute=10, hour=7),

@@ -8240,6 +8240,104 @@ def penny_opportunity_scanner() -> dict[str, Any]:
     return {'status': 'ok', 'count': len(candidates), 'results': candidates[:10]}
 
 
+def _prune_watchlist_reasons(info: dict) -> list[str]:
+    """
+    Mêmes seuils d'anomalie que analysis/services/sanity_check.py
+    (ROE < -30% = perte massive et structurelle) -- réimplémentés ici
+    plutôt qu'importés pour ne pas introduire de dépendance portfolio ->
+    analysis (sens inverse de toutes les dépendances existantes du
+    projet, analysis -> portfolio uniquement jusqu'ici). debtToEquity de
+    yfinance est déjà en points de pourcentage (vérifié en direct
+    2026-08-23, quant_filter.py::_evaluate_factor_investing) -- PAS besoin
+    de multiplier par 100, contrairement à returnOnEquity qui est un ratio
+    0-1.
+    """
+    reasons = []
+    roe_threshold = float(os.getenv("WATCHLIST_PRUNE_ROE_THRESHOLD", "-30"))
+    debt_equity_threshold = float(os.getenv("WATCHLIST_PRUNE_DEBT_EQUITY_THRESHOLD", "300"))
+
+    roe_raw = info.get("returnOnEquity")
+    if roe_raw is not None:
+        roe_pct = roe_raw * 100
+        if roe_pct < roe_threshold:
+            reasons.append(f"ROE {roe_pct:.1f}% < seuil {roe_threshold:.0f}% (perte massive)")
+
+    debt_to_equity = info.get("debtToEquity")
+    if debt_to_equity is not None and debt_to_equity > debt_equity_threshold:
+        reasons.append(f"Dette/équité {debt_to_equity:.0f}% > seuil {debt_equity_threshold:.0f}% (levier extrême)")
+
+    return reasons
+
+
+@shared_task
+def prune_watchlist_weekly(sandbox: str = "WATCHLIST") -> dict[str, Any]:
+    """
+    Vérification hebdomadaire (2026-08-23) : rien ne retirait jamais un
+    titre d'une SandboxWatchlist une fois ajouté -- seuls des mécanismes
+    d'AJOUT existaient (market_scanner_task, penny_opportunity_scanner,
+    etc.), jamais de retrait. Trouvé en creusant pourquoi WATCHLIST
+    contenait SONI.CN (ROE -231.6%, dette/équité 355% -- vérifié en
+    direct le même jour dans un tout autre contexte, Factor Investing).
+
+    Ne retire JAMAIS un titre qui a une position OUVERTE dans ce sandbox
+    -- un titre objectivement mauvais reste affiché/loggé mais pas
+    silencieusement sorti de la watchlist tant qu'une vraie position lui
+    est encore attachée (éviter un état confus : position ouverte sur un
+    titre que la watchlist ne connaît plus).
+    """
+    watch = SandboxWatchlist.objects.filter(sandbox=sandbox).first()
+    if not watch or not watch.symbols:
+        return {"status": "no_data", "sandbox": sandbox}
+
+    open_tickers = set(
+        PaperTrade.objects.filter(sandbox=sandbox, status="OPEN").values_list("ticker", flat=True)
+    )
+
+    kept = []
+    removed = []
+    kept_flagged = []
+    for symbol in watch.symbols:
+        try:
+            info = yf.Ticker(symbol).info or {}
+        except Exception:
+            logger.warning("prune_watchlist_weekly: échec fetch info pour %s, conservé par prudence.", symbol)
+            kept.append(symbol)
+            continue
+
+        reasons = _prune_watchlist_reasons(info)
+        if not reasons:
+            kept.append(symbol)
+            continue
+
+        if symbol in open_tickers:
+            kept.append(symbol)
+            kept_flagged.append({"symbol": symbol, "reasons": reasons})
+            logger.warning(
+                "prune_watchlist_weekly: %s signalé (%s) mais conservé -- position ouverte dans %s.",
+                symbol, "; ".join(reasons), sandbox,
+            )
+        else:
+            removed.append({"symbol": symbol, "reasons": reasons})
+            logger.info("prune_watchlist_weekly: %s retiré de %s -- %s", symbol, sandbox, "; ".join(reasons))
+
+    if removed:
+        watch.symbols = kept
+        watch.source = f"{watch.source or ''}+pruned_{timezone.now().date().isoformat()}".lstrip("+")
+        watch.save(update_fields=["symbols", "source"])
+        _system_log(
+            sandbox, "WARNING",
+            f"prune_watchlist_weekly: {len(removed)} titre(s) retiré(s) -- {', '.join(r['symbol'] for r in removed)}",
+            metadata={"removed": removed, "kept_flagged": kept_flagged},
+        )
+
+    result = {
+        "status": "ok", "sandbox": sandbox, "checked": len(kept) + len(removed),
+        "removed": removed, "kept_flagged": kept_flagged,
+    }
+    logger.info("prune_watchlist_weekly terminé: %s", result)
+    return result
+
+
 @shared_task
 def market_scanner_task(symbols: list[str] | None = None) -> dict[str, Any]:
     """Scan market for high-momentum candidates and cache results."""
