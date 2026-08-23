@@ -340,6 +340,14 @@ def _create_lab_position(scan_result: ScanResult, preset: ScreenerPreset, benchm
     try:
         position_size = float(os.getenv("FUNDAMENTAL_LAB_POSITION_SIZE", "100"))
         stop_pct = float(os.getenv("FUNDAMENTAL_LAB_STOP_PCT", "0.05"))
+        # 2026-08-23 : ajouté avec la prise de profit dans monitor_lab_
+        # positions -- 20% par défaut, dans la fourchette 20-25% déjà citée
+        # dans quant_filter.py (méthodologie CAN SLIM/O'Neil) sans être
+        # spécifique à ce seul preset (le Lab mélange Buffett/Minervini/
+        # CAN SLIM/etc. sous un même stop/take-profit uniforme, plus simple
+        # que différencier par preset avant d'avoir des données pour savoir
+        # si ça vaut la peine).
+        take_profit_pct = float(os.getenv("FUNDAMENTAL_LAB_TAKE_PROFIT_PCT", "0.20"))
         entry_price = float(scan_result.price_at_scan)
 
         if entry_price <= 0:
@@ -351,6 +359,7 @@ def _create_lab_position(scan_result: ScanResult, preset: ScreenerPreset, benchm
 
         quantity = max(1, int(position_size / entry_price))
         stop_loss = round(entry_price * (1 - stop_pct), 2)
+        take_profit = round(entry_price * (1 + take_profit_pct), 2)
         is_tsx = scan_result.ticker.strip().upper().endswith(".TO")
 
         if is_tsx:
@@ -360,6 +369,7 @@ def _create_lab_position(scan_result: ScanResult, preset: ScreenerPreset, benchm
                 entry_price=round(entry_price, 4),
                 quantity=quantity,
                 stop_loss=stop_loss,
+                take_profit=take_profit,
                 entry_signal=scan_result.quant_score,
                 model_name="FUNDAMENTAL_LAB",
                 broker="SIM",
@@ -387,6 +397,7 @@ def _create_lab_position(scan_result: ScanResult, preset: ScreenerPreset, benchm
             entry_price=round(entry_price, 4),
             quantity=quantity,
             stop_loss=stop_loss,
+            take_profit=take_profit,
             entry_signal=scan_result.quant_score,
             # model_name par défaut sur PaperTrade est 'BLUECHIP' (valeur du
             # champ) — ce pick vient du screener d'analyse fondamentale, pas
@@ -668,49 +679,89 @@ def run_broad_index_scan(self) -> dict:
     return result
 
 
+def _fundamental_lab_max_hold_days() -> int:
+    return int(os.getenv("FUNDAMENTAL_LAB_MAX_HOLD_DAYS", "60"))
+
+
+def _close_fundamental_lab_trade(trade: PaperTrade, price: float, close_reason: str, extra_note: str = "") -> None:
+    """
+    Écriture de fermeture commune à PaperTrade + sa FundamentalLabPosition
+    liée -- factorisé (2026-08-23) pour que stop_loss/take_profit/
+    max_hold_time, et les chemins ALPACA_LAB/SIM, écrivent tous exactement
+    les mêmes champs de la même façon (avant, seul stop_loss avait ce
+    code, dupliqué aurait été un risque de désynchronisation évident).
+    """
+    trade.status = "CLOSED"
+    trade.exit_price = round(float(price), 4)
+    trade.exit_date = timezone.now()
+    trade.pnl = round((float(trade.exit_price) - float(trade.entry_price)) * float(trade.quantity), 2)
+    trade.outcome = "WIN" if float(trade.pnl) > 0 else "LOSS"
+    if extra_note:
+        trade.notes = f"{trade.notes} | {extra_note}"
+    trade.save(update_fields=["status", "exit_price", "exit_date", "pnl", "outcome", "notes"])
+
+    lab_position = FundamentalLabPosition.objects.filter(paper_trade=trade).first()
+    if lab_position:
+        lab_position.is_open = False
+        lab_position.exit_price = trade.exit_price
+        lab_position.exit_date = trade.exit_date
+        lab_position.close_reason = close_reason
+        try:
+            entry = float(lab_position.entry_price)
+            lab_position.realized_return_pct = (
+                round((float(trade.exit_price) - entry) / entry * 100, 2) if entry else None
+            )
+        except Exception:
+            lab_position.realized_return_pct = None
+        lab_position.save(update_fields=[
+            "is_open", "exit_price", "exit_date", "close_reason", "realized_return_pct",
+        ])
+    else:
+        logger.warning(
+            "monitor_lab_positions: PaperTrade %s fermé (%s) mais aucune FundamentalLabPosition "
+            "liée trouvée -- vérifier la cohérence des données.",
+            trade.id, close_reason,
+        )
+
+
 @shared_task(bind=True, max_retries=1)
 def monitor_lab_positions(self) -> dict:
     """
-    Stop-loss minimal pour les positions FUNDAMENTAL_LAB à ordre RÉEL
-    (broker='ALPACA_LAB' uniquement -- les positions SIM (tickers TSX,
-    échecs d'ordre) ne sont pas concernées, aucun capital réel à protéger
-    pour elles). Ajouté le 2026-08-11 (Partie B) suite à une découverte en
-    revue : aucun mécanisme de sortie n'existait pour FUNDAMENTAL_LAB avant
-    ce soir, ni automatique ni manuel (LabPositionMarkManualView ne fait que
-    poser un flag "j'y crois", jamais fermer quoi que ce soit). Acceptable
-    en pure simulation DB (aucune conséquence), plus une fois du vrai
-    capital paper engagé -- voir docs/TECH_DEBT_NOTES.md item 11.
+    Sortie automatique pour les positions FUNDAMENTAL_LAB, sur trois
+    conditions : stop_loss, take_profit, max_hold_time (2026-08-23 --
+    voir docstring de FundamentalLabPosition.CLOSE_REASON_CHOICES pour le
+    pourquoi : un stop-loss seul ne fermait jamais les gagnants, rendant
+    tout jugement de performance structurellement biaisé vers les pertes).
 
-    Volontairement minimal : vend au marché si le prix casse le stop_loss
-    déjà calculé à l'entrée (PaperTrade.stop_loss, stocké mais jamais
-    utilisé avant ce soir) -- pas de take-profit, pas de trailing stop.
-    Objectif : fermer la faille de capital avant d'aller plus loin, pas
-    répliquer toute la sophistication des sandboxes ML existants.
-
-    Garde-fou ajouté le 2026-08-11 (revue avant l'ouverture du 2026-08-12,
-    suite au dry-run ADBE placé hors marché, order_id 7dbe7a3d-...) : un
-    ordre 'ACCEPTED'/'NEW' n'a PAS encore de position réelle derrière --
-    comparer son prix au stop-loss et tenter une vente dessus serait une
-    action sur du vide (échec silencieux ou bruyant selon le comportement
-    d'Alpaca pour une vente à découvert non voulue, jamais testé). On
-    vérifie maintenant le statut RÉEL de l'ordre via get_lab_order_by_id
-    (compte dédié) avant toute comparaison de prix -- seul un ordre
-    effectivement 'filled' est éligible au stop-loss. Sert aussi de
-    synchro légère au passage (broker_status/entry_price recalés sur le
-    remplissage réel dès qu'il est détecté) -- pas une tâche de synchro
-    complète, juste ce qui est nécessaire pour que ce garde-fou soit fiable.
+    Deux populations séparées :
+    - broker='ALPACA_LAB' (ordre réel sur le compte paper dédié) : stop_loss
+      ET take_profit ET max_hold_time, mais seulement après vérification du
+      statut RÉEL de l'ordre via get_lab_order_by_id (garde-fou du
+      2026-08-11, dry-run ADBE hors marché -- un ordre 'ACCEPTED'/'NEW' n'a
+      pas encore de position réelle derrière, comparer son prix à quoi que
+      ce soit serait une action sur du vide). La fermeture passe par un
+      vrai ordre de vente (submit_lab_market_order).
+    - broker='SIM' (tickers TSX, hors périmètre Alpaca) : take_profit ET
+      max_hold_time SEULEMENT -- pas de stop_loss ici par design d'origine
+      (aucun capital réel à protéger), mais les exclure aussi de take_profit/
+      max_hold_time aurait laissé TOUTE position TSX ouverte pour toujours
+      (K.TO, FVI.TO, OGC.TO, BTO.TO...), biaisant l'échantillon fermé d'une
+      toute autre façon. Fermeture directe en DB, aucun ordre réel à passer.
     """
-    trades = PaperTrade.objects.filter(sandbox="FUNDAMENTAL_LAB", broker="ALPACA_LAB", status="OPEN")
+    max_hold_days = _fundamental_lab_max_hold_days()
+    hold_cutoff = timezone.now() - timedelta(days=max_hold_days)
+
     checked = 0
     closed = 0
     skipped_unfilled = 0
-    for trade in trades:
+
+    # --- ALPACA_LAB : stop_loss + take_profit + max_hold_time ---
+    alpaca_trades = PaperTrade.objects.filter(sandbox="FUNDAMENTAL_LAB", broker="ALPACA_LAB", status="OPEN")
+    for trade in alpaca_trades:
         checked += 1
-        if not trade.stop_loss:
-            continue
         if not trade.broker_order_id:
             logger.warning(
-                "monitor_lab_positions: %s (PaperTrade %s) sans broker_order_id, stop-loss non vérifiable ce cycle.",
+                "monitor_lab_positions: %s (PaperTrade %s) sans broker_order_id, sortie non vérifiable ce cycle.",
                 trade.ticker, trade.id,
             )
             continue
@@ -719,7 +770,7 @@ def monitor_lab_positions(self) -> dict:
         if order_status is None:
             logger.warning(
                 "monitor_lab_positions: échec de la vérification du statut réel de l'ordre pour %s "
-                "(order_id=%s) -- API Alpaca indisponible ou ordre introuvable, stop-loss non vérifié ce cycle.",
+                "(order_id=%s) -- API Alpaca indisponible ou ordre introuvable, sortie non vérifiée ce cycle.",
                 trade.ticker, trade.broker_order_id,
             )
             continue
@@ -735,7 +786,7 @@ def monitor_lab_positions(self) -> dict:
             skipped_unfilled += 1
             logger.info(
                 "monitor_lab_positions: %s (order_id=%s) statut réel='%s' filled_qty=%s -- pas encore rempli, "
-                "stop-loss non applicable ce cycle (aucune position réelle à protéger).",
+                "sortie non applicable ce cycle (aucune position réelle à protéger).",
                 trade.ticker, trade.broker_order_id, status_value, filled_qty,
             )
             if status_value and status_value != (trade.broker_status or "").lower():
@@ -766,64 +817,70 @@ def monitor_lab_positions(self) -> dict:
         try:
             data = fetch_ticker_data(trade.ticker)
         except Exception:
-            logger.exception("monitor_lab_positions: échec fetch_ticker_data pour %s, stop-loss non vérifié ce cycle.", trade.ticker)
+            logger.exception("monitor_lab_positions: échec fetch_ticker_data pour %s, sortie non vérifiée ce cycle.", trade.ticker)
             continue
         price = data.get("price") if data else None
         if price is None or price <= 0:
-            logger.warning("monitor_lab_positions: prix indisponible pour %s, stop-loss non vérifié ce cycle.", trade.ticker)
+            logger.warning("monitor_lab_positions: prix indisponible pour %s, sortie non vérifiée ce cycle.", trade.ticker)
             continue
-        if float(price) > float(trade.stop_loss):
+
+        close_reason = None
+        note = ""
+        if trade.stop_loss and float(price) <= float(trade.stop_loss):
+            close_reason = "stop_loss"
+            note = f"Stop-loss déclenché ({float(price):.4f} <= {float(trade.stop_loss):.4f})"
+        elif trade.take_profit and float(price) >= float(trade.take_profit):
+            close_reason = "take_profit"
+            note = f"Prise de profit déclenchée ({float(price):.4f} >= {float(trade.take_profit):.4f})"
+        elif trade.entry_date and trade.entry_date <= hold_cutoff:
+            close_reason = "max_hold_time"
+            note = f"Durée maximale de détention atteinte ({max_hold_days}j)"
+        if close_reason is None:
             continue
 
         order = submit_lab_market_order(trade.ticker, int(trade.quantity), "sell")
         if order is None:
             logger.error(
-                "monitor_lab_positions: stop-loss cassé pour %s (prix=%.4f <= stop=%.4f) mais l'ordre de "
+                "monitor_lab_positions: sortie '%s' déclenchée pour %s (prix=%.4f) mais l'ordre de "
                 "vente réel a ÉCHOUÉ -- position reste OPEN, capital réel toujours exposé, à vérifier "
                 "manuellement sur le dashboard Alpaca (compte FUNDAMENTAL_LAB).",
-                trade.ticker, float(price), float(trade.stop_loss),
+                close_reason, trade.ticker, float(price),
             )
             continue
 
-        trade.status = "CLOSED"
-        trade.exit_price = round(float(price), 4)
-        trade.exit_date = timezone.now()
-        trade.pnl = round((float(trade.exit_price) - float(trade.entry_price)) * float(trade.quantity), 2)
-        trade.outcome = "WIN" if float(trade.pnl) > 0 else "LOSS"
         trade.broker_status = str(getattr(order, "status", "") or "")
         trade.broker_side = "SELL"
         trade.broker_updated_at = timezone.now()
-        trade.notes = (
-            f"{trade.notes} | Stop-loss déclenché ({float(price):.4f} <= {float(trade.stop_loss):.4f}), "
-            f"ordre de vente réel {getattr(order, 'id', '')}."
-        )
-        trade.save(update_fields=[
-            "status", "exit_price", "exit_date", "pnl", "outcome",
-            "broker_status", "broker_side", "broker_updated_at", "notes",
-        ])
+        trade.save(update_fields=["broker_status", "broker_side", "broker_updated_at"])
+        _close_fundamental_lab_trade(trade, price, close_reason, f"{note}, ordre de vente réel {getattr(order, 'id', '')}.")
+        closed += 1
 
-        lab_position = FundamentalLabPosition.objects.filter(paper_trade=trade).first()
-        if lab_position:
-            lab_position.is_open = False
-            lab_position.exit_price = trade.exit_price
-            lab_position.exit_date = trade.exit_date
-            lab_position.close_reason = "stop_loss"
-            try:
-                entry = float(lab_position.entry_price)
-                lab_position.realized_return_pct = (
-                    round((float(trade.exit_price) - entry) / entry * 100, 2) if entry else None
-                )
-            except Exception:
-                lab_position.realized_return_pct = None
-            lab_position.save(update_fields=[
-                "is_open", "exit_price", "exit_date", "close_reason", "realized_return_pct",
-            ])
-        else:
-            logger.warning(
-                "monitor_lab_positions: PaperTrade %s fermé (stop-loss) mais aucune FundamentalLabPosition "
-                "liée trouvée -- vérifier la cohérence des données.",
-                trade.id,
-            )
+    # --- SIM (TSX) : take_profit + max_hold_time seulement, fermeture directe ---
+    sim_trades = PaperTrade.objects.filter(sandbox="FUNDAMENTAL_LAB", broker="SIM", status="OPEN")
+    for trade in sim_trades:
+        checked += 1
+        try:
+            data = fetch_ticker_data(trade.ticker)
+        except Exception:
+            logger.exception("monitor_lab_positions: échec fetch_ticker_data pour %s (SIM), sortie non vérifiée ce cycle.", trade.ticker)
+            continue
+        price = data.get("price") if data else None
+        if price is None or price <= 0:
+            logger.warning("monitor_lab_positions: prix indisponible pour %s (SIM), sortie non vérifiée ce cycle.", trade.ticker)
+            continue
+
+        close_reason = None
+        note = ""
+        if trade.take_profit and float(price) >= float(trade.take_profit):
+            close_reason = "take_profit"
+            note = f"Prise de profit déclenchée ({float(price):.4f} >= {float(trade.take_profit):.4f}, simulation)"
+        elif trade.entry_date and trade.entry_date <= hold_cutoff:
+            close_reason = "max_hold_time"
+            note = f"Durée maximale de détention atteinte ({max_hold_days}j, simulation)"
+        if close_reason is None:
+            continue
+
+        _close_fundamental_lab_trade(trade, price, close_reason, note)
         closed += 1
 
     result = {"checked": checked, "closed": closed, "skipped_unfilled": skipped_unfilled}

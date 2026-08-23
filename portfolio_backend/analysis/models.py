@@ -151,6 +151,14 @@ class FundamentalLabPosition(models.Model):
     CLOSE_REASON_CHOICES = (
         ('stop_loss', 'stop_loss'),
         ('manual', 'manual'),
+        # Ajoutés le 2026-08-23 : avant ça, monitor_lab_positions n'avait
+        # qu'un stop-loss -- une position gagnante ne se fermait JAMAIS
+        # d'elle-même, seuls les perdants se fermaient. Impossible de
+        # mesurer honnêtement la performance du screener avec un
+        # échantillon de positions fermées structurellement biaisé vers
+        # les pertes. Voir monitor_lab_positions pour les seuils.
+        ('take_profit', 'take_profit'),
+        ('max_hold_time', 'max_hold_time'),
     )
     # Ajoutés le 2026-08-14 (audit ML_LAB_FUTURE_MODEL.md, Partie 2) : avant
     # ça, une position fermée n'était traçable que via son paper_trade lié

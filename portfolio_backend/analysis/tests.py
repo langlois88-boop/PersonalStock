@@ -524,6 +524,130 @@ class MonitorLabPositionsCloseFieldsTests(APITestCase):
         self.assertAlmostEqual(self.lab_position.realized_return_pct, -10.0, places=2)
 
 
+class MonitorLabPositionsTakeProfitAndMaxHoldTests(APITestCase):
+    """
+    2026-08-23 : avant ça, monitor_lab_positions n'avait qu'un stop_loss --
+    une position gagnante ne se fermait JAMAIS d'elle-même (aucune prise de
+    profit, aucune limite de temps), biaisant structurellement tout
+    échantillon de positions fermées vers les pertes. Couvre les deux
+    nouvelles conditions de sortie, pour ALPACA_LAB ET SIM (TSX)."""
+
+    def setUp(self):
+        self.preset = _make_preset()
+
+    def _make_position(self, ticker, broker, entry_date=None, stop_loss=None, take_profit=None):
+        scan_run = ScanRun.objects.create(preset=self.preset, universe_source="sandboxes")
+        scan_result = ScanResult.objects.create(
+            scan_run=scan_run, ticker=ticker, final_verdict="confirmed",
+            price_at_scan=Decimal("10.00"), quant_score=3.0,
+        )
+        trade = PaperTrade.objects.create(
+            ticker=ticker, sandbox="FUNDAMENTAL_LAB", entry_price=Decimal("10.00"),
+            quantity=10, stop_loss=stop_loss or Decimal("9.50"), take_profit=take_profit,
+            status="OPEN", broker=broker,
+            broker_order_id="order-abc" if broker == "ALPACA_LAB" else "",
+            broker_status="new" if broker == "ALPACA_LAB" else "",
+        )
+        if entry_date is not None:
+            # entry_date a auto_now_add=True -- ignore toute valeur passée à
+            # create()/save(), doit être forcé via .update() (bypass
+            # auto_now_add) pour simuler une position ouverte depuis
+            # longtemps dans ces tests de max_hold_time.
+            PaperTrade.objects.filter(pk=trade.pk).update(entry_date=entry_date)
+            trade.refresh_from_db()
+        lab_position = FundamentalLabPosition.objects.create(
+            scan_result=scan_result, ticker=ticker, preset=self.preset,
+            entry_price=Decimal("10.00"), entry_date=entry_date or timezone.now(),
+            paper_trade=trade,
+        )
+        return trade, lab_position
+
+    def test_alpaca_take_profit_closes_with_a_real_sell_order(self):
+        trade, lab_position = self._make_position("ATD", "ALPACA_LAB", take_profit=Decimal("12.00"))
+        filled_order = MagicMock(status="filled", filled_qty="10", filled_avg_price="10.00")
+        sell_order = MagicMock(id="sell-order-xyz", status="filled")
+
+        with patch.object(tasks, "get_lab_order_by_id", return_value=filled_order), \
+                patch.object(tasks, "fetch_ticker_data", return_value={"price": 12.50}), \
+                patch.object(tasks, "submit_lab_market_order", return_value=sell_order) as mock_sell:
+            tasks.monitor_lab_positions()
+
+        mock_sell.assert_called_once()
+        lab_position.refresh_from_db()
+        trade.refresh_from_db()
+        self.assertFalse(lab_position.is_open)
+        self.assertEqual(lab_position.close_reason, "take_profit")
+        self.assertEqual(trade.outcome, "WIN")
+        self.assertAlmostEqual(lab_position.realized_return_pct, 25.0, places=2)
+
+    def test_alpaca_max_hold_time_closes_regardless_of_price(self):
+        old_entry = timezone.now() - timedelta(days=61)  # au-delà du défaut de 60j
+        trade, lab_position = self._make_position("ATD", "ALPACA_LAB", entry_date=old_entry, take_profit=Decimal("12.00"))
+        filled_order = MagicMock(status="filled", filled_qty="10", filled_avg_price="10.00")
+        sell_order = MagicMock(id="sell-order-xyz", status="filled")
+
+        with patch.object(tasks, "get_lab_order_by_id", return_value=filled_order), \
+                patch.object(tasks, "fetch_ticker_data", return_value={"price": 10.20}), \
+                patch.object(tasks, "submit_lab_market_order", return_value=sell_order):
+            tasks.monitor_lab_positions()
+
+        lab_position.refresh_from_db()
+        self.assertFalse(lab_position.is_open)
+        self.assertEqual(lab_position.close_reason, "max_hold_time")
+
+    def test_alpaca_neither_condition_stays_open(self):
+        trade, lab_position = self._make_position("ATD", "ALPACA_LAB", take_profit=Decimal("12.00"))
+        filled_order = MagicMock(status="filled", filled_qty="10", filled_avg_price="10.00")
+
+        with patch.object(tasks, "get_lab_order_by_id", return_value=filled_order), \
+                patch.object(tasks, "fetch_ticker_data", return_value={"price": 10.50}), \
+                patch.object(tasks, "submit_lab_market_order") as mock_sell:
+            tasks.monitor_lab_positions()
+
+        mock_sell.assert_not_called()
+        lab_position.refresh_from_db()
+        self.assertTrue(lab_position.is_open)
+
+    def test_sim_tsx_take_profit_closes_without_any_real_order(self):
+        # Régression directe : sans ça, TOUTE position TSX (broker='SIM')
+        # restait ouverte pour toujours -- ni stop_loss (jamais eu, par
+        # design) ni aucune autre sortie n'existait avant ce correctif.
+        trade, lab_position = self._make_position("K.TO", "SIM", take_profit=Decimal("12.00"))
+
+        with patch.object(tasks, "fetch_ticker_data", return_value={"price": 13.00}), \
+                patch.object(tasks, "submit_lab_market_order") as mock_sell, \
+                patch.object(tasks, "get_lab_order_by_id") as mock_get_order:
+            tasks.monitor_lab_positions()
+
+        mock_sell.assert_not_called()  # SIM -- jamais d'ordre réel, ni à l'achat ni à la sortie
+        mock_get_order.assert_not_called()
+        lab_position.refresh_from_db()
+        trade.refresh_from_db()
+        self.assertFalse(lab_position.is_open)
+        self.assertEqual(lab_position.close_reason, "take_profit")
+        self.assertEqual(trade.status, "CLOSED")
+
+    def test_sim_tsx_max_hold_time_closes(self):
+        old_entry = timezone.now() - timedelta(days=61)
+        trade, lab_position = self._make_position("K.TO", "SIM", entry_date=old_entry, take_profit=Decimal("12.00"))
+
+        with patch.object(tasks, "fetch_ticker_data", return_value={"price": 10.10}):
+            tasks.monitor_lab_positions()
+
+        lab_position.refresh_from_db()
+        self.assertFalse(lab_position.is_open)
+        self.assertEqual(lab_position.close_reason, "max_hold_time")
+
+    def test_sim_tsx_stays_open_without_take_profit_or_max_hold(self):
+        trade, lab_position = self._make_position("K.TO", "SIM", take_profit=Decimal("12.00"))
+
+        with patch.object(tasks, "fetch_ticker_data", return_value={"price": 10.50}):
+            tasks.monitor_lab_positions()
+
+        lab_position.refresh_from_db()
+        self.assertTrue(lab_position.is_open)
+
+
 class LabPerformanceViewTests(APITestCase):
     """
     Confirmed live 2026-08-15 (session investigating a user-reported

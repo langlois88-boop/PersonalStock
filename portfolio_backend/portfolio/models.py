@@ -130,6 +130,11 @@ class PaperTrade(models.Model):
 	broker_avg_price = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
 	broker_updated_at = models.DateTimeField(null=True, blank=True)
 	stop_loss = models.DecimalField(max_digits=10, decimal_places=2)
+	# Nullable (2026-08-23) : seul FUNDAMENTAL_LAB la renseigne pour l'instant
+	# (voir analysis/tasks.py::_create_lab_position/monitor_lab_positions) --
+	# les autres sandboxes (WATCHLIST/AI_BLUECHIP/AI_PENNY/AI_CRYPTO) n'y
+	# touchent pas, restent avec take_profit=None, comportement inchangé.
+	take_profit = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
 	status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='OPEN')
 	pnl = models.DecimalField(max_digits=10, decimal_places=2, default=0)
 	outcome = models.CharField(max_length=10, choices=(('WIN', 'WIN'), ('LOSS', 'LOSS')), null=True, blank=True)
