@@ -30,7 +30,17 @@ const PRESETS = [
   { slug: 'minervini', label: 'Minervini (Trend Template)' },
   { slug: 'can-slim', label: 'CAN SLIM (O\'Neil)' },
   { slug: 'factor-investing', label: 'Factor Investing' },
-  { slug: 'insider-trading', label: 'Insider Trading' },
+  // 'insider-trading' (2026-08-23) : preset construit et testé, mais PAS
+  // affiché ici -- son unique source de données (FMP v3/v4 insider-trading)
+  // renvoie 403 "Legacy Endpoint" depuis le 31 août 2025, et l'endpoint
+  // "stable" équivalent est 402 (hors plan actuel). Le préset resterait
+  // toujours vide en prod, ce qui se lirait comme "aucun signal" plutôt
+  // que "source cassée" -- même piège que les faux 0 candidats déjà
+  // vérifiés pour Minervini/CAN SLIM ce jour-là, mais ici la cause réelle
+  // est confirmée côté API, pas côté filtre. Voir ScreenerPreset
+  // slug='insider-trading' en base (is_active=False) pour le retrouver
+  // une fois la source de données réglée (upgrade FMP ou bascule SEC
+  // EDGAR Form 4, déjà utilisé ailleurs dans AI_PENNY).
 ];
 
 const formatNumber = (value, digits = 2) => {
