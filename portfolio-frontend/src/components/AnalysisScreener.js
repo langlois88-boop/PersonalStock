@@ -26,6 +26,9 @@ const ANOMALY_GUARDRAIL_MESSAGE = (
 const PRESETS = [
   { slug: 'undervalued-without-reason', label: 'Undervalued Without Reason' },
   { slug: 'value-catalyst', label: 'Value + Catalyst' },
+  { slug: 'buffett', label: 'Buffett' },
+  { slug: 'minervini', label: 'Minervini (Trend Template)' },
+  { slug: 'can-slim', label: 'CAN SLIM (O\'Neil)' },
 ];
 
 const formatNumber = (value, digits = 2) => {
