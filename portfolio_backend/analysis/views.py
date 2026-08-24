@@ -338,7 +338,15 @@ class LabPerformanceView(APIView):
         # frontend ("Impossible de charger les performances"). Parallélisé
         # comme penny_opportunity_scanner (ThreadPoolExecutor) -- aucun état
         # partagé entre les appels, sûr à paralléliser.
-        tickers = list(positions.values_list("ticker", flat=True).distinct())
+        #
+        # dict.fromkeys(...) plutôt que .distinct() sur le values_list :
+        # FundamentalLabPosition.Meta.ordering = ['-entry_date'] s'applique
+        # implicitement ici, et combiné à .distinct() sur un values_list
+        # d'une AUTRE colonne, ça ne déduplique pas réellement (même piège
+        # Django que sync_watchlist_from_fundamental_lab plus tôt le même
+        # jour) -- confirmé en direct : 33 "tickers distincts" pour ~18
+        # titres réels, donc jusqu'à 2x plus d'appels réseau que nécessaire.
+        tickers = list(dict.fromkeys(positions.values_list("ticker", flat=True)))
         current_prices = {}
         if tickers:
             max_workers = int(os.getenv("LAB_PERFORMANCE_FETCH_WORKERS", "8"))

@@ -832,6 +832,30 @@ class LabPerformanceViewTests(APITestCase):
         opened = next(p for p in response.data["positions"] if p["ticker"] == "OPEN")
         self.assertEqual(opened["current_return_pct"], 10.0)
 
+    def test_same_ticker_across_multiple_positions_fetched_only_once(self):
+        # Régression (2026-08-24) : FundamentalLabPosition.Meta.ordering =
+        # ['-entry_date'] s'applique implicitement -- combiné à .distinct()
+        # sur un values_list('ticker'), ça ne dédupliquait pas réellement
+        # (même piège Django que sync_watchlist_from_fundamental_lab le
+        # même jour). Confirmé en direct : 33 "tickers distincts" pour
+        # ~18 titres réels -- jusqu'à 2x plus d'appels réseau que
+        # nécessaire, contribuant au dépassement de délai du frontend.
+        second_result = ScanResult.objects.create(
+            scan_run=self.scan_run, ticker="OPEN", final_verdict="uncertain",
+            price_at_scan=Decimal("9.00"), quant_score=2.0,
+        )
+        FundamentalLabPosition.objects.create(
+            scan_result=second_result, ticker="OPEN", preset=self.preset,
+            entry_price=Decimal("9.00"), entry_date=timezone.now(), is_open=True,
+        )
+
+        with patch.object(quant_filter, "fetch_ticker_data", return_value={"price": 11.0}) as mock_fetch:
+            response = self.client.get("/api/analysis/lab/performance/")
+
+        self.assertEqual(response.status_code, 200)
+        open_calls = [c for c in mock_fetch.call_args_list if c.args == ("OPEN",)]
+        self.assertEqual(len(open_calls), 1, "OPEN a été fetché plus d'une fois malgré la déduplication")
+
 
 class GenerateLabWeeklySuggestionsTests(APITestCase):
     """
