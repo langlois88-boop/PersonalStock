@@ -648,6 +648,122 @@ class MonitorLabPositionsTakeProfitAndMaxHoldTests(APITestCase):
         self.assertTrue(lab_position.is_open)
 
 
+class SplitAdjustmentTests(APITestCase):
+    """
+    2026-08-24 : régression directe du cas BRCC -- reverse split 1-pour-10
+    pendant qu'une position FUNDAMENTAL_LAB était ouverte. Comparer
+    entry_price (avant le split) au prix courant (après) donnait un faux
+    mouvement de +1000%, qui a déclenché une VRAIE prise de profit (ordre
+    de vente réel exécuté sur le compte paper Alpaca dédié) -- confirmé
+    par le relevé de transactions Alpaca lui-même (achats ~0,84$ le
+    18 août, vente ~9,18$ le 24 août, exactement le ratio 0.1 du split).
+    """
+
+    def setUp(self):
+        self.preset = _make_preset()
+
+    def _make_position(self, ticker, broker, entry_date, entry_price, stop_loss, take_profit):
+        scan_run = ScanRun.objects.create(preset=self.preset, universe_source="sandboxes")
+        scan_result = ScanResult.objects.create(
+            scan_run=scan_run, ticker=ticker, final_verdict="uncertain",
+            price_at_scan=Decimal(str(entry_price)), quant_score=1.0,
+        )
+        trade = PaperTrade.objects.create(
+            ticker=ticker, sandbox="FUNDAMENTAL_LAB", entry_price=Decimal(str(entry_price)),
+            quantity=121, stop_loss=Decimal(str(stop_loss)), take_profit=Decimal(str(take_profit)),
+            status="OPEN", broker=broker,
+            broker_order_id="order-brcc" if broker == "ALPACA_LAB" else "",
+            broker_status="new" if broker == "ALPACA_LAB" else "",
+        )
+        PaperTrade.objects.filter(pk=trade.pk).update(entry_date=entry_date)
+        trade.refresh_from_db()
+        lab_position = FundamentalLabPosition.objects.create(
+            scan_result=scan_result, ticker=ticker, preset=self.preset,
+            entry_price=Decimal(str(entry_price)), entry_date=entry_date, paper_trade=trade,
+        )
+        return trade, lab_position
+
+    def _brcc_split_series(self, split_date):
+        return pd.Series([0.1], index=pd.DatetimeIndex([split_date]))
+
+    def test_split_after_entry_prevents_a_false_take_profit(self):
+        entry_date = timezone.now() - timedelta(days=6)  # avant le split simulé
+        split_date = timezone.now() - timedelta(hours=10)
+        trade, lab_position = self._make_position(
+            "BRCC", "ALPACA_LAB", entry_date, entry_price=0.84, stop_loss=0.80, take_profit=1.01,
+        )
+        filled_order = MagicMock(status="filled", filled_qty="121", filled_avg_price="0.84")
+
+        with patch.object(tasks, "get_lab_order_by_id", return_value=filled_order), \
+                patch.object(tasks, "fetch_ticker_data", return_value={"price": 9.26}), \
+                patch.object(tasks.market_data, "Ticker") as mock_ticker_cls, \
+                patch.object(tasks, "submit_lab_market_order") as mock_sell:
+            mock_ticker_cls.return_value.splits = self._brcc_split_series(split_date)
+            tasks.monitor_lab_positions()
+
+        mock_sell.assert_not_called()
+        trade.refresh_from_db()
+        lab_position.refresh_from_db()
+        self.assertTrue(lab_position.is_open, "la fausse prise de profit ne doit pas fermer la position")
+        # entry_price/take_profit ajustés par le ratio (0.1) pour rester
+        # comparables au prix courant post-split.
+        self.assertAlmostEqual(float(trade.entry_price), 8.4, places=2)
+        self.assertAlmostEqual(float(trade.take_profit), 10.1, places=2)
+        self.assertAlmostEqual(float(trade.quantity), 12.1, places=2)
+
+    def test_split_before_entry_is_ignored(self):
+        entry_date = timezone.now() - timedelta(hours=2)
+        split_date = timezone.now() - timedelta(days=10)  # bien avant l'entrée -- non pertinent
+        trade, lab_position = self._make_position(
+            "BRCC", "ALPACA_LAB", entry_date, entry_price=8.4, stop_loss=8.0, take_profit=10.1,
+        )
+        filled_order = MagicMock(status="filled", filled_qty="12", filled_avg_price="8.4")
+
+        with patch.object(tasks, "get_lab_order_by_id", return_value=filled_order), \
+                patch.object(tasks, "fetch_ticker_data", return_value={"price": 9.0}), \
+                patch.object(tasks.market_data, "Ticker") as mock_ticker_cls, \
+                patch.object(tasks, "submit_lab_market_order") as mock_sell:
+            mock_ticker_cls.return_value.splits = self._brcc_split_series(split_date)
+            tasks.monitor_lab_positions()
+
+        mock_sell.assert_not_called()
+        trade.refresh_from_db()
+        self.assertEqual(float(trade.entry_price), 8.4)  # inchangé -- le split est hors fenêtre
+
+    def test_no_splits_at_all_leaves_fields_untouched(self):
+        entry_date = timezone.now() - timedelta(days=1)
+        trade, lab_position = self._make_position(
+            "GOOD", "SIM", entry_date, entry_price=10.0, stop_loss=9.0, take_profit=12.0,
+        )
+
+        with patch.object(tasks, "fetch_ticker_data", return_value={"price": 10.5}), \
+                patch.object(tasks.market_data, "Ticker") as mock_ticker_cls:
+            mock_ticker_cls.return_value.splits = pd.Series(dtype="float64")
+            tasks.monitor_lab_positions()
+
+        trade.refresh_from_db()
+        self.assertEqual(float(trade.entry_price), 10.0)
+
+    def test_real_take_profit_after_split_adjustment_still_closes(self):
+        # Le titre continue de monter APRÈS le split, dépassant vraiment le
+        # take_profit ajusté (10.1$) -- doit se fermer normalement, la
+        # protection contre les splits ne doit pas bloquer une vraie sortie.
+        entry_date = timezone.now() - timedelta(days=6)
+        split_date = timezone.now() - timedelta(hours=10)
+        trade, lab_position = self._make_position(
+            "BRCC", "SIM", entry_date, entry_price=0.84, stop_loss=0.80, take_profit=1.01,
+        )
+
+        with patch.object(tasks, "fetch_ticker_data", return_value={"price": 11.0}), \
+                patch.object(tasks.market_data, "Ticker") as mock_ticker_cls:
+            mock_ticker_cls.return_value.splits = self._brcc_split_series(split_date)
+            tasks.monitor_lab_positions()
+
+        lab_position.refresh_from_db()
+        self.assertFalse(lab_position.is_open)
+        self.assertEqual(lab_position.close_reason, "take_profit")
+
+
 class SyncWatchlistFromFundamentalLabTests(APITestCase):
     """
     2026-08-23 : remplace, pour WATCHLIST, l'ancien mécanisme d'ajout

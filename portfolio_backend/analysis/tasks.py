@@ -724,6 +724,93 @@ def _close_fundamental_lab_trade(trade: PaperTrade, price: float, close_reason: 
         )
 
 
+def _apply_split_adjustment_if_needed(trade: PaperTrade) -> bool:
+    """
+    Détecte un split d'actions survenu depuis l'ouverture d'une position et
+    ajuste entry_price/stop_loss/take_profit/quantity en conséquence.
+
+    Trouvé en direct sur BRCC (reverse split 1-pour-10, 2026-08-24) :
+    comparer un entry_price d'AVANT le split au prix courant d'APRÈS le
+    split donnait un faux mouvement de +1000%, qui a déclenché une vraie
+    prise de profit (ordre de vente réel exécuté sur le compte paper
+    Alpaca dédié) -- confirmé par le relevé de transactions Alpaca lui-même
+    (achats ~0,84$ le 18 août, vente ~9,18$ le 24 août, exactement le
+    ratio 0.1 du split). Le compte paper Alpaca n'ajuste pas le nombre
+    d'actions détenues pendant un split (contrairement à un vrai
+    courtier) -- ce correctif ne porte que sur NOS champs, pour que la
+    comparaison de sortie reste juste ; il ne tente pas de resynchroniser
+    la position réelle côté Alpaca (hors de portée ici).
+
+    N'appelée qu'au moment où stop_loss/take_profit semble sur le point de
+    se déclencher (voir _evaluate_lab_exit) -- pas à chaque cycle pour
+    chaque position, pour ne pas ajouter un appel réseau systématique à
+    une vérification qui ne change presque jamais rien (les splits sont
+    rares).
+    """
+    try:
+        splits = market_data.Ticker(trade.ticker).splits
+    except Exception:
+        logger.warning("monitor_lab_positions: échec fetch splits pour %s.", trade.ticker)
+        return False
+    if splits is None or splits.empty or trade.entry_date is None:
+        return False
+
+    try:
+        relevant = splits[splits.index >= trade.entry_date]
+    except Exception:
+        return False
+    if relevant.empty:
+        return False
+
+    ratio = 1.0
+    for value in relevant:
+        try:
+            ratio *= float(value)
+        except (TypeError, ValueError):
+            continue
+    if ratio == 1.0 or ratio <= 0:
+        return False
+
+    old_entry, old_stop, old_take, old_qty = trade.entry_price, trade.stop_loss, trade.take_profit, trade.quantity
+    trade.entry_price = round(float(old_entry) / ratio, 4)
+    if trade.stop_loss:
+        trade.stop_loss = round(float(trade.stop_loss) / ratio, 2)
+    if trade.take_profit:
+        trade.take_profit = round(float(trade.take_profit) / ratio, 2)
+    trade.quantity = round(float(old_qty) * ratio, 4)
+    trade.notes = (
+        f"{trade.notes} | Split détecté (ratio {ratio:g}) le {timezone.now().date().isoformat()} -- "
+        f"entry_price/stop_loss/take_profit/quantity ajustés pour rester comparables au prix courant."
+    )
+    trade.save(update_fields=["entry_price", "stop_loss", "take_profit", "quantity", "notes"])
+
+    lab_position = FundamentalLabPosition.objects.filter(paper_trade=trade).first()
+    if lab_position:
+        lab_position.entry_price = trade.entry_price
+        lab_position.save(update_fields=["entry_price"])
+
+    logger.warning(
+        "monitor_lab_positions: split détecté pour %s (ratio=%s) -- entry %.4f->%.4f, "
+        "stop %s->%s, take_profit %s->%s, qty %.4f->%.4f.",
+        trade.ticker, ratio, float(old_entry), float(trade.entry_price),
+        old_stop, trade.stop_loss, old_take, trade.take_profit, float(old_qty), float(trade.quantity),
+    )
+    return True
+
+
+def _evaluate_lab_exit(
+    trade: PaperTrade, price: float, hold_cutoff, max_hold_days: int, check_stop_loss: bool, simulation: bool = False,
+) -> tuple[str | None, str]:
+    suffix = ", simulation" if simulation else ""
+    if check_stop_loss and trade.stop_loss and float(price) <= float(trade.stop_loss):
+        return "stop_loss", f"Stop-loss déclenché ({float(price):.4f} <= {float(trade.stop_loss):.4f}{suffix})"
+    if trade.take_profit and float(price) >= float(trade.take_profit):
+        return "take_profit", f"Prise de profit déclenchée ({float(price):.4f} >= {float(trade.take_profit):.4f}{suffix})"
+    if trade.entry_date and trade.entry_date <= hold_cutoff:
+        return "max_hold_time", f"Durée maximale de détention atteinte ({max_hold_days}j{suffix})"
+    return None, ""
+
+
 @shared_task(bind=True, max_retries=1)
 def monitor_lab_positions(self) -> dict:
     """
@@ -824,17 +911,13 @@ def monitor_lab_positions(self) -> dict:
             logger.warning("monitor_lab_positions: prix indisponible pour %s, sortie non vérifiée ce cycle.", trade.ticker)
             continue
 
-        close_reason = None
-        note = ""
-        if trade.stop_loss and float(price) <= float(trade.stop_loss):
-            close_reason = "stop_loss"
-            note = f"Stop-loss déclenché ({float(price):.4f} <= {float(trade.stop_loss):.4f})"
-        elif trade.take_profit and float(price) >= float(trade.take_profit):
-            close_reason = "take_profit"
-            note = f"Prise de profit déclenchée ({float(price):.4f} >= {float(trade.take_profit):.4f})"
-        elif trade.entry_date and trade.entry_date <= hold_cutoff:
-            close_reason = "max_hold_time"
-            note = f"Durée maximale de détention atteinte ({max_hold_days}j)"
+        close_reason, note = _evaluate_lab_exit(trade, price, hold_cutoff, max_hold_days, check_stop_loss=True)
+        if close_reason in ("stop_loss", "take_profit") and _apply_split_adjustment_if_needed(trade):
+            # Un split a été détecté et les champs viennent d'être corrigés
+            # -- refait la comparaison avec les valeurs ajustées avant de
+            # conclure quoi que ce soit (cas BRCC : sans ça, la fausse
+            # prise de profit se serait quand même déclenchée).
+            close_reason, note = _evaluate_lab_exit(trade, price, hold_cutoff, max_hold_days, check_stop_loss=True)
         if close_reason is None:
             continue
 
@@ -869,14 +952,13 @@ def monitor_lab_positions(self) -> dict:
             logger.warning("monitor_lab_positions: prix indisponible pour %s (SIM), sortie non vérifiée ce cycle.", trade.ticker)
             continue
 
-        close_reason = None
-        note = ""
-        if trade.take_profit and float(price) >= float(trade.take_profit):
-            close_reason = "take_profit"
-            note = f"Prise de profit déclenchée ({float(price):.4f} >= {float(trade.take_profit):.4f}, simulation)"
-        elif trade.entry_date and trade.entry_date <= hold_cutoff:
-            close_reason = "max_hold_time"
-            note = f"Durée maximale de détention atteinte ({max_hold_days}j, simulation)"
+        close_reason, note = _evaluate_lab_exit(
+            trade, price, hold_cutoff, max_hold_days, check_stop_loss=False, simulation=True,
+        )
+        if close_reason == "take_profit" and _apply_split_adjustment_if_needed(trade):
+            close_reason, note = _evaluate_lab_exit(
+                trade, price, hold_cutoff, max_hold_days, check_stop_loss=False, simulation=True,
+            )
         if close_reason is None:
             continue
 

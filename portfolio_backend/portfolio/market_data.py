@@ -415,6 +415,20 @@ class Ticker:
         return _with_timeout(lambda: _yfinance.Ticker(self.symbol).dividends, timeout, pd.Series(dtype='float64'))
 
     @property
+    def splits(self) -> pd.Series:
+        # 2026-08-24 : ajouté suite au cas BRCC (reverse split 1-pour-10)
+        # -- monitor_lab_positions (analysis/tasks.py) compare entry_price
+        # (avant le split) au prix courant (après) sans ajustement,
+        # produisant une fausse prise de profit de +1000% sur un compte
+        # paper Alpaca qui n'avait pas ajusté le nombre d'actions détenues
+        # pendant le split. Série pandas indexée par date, valeur = ratio
+        # (0.1 = 1-pour-10 inverse, 2.0 = 2-pour-1).
+        if _yfinance is None:
+            return pd.Series(dtype='float64')
+        timeout = _yf_timeout()
+        return _with_timeout(lambda: _yfinance.Ticker(self.symbol).splits, timeout, pd.Series(dtype='float64'))
+
+    @property
     def balance_sheet(self) -> pd.DataFrame:
         if _yfinance is None:
             return pd.DataFrame()
