@@ -5,6 +5,7 @@ inclus depuis portfolio_backend/urls.py sous 'api/analysis/'.
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 from django.db.models import Avg, Count
@@ -330,11 +331,21 @@ class LabPerformanceView(APIView):
         positions = FundamentalLabPosition.objects.select_related("scan_result").exclude(
             is_open=False, exit_date__isnull=True,
         )
+        # 2026-08-24 : allers-retours réseau en série, un par ticker distinct
+        # -- confirmé en direct à 31,7s de réponse une fois le nombre de
+        # positions ouvertes monté (33 après la première vraie journée de
+        # trading post-corrections), assez pour dépasser le délai du
+        # frontend ("Impossible de charger les performances"). Parallélisé
+        # comme penny_opportunity_scanner (ThreadPoolExecutor) -- aucun état
+        # partagé entre les appels, sûr à paralléliser.
+        tickers = list(positions.values_list("ticker", flat=True).distinct())
         current_prices = {}
-        for ticker in positions.values_list("ticker", flat=True).distinct():
-            data = fetch_ticker_data(ticker)
-            if data:
-                current_prices[ticker] = data["price"]
+        if tickers:
+            max_workers = int(os.getenv("LAB_PERFORMANCE_FETCH_WORKERS", "8"))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for ticker, data in zip(tickers, executor.map(fetch_ticker_data, tickers)):
+                    if data:
+                        current_prices[ticker] = data["price"]
 
         serialized = LabPositionSerializer(
             positions, many=True, context={"current_prices": current_prices}
