@@ -129,6 +129,19 @@ class PaperTrade(models.Model):
 	broker_filled_qty = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
 	broker_avg_price = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
 	broker_updated_at = models.DateTimeField(null=True, blank=True)
+	# 2026-08-25 : id de l'ordre stop RÉEL placé chez Alpaca (broker='ALPACA_LAB'
+	# uniquement) une fois l'achat confirmé rempli -- voir analysis/tasks.py::
+	# monitor_lab_positions. Remplace la comparaison de prix + market order
+	# a posteriori pour stop_loss : trouvé qu'un poll toutes les 10 min pouvait
+	# laisser une perte dépasser largement le -5% visé avant réaction (cas
+	# SLQT -37,57% le 2026-08-25, prix ayant gappé hors des heures de check).
+	# Un vrai ordre stop chez le courtier réagit en continu pendant les heures
+	# de marché au lieu d'attendre le prochain cycle de 10 min -- ne règle pas
+	# le risque de gap hors marché (aucun ordre ne s'exécute marché fermé,
+	# même chez un vrai courtier), mais élimine le lag de polling intraday.
+	# blank/default='' (pas null=True) pour matcher la convention broker_order_id
+	# ci-dessus ; vide tant que l'achat n'est pas confirmé rempli.
+	stop_order_id = models.CharField(max_length=120, blank=True, default='')
 	stop_loss = models.DecimalField(max_digits=10, decimal_places=2)
 	# Nullable (2026-08-23) : seul FUNDAMENTAL_LAB la renseigne pour l'instant
 	# (voir analysis/tasks.py::_create_lab_position/monitor_lab_positions) --

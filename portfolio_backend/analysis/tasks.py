@@ -29,7 +29,9 @@ from django.utils import timezone
 
 from portfolio import market_data
 from portfolio.models import PaperTrade, SandboxWatchlist
-from portfolio.alpaca_data_lab import submit_lab_market_order, get_lab_order_by_id
+from portfolio.alpaca_data_lab import (
+    submit_lab_market_order, get_lab_order_by_id, submit_lab_stop_order, cancel_lab_order,
+)
 
 from .models import (
     ScreenerPreset, ScanRun, ScanResult, FundamentalLabPosition,
@@ -741,11 +743,17 @@ def _apply_split_adjustment_if_needed(trade: PaperTrade) -> bool:
     comparaison de sortie reste juste ; il ne tente pas de resynchroniser
     la position réelle côté Alpaca (hors de portée ici).
 
-    N'appelée qu'au moment où stop_loss/take_profit semble sur le point de
-    se déclencher (voir _evaluate_lab_exit) -- pas à chaque cycle pour
-    chaque position, pour ne pas ajouter un appel réseau systématique à
-    une vérification qui ne change presque jamais rien (les splits sont
-    rares).
+    Pour ALPACA_LAB (2026-08-25) : appelée à CHAQUE cycle désormais, pas
+    seulement quand un déclenchement de prix semble imminent -- depuis que
+    stop_loss est protégé par un vrai ordre stop chez Alpaca (voir
+    monitor_lab_positions), attendre un signal de prix pour détecter un
+    split arriverait TROP TARD, l'ordre réel ayant pu se déclencher tout
+    seul sur un prix post-split faussé avant qu'on ne regarde. Un appel
+    réseau de plus par position par cycle est acceptable (peu de positions
+    ouvertes à la fois, splits rares mais coût de la vérification faible).
+    Pour SIM (pas d'ordre réel à garder synchronisé) : toujours appelée
+    seulement quand take_profit semble sur le point de se déclencher,
+    l'ancien comportement reste suffisant là.
     """
     try:
         splits = market_data.Ticker(trade.ticker).splits
@@ -826,8 +834,21 @@ def monitor_lab_positions(self) -> dict:
       statut RÉEL de l'ordre via get_lab_order_by_id (garde-fou du
       2026-08-11, dry-run ADBE hors marché -- un ordre 'ACCEPTED'/'NEW' n'a
       pas encore de position réelle derrière, comparer son prix à quoi que
-      ce soit serait une action sur du vide). La fermeture passe par un
-      vrai ordre de vente (submit_lab_market_order).
+      ce soit serait une action sur du vide).
+      2026-08-25 -- stop_loss n'est plus détecté par comparaison de prix
+      dans ce cycle : un vrai ordre stop (GTC) est placé chez Alpaca dès
+      l'achat confirmé rempli (submit_lab_stop_order), surveillé en continu
+      par le courtier au lieu d'attendre le prochain poll de 10 min. Root
+      cause du changement : SLQT a perdu -37,57% avant que le stop
+      (visé -5%) ne soit détecté, le prix ayant gappé hors du cycle de
+      poll. La comparaison de prix (check_stop_loss=True) ne reste qu'en
+      secours si le placement de l'ordre stop réel a échoué. take_profit
+      et max_hold_time restent détectés par comparaison de prix (pas de
+      contrepartie "prise de profit" native chez Alpaca sans passer à un
+      ordre bracket, hors scope ici) ; leur fermeture passe par un vrai
+      ordre de vente (submit_lab_market_order), après annulation du stop
+      order protecteur pour ne jamais avoir deux ordres de vente actifs en
+      même temps sur la même position.
     - broker='SIM' (tickers TSX, hors périmètre Alpaca) : take_profit ET
       max_hold_time SEULEMENT -- pas de stop_loss ici par design d'origine
       (aucun capital réel à protéger), mais les exclure aussi de take_profit/
@@ -901,6 +922,73 @@ def monitor_lab_positions(self) -> dict:
                 trade.ticker, trade.broker_order_id, float(trade.entry_price),
             )
 
+        # Split : vérifié à CHAQUE cycle ici (voir docstring de
+        # _apply_split_adjustment_if_needed) -- si détecté et qu'un stop
+        # order réel est déjà vivant, il faut le replacer au nouveau
+        # stop_loss AVANT qu'il ne se déclenche tout seul sur l'ancien prix.
+        if _apply_split_adjustment_if_needed(trade) and trade.stop_order_id:
+            old_stop_order_id = trade.stop_order_id
+            if cancel_lab_order(old_stop_order_id):
+                new_stop_order = submit_lab_stop_order(trade.ticker, int(trade.quantity), float(trade.stop_loss))
+                trade.stop_order_id = str(getattr(new_stop_order, "id", "") or "") if new_stop_order else ""
+                trade.save(update_fields=["stop_order_id"])
+                if not trade.stop_order_id:
+                    logger.error(
+                        "monitor_lab_positions: split détecté pour %s, ancien stop order %s annulé mais le "
+                        "nouveau (stop=%.2f) n'a pas pu être placé -- position SANS protection stop réelle, "
+                        "à vérifier manuellement sur le dashboard Alpaca (compte FUNDAMENTAL_LAB).",
+                        trade.ticker, old_stop_order_id, float(trade.stop_loss),
+                    )
+            else:
+                logger.error(
+                    "monitor_lab_positions: split détecté pour %s mais l'annulation de l'ancien stop order "
+                    "(%s) a échoué -- potentiellement encore actif à un prix pré-split faux, à vérifier "
+                    "manuellement sur le dashboard Alpaca.",
+                    trade.ticker, old_stop_order_id,
+                )
+
+        # Place le stop order réel s'il n'en existe pas encore (nouvelle
+        # position juste confirmée remplie, ou tentative précédente échouée
+        # -- retentée à chaque cycle tant qu'aucun id n'est enregistré).
+        if not trade.stop_order_id:
+            stop_order = submit_lab_stop_order(trade.ticker, int(trade.quantity), float(trade.stop_loss))
+            if stop_order is not None:
+                trade.stop_order_id = str(getattr(stop_order, "id", "") or "")
+                trade.save(update_fields=["stop_order_id"])
+            else:
+                logger.error(
+                    "monitor_lab_positions: échec du placement du stop order réel pour %s (stop=%.2f) -- "
+                    "comparaison de prix utilisée en secours ce cycle.",
+                    trade.ticker, float(trade.stop_loss),
+                )
+
+        # Le stop order réel est la sortie stop_loss primaire désormais --
+        # vérifié AVANT toute comparaison de prix, il a pu se déclencher
+        # n'importe quand depuis le dernier cycle (c'est tout le point).
+        if trade.stop_order_id:
+            stop_status = get_lab_order_by_id(trade.stop_order_id)
+            stop_status_value = ""
+            if stop_status is not None:
+                stop_raw_status = getattr(stop_status, "status", None)
+                stop_status_value = str(getattr(stop_raw_status, "value", stop_raw_status) or "").lower()
+            if stop_status_value == "filled":
+                try:
+                    stop_filled_price = float(getattr(stop_status, "filled_avg_price", None) or 0.0)
+                except Exception:
+                    stop_filled_price = 0.0
+                if stop_filled_price > 0:
+                    trade.broker_status = "filled"
+                    trade.broker_side = "SELL"
+                    trade.broker_updated_at = timezone.now()
+                    trade.save(update_fields=["broker_status", "broker_side", "broker_updated_at"])
+                    _close_fundamental_lab_trade(
+                        trade, stop_filled_price, "stop_loss",
+                        f"Stop-loss réel déclenché chez Alpaca (stop order {trade.stop_order_id}, "
+                        f"prix rempli {stop_filled_price:.4f}).",
+                    )
+                    closed += 1
+                    continue
+
         try:
             data = fetch_ticker_data(trade.ticker)
         except Exception:
@@ -911,14 +999,27 @@ def monitor_lab_positions(self) -> dict:
             logger.warning("monitor_lab_positions: prix indisponible pour %s, sortie non vérifiée ce cycle.", trade.ticker)
             continue
 
-        close_reason, note = _evaluate_lab_exit(trade, price, hold_cutoff, max_hold_days, check_stop_loss=True)
-        if close_reason in ("stop_loss", "take_profit") and _apply_split_adjustment_if_needed(trade):
-            # Un split a été détecté et les champs viennent d'être corrigés
-            # -- refait la comparaison avec les valeurs ajustées avant de
-            # conclure quoi que ce soit (cas BRCC : sans ça, la fausse
-            # prise de profit se serait quand même déclenchée).
-            close_reason, note = _evaluate_lab_exit(trade, price, hold_cutoff, max_hold_days, check_stop_loss=True)
+        # check_stop_loss=False dès qu'un stop order réel est vivant (il est
+        # la source de vérité pour stop_loss ci-dessus) -- ne repasse à la
+        # comparaison de prix que si aucun stop order réel n'a pu être
+        # établi (secours, voir plus haut).
+        close_reason, note = _evaluate_lab_exit(
+            trade, price, hold_cutoff, max_hold_days, check_stop_loss=not bool(trade.stop_order_id),
+        )
         if close_reason is None:
+            continue
+
+        # take_profit / max_hold_time (ou stop_loss de secours) : annule le
+        # stop order protecteur AVANT de vendre manuellement pour ne jamais
+        # laisser deux ordres de vente actifs en même temps sur la même
+        # position (double-vente ou rejet Alpaca pour qty insuffisante).
+        if trade.stop_order_id and not cancel_lab_order(trade.stop_order_id):
+            logger.error(
+                "monitor_lab_positions: sortie '%s' déclenchée pour %s mais l'annulation du stop order "
+                "protecteur (%s) a échoué -- vente manuelle ANNULÉE ce cycle pour éviter un double ordre de "
+                "vente, à vérifier manuellement sur le dashboard Alpaca.",
+                close_reason, trade.ticker, trade.stop_order_id,
+            )
             continue
 
         order = submit_lab_market_order(trade.ticker, int(trade.quantity), "sell")
@@ -934,7 +1035,8 @@ def monitor_lab_positions(self) -> dict:
         trade.broker_status = str(getattr(order, "status", "") or "")
         trade.broker_side = "SELL"
         trade.broker_updated_at = timezone.now()
-        trade.save(update_fields=["broker_status", "broker_side", "broker_updated_at"])
+        trade.stop_order_id = ""
+        trade.save(update_fields=["broker_status", "broker_side", "broker_updated_at", "stop_order_id"])
         _close_fundamental_lab_trade(trade, price, close_reason, f"{note}, ordre de vente réel {getattr(order, 'id', '')}.")
         closed += 1
 

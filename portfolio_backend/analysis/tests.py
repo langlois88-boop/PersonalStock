@@ -510,6 +510,7 @@ class MonitorLabPositionsCloseFieldsTests(APITestCase):
 
         with patch.object(tasks, "get_lab_order_by_id", return_value=filled_order), \
                 patch.object(tasks, "fetch_ticker_data", return_value={"price": 9.00}), \
+                patch.object(tasks, "submit_lab_stop_order", return_value=None), \
                 patch.object(tasks, "submit_lab_market_order", return_value=sell_order):
             tasks.monitor_lab_positions()
 
@@ -569,6 +570,7 @@ class MonitorLabPositionsTakeProfitAndMaxHoldTests(APITestCase):
 
         with patch.object(tasks, "get_lab_order_by_id", return_value=filled_order), \
                 patch.object(tasks, "fetch_ticker_data", return_value={"price": 12.50}), \
+                patch.object(tasks, "submit_lab_stop_order", return_value=None), \
                 patch.object(tasks, "submit_lab_market_order", return_value=sell_order) as mock_sell:
             tasks.monitor_lab_positions()
 
@@ -588,6 +590,7 @@ class MonitorLabPositionsTakeProfitAndMaxHoldTests(APITestCase):
 
         with patch.object(tasks, "get_lab_order_by_id", return_value=filled_order), \
                 patch.object(tasks, "fetch_ticker_data", return_value={"price": 10.20}), \
+                patch.object(tasks, "submit_lab_stop_order", return_value=None), \
                 patch.object(tasks, "submit_lab_market_order", return_value=sell_order):
             tasks.monitor_lab_positions()
 
@@ -601,6 +604,7 @@ class MonitorLabPositionsTakeProfitAndMaxHoldTests(APITestCase):
 
         with patch.object(tasks, "get_lab_order_by_id", return_value=filled_order), \
                 patch.object(tasks, "fetch_ticker_data", return_value={"price": 10.50}), \
+                patch.object(tasks, "submit_lab_stop_order", return_value=None), \
                 patch.object(tasks, "submit_lab_market_order") as mock_sell:
             tasks.monitor_lab_positions()
 
@@ -697,6 +701,7 @@ class SplitAdjustmentTests(APITestCase):
         with patch.object(tasks, "get_lab_order_by_id", return_value=filled_order), \
                 patch.object(tasks, "fetch_ticker_data", return_value={"price": 9.26}), \
                 patch.object(tasks.market_data, "Ticker") as mock_ticker_cls, \
+                patch.object(tasks, "submit_lab_stop_order", return_value=None), \
                 patch.object(tasks, "submit_lab_market_order") as mock_sell:
             mock_ticker_cls.return_value.splits = self._brcc_split_series(split_date)
             tasks.monitor_lab_positions()
@@ -722,6 +727,7 @@ class SplitAdjustmentTests(APITestCase):
         with patch.object(tasks, "get_lab_order_by_id", return_value=filled_order), \
                 patch.object(tasks, "fetch_ticker_data", return_value={"price": 9.0}), \
                 patch.object(tasks.market_data, "Ticker") as mock_ticker_cls, \
+                patch.object(tasks, "submit_lab_stop_order", return_value=None), \
                 patch.object(tasks, "submit_lab_market_order") as mock_sell:
             mock_ticker_cls.return_value.splits = self._brcc_split_series(split_date)
             tasks.monitor_lab_positions()
@@ -762,6 +768,175 @@ class SplitAdjustmentTests(APITestCase):
         lab_position.refresh_from_db()
         self.assertFalse(lab_position.is_open)
         self.assertEqual(lab_position.close_reason, "take_profit")
+
+
+class MonitorLabPositionsRealStopOrderTests(APITestCase):
+    """
+    2026-08-25 : remplace la détection de stop_loss par comparaison de prix
+    (poll toutes les 10 min) par un vrai ordre stop chez Alpaca pour
+    broker='ALPACA_LAB', surveillé en continu par le courtier au lieu
+    d'attendre le prochain cycle. Root cause du changement : SLQT a perdu
+    -37,57% avant que le stop (visé -5%) ne soit détecté, le prix ayant
+    gappé hors du cycle de poll de 10 min. Les tests des autres classes de
+    ce fichier (MonitorLabPositionsCloseFieldsTests,
+    MonitorLabPositionsTakeProfitAndMaxHoldTests, SplitAdjustmentTests)
+    mockent submit_lab_stop_order à None -- ils couvrent le chemin de
+    secours (stop_order_id jamais renseigné -> comparaison de prix
+    inchangée). Ceux-ci couvrent le nouveau chemin principal.
+    """
+
+    def setUp(self):
+        self.preset = _make_preset()
+
+    def _make_position(self, ticker="ATD", stop_order_id="", broker_status="filled",
+                        stop_loss="9.50", take_profit="12.00", entry_date=None, quantity=10):
+        scan_run = ScanRun.objects.create(preset=self.preset, universe_source="sandboxes")
+        scan_result = ScanResult.objects.create(
+            scan_run=scan_run, ticker=ticker, final_verdict="confirmed",
+            price_at_scan=Decimal("10.00"), quant_score=3.0,
+        )
+        trade = PaperTrade.objects.create(
+            ticker=ticker, sandbox="FUNDAMENTAL_LAB", entry_price=Decimal("10.00"),
+            quantity=quantity, stop_loss=Decimal(stop_loss), take_profit=Decimal(take_profit),
+            status="OPEN", broker="ALPACA_LAB", broker_order_id="order-abc",
+            broker_status=broker_status, stop_order_id=stop_order_id,
+        )
+        if entry_date is not None:
+            PaperTrade.objects.filter(pk=trade.pk).update(entry_date=entry_date)
+            trade.refresh_from_db()
+        lab_position = FundamentalLabPosition.objects.create(
+            scan_result=scan_result, ticker=ticker, preset=self.preset,
+            entry_price=Decimal("10.00"), entry_date=entry_date or timezone.now(),
+            paper_trade=trade,
+        )
+        return trade, lab_position
+
+    def test_new_position_places_a_real_stop_order_once_buy_confirmed_filled(self):
+        # broker_status="new" -- premier cycle après l'achat, pas encore
+        # confirmé rempli côté PaperTrade.
+        trade, lab_position = self._make_position(broker_status="new")
+        buy_filled = MagicMock(status="filled", filled_qty="10", filled_avg_price="10.00")
+        stop_not_yet_filled = MagicMock(status="new")
+        new_stop_order = MagicMock(id="stop-order-new-1")
+
+        with patch.object(tasks, "get_lab_order_by_id", side_effect=[buy_filled, stop_not_yet_filled]), \
+                patch.object(tasks.market_data, "Ticker") as mock_ticker_cls, \
+                patch.object(tasks, "submit_lab_stop_order", return_value=new_stop_order) as mock_stop, \
+                patch.object(tasks, "fetch_ticker_data", return_value={"price": 10.10}), \
+                patch.object(tasks, "submit_lab_market_order") as mock_sell:
+            mock_ticker_cls.return_value.splits = pd.Series(dtype="float64")
+            tasks.monitor_lab_positions()
+
+        mock_stop.assert_called_once_with(trade.ticker, 10, 9.50)
+        mock_sell.assert_not_called()  # rien à vendre manuellement, le stop est juste placé
+        trade.refresh_from_db()
+        self.assertEqual(trade.stop_order_id, "stop-order-new-1")
+
+    def test_real_stop_order_fill_closes_as_stop_loss_without_a_manual_sell(self):
+        # Le stop a pu se déclencher n'importe quand depuis le dernier
+        # cycle -- c'est tout le point de déléguer au courtier. Le PaperTrade
+        # est déjà 'filled' (achat confirmé il y a longtemps).
+        trade, lab_position = self._make_position(stop_order_id="stop-order-live-1")
+        buy_status = MagicMock(status="filled", filled_qty="10", filled_avg_price="10.00")
+        stop_filled = MagicMock(status="filled", filled_avg_price="8.70")
+
+        with patch.object(tasks, "get_lab_order_by_id", side_effect=[buy_status, stop_filled]), \
+                patch.object(tasks.market_data, "Ticker") as mock_ticker_cls, \
+                patch.object(tasks, "submit_lab_stop_order") as mock_stop, \
+                patch.object(tasks, "fetch_ticker_data") as mock_fetch, \
+                patch.object(tasks, "submit_lab_market_order") as mock_sell:
+            mock_ticker_cls.return_value.splits = pd.Series(dtype="float64")
+            tasks.monitor_lab_positions()
+
+        # Sortie déjà exécutée par le stop réel -- aucun ordre de vente
+        # manuel, aucun besoin même de lire le prix courant.
+        mock_sell.assert_not_called()
+        mock_stop.assert_not_called()
+        mock_fetch.assert_not_called()
+        trade.refresh_from_db()
+        lab_position.refresh_from_db()
+        self.assertEqual(trade.status, "CLOSED")
+        self.assertFalse(lab_position.is_open)
+        self.assertEqual(lab_position.close_reason, "stop_loss")
+        self.assertEqual(float(lab_position.exit_price), 8.70)
+
+    def test_take_profit_cancels_the_live_stop_order_before_selling_manually(self):
+        trade, lab_position = self._make_position(stop_order_id="stop-order-live-2")
+        # get_lab_order_by_id est appelé 2x ce cycle : une fois pour le
+        # statut de l'achat (déjà 'filled', peu importe le contenu ici vu
+        # que broker_status est déjà 'filled'), une fois pour le statut du
+        # stop protecteur (PAS rempli -- sinon ce serait le test précédent).
+        buy_status = MagicMock(status="filled", filled_qty="10", filled_avg_price="10.00")
+        stop_status = MagicMock(status="new")
+        sell_order = MagicMock(id="sell-order-manual-1", status="filled")
+
+        with patch.object(tasks, "get_lab_order_by_id", side_effect=[buy_status, stop_status]), \
+                patch.object(tasks.market_data, "Ticker") as mock_ticker_cls, \
+                patch.object(tasks, "submit_lab_stop_order") as mock_stop, \
+                patch.object(tasks, "cancel_lab_order", return_value=True) as mock_cancel, \
+                patch.object(tasks, "fetch_ticker_data", return_value={"price": 12.50}), \
+                patch.object(tasks, "submit_lab_market_order", return_value=sell_order) as mock_sell:
+            mock_ticker_cls.return_value.splits = pd.Series(dtype="float64")
+            tasks.monitor_lab_positions()
+
+        mock_cancel.assert_called_once_with("stop-order-live-2")
+        mock_sell.assert_called_once_with(trade.ticker, 10, "sell")
+        mock_stop.assert_not_called()  # un stop est déjà vivant, n'en replace pas un second
+        trade.refresh_from_db()
+        lab_position.refresh_from_db()
+        self.assertEqual(lab_position.close_reason, "take_profit")
+        self.assertEqual(trade.stop_order_id, "")  # nettoyé après la fermeture manuelle
+
+    def test_cancel_failure_blocks_the_manual_sell_to_avoid_a_double_order(self):
+        trade, lab_position = self._make_position(stop_order_id="stop-order-live-3")
+        buy_status = MagicMock(status="filled", filled_qty="10", filled_avg_price="10.00")
+        stop_status = MagicMock(status="new")
+
+        with patch.object(tasks, "get_lab_order_by_id", side_effect=[buy_status, stop_status]), \
+                patch.object(tasks.market_data, "Ticker") as mock_ticker_cls, \
+                patch.object(tasks, "submit_lab_stop_order") as mock_stop, \
+                patch.object(tasks, "cancel_lab_order", return_value=False), \
+                patch.object(tasks, "fetch_ticker_data", return_value={"price": 12.50}), \
+                patch.object(tasks, "submit_lab_market_order") as mock_sell:
+            mock_ticker_cls.return_value.splits = pd.Series(dtype="float64")
+            tasks.monitor_lab_positions()
+
+        # L'annulation du stop protecteur a échoué -- pas de vente manuelle
+        # cette fois (éviterait un double ordre de vente actif), position
+        # laissée OPEN pour être retentée au prochain cycle.
+        mock_sell.assert_not_called()
+        lab_position.refresh_from_db()
+        self.assertTrue(lab_position.is_open)
+
+    def test_split_with_a_live_stop_order_cancels_and_replaces_it(self):
+        entry_date = timezone.now() - timedelta(days=6)
+        split_date = timezone.now() - timedelta(hours=10)
+        trade, lab_position = self._make_position(
+            ticker="BRCC", stop_order_id="stop-order-pre-split", stop_loss="0.80",
+            take_profit="1.01", entry_date=entry_date, quantity=121,
+        )
+        PaperTrade.objects.filter(pk=trade.pk).update(entry_price=Decimal("0.84"))
+        trade.refresh_from_db()
+        buy_status = MagicMock(status="filled", filled_qty="121", filled_avg_price="0.84")
+        stop_status = MagicMock(status="new")  # pas encore rempli au prix pré-split
+        new_stop_order = MagicMock(id="stop-order-post-split")
+
+        with patch.object(tasks, "get_lab_order_by_id", side_effect=[buy_status, stop_status]), \
+                patch.object(tasks.market_data, "Ticker") as mock_ticker_cls, \
+                patch.object(tasks, "cancel_lab_order", return_value=True) as mock_cancel, \
+                patch.object(tasks, "submit_lab_stop_order", return_value=new_stop_order) as mock_stop, \
+                patch.object(tasks, "fetch_ticker_data", return_value={"price": 9.26}), \
+                patch.object(tasks, "submit_lab_market_order") as mock_sell:
+            mock_ticker_cls.return_value.splits = pd.Series([0.1], index=pd.DatetimeIndex([split_date]))
+            tasks.monitor_lab_positions()
+
+        mock_cancel.assert_called_once_with("stop-order-pre-split")
+        # Nouveau stop_loss ajusté par le ratio (0.1) : 0.80 / 0.1 = 8.00.
+        mock_stop.assert_called_once_with("BRCC", 12, 8.00)
+        mock_sell.assert_not_called()  # aucune sortie déclenchée, juste un re-pricing
+        trade.refresh_from_db()
+        self.assertEqual(trade.stop_order_id, "stop-order-post-split")
+        self.assertAlmostEqual(float(trade.stop_loss), 8.00, places=2)
 
 
 class SyncWatchlistFromFundamentalLabTests(APITestCase):

@@ -674,11 +674,18 @@ CELERY_BEAT_SCHEDULE = {
     # Stop-loss minimal pour les positions FUNDAMENTAL_LAB à ordre Alpaca
     # réel (broker='ALPACA_LAB', voir docs/TECH_DEBT_NOTES.md item 11,
     # Partie B 2026-08-11) -- aucun mécanisme de sortie n'existait avant ça.
-    # */10 pendant les heures de marché ET, cohérent avec les autres tâches
-    # de surveillance de ce fichier.
+    # */10 -> */2 le 2026-08-25 : trouvé qu'un poll toutes les 10 min laissait
+    # take_profit/max_hold_time (et stop_loss pour SIM/TSX, sans ordre réel
+    # possible) accuser jusqu'à 10 min de retard sur un mouvement de prix
+    # rapide. stop_loss pour ALPACA_LAB est désormais protégé par un vrai
+    # ordre stop chez Alpaca (voir analysis/tasks.py::monitor_lab_positions,
+    # submit_lab_stop_order) surveillé en continu par le courtier -- ce
+    # */2 reste la fréquence de détection pour take_profit/max_hold_time
+    # (toutes sandboxes) et tout SIM/TSX (pas de courtier réel à qui déléguer
+    # la surveillance).
     'monitor-lab-positions': {
         'task': 'analysis.tasks.monitor_lab_positions',
-        'schedule': crontab(minute='*/10', hour='9-16', day_of_week='mon-fri'),
+        'schedule': crontab(minute='*/2', hour='9-16', day_of_week='mon-fri'),
     },
 }
 
