@@ -32,6 +32,12 @@ from portfolio.models import PaperTrade, SandboxWatchlist
 from portfolio.alpaca_data_lab import (
     submit_lab_market_order, get_lab_order_by_id, submit_lab_stop_order, cancel_lab_order,
 )
+# 2026-08-26 : réutilise le helper existant plutôt que de dupliquer un
+# SystemLog.objects.create() -- voir _create_lab_position, root cause du
+# jour (RY/PNR) : un ordre Alpaca réel qui réussit puis un PaperTrade qui ne
+# se crée pas ne laissait de trace QUE dans les logs du conteneur (perdus
+# au prochain redéploiement, invisible au dashboard) -- jamais en base.
+from portfolio.tasks import _system_log
 
 from .models import (
     ScreenerPreset, ScanRun, ScanResult, FundamentalLabPosition,
@@ -357,6 +363,12 @@ def _create_lab_position(scan_result: ScanResult, preset: ScreenerPreset, benchm
                 "Impossible de créer le PaperTrade FUNDAMENTAL_LAB pour %s : prix d'entrée invalide (%s).",
                 scan_result.ticker, entry_price,
             )
+            _system_log(
+                "PAPER_TRADE", "ERROR",
+                f"FUNDAMENTAL_LAB : prix d'entrée invalide ({entry_price}) pour {scan_result.ticker} "
+                f"(preset {preset.slug}) -- aucun PaperTrade créé, lab_position={lab_position.id} à examiner.",
+                symbol=scan_result.ticker,
+            )
             return
 
         quantity = max(1, int(position_size / entry_price))
@@ -391,6 +403,12 @@ def _create_lab_position(scan_result: ScanResult, preset: ScreenerPreset, benchm
                 "aucun PaperTrade créé, lab_position=%s conservée sans ordre, à examiner.",
                 scan_result.ticker, quantity, lab_position.id,
             )
+            _system_log(
+                "PAPER_TRADE", "ERROR",
+                f"FUNDAMENTAL_LAB : échec de l'ordre Alpaca réel pour {scan_result.ticker} qty={quantity} "
+                f"(preset {preset.slug}) -- aucun PaperTrade créé, lab_position={lab_position.id} à examiner.",
+                symbol=scan_result.ticker,
+            )
             return
 
         paper_trade = PaperTrade.objects.create(
@@ -416,11 +434,26 @@ def _create_lab_position(scan_result: ScanResult, preset: ScreenerPreset, benchm
         )
         lab_position.paper_trade = paper_trade
         lab_position.save(update_fields=["paper_trade"])
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Échec de la création du PaperTrade FUNDAMENTAL_LAB pour %s (lab_position=%s) — "
             "position lab conservée sans ordre, à examiner.",
             scan_result.ticker, lab_position.id,
+        )
+        # 2026-08-26 : root cause du jour (RY/PNR) -- un ordre Alpaca réel
+        # placé avec succès puis un PaperTrade.objects.create() qui échoue
+        # ENSUITE laisse une VRAIE position chez Alpaca sans AUCUNE trace en
+        # base (ni PaperTrade, ni log persistant) -- seul logger.exception
+        # ci-dessus existait avant, perdu au prochain redéploiement (voir
+        # incident du jour). SystemLog persiste en base, visible du
+        # dashboard, survit à un redéploiement.
+        _system_log(
+            "PAPER_TRADE", "ERROR",
+            f"FUNDAMENTAL_LAB : exception lors de la création du PaperTrade pour {scan_result.ticker} "
+            f"(preset {preset.slug}, lab_position={lab_position.id}) -- {exc!r}. Si l'ordre Alpaca réel a "
+            "quand même réussi (vérifier le dashboard Alpaca, compte FUNDAMENTAL_LAB), cette position est "
+            "SANS PaperTrade et donc SANS stop-loss/take-profit -- à corriger manuellement.",
+            symbol=scan_result.ticker,
         )
 
 
