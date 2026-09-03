@@ -31,8 +31,11 @@ jamais casser ce module, et vice versa -- indépendance complète.
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 try:
     from alpaca.trading.client import TradingClient
@@ -99,7 +102,8 @@ def submit_lab_market_order(symbol: str, qty: int, side: str) -> Any | None:
             time_in_force=TimeInForce.DAY,
         )
         return client.submit_order(request)
-    except Exception:
+    except Exception as exc:
+        logger.warning("submit_lab_market_order: échec pour %s qty=%s side=%s -- %r", symbol, qty, side, exc)
         return None
 
 
@@ -137,7 +141,19 @@ def submit_lab_stop_order(symbol: str, qty: int, stop_price: float) -> Any | Non
             stop_price=round(float(stop_price), 2),
         )
         return client.submit_order(request)
-    except Exception:
+    except Exception as exc:
+        # 2026-09-01 : root cause encore inconnue d'un échec récurrent de
+        # placement pour des penny stocks sous 1$ (SOAR/CLGN/CHOW) -- avant
+        # ce log, `except Exception: return None` avalait le message réel
+        # sans aucune trace, y compris dans les logs du conteneur. L'appelant
+        # (monitor_lab_positions) journalise déjà l'échec dans SystemLog (visible
+        # au dashboard) ; ce logger.warning donne le détail technique associé
+        # (raison exacte du rejet Alpaca) dans les logs du conteneur pour
+        # diagnostiquer la PROCHAINE occurrence au lieu de deviner.
+        logger.warning(
+            "submit_lab_stop_order: échec pour %s qty=%s stop_price=%s -- %r",
+            symbol, qty, stop_price, exc,
+        )
         return None
 
 
@@ -147,7 +163,8 @@ def get_lab_order_by_id(order_id: str) -> Any | None:
         return None
     try:
         return client.get_order_by_id(order_id)
-    except Exception:
+    except Exception as exc:
+        logger.warning("get_lab_order_by_id: échec pour order_id=%s -- %r", order_id, exc)
         return None
 
 
@@ -179,7 +196,8 @@ def cancel_lab_order(order_id: str) -> bool:
     try:
         client.cancel_order_by_id(order_id)
         return True
-    except Exception:
+    except Exception as exc:
+        logger.warning("cancel_lab_order: échec pour order_id=%s -- %r", order_id, exc)
         return False
 
 

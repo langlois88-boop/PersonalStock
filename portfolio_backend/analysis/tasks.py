@@ -972,12 +972,26 @@ def monitor_lab_positions(self) -> dict:
                         "à vérifier manuellement sur le dashboard Alpaca (compte FUNDAMENTAL_LAB).",
                         trade.ticker, old_stop_order_id, float(trade.stop_loss),
                     )
+                    _system_log(
+                        "PAPER_TRADE", "ERROR",
+                        f"FUNDAMENTAL_LAB : split détecté pour {trade.ticker}, ancien stop order annulé mais "
+                        f"le nouveau (stop={float(trade.stop_loss):.2f}) n'a pas pu être replacé -- position "
+                        "SANS protection stop réelle, comparaison de prix utilisée en secours.",
+                        symbol=trade.ticker,
+                    )
             else:
                 logger.error(
                     "monitor_lab_positions: split détecté pour %s mais l'annulation de l'ancien stop order "
                     "(%s) a échoué -- potentiellement encore actif à un prix pré-split faux, à vérifier "
                     "manuellement sur le dashboard Alpaca.",
                     trade.ticker, old_stop_order_id,
+                )
+                _system_log(
+                    "PAPER_TRADE", "ERROR",
+                    f"FUNDAMENTAL_LAB : split détecté pour {trade.ticker} mais l'annulation de l'ancien stop "
+                    "order a échoué -- potentiellement encore actif à un prix pré-split faux, à vérifier "
+                    "manuellement sur le dashboard Alpaca.",
+                    symbol=trade.ticker,
                 )
 
         # Place le stop order réel s'il n'en existe pas encore (nouvelle
@@ -993,6 +1007,19 @@ def monitor_lab_positions(self) -> dict:
                     "monitor_lab_positions: échec du placement du stop order réel pour %s (stop=%.2f) -- "
                     "comparaison de prix utilisée en secours ce cycle.",
                     trade.ticker, float(trade.stop_loss),
+                )
+                # 2026-09-01 : trouvé en direct (SOAR/CLGN/CHOW le même jour)
+                # -- avant ça, cet échec ne laissait AUCUNE trace visible du
+                # dashboard, seulement ce logger.error perdu au prochain
+                # redéploiement. Le détail technique de l'échec Alpaca (raison
+                # exacte du rejet) est loggé séparément dans
+                # submit_lab_stop_order (portfolio/alpaca_data_lab.py).
+                _system_log(
+                    "PAPER_TRADE", "ERROR",
+                    f"FUNDAMENTAL_LAB : échec du placement du stop order réel pour {trade.ticker} "
+                    f"(stop={float(trade.stop_loss):.4f}) -- comparaison de prix utilisée en secours "
+                    "(moins précise, voir logs du conteneur pour la raison exacte du rejet Alpaca).",
+                    symbol=trade.ticker,
                 )
 
         # Le stop order réel est la sortie stop_loss primaire désormais --
