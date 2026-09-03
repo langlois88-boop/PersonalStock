@@ -552,6 +552,21 @@ def evaluate_ticker(ticker: str, preset_thresholds: dict) -> Optional[QuantResul
     score = 0.0
 
     # --- Filtres obligatoires (garde-fous qualité, étape 1 du guide) ---
+    # 2026-09-03 : ajouté après analyse du P&L par preset -- "undervalued-
+    # without-reason" représentait 58% de tout le volume FUNDAMENTAL_LAB
+    # (52/90 positions) avec seulement 25% de trades gagnants et -70,37$
+    # de P&L, le pire de tous les presets. 37% de TOUTES les positions du
+    # Lab étaient sous 1$ -- des micro-caps spéculatives où "l'analyse
+    # fondamentale" (ROE, dette/EBITDA, etc.) porte peu de sens face au
+    # bruit de prix pur. AI_PENNY a son propre modèle ML pour ce segment ;
+    # FUNDAMENTAL_LAB doit rester sur des titres où les fondamentaux
+    # comptent réellement. Absent/None par défaut (aucun changement pour
+    # les presets qui ne le définissent pas dans leurs `thresholds`).
+    min_price = thresholds.get("min_price")
+    if min_price and data["price"] is not None:
+        if data["price"] < min_price:
+            reasons_failed.append(f"Prix {data['price']:.2f}$ < seuil {min_price}$ (trop spéculatif)")
+
     roe_min = thresholds.get("roe_min")
     if roe_min and data["roe"] is not None:
         if data["roe"] < roe_min:

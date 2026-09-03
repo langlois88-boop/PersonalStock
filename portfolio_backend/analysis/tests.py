@@ -1499,6 +1499,65 @@ class QuantFilterValueCatalystTests(APITestCase):
         self.assertNotIn("insiders_buying", result.details)
 
 
+class QuantFilterMinPriceTests(APITestCase):
+    """
+    2026-09-03 : "undervalued-without-reason" représentait 58% de tout le
+    volume FUNDAMENTAL_LAB (52/90 positions) avec seulement 25% de trades
+    gagnants et -70,37$ de P&L, le pire de tous les presets -- 37% de
+    TOUTES les positions du Lab étaient sous 1$, des micro-caps
+    spéculatives où l'analyse fondamentale (ROE, dette/EBITDA) porte peu
+    de sens face au bruit de prix pur. thresholds['min_price'] ajoute un
+    garde-fou obligatoire, absent par défaut pour ne changer aucun autre
+    preset.
+    """
+
+    def _mock_info(self, price: float, **overrides):
+        base = {
+            "regularMarketPrice": price,
+            "sector": "Technology",
+            "trailingPE": 8.2,
+            "returnOnEquity": 0.18,
+            "totalDebt": 100.0,
+            "ebitda": 200.0,
+            "numberOfAnalystOpinions": 3,
+        }
+        base.update(overrides)
+        return base
+
+    def test_min_price_rejects_a_penny_stock(self):
+        with patch.object(quant_filter, "market_data") as mock_market_data, \
+                patch.object(quant_filter.yf, "Ticker") as mock_yf_ticker:
+            mock_market_data.Ticker.return_value.info = self._mock_info(0.24)  # ex. SOAR
+            mock_yf_ticker.return_value.quarterly_financials = pd.DataFrame()
+
+            result = quant_filter.evaluate_ticker("SOAR", preset_thresholds={"min_price": 2.0})
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any("Prix" in r and "spéculatif" in r for r in result.reasons_failed))
+
+    def test_min_price_passes_a_ticker_above_the_floor(self):
+        with patch.object(quant_filter, "market_data") as mock_market_data, \
+                patch.object(quant_filter.yf, "Ticker") as mock_yf_ticker:
+            mock_market_data.Ticker.return_value.info = self._mock_info(12.5)
+            mock_yf_ticker.return_value.quarterly_financials = pd.DataFrame()
+
+            result = quant_filter.evaluate_ticker("AAPL", preset_thresholds={"min_price": 2.0})
+
+        self.assertTrue(result.passed)
+
+    def test_default_preset_has_no_min_price(self):
+        """thresholds={} (comportement d'avant ce correctif) -- aucun plancher,
+        aucun changement pour les presets qui ne définissent pas min_price."""
+        with patch.object(quant_filter, "market_data") as mock_market_data, \
+                patch.object(quant_filter.yf, "Ticker") as mock_yf_ticker:
+            mock_market_data.Ticker.return_value.info = self._mock_info(0.24)
+            mock_yf_ticker.return_value.quarterly_financials = pd.DataFrame()
+
+            result = quant_filter.evaluate_ticker("SOAR", preset_thresholds={})
+
+        self.assertTrue(result.passed)
+
+
 def _make_ohlc_frame(rows: int = 30) -> pd.DataFrame:
     """OHLC + volume factices avec un DatetimeIndex nommé 'Date', pour
     simuler ce que market_data.Ticker(...).history() renvoie réellement."""
