@@ -1698,3 +1698,21 @@ complète.
 **Limite connue** : NULL sur tout trade créé avant ce déploiement (pas
 de backfill -- la quantité/stop d'origine n'existe plus nulle part une
 fois `quantity`/`stop_loss` écrasés par le trailing).
+## 27. [À RETENIR] Tout futur critère de rollback/promotion de modèle doit utiliser l'espérance $, pas le `win_rate` actuel
+
+**Constat** (diagnostic du 2026-10-22, confirmé en auditant
+`compute_model_evaluation_daily`/`detect_model_drift`/
+`compute_continuous_evaluation_daily`) : ces tâches utilisent déjà de
+façon cohérente `outcome == 'WIN' ou pnl > 0` (pas la variation de
+prix) -- cohérence interne correcte. Le problème est ailleurs : sur
+AI_PENNY, c'est précisément cette base ($/pnl réel) que les ventes
+partielles gonflent (ex. octobre 2026 : 59,5% de win rate sur cette base
+contre 14,4% en simple variation de prix). Un trade peut être compté
+`WIN` uniquement grâce à une vente partielle prise tôt, alors que la
+position restante finit perdante. `realized_partial_pnl` (item 26
+ci-dessus) et l'espérance $ (`avg_gain_dollars`/`avg_loss_dollars`/
+`expectancy_dollars`, ajoutés à `ModelEvaluationDaily`) permettent de
+distinguer les deux cas -- **tout futur seuil de rollback ou de
+promotion de modèle devra se baser sur l'espérance $ par trade, pas sur
+ce `win_rate`**, qui reste mesuré pour la continuité historique mais
+n'est plus le signal à utiliser pour une décision automatique.

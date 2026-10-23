@@ -251,6 +251,17 @@ class ModelEvaluationDaily(models.Model):
 	brier_score = models.FloatField(null=True, blank=True)
 	mean_predicted = models.FloatField(null=True, blank=True)
 	mean_outcome = models.FloatField(null=True, blank=True)
+	# Ajoutés 2026-10 (volet B3) : win_rate/avg_pnl ci-dessus restent
+	# inchangés (même base $/pnl, voir docs/TECH_DEBT_NOTES.md item 27) --
+	# ces 3 champs viennent compléter, pas remplacer. Séparent gain moyen et
+	# perte moyenne (avg_pnl seul les mélange) pour calculer une espérance $
+	# par trade -- le signal à utiliser pour un futur critère de rollback/
+	# promotion, pas win_rate, qui est gonflé par les ventes partielles sur
+	# AI_PENNY (59,5% $/pnl vs 14,4% en variation de prix, octobre 2026).
+	# Nullable : pas de backfill sur les lignes déjà écrites.
+	avg_gain_dollars = models.FloatField(null=True, blank=True)
+	avg_loss_dollars = models.FloatField(null=True, blank=True)
+	expectancy_dollars = models.FloatField(null=True, blank=True)
 	created_at = models.DateTimeField(auto_now_add=True)
 
 	class Meta:

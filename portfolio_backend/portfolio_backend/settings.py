@@ -714,6 +714,24 @@ if not AFTER_HOURS_TASKS_ENABLED:
     # credentials Reddit jamais configurées) -- ce mécanisme alternatif,
     # scanne directement le marché (yfinance most_actives), pas les
     # mentions sociales, existait déjà tout ce temps, juste jamais activé.
+    # model-evaluation-daily, model-drift-check-daily et continuous-
+    # evaluation-daily sorties de cette liste (2026-10), même raisonnement
+    # que les deux carve-outs ci-dessus : audité ligne par ligne
+    # (compute_model_evaluation_daily, detect_model_drift,
+    # compute_continuous_evaluation_daily) avant de les sortir -- aucune des
+    # trois n'écrit dans ModelRegistry, ne touche un fichier .pkl, ni ne
+    # déclenche une autre tâche (retrain/rollback/.delay/apply_async/chain) ;
+    # elles n'écrivent que dans leurs tables de mesure (ModelEvaluationDaily,
+    # ModelCalibrationDaily, ModelDriftDaily) et les logs. detect_model_drift
+    # envoie en plus une alerte Telegram si drift détecté (aucune
+    # déduplication/délai minimal entre deux alertes -- assumé pour
+    # l'instant, voir docs/TECH_DEBT_NOTES.md). Le reste du lot (retrain/
+    # rollback/promotion -- paper-trade-retrain-daily, backtest-retrain-
+    # guard-daily, drift-retrain-daily, model-rollback-daily, nightly-
+    # closed-market-retrain, nightly-intraday-retrain, deep-learning-retro-
+    # nightly) reste désactivé par défaut : décision explicite de ne pas
+    # réactiver la gouvernance ML en bloc (item 12, TECH_DEBT_NOTES.md),
+    # uniquement les tâches de MESURE.
     for task_name in [
         'deep-learning-retro-nightly',
         'nightly-closed-market-retrain',
@@ -725,11 +743,8 @@ if not AFTER_HOURS_TASKS_ENABLED:
         'daily-performance-report',
         'daily-profit-tracker',
         'paper-trade-retrain-daily',
-        'model-evaluation-daily',
-        'model-drift-check-daily',
         'data-pipeline-daily',
         'data-qa-daily',
-        'continuous-evaluation-daily',
         'backtest-retrain-guard-daily',
         'drift-retrain-daily',
         'model-rollback-daily',

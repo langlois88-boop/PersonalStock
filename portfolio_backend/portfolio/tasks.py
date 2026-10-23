@@ -10641,6 +10641,20 @@ def compute_model_evaluation_daily(as_of: str | None = None) -> dict[str, Any]:
         avg_pnl = total_pnl / trades_count if trades_count else 0.0
         win_rate = wins / trades_count if trades_count else 0.0
 
+        # Volet B3 (2026-10) : gain/perte moyens séparés + espérance $ par
+        # trade, en plus de win_rate/avg_pnl ci-dessus (ne les remplace pas) --
+        # voir docs/TECH_DEBT_NOTES.md item 27 sur pourquoi win_rate seul est
+        # trompeur sur AI_PENNY (ventes partielles).
+        day_pnls = [float(t.pnl or 0) for t in day_trades]
+        gain_pnls = [p for p in day_pnls if p > 0]
+        loss_pnls = [p for p in day_pnls if p <= 0]
+        avg_gain_dollars = (sum(gain_pnls) / len(gain_pnls)) if gain_pnls else None
+        avg_loss_dollars = (sum(loss_pnls) / len(loss_pnls)) if loss_pnls else None
+        if avg_gain_dollars is not None and avg_loss_dollars is not None:
+            expectancy_dollars = win_rate * avg_gain_dollars - (1 - win_rate) * abs(avg_loss_dollars)
+        else:
+            expectancy_dollars = None
+
         signals = []
         outcomes = []
         for trade in day_trades:
@@ -10683,6 +10697,9 @@ def compute_model_evaluation_daily(as_of: str | None = None) -> dict[str, Any]:
                 'brier_score': brier,
                 'mean_predicted': mean_pred,
                 'mean_outcome': mean_out,
+                'avg_gain_dollars': avg_gain_dollars,
+                'avg_loss_dollars': avg_loss_dollars,
+                'expectancy_dollars': expectancy_dollars,
             },
         )
         created += 1
