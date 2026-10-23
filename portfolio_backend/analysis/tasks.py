@@ -147,10 +147,30 @@ def _get_benchmark_price(symbol: str = "^GSPTSE") -> Decimal:
     """
     try:
         price = market_data.Ticker(symbol).info.get("regularMarketPrice")
-        return Decimal(str(price)) if price else Decimal("0")
+        if price:
+            return Decimal(str(price))
     except Exception:
         logger.exception("Erreur fetch prix benchmark %s", symbol)
         return Decimal("0")
+
+    # Repli (2026-10, volet A3) : pas de cotation du jour (marché fermé --
+    # cas réel du 2026-09-01, Fête du Travail -- ou juste absente de .info)
+    # -- dernière clôture de bourse disponible plutôt que Decimal("0"), qui
+    # se confondait silencieusement avec "pas de valeur" (FundamentalLabPosition
+    # .benchmark_price_at_entry accepte NULL mais recevait 0.0000, faussement
+    # "présent" pour tout code qui teste juste la vérité du champ en Python,
+    # où 0 et None sont tous les deux falsy).
+    try:
+        hist = market_data.Ticker(symbol).history(period="5d")
+        if hist is not None and not hist.empty:
+            close_col = "Close" if "Close" in hist.columns else "close"
+            if close_col in hist.columns:
+                last_close = hist[close_col].dropna()
+                if not last_close.empty:
+                    return Decimal(str(float(last_close.iloc[-1])))
+    except Exception:
+        logger.exception("Erreur fetch repli (dernière clôture) benchmark %s", symbol)
+    return Decimal("0")
 
 
 @shared_task(bind=True, max_retries=2)
@@ -372,17 +392,19 @@ def _create_lab_position(scan_result: ScanResult, preset: ScreenerPreset, benchm
             return
 
         quantity = max(1, int(position_size / entry_price))
-        stop_loss = round(entry_price * (1 - stop_pct), 2)
-        take_profit = round(entry_price * (1 + take_profit_pct), 2)
+        stop_loss = entry_price * (1 - stop_pct)
+        take_profit = entry_price * (1 + take_profit_pct)
         is_tsx = scan_result.ticker.strip().upper().endswith(".TO")
 
         if is_tsx:
             paper_trade = PaperTrade.objects.create(
                 ticker=scan_result.ticker,
                 sandbox="FUNDAMENTAL_LAB",
-                entry_price=round(entry_price, 4),
+                entry_price=entry_price,
                 quantity=quantity,
+                initial_quantity=quantity,
                 stop_loss=stop_loss,
+                initial_stop_loss=stop_loss,
                 take_profit=take_profit,
                 entry_signal=scan_result.quant_score,
                 model_name="FUNDAMENTAL_LAB",
@@ -414,9 +436,11 @@ def _create_lab_position(scan_result: ScanResult, preset: ScreenerPreset, benchm
         paper_trade = PaperTrade.objects.create(
             ticker=scan_result.ticker,
             sandbox="FUNDAMENTAL_LAB",
-            entry_price=round(entry_price, 4),
+            entry_price=entry_price,
             quantity=quantity,
+            initial_quantity=quantity,
             stop_loss=stop_loss,
+            initial_stop_loss=stop_loss,
             take_profit=take_profit,
             entry_signal=scan_result.quant_score,
             # model_name par défaut sur PaperTrade est 'BLUECHIP' (valeur du
@@ -727,7 +751,7 @@ def _close_fundamental_lab_trade(trade: PaperTrade, price: float, close_reason: 
     code, dupliqué aurait été un risque de désynchronisation évident).
     """
     trade.status = "CLOSED"
-    trade.exit_price = round(float(price), 4)
+    trade.exit_price = float(price)
     trade.exit_date = timezone.now()
     trade.pnl = round((float(trade.exit_price) - float(trade.entry_price)) * float(trade.quantity), 2)
     trade.outcome = "WIN" if float(trade.pnl) > 0 else "LOSS"
@@ -813,11 +837,11 @@ def _apply_split_adjustment_if_needed(trade: PaperTrade) -> bool:
         return False
 
     old_entry, old_stop, old_take, old_qty = trade.entry_price, trade.stop_loss, trade.take_profit, trade.quantity
-    trade.entry_price = round(float(old_entry) / ratio, 4)
+    trade.entry_price = float(old_entry) / ratio
     if trade.stop_loss:
-        trade.stop_loss = round(float(trade.stop_loss) / ratio, 2)
+        trade.stop_loss = float(trade.stop_loss) / ratio
     if trade.take_profit:
-        trade.take_profit = round(float(trade.take_profit) / ratio, 2)
+        trade.take_profit = float(trade.take_profit) / ratio
     trade.quantity = round(float(old_qty) * ratio, 4)
     trade.notes = (
         f"{trade.notes} | Split détecté (ratio {ratio:g}) le {timezone.now().date().isoformat()} -- "
@@ -944,7 +968,7 @@ def monitor_lab_positions(self) -> dict:
             filled_avg_price = getattr(order_status, "filled_avg_price", None)
             try:
                 if filled_avg_price is not None:
-                    trade.entry_price = round(float(filled_avg_price), 4)
+                    trade.entry_price = float(filled_avg_price)
                     trade.broker_avg_price = float(filled_avg_price)
                     update_fields += ["entry_price", "broker_avg_price"]
             except Exception:

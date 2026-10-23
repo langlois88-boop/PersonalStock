@@ -106,7 +106,11 @@ class PaperTrade(models.Model):
 
 	ticker = models.CharField(max_length=10)
 	sandbox = models.CharField(max_length=20, choices=SANDBOX_CHOICES, default='WATCHLIST', db_index=True)
-	entry_price = models.DecimalField(max_digits=10, decimal_places=2)
+	# max_digits=14/decimal_places=6 depuis 2026-10 (avant : 10/2, qui
+	# arrondissait tout prix sous ~0,50$ à l'équivalent de 0% de variation --
+	# cas SDST, voir docs/TECH_DEBT_NOTES.md). Les lignes closes avant ce
+	# changement restent à 2 décimales en base, non récupérables.
+	entry_price = models.DecimalField(max_digits=14, decimal_places=6)
 	# IntegerField -> FloatField le 2026-08-18 : le chemin crypto (SIM
 	# existant ET le nouveau chemin Alpaca swing) a besoin de quantités
 	# fractionnaires (ex. 0.1 BTC) -- un IntegerField tronque silencieusement
@@ -142,18 +146,31 @@ class PaperTrade(models.Model):
 	# blank/default='' (pas null=True) pour matcher la convention broker_order_id
 	# ci-dessus ; vide tant que l'achat n'est pas confirmé rempli.
 	stop_order_id = models.CharField(max_length=120, blank=True, default='')
-	stop_loss = models.DecimalField(max_digits=10, decimal_places=2)
+	# 14/6 depuis 2026-10, voir entry_price ci-dessus pour le contexte complet.
+	stop_loss = models.DecimalField(max_digits=14, decimal_places=6)
 	# Nullable (2026-08-23) : seul FUNDAMENTAL_LAB la renseigne pour l'instant
 	# (voir analysis/tasks.py::_create_lab_position/monitor_lab_positions) --
 	# les autres sandboxes (WATCHLIST/AI_BLUECHIP/AI_PENNY/AI_CRYPTO) n'y
 	# touchent pas, restent avec take_profit=None, comportement inchangé.
-	take_profit = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+	take_profit = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
 	status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='OPEN')
 	pnl = models.DecimalField(max_digits=10, decimal_places=2, default=0)
 	outcome = models.CharField(max_length=10, choices=(('WIN', 'WIN'), ('LOSS', 'LOSS')), null=True, blank=True)
-	exit_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+	exit_price = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
 	exit_date = models.DateTimeField(null=True, blank=True)
 	notes = models.TextField(blank=True, default='')
+	# --- A2 (2026-10) : traçabilité de la position d'origine, ventes partielles ---
+	# Renseignés UNE SEULE FOIS à la création, jamais modifiés ensuite -- y
+	# compris par le trailing-stop, qui continue d'écraser stop_loss en place.
+	# NULL sur tout trade créé avant ce changement (pas de backfill possible,
+	# la donnée d'origine n'existe plus) -- voir docs/TECH_DEBT_NOTES.md.
+	initial_quantity = models.FloatField(null=True, blank=True)
+	initial_stop_loss = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
+	# Accumule le PnL réalisé des ventes partielles (_execute_paper_trades_for_sandbox),
+	# séparément de pnl (qui reste le total, partiel + solde final à la clôture).
+	# Permet de distinguer "gagnant grâce à la vente partielle" de "gagnant sur
+	# la position complète" -- voir TECH_DEBT_NOTES.md sur le biais win_rate AI_PENNY.
+	realized_partial_pnl = models.DecimalField(max_digits=10, decimal_places=2, default=0)
 
 	class Meta:
 		ordering = ['-entry_date']

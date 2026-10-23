@@ -1647,3 +1647,54 @@ Celery/planning, puisque n'importe quel changement de code Python
 partagée. Complète directement la leçon de l'item 15 (nginx/IP backend)
 -- les deux sont désormais à vérifier systématiquement à chaque
 déploiement.
+
+## 25. [FAIT le 2026-10] `PaperTrade.entry_price/exit_price/stop_loss/take_profit` passés de `DecimalField(10,2)` à `(14,6)`
+
+**Constat** (diagnostic du 2026-10-22) : sous ~0,50$, l'arrondi à 2
+décimales fausse les rendements affichés -- cas SDST, deux trades à
+0,02$/0,02$ (0% de variation affichée) pour des pertes réelles de
+139-151$. Tous les `round(..., 2)` et `round(..., 4)` explicites qui
+précédaient l'écriture de ces 4 champs ont aussi été retirés (sinon la
+précision se perdait avant même d'atteindre le champ migré) --
+`portfolio/tasks.py`, `portfolio/views.py`, `analysis/tasks.py`. Tracé
+jusqu'au bout tous les arrondis "dict/dataclass" qui semblaient
+similaires (`penny_signal_engine.py`, `swing_calculator.py`,
+`deepseek_analyst.py`) : aucun n'alimente un champ `PaperTrade`
+(`PennySignal.data` en JSON pour le premier ; les deux autres sont du
+code mort, aucun appelant nulle part dans le dépôt) -- laissés intacts.
+
+**Limite connue** : les trades fermés AVANT ce déploiement restent à 2
+(ou 4) décimales en base, de façon permanente -- la précision d'origine
+n'existe plus, impossible à reconstruire. Tout calcul de rendement sur
+des trades historiques sous ~0,50$ reste donc non fiable ; seuls les
+trades créés après ce déploiement bénéficient de la précision à 6
+décimales de bout en bout.
+
+## 26. [FAIT le 2026-10] Vente partielle AI_PENNY/AI_BLUECHIP (`_execute_paper_trades_for_sandbox`) : `int()` remplacé par `floor()`, plus de minimum forcé à 1 action, `realized_partial_pnl` séparé
+
+**Constat** : `sell_qty = max(1, int(quantity * ratio))` forçait la
+vente d'au moins 1 action même sur une position trop petite pour que ça
+ait un sens, et surtout -- une fois `trade.quantity` écrasé par la
+vente partielle -- rien ne préservait la taille ni le stop *d'origine*
+du trade. Vérifié avant de coder (demande explicite) : le pnl partiel
+n'était PAS calculé sur une quantité fractionnaire différente de celle
+réellement retirée -- `sell_qty` était déjà un entier avant le calcul du
+pnl, les deux étaient déjà cohérents entre eux. Le biais réel n'est donc
+pas un écart pnl/quantity à l'intérieur de cette fonction, mais
+l'absence de toute trace de la position d'origine une fois `quantity`
+modifié en place (voir item lié au win_rate ci-dessous).
+
+**Fix** : `sell_qty = math.floor(quantity * ratio)` ; si `sell_qty ==
+0`, aucune vente partielle (position trop petite) au lieu d'en forcer
+une sur 1 action. Nouveaux champs `PaperTrade.initial_quantity` et
+`initial_stop_loss`, renseignés une seule fois à la création dans les 11
+chemins de création identifiés (`PaperTrade.objects.create`/`PaperTrade(`
+dans `portfolio/tasks.py`, `portfolio/views.py`, `analysis/tasks.py`),
+jamais modifiés ensuite. `realized_partial_pnl` accumule le pnl des
+ventes partielles séparément du pnl final, pour distinguer un trade
+gagnant grâce à la vente partielle d'un trade gagnant sur la position
+complète.
+
+**Limite connue** : NULL sur tout trade créé avant ce déploiement (pas
+de backfill -- la quantité/stop d'origine n'existe plus nulle part une
+fois `quantity`/`stop_loss` écrasés par le trailing).

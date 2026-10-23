@@ -1314,7 +1314,7 @@ class PaperTradeManualCreateView(APIView):
 		except (TypeError, ValueError):
 			stop_loss = None
 		if not stop_loss or stop_loss <= 0:
-			stop_loss = round(float(price) * 0.95, 2)
+			stop_loss = float(price) * 0.95
 
 		confidence = request.data.get('confidence')
 		try:
@@ -1329,10 +1329,12 @@ class PaperTradeManualCreateView(APIView):
 		trade = PaperTrade.objects.create(
 			ticker=ticker,
 			sandbox=sandbox,
-			entry_price=round(float(price), 4),
+			entry_price=float(price),
 			quantity=quantity,
+			initial_quantity=quantity,
 			entry_signal=entry_signal,
-			stop_loss=round(float(stop_loss), 2),
+			stop_loss=float(stop_loss),
+			initial_stop_loss=float(stop_loss),
 			notes='Manual quick analysis trade',
 		)
 		return Response({'status': 'created', 'trade': PaperTradeSerializer(trade).data}, status=201)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import os
 from uuid import uuid4
 from pathlib import Path
@@ -905,8 +906,9 @@ def process_alpaca_trade_approval(token: str, approved: bool) -> dict[str, Any]:
     PaperTrade.objects.create(
         ticker=symbol,
         sandbox=sandbox,
-        entry_price=round(price, 2),
+        entry_price=price,
         quantity=qty,
+        initial_quantity=qty,
         entry_signal=signal_payload.get('signal'),
         entry_features={
             **(signal_payload.get('features') or {}),
@@ -922,7 +924,8 @@ def process_alpaca_trade_approval(token: str, approved: bool) -> dict[str, Any]:
         broker_status=str(getattr(order, 'status', '') or ''),
         broker_side='BUY',
         broker_updated_at=timezone.now(),
-        stop_loss=round(stop_loss, 2) if stop_loss > 0 else None,
+        stop_loss=stop_loss if stop_loss > 0 else None,
+        initial_stop_loss=stop_loss if stop_loss > 0 else None,
         status='OPEN',
         pnl=0,
         notes=f"manual approval | {notes}".strip(),
@@ -5996,14 +5999,26 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             partial_tp_pct = float(os.getenv('PARTIAL_TAKE_PROFIT_PCT', '0.03'))
             partial_qty_pct = float(os.getenv('PARTIAL_TAKE_PROFIT_QTY_PCT', '0.5'))
             if profit_pct >= partial_tp_pct and not partial_taken:
-                sell_qty = max(1, int(float(trade.quantity) * partial_qty_pct))
-                if sell_qty < trade.quantity:
-                    trade.quantity = int(trade.quantity - sell_qty)
-                    trade.pnl = float(trade.pnl or 0) + float(price - entry_price) * float(sell_qty)
+                # floor() entier (pas de troncature forcée à 1) : une position
+                # trop petite pour céder au moins 1 action entière (cohérence
+                # avec Alpaca, qui n'accepte pas de quantité fractionnaire sur
+                # les actions -- voir submit_market_order) ne déclenche aucune
+                # vente partielle plutôt que d'en forcer une sur une seule
+                # action. pnl partiel calculé sur ce même sell_qty entier,
+                # accumulé séparément dans realized_partial_pnl (2026-10) pour
+                # distinguer un trade gagnant grâce à la vente partielle d'un
+                # trade gagnant sur la position complète -- voir
+                # docs/TECH_DEBT_NOTES.md.
+                sell_qty = math.floor(float(trade.quantity) * partial_qty_pct)
+                if 0 < sell_qty < trade.quantity:
+                    partial_pnl = float(price - entry_price) * float(sell_qty)
+                    trade.quantity = trade.quantity - sell_qty
+                    trade.pnl = float(trade.pnl or 0) + partial_pnl
+                    trade.realized_partial_pnl = float(trade.realized_partial_pnl or 0) + partial_pnl
                     entry_features['partial_taken'] = True
                     trade.entry_features = entry_features
                     trade.notes = (trade.notes or '') + ' | Partial TP exécuté.'
-                    trade.save(update_fields=['quantity', 'pnl', 'entry_features', 'notes'])
+                    trade.save(update_fields=['quantity', 'pnl', 'realized_partial_pnl', 'entry_features', 'notes'])
             time_exit_min = int(os.getenv('TIME_BASED_EXIT_MINUTES', '120'))
             if trade.entry_date and time_exit_min > 0:
                 age_min = (timezone.now() - trade.entry_date).total_seconds() / 60
@@ -6463,15 +6478,17 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             PaperTrade.objects.create(
                 ticker=symbol,
                 sandbox=sandbox,
-                entry_price=round(price, 2),
+                entry_price=price,
                 quantity=quantity,
+                initial_quantity=quantity,
                 entry_signal=signal,
                 entry_features=entry_features,
                 entry_explanations=(signal_payload or {}).get('explanations'),
                 model_name=(signal_payload or {}).get('model_name', universe),
                 model_version=(signal_payload or {}).get('model_version', ''),
                 broker='SIM',
-                stop_loss=round(stop_loss, 2),
+                stop_loss=stop_loss,
+                initial_stop_loss=stop_loss,
                 status='OPEN',
                 pnl=0,
                 notes=(
@@ -6582,15 +6599,17 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
                     PaperTrade.objects.create(
                         ticker=best_symbol,
                         sandbox=sandbox,
-                        entry_price=round(price, 2),
+                        entry_price=price,
                         quantity=quantity,
+                        initial_quantity=quantity,
                         entry_signal=best_signal,
                         entry_features={},
                         entry_explanations=[],
                         model_name='FORCED_PENNY',
                         model_version='forced',
                         broker='SIM',
-                        stop_loss=round(price * 0.95, 2),
+                        stop_loss=price * 0.95,
+                        initial_stop_loss=price * 0.95,
                         status='OPEN',
                         pnl=0,
                         notes='Forced entry to bootstrap learning.',
@@ -6754,13 +6773,13 @@ def _execute_paper_trades_for_crypto_sandbox() -> dict[str, Any]:
         if price >= entry_price * (1 + trail_trigger_pct):
             new_stop = max(stop_loss, price * (1 - trail_pct))
             if new_stop > stop_loss:
-                trade.stop_loss = round(new_stop, 2)
+                trade.stop_loss = new_stop
                 trade.save(update_fields=['stop_loss'])
                 stop_loss = float(trade.stop_loss)
 
         should_close = price <= stop_loss or price >= entry_price * (1 + take_profit_pct)
         if should_close:
-            trade.exit_price = round(price, 2)
+            trade.exit_price = price
             trade.exit_date = timezone.now()
             trade.status = 'CLOSED'
             trade.pnl = float(trade.exit_price - float(trade.entry_price)) * float(trade.quantity)
@@ -6799,8 +6818,9 @@ def _execute_paper_trades_for_crypto_sandbox() -> dict[str, Any]:
         PaperTrade.objects.create(
             ticker=symbol,
             sandbox=sandbox,
-            entry_price=round(price, 2),
+            entry_price=price,
             quantity=qty,
+            initial_quantity=qty,
             entry_signal=float(score) if score is not None else None,
             entry_features={
                 'score': score,
@@ -6812,7 +6832,8 @@ def _execute_paper_trades_for_crypto_sandbox() -> dict[str, Any]:
             },
             model_name='CRYPTO',
             broker='SIM',
-            stop_loss=round(stop_loss, 2),
+            stop_loss=stop_loss,
+            initial_stop_loss=stop_loss,
             status='OPEN',
             pnl=0,
             notes='auto crypto sandbox',
@@ -6902,14 +6923,14 @@ def _execute_alpaca_paper_trades_for_crypto_swing() -> dict[str, Any]:
         if price >= entry_price * (1 + trail_trigger_pct):
             new_stop = max(stop_loss, price * (1 - trail_pct))
             if new_stop > stop_loss:
-                trade.stop_loss = round(new_stop, 2)
+                trade.stop_loss = new_stop
                 trade.save(update_fields=['stop_loss'])
                 stop_loss = float(trade.stop_loss)
 
         should_close = price <= stop_loss or price >= entry_price * (1 + take_profit_pct)
         if should_close:
             order = submit_crypto_market_order(trade.ticker, float(trade.quantity), 'sell')
-            trade.exit_price = round(price, 2)
+            trade.exit_price = price
             trade.exit_date = timezone.now()
             trade.status = 'CLOSED'
             trade.pnl = float(trade.exit_price - entry_price) * float(trade.quantity)
@@ -6943,8 +6964,9 @@ def _execute_alpaca_paper_trades_for_crypto_swing() -> dict[str, Any]:
         PaperTrade.objects.create(
             ticker=symbol,
             sandbox=sandbox,
-            entry_price=round(price, 2),
+            entry_price=price,
             quantity=qty,
+            initial_quantity=qty,
             entry_signal=float(score) if score is not None else None,
             entry_features={
                 'score': score,
@@ -6958,7 +6980,8 @@ def _execute_alpaca_paper_trades_for_crypto_swing() -> dict[str, Any]:
             model_name='CRYPTO_SWING',
             broker='ALPACA',
             broker_status='submitted',
-            stop_loss=round(price * (1 - stop_loss_pct), 2),
+            stop_loss=price * (1 - stop_loss_pct),
+            initial_stop_loss=price * (1 - stop_loss_pct),
             status='OPEN',
             pnl=0,
             notes='alpaca crypto swing sandbox',
@@ -7536,8 +7559,9 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
             PaperTrade.objects.create(
                 ticker=symbol,
                 sandbox=sandbox,
-                entry_price=round(price, 2),
+                entry_price=price,
                 quantity=qty,
+                initial_quantity=qty,
                 entry_signal=signal,
                 entry_features={
                     **((signal_payload or {}).get('features') or {}),
@@ -7552,7 +7576,8 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
                 broker_status='SHADOW',
                 broker_side='BUY',
                 broker_updated_at=timezone.now(),
-                stop_loss=round(stop_loss, 2),
+                stop_loss=stop_loss,
+                initial_stop_loss=stop_loss,
                 status='OPEN',
                 pnl=0,
                 notes=f"shadow | tier {tier}",
@@ -7596,8 +7621,9 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
         PaperTrade.objects.create(
             ticker=symbol,
             sandbox=sandbox,
-            entry_price=round(price, 2),
+            entry_price=price,
             quantity=qty,
+            initial_quantity=qty,
             entry_signal=signal,
             entry_features={
                 **((signal_payload or {}).get('features') or {}),
@@ -7614,7 +7640,8 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
             broker_status=str(getattr(order, 'status', '') or ''),
             broker_side='BUY',
             broker_updated_at=timezone.now(),
-            stop_loss=round(stop_loss, 2),
+            stop_loss=stop_loss,
+            initial_stop_loss=stop_loss,
             status='OPEN',
             pnl=0,
             notes=(notes or '') + f" | tier {tier}"
@@ -7719,8 +7746,9 @@ def sync_alpaca_paper_trades() -> dict[str, Any]:
                 PaperTrade.objects.create(
                     ticker=symbol,
                     sandbox=sandbox,
-                    entry_price=round(float(filled_avg_price), 2),
+                    entry_price=float(filled_avg_price),
                     quantity=int(filled_qty),
+                    initial_quantity=int(filled_qty),
                     entry_signal=None,
                     broker='ALPACA',
                     broker_order_id=order_id,
@@ -7729,7 +7757,8 @@ def sync_alpaca_paper_trades() -> dict[str, Any]:
                     broker_updated_at=timezone.now(),
                     broker_filled_qty=filled_qty,
                     broker_avg_price=filled_avg_price,
-                    stop_loss=round(float(filled_avg_price) * 0.96, 2),
+                    stop_loss=float(filled_avg_price) * 0.96,
+                    initial_stop_loss=float(filled_avg_price) * 0.96,
                     status='OPEN',
                     pnl=0,
                     notes='imported from alpaca orders',
@@ -7743,7 +7772,7 @@ def sync_alpaca_paper_trades() -> dict[str, Any]:
                 ).order_by('entry_date').first()
                 if not open_trade:
                     continue
-                open_trade.exit_price = round(float(filled_avg_price), 2)
+                open_trade.exit_price = float(filled_avg_price)
                 open_trade.exit_date = timezone.now()
                 open_trade.status = 'CLOSED'
                 open_trade.pnl = float(open_trade.exit_price - float(open_trade.entry_price)) * float(open_trade.quantity)
@@ -7791,9 +7820,9 @@ def sync_alpaca_paper_trades() -> dict[str, Any]:
             pass
 
         if status.lower() == 'filled' and trade.broker_side == 'BUY' and filled_avg_price:
-            trade.entry_price = round(float(filled_avg_price), 2)
+            trade.entry_price = float(filled_avg_price)
         if status.lower() == 'filled' and trade.broker_side == 'SELL' and filled_avg_price:
-            trade.exit_price = round(float(filled_avg_price), 2)
+            trade.exit_price = float(filled_avg_price)
             trade.exit_date = timezone.now()
             trade.status = 'CLOSED'
             trade.pnl = float(trade.exit_price - trade.entry_price) * float(trade.quantity)
