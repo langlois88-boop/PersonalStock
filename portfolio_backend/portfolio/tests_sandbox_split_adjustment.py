@@ -9,7 +9,9 @@ A2) exécutée sur ce prix fictif.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -18,6 +20,7 @@ from django.utils import timezone
 
 from portfolio import tasks
 from portfolio.models import PaperTrade
+from portfolio.tests_confidence_floor import _FakeDataFusionEngine, _model_signal_side_effect
 
 
 def _split_series(split_date, ratio):
@@ -137,3 +140,83 @@ class SandboxSplitAdjustmentTests(TestCase):
         self.assertAlmostEqual(float(trade.entry_price), 5.98, places=3)
         self.assertIsNone(trade.initial_quantity)
         self.assertIsNone(trade.initial_stop_loss)
+
+
+class AlpacaShadowPathSplitAdjustmentTests(TestCase):
+    """Même trou côté réel : _execute_alpaca_paper_trades_for_sandbox gère
+    les positions existantes (broker SHADOW ou ALPACA) via _update_open_trade,
+    qui lisait trade.entry_price/quantity sans jamais les resynchroniser
+    avec un split -- même si le compte Alpaca réel, lui, ajuste ses propres
+    positions. ALPACA_SHADOW_TRADING=true pour rester sur le chemin
+    SHADOW (déjà utilisé par tests_confidence_floor.py), qui crée/modifie
+    un vrai PaperTrade sans jamais appeler l'API Alpaca réelle."""
+
+    def _run(self, sandbox, prefix, signal_by_symbol, price_by_symbol, split_date, split_ratio):
+        simple_mocks = {
+            '_get_watchlist': lambda sandbox, prefix, default: list(signal_by_symbol.keys()),
+            '_midday_blackout': lambda: False,
+            '_is_reentry_candidate': lambda symbol, sandbox: False,
+            '_weak_list_health': lambda: {'defensive': False},
+            '_earnings_blackout': lambda symbol, days=2: (False, None),
+            '_daily_trend_ok': lambda symbol, use_alpaca=False: True,
+            '_correlation_blocked': lambda symbol, open_symbols: False,
+            '_symbol_currency': lambda symbol: 'USD',
+            'get_market_sentiment': lambda: ('NEUTRAL', {}),
+            '_market_sentiment_score': lambda: 0.5,
+            'get_market_regime_context': lambda: {'risk_off': False},
+            '_alpaca_buying_power': lambda: 50000.0,
+            'get_account': lambda: SimpleNamespace(equity=50000.0),
+            'get_open_positions': lambda: [],
+            '_daily_equity_circuit_breaker': lambda sandbox, equity, **kwargs: {'triggered': False},
+            '_model_signal': _model_signal_side_effect(signal_by_symbol),
+            'get_intraday_context': lambda *a, **k: None,
+            '_time_of_day_penalty': lambda *a, **k: 1.0,
+            '_loss_blacklist': lambda symbol, sandbox: False,
+            '_sector_trend_ok': lambda symbol: True,
+            '_atr_spike': lambda symbol, use_alpaca=False: False,
+            '_btc_trend_ok': lambda symbol: True,
+            'get_latest_bid_ask_spread_pct': lambda symbol: 0.001,
+            'get_order_book_imbalance': lambda symbol: None,
+            'get_latest_trade_price': lambda symbol: price_by_symbol.get(symbol),
+            'DataFusionEngine': _FakeDataFusionEngine,
+        }
+        env = {'ALPACA_SHADOW_TRADING': 'true'}
+        with ExitStack() as stack:
+            for name, value in simple_mocks.items():
+                stack.enter_context(patch.object(tasks, name, value))
+            stack.enter_context(patch.dict('os.environ', env))
+            mock_ticker_cls = stack.enter_context(patch.object(tasks.yf, 'Ticker'))
+            mock_ticker_cls.return_value.splits = _split_series(split_date, split_ratio)
+            tasks._execute_alpaca_paper_trades_for_sandbox(sandbox, prefix)
+
+    def test_shadow_trade_entry_price_adjusted_before_sell_decision(self):
+        entry_date = timezone.now() - timedelta(days=2)
+        split_date = timezone.now() - timedelta(hours=10)
+        trade = PaperTrade.objects.create(
+            ticker='SHADOWSPLIT', sandbox='AI_BLUECHIP', entry_price=0.0299,
+            quantity=1000.0, initial_quantity=1000.0, stop_loss=0.02832,
+            initial_stop_loss=0.02832, status='OPEN', broker='SHADOW',
+        )
+        PaperTrade.objects.filter(pk=trade.pk).update(entry_date=entry_date)
+
+        # Signal haut pour passer tous les filtres d'entrée (même position
+        # déjà ouverte, le chemin doit quand même clear min_confidence pour
+        # atteindre la gestion de position -- comportement existant, pas
+        # changé ici) ; prix courant = post-split réaliste (même échelle
+        # que le cas AXG réel).
+        self._run(
+            'AI_BLUECHIP', 'AI_BLUECHIP',
+            signal_by_symbol={'SHADOWSPLIT': 0.95},
+            price_by_symbol={'SHADOWSPLIT': 4.15},
+            split_date=split_date, split_ratio=0.005,
+        )
+
+        trade.refresh_from_db()
+        self.assertAlmostEqual(float(trade.entry_price), 5.98, places=3)
+        self.assertAlmostEqual(float(trade.quantity), 5.0, places=3)
+        self.assertAlmostEqual(float(trade.initial_quantity), 5.0, places=3)
+        # Avec un entry_price corrigé (5.98$) contre un prix courant de
+        # 4.15$, ceci est une PERTE, pas le faux +13880% d'avant -- la
+        # décision de vente peut légitimement se déclencher, mais plus sur
+        # un prix fictif.
+        self.assertLess(float(trade.entry_price), 6.0)

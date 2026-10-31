@@ -7281,6 +7281,14 @@ def _execute_alpaca_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[
         return frame if frame is not None else pd.DataFrame()
 
     def _update_open_trade(trade: PaperTrade, price: float, signal: float | None) -> bool:
+        # Même trou que le chemin SIM (voir _apply_sandbox_split_adjustment_if_needed
+        # et le cas AXG/ATYR, docs/TECH_DEBT_NOTES.md item 28) : trade.entry_price/
+        # quantity sont des instantanés locaux, jamais resynchronisés avec
+        # Alpaca -- un split laisse la comparaison entry/prix courant fausse
+        # même si le compte réel Alpaca, lui, ajuste ses propres positions.
+        # Couvre shadow_trade ET open_trade (seuls appelants, tous les deux
+        # via cette fonction).
+        _apply_sandbox_split_adjustment_if_needed(trade)
         frame = _alpaca_fusion(trade.ticker)
         tier, tier_reasons = _classify_tier(frame, {'signal': signal})
         entry_features = dict(trade.entry_features or {})
