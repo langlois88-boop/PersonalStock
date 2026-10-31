@@ -1757,6 +1757,22 @@ changent pas. Résultat : AXG et ATYR passent de +137 792,62 $/+38 715,23 $
 à −306,01 $/−7,09 $.
 
 **Portée du fix** : couvre `_execute_paper_trades_for_sandbox`
-(WATCHLIST/AI_BLUECHIP/AI_PENNY, broker SIM) uniquement. `_execute_alpaca_paper_trades_for_sandbox`
-(même 3 sandboxes, mais ordres réels Alpaca) a probablement le même
-trou -- pas vérifié, pas corrigé ici, pas demandé pour cette passe.
+(WATCHLIST/AI_BLUECHIP/AI_PENNY, broker SIM). **Mise à jour 2026-10-30
+soir** : `_execute_alpaca_paper_trades_for_sandbox` (mêmes 3 sandboxes,
+ordres réels/shadow Alpaca) avait bien le même trou -- `_update_open_trade`
+(gère shadow_trade et open_trade) lisait `entry_price`/`quantity` locaux
+sans jamais les resynchroniser après un split, alors que
+`sync_alpaca_paper_trades` calcule `pnl = (exit_price - entry_price) *
+quantity` à partir de ces mêmes champs. Un seul appel à
+`_apply_sandbox_split_adjustment_if_needed` ajouté au début de
+`_update_open_trade`, couvre les deux appelants.
+
+**Piège de déploiement rencontré en déployant ce second fix** :
+`docker compose up -d --build` a reconstruit les 4 images (nouveau
+digest confirmé) mais n'a PAS recréé les conteneurs -- aucun "Recreate"
+dans la sortie, `docker inspect` confirmait l'ancien digest encore actif
+après coup. Fallait `docker compose up -d --force-recreate <services>`
+explicitement, comme pour `celery_beat` (item 24) mais ici pour TOUS les
+services touchés, pas seulement Beat. À vérifier systématiquement après
+un `--build` : comparer `docker inspect <conteneur> --format '{{.Image}}'`
+au digest qui vient d'être buildé, pas supposer que `--build` recrée.
