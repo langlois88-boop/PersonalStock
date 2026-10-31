@@ -5576,6 +5576,81 @@ def _penny_breakout_score(bars: pd.DataFrame | None) -> tuple[bool, float]:
     return breakout, max(0.0, min(1.0, score))
 
 
+def _apply_sandbox_split_adjustment_if_needed(trade: PaperTrade) -> bool:
+    """
+    Détecte un split d'actions survenu depuis l'ouverture d'une position
+    WATCHLIST/AI_BLUECHIP/AI_PENNY (broker SIM) et ajuste entry_price/
+    stop_loss/take_profit/quantity/initial_quantity/initial_stop_loss en
+    conséquence. Même bug que BRCC (voir analysis/tasks.py::
+    _apply_split_adjustment_if_needed, 2026-08-24), jamais couvert pour ce
+    pipeline avant le cas AXG/ATYR du 2026-10-29 (reverse splits 1-pour-200
+    et 1-pour-40) : comparer un entry_price d'AVANT le split au prix
+    courant d'APRÈS le split a donné un faux gain de +13880%/+3872%, et la
+    vente partielle (floor(), 2026-10) a vendu la moitié de la position sur
+    ce prix fictif -- $88k+ de realized_partial_pnl fabriqué avant d'être
+    découvert en diagnostiquant la performance AI_PENNY. Les positions déjà
+    closes au moment de la découverte ont été corrigées séparément (voir
+    migration portfolio.0042 et docs/TECH_DEBT_NOTES.md), pas par cette
+    fonction qui ne regarde que les positions encore OPEN.
+
+    initial_quantity/initial_stop_loss sont ajustés ici aussi (seule
+    exception à la règle "jamais modifié après création", volet A2) --
+    un split change l'unité de compte, pas la position économique ; sans
+    cet ajustement, comparer l'avant/après donnerait l'illusion d'une
+    vente massive qui n'a jamais eu lieu.
+    """
+    try:
+        splits = yf.Ticker(trade.ticker).splits
+    except Exception:
+        logger.warning("_execute_paper_trades_for_sandbox: échec fetch splits pour %s.", trade.ticker)
+        return False
+    if splits is None or splits.empty or trade.entry_date is None:
+        return False
+    try:
+        relevant = splits[splits.index >= trade.entry_date]
+    except Exception:
+        return False
+    if relevant.empty:
+        return False
+
+    ratio = 1.0
+    for value in relevant:
+        try:
+            ratio *= float(value)
+        except (TypeError, ValueError):
+            continue
+    if ratio == 1.0 or ratio <= 0:
+        return False
+
+    old_entry, old_stop, old_qty = trade.entry_price, trade.stop_loss, trade.quantity
+    update_fields = ["entry_price", "stop_loss", "quantity", "notes"]
+    trade.entry_price = float(old_entry) / ratio
+    if trade.stop_loss:
+        trade.stop_loss = float(trade.stop_loss) / ratio
+    if trade.take_profit:
+        trade.take_profit = float(trade.take_profit) / ratio
+        update_fields.append("take_profit")
+    trade.quantity = float(old_qty) * ratio
+    if trade.initial_quantity is not None:
+        trade.initial_quantity = float(trade.initial_quantity) * ratio
+        update_fields.append("initial_quantity")
+    if trade.initial_stop_loss is not None:
+        trade.initial_stop_loss = float(trade.initial_stop_loss) / ratio
+        update_fields.append("initial_stop_loss")
+    trade.notes = (
+        f"{trade.notes or ''} | Split détecté (ratio {ratio:g}) le {timezone.now().date().isoformat()} -- "
+        f"entry_price/stop_loss/quantity ajustés pour rester comparables au prix courant."
+    )
+    trade.save(update_fields=update_fields)
+    logger.warning(
+        "_execute_paper_trades_for_sandbox: split détecté pour %s (ratio=%s) -- entry %.6f->%.6f, "
+        "stop %s->%s, qty %.4f->%.4f.",
+        trade.ticker, ratio, float(old_entry), float(trade.entry_price),
+        old_stop, trade.stop_loss, float(old_qty), float(trade.quantity),
+    )
+    return True
+
+
 def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, Any]:
     """Execute live paper trades for a specific sandbox using model signals and risk rules."""
     use_alpaca = sandbox in {'AI_BLUECHIP', 'AI_PENNY'}
@@ -5992,6 +6067,7 @@ def _execute_paper_trades_for_sandbox(sandbox: str, prefix: str) -> dict[str, An
             if now_ny.time() >= dt_time(14, 30) and float(intraday_ctx.get('rvol') or 0) < 1.0:
                 signal = float(signal) * 0.9
         for trade in trades:
+            _apply_sandbox_split_adjustment_if_needed(trade)
             entry_price = float(trade.entry_price or 0)
             profit_pct = (price - entry_price) / entry_price if entry_price else 0.0
             entry_features = dict(trade.entry_features or {})

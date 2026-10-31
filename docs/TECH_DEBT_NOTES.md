@@ -1716,3 +1716,47 @@ distinguer les deux cas -- **tout futur seuil de rollback ou de
 promotion de modèle devra se baser sur l'espérance $ par trade, pas sur
 ce `win_rate`**, qui reste mesuré pour la continuité historique mais
 n'est plus le signal à utiliser pour une décision automatique.
+
+## 28. [CORRIGÉ le 2026-10-30] AXG/ATYR : reverse splits jamais gérés par `_execute_paper_trades_for_sandbox`, +$176k de PnL fabriqué sur AI_PENNY
+
+**Constat** (trouvé en vérifiant la performance AI_PENNY une semaine
+après le déploiement du volet A/B) : AXG et ATYR ont subi un reverse
+split le 2026-10-29 (1-pour-200 et 1-pour-40, confirmés via
+`yfinance`) pendant que des positions AI_PENNY étaient ouvertes.
+`_execute_paper_trades_for_sandbox` (WATCHLIST/AI_BLUECHIP/AI_PENNY,
+broker SIM) n'avait **aucune gestion de split** -- contrairement à
+FUNDAMENTAL_LAB, qui en a une depuis le cas BRCC (item lié, 2026-08-24,
+`analysis/tasks.py::_apply_split_adjustment_if_needed`). Comparer un
+entry_price pré-split à un prix courant post-split a produit un faux
+gain de +13880% (AXG) et +3872% (ATYR), et la vente partielle (floor(),
+volet A2) a vendu la moitié de chaque position sur ce prix fictif :
+$88 397 + $19 358 de `realized_partial_pnl` fabriqué, $176 508 de `pnl`
+fabriqué au total -- presque la totalité du PnL AI_PENNY affiché sur
+la semaine (le reste des 31 autres trades clôturés somme à −222,03 $).
+
+**Fix préventif** : nouvelle fonction `_apply_sandbox_split_adjustment_if_needed`
+(`portfolio/tasks.py`), appelée au début de la boucle des positions
+ouvertes dans `_execute_paper_trades_for_sandbox` -- même formule que
+le cas BRCC (ratio de split via `yf.Ticker(ticker).splits`, ajuste
+entry_price/stop_loss/take_profit/quantity). Étendue pour ajuster aussi
+`initial_quantity`/`initial_stop_loss` (seule exception à la règle
+"jamais modifié après création" du volet A2 : un split change l'unité
+de compte, pas la position économique -- sans cet ajustement, l'écart
+donnerait l'illusion d'une vente massive qui n'a jamais eu lieu).
+
+**Correction rétroactive** (migration `portfolio.0042`, réversible) :
+les deux positions étaient déjà fermées à la découverte, donc hors
+d'atteinte du fix préventif. `entry_price`/`stop_loss`/
+`initial_stop_loss`/`quantity`/`initial_quantity` corrigés par le ratio
+de split ; `pnl`/`realized_partial_pnl` **recalculés** à partir de ces
+valeurs corrigées et de `exit_price` (un prix réel post-split, jamais
+modifié) -- pas une reconstruction de ce que le bot "aurait dû"
+décider, seulement la correction d'une erreur d'unité qui faussait la
+comparaison entrée/sortie ; les prix de vente réellement enregistrés ne
+changent pas. Résultat : AXG et ATYR passent de +137 792,62 $/+38 715,23 $
+à −306,01 $/−7,09 $.
+
+**Portée du fix** : couvre `_execute_paper_trades_for_sandbox`
+(WATCHLIST/AI_BLUECHIP/AI_PENNY, broker SIM) uniquement. `_execute_alpaca_paper_trades_for_sandbox`
+(même 3 sandboxes, mais ordres réels Alpaca) a probablement le même
+trou -- pas vérifié, pas corrigé ici, pas demandé pour cette passe.
